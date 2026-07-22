@@ -1,0 +1,34 @@
+name: Feature request
+description: Propose a product or architecture improvement
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user or operational problem without prescribing a solution.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: What measurable behavior should be possible?
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints and non-goals
+      description: Include security, compatibility, cost, provider, and workflow boundaries.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Draft acceptance criteria
+      description: List testable success and failure conditions.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other approaches or workarounds exist?

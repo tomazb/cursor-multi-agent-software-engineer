@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "runtime": {
+    "kind": "cursor-cli",
+    "command": "agent",
+    "outputFormat": "json"
+  },
+  "roles": {
+    "brainstormer": {
+      "model": "grok-4.5",
+      "reasoning": "high",
+      "permissions": "read-only"
+    },
+    "designer": {
+      "model": "claude-fable-5",
+      "fallbackModels": ["claude-opus-4.8"],
+      "reasoning": "high",
+      "permissions": "read-only"
+    },
+    "builder": {
+      "model": "grok-4.5",
+      "reasoning": "high",
+      "permissions": "workspace-write"
+    },
+    "verifier": {
+      "model": "gpt-5.6-sol-high",
+      "reasoning": "high",
+      "permissions": "read-only"
+    },
+    "prResolver": {
+      "model": "gpt-5.6-sol-high",
+      "reasoning": "high",
+      "permissions": "workspace-write"
+    }
+  },
+  "gates": {
+    "requireBrainstormApproval": true,
+    "requireDesignApproval": true,
+    "requireCiPass": true,
+    "requireVerifierPass": true
+  },
+  "quality": {
+    "commands": [
+      "pnpm test",
+      "pnpm lint",
+      "pnpm typecheck",
+      "pnpm build"
+    ]
+  },
+  "policy": {
+    "rejectModelFallback": true,
+    "maxBuildVerifyCycles": 3,
+    "maxCommentResolutionCycles": 2,
+    "allowDirtyWorkspace": false
+  }
+}

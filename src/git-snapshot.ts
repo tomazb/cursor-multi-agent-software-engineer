@@ -1,0 +1,66 @@
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { spawn } from "node:child_process";
+
+interface ProcessResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+function run(command: string, args: string[], cwd: string): Promise<ProcessResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => (stdout += chunk));
+    child.stderr.on("data", (chunk: string) => (stderr += chunk));
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ exitCode: code ?? 1, stdout, stderr }));
+  });
+}
+
+export async function isGitRepository(cwd: string): Promise<boolean> {
+  try {
+    const result = await run("git", ["rev-parse", "--is-inside-work-tree"], cwd);
+    return result.exitCode === 0 && result.stdout.trim() === "true";
+  } catch {
+    return false;
+  }
+}
+
+
+export async function isGitWorkspaceClean(cwd: string): Promise<boolean> {
+  if (!(await isGitRepository(cwd))) return true;
+  const result = await run("git", ["status", "--porcelain=v1", "--untracked-files=all"], cwd);
+  return result.exitCode === 0 && result.stdout.trim().length === 0;
+}
+
+export async function gitWorkspaceFingerprint(cwd: string): Promise<string> {
+  if (!(await isGitRepository(cwd))) return "not-a-git-repository";
+  const hash = createHash("sha256");
+  const commands = [
+    ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    ["diff", "--binary"],
+    ["diff", "--cached", "--binary"],
+  ];
+  for (const args of commands) {
+    const result = await run("git", args, cwd);
+    hash.update(result.stdout);
+    hash.update(result.stderr);
+  }
+
+  const untracked = await run("git", ["ls-files", "--others", "--exclude-standard", "-z"], cwd);
+  for (const relative of untracked.stdout.split("\0").filter(Boolean).sort()) {
+    try {
+      hash.update(relative);
+      hash.update(await readFile(path.join(cwd, relative)));
+    } catch {
+      hash.update("unreadable");
+    }
+  }
+  return hash.digest("hex");
+}

@@ -1,0 +1,42 @@
+{
+  "name": "cursor-multi-agent-software-engineer",
+  "version": "0.1.0",
+  "description": "A durable, model-configurable software delivery orchestrator for Cursor and Superpowers.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "maswe": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "prompts",
+    "skills",
+    ".cursor-plugin",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.15"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run build",
+    "dev": "node --experimental-strip-types src/cli.ts",
+    "start": "node dist/cli.js"
+  },
+  "peerDependencies": {
+    "@cursor/sdk": "*"
+  },
+  "peerDependenciesMeta": {
+    "@cursor/sdk": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.3"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+.maswe/runs/
+.maswe/logs/
+*.log
+.DS_Store
