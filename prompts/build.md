@@ -54,4 +54,10 @@ Return Markdown containing:
 5. Deviations, limitations, and follow-up work.
 6. Current git status and commit SHA when available.
 
-End with `BUILD_COMPLETE` only when the workspace is ready for deterministic CI.
+## Terminal marker (mandatory)
+
+Only when the workspace is ready for deterministic CI, end with exactly this bare final line:
+
+BUILD_COMPLETE
+
+Do not wrap it in backticks, quotes, bold, or code fences. Do not mention that marker text anywhere else in the response.

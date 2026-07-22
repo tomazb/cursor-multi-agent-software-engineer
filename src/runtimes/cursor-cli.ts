@@ -5,16 +5,50 @@ import { ensureRunWorkspace, cleanupDoctorProbeResources } from "../git-workspac
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-function extractOutput(stdout: string): string {
+/** Extract assistant text from Cursor CLI `-p` stdout (text, json, or NDJSON stream-json). */
+export function extractCursorCliOutput(stdout: string): string {
   const trimmed = stdout.trim();
   if (!trimmed) return "";
-  try {
-    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-    const candidate = parsed.result ?? parsed.text ?? parsed.message;
-    return typeof candidate === "string" ? candidate : JSON.stringify(parsed, null, 2);
-  } catch {
-    return stdout;
+
+  const tryObject = (raw: string): string | undefined => {
+    try {
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const candidate = parsed.result ?? parsed.text ?? parsed.message;
+      if (typeof candidate === "string") return candidate;
+      // Prefer terminal stream-json result events.
+      if (parsed.type === "result" && typeof parsed.result === "string") {
+        return parsed.result;
+      }
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  };
+
+  const whole = tryObject(trimmed);
+  if (whole !== undefined) return whole;
+
+  // NDJSON / stream-json: take the last parseable result-bearing object.
+  const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]!;
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      if (parsed.type === "result" && typeof parsed.result === "string") {
+        return parsed.result;
+      }
+      const candidate = parsed.result ?? parsed.text ?? parsed.message;
+      if (typeof candidate === "string") return candidate;
+    } catch {
+      // keep scanning
+    }
   }
+
+  return stdout;
+}
+
+function extractOutput(stdout: string): string {
+  return extractCursorCliOutput(stdout);
 }
 
 function looksLikeNode(command: string): boolean {

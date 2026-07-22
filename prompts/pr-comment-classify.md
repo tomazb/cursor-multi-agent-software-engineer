@@ -27,8 +27,11 @@ Return:
 - Minimal permitted change.
 - Risks and ambiguity.
 
-The final line must be exactly one of:
+## Terminal marker (mandatory)
 
-`SCOPE: IN_SCOPE`
+The **very last line** of your response must be exactly one of these bare markers:
 
-`SCOPE: OUT_OF_SCOPE`
+SCOPE: IN_SCOPE
+SCOPE: OUT_OF_SCOPE
+
+Do not wrap the marker in backticks, quotes, bold, or code fences. Do not mention those marker strings anywhere else in the response.

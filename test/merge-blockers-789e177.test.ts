@@ -246,13 +246,16 @@ test(
 
     const config = structuredClone(DEFAULT_CONFIG);
     config.runtime.kind = "cursor-cli";
+    config.runtime.outputFormat = "text";
+    config.roles.brainstormer.model =
+      process.env.MASWE_MODEL_BRAINSTORMER?.trim() || "cursor-grok-4.5-high";
     config.policy.trustManagedWorktrees = true;
     config.policy.useIsolatedWorktree = true;
     config.gates.requireBrainstormApproval = true;
     config.quality.commands = [];
 
     const orchestrator = new Orchestrator(cwd, config, createRuntime(config, cwd));
-    const run = await orchestrator.start("Smoke", "One-sentence brainstorm only.");
+    const run = await orchestrator.start("Smoke", "One-sentence brainstorm only. Keep the report short.");
     assert.ok(run.workspace?.worktreePath);
     assert.equal(
       run.state,

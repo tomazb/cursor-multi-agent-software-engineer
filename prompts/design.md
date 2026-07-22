@@ -32,4 +32,12 @@ Produce one self-contained Markdown artifact containing:
 10. An ordered implementation plan with small reviewable tasks, files likely to change, and verification commands.
 11. Risks, alternatives rejected, and decisions needing human approval.
 
-Separate requirements from implementation choices. Do not silently broaden scope. End with `READY_FOR_DESIGN_APPROVAL`.
+Separate requirements from implementation choices. Do not silently broaden scope.
+
+## Terminal marker (mandatory)
+
+The **very last line** of your response must be exactly this bare marker and nothing else on that line:
+
+READY_FOR_DESIGN_APPROVAL
+
+Do not wrap it in backticks, quotes, bold, or code fences. Do not mention that marker text anywhere else in the response.
