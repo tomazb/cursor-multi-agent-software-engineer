@@ -173,7 +173,7 @@ The v0.2 verifier and quality gates bind evidence to the current git **head SHA*
 - GitHub webhooks and check runs are not yet wired to the CLI.
 - Human approvals are local commands rather than signed GitHub actions.
 - File-based state is suitable for one operator or CI job, not concurrent distributed workers.
-- Model catalogue output differs across Cursor versions; `maswe doctor` resolves logical names against exact catalogue IDs and fails closed on missing or ambiguous matches.
+- Model catalogue output differs across Cursor versions; for Cursor CLI, `maswe doctor` resolves logical names against exact catalogue IDs for its probe (without persisting a run snapshot) and fails closed on missing or ambiguous matches. `maswe start` persists resolved exact IDs into the new run config.
 - The Cursor SDK is a public beta and is kept behind an adapter boundary.
 
 These are deliberate boundaries rather than hidden behavior. See [the roadmap](docs/ROADMAP.md).

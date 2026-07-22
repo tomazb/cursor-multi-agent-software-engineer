@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { createHash, type Hash } from "node:crypto";
+import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { spawnCaptured } from "./process.ts";
 
@@ -10,6 +10,64 @@ interface ProcessResult {
 }
 
 const GIT_TIMEOUT_MS = 120_000;
+
+/** Lock/recovery markers and write temps that may churn during normal orchestration. */
+const MASWE_EPHEMERAL_BASENAMES = new Set([
+  ".lock",
+  ".admin.lock",
+  ".admin.lock.recovering",
+]);
+
+/**
+ * Authoritative MASWE paths included in the read-only fingerprint (under `cwd/.maswe`):
+ * - project config files
+ * - `runs/<id>/run.json`
+ * - `runs/<id>/artifacts/**` (durable handoff content)
+ *
+ * Intentionally excluded (ephemeral / self-churn):
+ * - `.lock`, `.admin.lock`, `.admin.lock.recovering`
+ * - `*.tmp` write staging files
+ *
+ * Git-excluded files outside `.maswe` are not hashed here; they follow ordinary
+ * git status/`--exclude-standard` policy. Isolated worktrees fingerprint their
+ * own `cwd` (typically without a local `.maswe` store).
+ */
+async function hashMasweAuthoritativeState(cwd: string, hash: Hash): Promise<void> {
+  const masweRoot = path.join(cwd, ".maswe");
+  let entries: string[];
+  try {
+    entries = await readdir(masweRoot, { recursive: true });
+  } catch {
+    return;
+  }
+
+  const relativePaths = entries
+    .map((entry) => entry.replace(/\\/g, "/"))
+    .filter((relative) => {
+      const base = path.posix.basename(relative);
+      if (MASWE_EPHEMERAL_BASENAMES.has(base)) return false;
+      if (base.endsWith(".tmp")) return false;
+      return true;
+    })
+    .sort();
+
+  for (const relative of relativePaths) {
+    const absolute = path.join(masweRoot, relative);
+    let fileStat;
+    try {
+      fileStat = await stat(absolute);
+    } catch {
+      continue;
+    }
+    if (!fileStat.isFile()) continue;
+    hash.update(`.maswe/${relative}`);
+    try {
+      hash.update(await readFile(absolute));
+    } catch {
+      hash.update("unreadable");
+    }
+  }
+}
 
 /** Shared git spawn with a hard timeout so hung git cannot wedge the orchestrator. */
 export async function gitRun(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Promise<ProcessResult> {
@@ -65,6 +123,10 @@ export async function gitWorkspaceFingerprint(cwd: string): Promise<string> {
       hash.update("unreadable");
     }
   }
+
+  // Git excludes hide `.maswe/`; hash authoritative run state separately so
+  // read-only roles cannot mutate handoffs without detection.
+  await hashMasweAuthoritativeState(cwd, hash);
   return hash.digest("hex");
 }
 

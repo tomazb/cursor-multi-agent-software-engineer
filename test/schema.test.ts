@@ -116,3 +116,20 @@ test("run-record schema rejects non-hex sha256 digests", async () => {
     /pattern/,
   );
 });
+
+test("config schema accepts stream-json outputFormat and rejects unknown values", async () => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/config.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const outputFormat = schema.properties?.runtime?.properties?.outputFormat;
+  assert.ok(outputFormat?.enum);
+  assert.deepEqual(outputFormat.enum, ["json", "text", "stream-json"]);
+
+  const withStream = structuredClone(DEFAULT_CONFIG);
+  withStream.runtime.outputFormat = "stream-json";
+  assertMatches(schema, schema, withStream, "config.stream-json");
+
+  const bad = structuredClone(DEFAULT_CONFIG) as { runtime: { outputFormat: string } };
+  bad.runtime.outputFormat = "yaml";
+  assert.throws(() => assertMatches(schema, schema, bad, "config.bad-format"), /enum/);
+});

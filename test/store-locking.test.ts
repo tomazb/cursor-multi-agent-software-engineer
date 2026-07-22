@@ -32,10 +32,12 @@ test("exclusive lock blocks simultaneous multi-process writers", async () => {
     process.execPath,
     [
       "--experimental-strip-types",
+      "--input-type=module",
       "-e",
       `
       import { FileRunStore } from ${JSON.stringify(storeModule)};
       import { DEFAULT_CONFIG } from ${JSON.stringify(fileURLToPath(new URL("../src/config.ts", import.meta.url)))};
+      console.log("CHILD_READY");
       const store = new FileRunStore(${JSON.stringify(cwd)});
       const run = await store.load(${JSON.stringify(run.id)});
       run.title = "child-writer";
@@ -67,8 +69,15 @@ test("exclusive lock blocks simultaneous multi-process writers", async () => {
   await holder.close();
   await import("node:fs/promises").then((fs) => fs.rm(lockPath, { force: true }));
 
+  const combined = `${result.stderr}${result.stdout}`;
+  assert.match(result.stdout, /CHILD_READY/, "child must load ESM modules and reach readiness");
+  assert.doesNotMatch(
+    combined,
+    /SyntaxError|Cannot use import statement|await is only valid|ERR_MODULE_NOT_FOUND|Cannot find module/i,
+  );
   assert.notEqual(result.code, 0, "child must not save while lock is held exclusively");
-  assert.match(`${result.stderr}${result.stdout}`, /lock|busy|contention|EEXIST/i);
+  assert.doesNotMatch(result.stdout, /\bSAVED\b/);
+  assert.match(combined, /lock|busy|contention|EEXIST/i);
   const loaded = await store.load(run.id);
   assert.notEqual(loaded.title, "child-writer");
 });

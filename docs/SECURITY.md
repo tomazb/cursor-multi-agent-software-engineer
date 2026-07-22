@@ -39,15 +39,15 @@ MASWE must prevent untrusted requests, model output, repository content, and PR 
 
 ### T2 — Read-only role modifies code
 
-**Threat:** Brainstormer, designer, verifier, or classifier writes files or stages changes.
+**Threat:** Brainstormer, designer, verifier, or classifier writes files or stages changes, including authoritative `.maswe` run state or artifacts hidden by Git excludes.
 
 **Controls:**
 
 - Cursor CLI omits `--force` for read-only roles.
-- All read-only adapters compare a git workspace fingerprint before and after execution.
+- All read-only adapters compare a workspace fingerprint before and after execution (git status/diffs/untracked plus authoritative `.maswe` state under `cwd`).
 - A mismatch fails the run.
 
-**Gap:** Detection occurs after the process runs; it is not a preventive OS sandbox. External side effects outside the repository are not fingerprinted.
+**Gap:** Detection occurs after the process runs; it is not a preventive OS sandbox. External side effects outside the repository are not fingerprinted. Ephemeral `.maswe` locks/`*.tmp` files are intentionally excluded from the fingerprint.
 
 ### T3 — Builder or resolver exceeds scope
 
@@ -134,8 +134,10 @@ A near-term change should pass large prompts through stdin or SDK calls rather t
 **Controls:**
 
 - Local read-only checks cover the workspace during the verifier execution.
+- Quality, verification, and merge-ready evidence records bind to the evaluated git **head SHA**.
+- Head-SHA movement after a successful stage invalidates stale evidence before merge-ready.
 
-**Gap:** v0.1 lacks exact git-SHA binding and GitHub check runs. Production GitHub integration must invalidate verification on every head-SHA change.
+**Gap:** Digests and evidence are not yet cryptographically signed, and remote GitHub check-run automation remains a later milestone. Production GitHub integration must continue to invalidate verification on every head-SHA change.
 
 ### T10 — Webhook replay or forged GitHub event
 

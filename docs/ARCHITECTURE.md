@@ -152,7 +152,10 @@ The optional SDK import means the CLI can build and run without installing the b
 - Git porcelain status including untracked files.
 - Unstaged binary diff.
 - Staged binary diff.
-- Paths and contents of untracked files.
+- Paths and contents of untracked files (honoring Git excludes).
+- Authoritative `.maswe` state under the fingerprinted `cwd`, hashed independently of Git excludes: project config, `runs/*/run.json`, and durable artifact files.
+
+Intentionally excluded from the MASWE portion (expected orchestration churn): `.lock`, `.admin.lock`, `.admin.lock.recovering`, and `*.tmp` staging files. Other Git-excluded paths outside `.maswe` follow ordinary `--exclude-standard` policy and are not hashed. Isolated worktrees fingerprint their own `cwd` (typically without a local `.maswe` store); non-isolated checkouts include the operator-tree `.maswe` so read-only roles cannot mutate handoffs undetected.
 
 Read-only runtimes compare the fingerprint before and after execution. Any difference fails the run. This is a detection boundary, not an operating-system sandbox. A future sandbox can prevent writes rather than merely detecting them.
 
@@ -204,7 +207,13 @@ With `rejectModelFallback: true`, only the primary candidate is attempted. If a 
 
 With `rejectModelFallback: false`, runtime or startup failure may advance through configured candidates. Every attempt remains visible in the failure message and successful event metadata.
 
-Model aliases are project configuration for **new runs only**. `start`/`doctor` resolve logical names to exact catalogue IDs and persist those exact IDs in `run.config`. Existing-run stages validate the persisted exact ID and never substitute same-core or same-family survivors when the catalogue drifts.
+Model aliases are project configuration for **new runs only**. For runtimes that implement catalogue discovery (`CursorCliRuntime` via `agent models`):
+
+- **`start`:** discovers the catalogue, resolves logical role models to exact executable IDs (effort-aware: an explicit `-high`/`-medium`/`-low` suffix requires the same effort; otherwise fail closed), and **persists** those exact IDs in the new `run.config` snapshot.
+- **`doctor`:** discovers the catalogue and resolves an exact ID for its stdin probe only. Doctor does **not** create a run and does **not** persist a `run.config` snapshot.
+- **Existing-run stages:** validate the persisted exact ID against the live catalogue and never substitute same-core, same-family, provider, or effort variants when the catalogue drifts.
+
+`CursorSdkRuntime` has no catalogue capability; doctor/start do not call `agent models`, and empty-catalogue pass-through keeps configured IDs as-is for SDK-only paths.
 
 ## 6. Superpowers integration
 

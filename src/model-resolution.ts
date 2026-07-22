@@ -1,7 +1,12 @@
 import type { MasweConfig, RoleId } from "./domain.ts";
 import { ROLE_IDS } from "./domain.ts";
 
-/** Strip Cursor catalogue decoration to a logical model core. */
+export type ModelEffortTier = "high" | "medium" | "low";
+
+/**
+ * Strip Cursor catalogue decoration to a logical model core.
+ * Effort suffixes (`-high`/`-medium`/`-low`) and `-fast` are not part of the core.
+ */
 export function logicalModelCore(modelId: string): string {
   return modelId
     .trim()
@@ -9,6 +14,16 @@ export function logicalModelCore(modelId: string): string {
     .replace(/^cursor-/, "")
     .replace(/-fast$/, "")
     .replace(/-(high|medium|low)$/, "");
+}
+
+/**
+ * Extract an explicit effort tier from a logical or catalogue model id.
+ * Provider prefix and `-fast` are ignored so `cursor-gpt-5.6-sol-high-fast` → `high`.
+ */
+export function modelEffortTier(modelId: string): ModelEffortTier | undefined {
+  const id = modelId.trim().toLowerCase().replace(/^cursor-/, "").replace(/-fast$/, "");
+  const match = id.match(/-(high|medium|low)$/);
+  return match ? (match[1] as ModelEffortTier) : undefined;
 }
 
 function preferenceScore(modelId: string): [number, number, number, string] {
@@ -34,6 +49,12 @@ function comparePreference(a: string, b: string): number {
  * Resolve a configured logical model name to exactly one catalogue ID.
  * Fail closed when no candidate exists or unrelated candidates tie.
  *
+ * Effort rule: when the configured logical model explicitly includes an effort
+ * suffix (`-high` / `-medium` / `-low`), only same-core catalogue IDs with that
+ * same effort are eligible. Missing effort fails closed (no silent upgrade or
+ * downgrade). When no effort is specified, existing deterministic preference
+ * (non-fast, high>medium>low, cursor-prefixed) selects among same-core IDs.
+ *
  * Empty catalogue pass-through is for providers without catalogue capability
  * (e.g. Cursor SDK). Cursor CLI must never call this with an empty catalogue.
  */
@@ -53,13 +74,27 @@ export function resolveLogicalModelId(requested: string, catalogue: Iterable<str
   }
 
   const needleCore = logicalModelCore(needle);
+  const needleEffort = modelEffortTier(needle);
   const sameCore = ids.filter((id) => logicalModelCore(id) === needleCore);
-  if (sameCore.length === 1) {
-    return sameCore[0]!;
+  const eligible = needleEffort
+    ? sameCore.filter((id) => modelEffortTier(id) === needleEffort)
+    : sameCore;
+
+  if (eligible.length === 1) {
+    return eligible[0]!;
   }
-  if (sameCore.length > 1) {
-    // Deterministic preference within the same logical family (non-fast, high>medium>low).
-    return [...sameCore].sort(comparePreference)[0]!;
+  if (eligible.length > 1) {
+    // Deterministic preference within the eligible set (non-fast, then tier, then prefix).
+    return [...eligible].sort(comparePreference)[0]!;
+  }
+
+  if (needleEffort && sameCore.length > 0) {
+    const available = [
+      ...new Set(sameCore.map((id) => modelEffortTier(id)).filter(Boolean)),
+    ].join(", ");
+    throw new Error(
+      `Requested effort '${needleEffort}' for model '${requested}' is unavailable in the catalogue (same-core efforts present: ${available || "none"}). Refusing silent effort substitution.`,
+    );
   }
 
   // No same-core family. Reject weak substring hits across different cores.

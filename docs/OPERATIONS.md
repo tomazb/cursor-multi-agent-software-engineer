@@ -73,12 +73,15 @@ Admin recovery is serialized through an exclusive `.admin.lock.recovering` marke
 
 Configured role models may use logical names (for example `grok-4.5`).
 
-- **New runs (`doctor` / `start`):** logical names are resolved against the local `agent models` catalogue to exact executable IDs (preferring non-fast `-high` variants within the same logical family). Catalogue parsing is fail-closed: only recognized catalogue rows contribute IDs; headings, aliases, metadata, and prose are ignored. Empty/unparseable catalogues are discovery failures.
-- **Run snapshot:** `run.config` stores those exact IDs. Environment and project-config mutations after start do not rewrite them.
-- **Existing-run stages (`run`, `approve`, `retry`, …):** validate the persisted exact ID against the live catalogue and use it as-is. Same-core / same-family / provider / reasoning-level substitution is forbidden. If the persisted exact ID disappears from the catalogue, execution fails closed naming that ID.
-- **Doctor stdin probe:** discovers the catalogue first, resolves the brainstormer model with the same project-resolution logic as `start`, then probes with that exact ID.
+Fail-closed catalogue discovery and logical→exact resolution apply to runtimes that implement catalogue discovery — currently **`CursorCliRuntime`** (`agent models`).
 
-Ambiguous cross-family matches and missing models fail closed. Treat a doctor catalogue failure as a reason to inspect `agent models` output format/auth, not as proof the provider is unavailable.
+- **New runs (`start`, Cursor CLI):** logical names are resolved against the local catalogue to exact executable IDs. When a configured logical model explicitly includes an effort suffix (`-high` / `-medium` / `-low`), only same-core catalogue IDs with that same effort are eligible; missing effort fails closed (no silent upgrade or downgrade). When no effort is specified, preference selects non-fast, then high>medium>low, then `cursor-` prefixed IDs within the same logical family. Catalogue parsing is fail-closed: only recognized catalogue rows contribute IDs; headings, aliases, metadata, and prose are ignored. Empty/unparseable catalogues are discovery failures.
+- **Run snapshot:** `start` stores those exact IDs in `run.config`. Environment and project-config mutations after start do not rewrite them.
+- **Existing-run stages (`run`, `approve`, `retry`, …):** validate the persisted exact ID against the live catalogue and use it as-is. Same-core / same-family / provider / effort-level substitution is forbidden. If the persisted exact ID disappears from the catalogue, execution fails closed naming that ID.
+- **Doctor (Cursor CLI):** discovers the catalogue first, resolves the brainstormer model with the same project-resolution logic as `start`, then probes with that exact ID. Doctor does **not** create a run and does **not** persist a `run.config` snapshot.
+- **`CursorSdkRuntime`:** has no catalogue capability. Doctor/start do not call `agent models`; empty-catalogue pass-through keeps configured IDs as-is. SDK doctor must not be described as resolving through the CLI catalogue.
+
+Ambiguous cross-family matches and missing models fail closed. Treat a Cursor CLI doctor catalogue failure as a reason to inspect `agent models` output format/auth, not as proof the provider is unavailable.
 
 Doctor probe cleanup is based on recorded probe identity: once a `doctor-*` probe ID is assigned, final cleanup removes the probe worktree (if present) and `maswe/doctor-*` branch even when worktree creation failed after the branch was created. Cleanup is idempotent; cleanup failures surface as a `doctor-probe-cleanup` check without erasing the original doctor failure.
 

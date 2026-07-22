@@ -179,7 +179,7 @@ Each role shall have a configurable model. When fail-closed model fallback is en
 
 ### FR-16 — Read-only enforcement
 
-The system shall fingerprint git-tracked, staged, and untracked workspace state before and after read-only roles. A difference shall fail the run.
+The system shall fingerprint git-tracked, staged, and untracked workspace state before and after read-only roles, and shall also fingerprint authoritative `.maswe` run state and artifacts under the fingerprinted working directory (independent of Git excludes). A difference shall fail the run. Ephemeral lock and `*.tmp` files under `.maswe` are excluded from that fingerprint so normal orchestration churn does not false-fail.
 
 ### FR-17 — Run inspection
 
@@ -195,7 +195,7 @@ The core shall support a mock runtime, Cursor CLI runtime, and optional Cursor S
 
 ### FR-20 — Environment diagnostics
 
-The system shall provide a doctor command that checks runtime availability, credentials where applicable, and configured model slugs after fail-closed catalogue discovery and project-style resolution. Doctor shall not report transport success when model resolution failed.
+The system shall provide a doctor command that checks runtime availability, credentials where applicable, and configured model slugs. For runtimes that implement catalogue discovery (currently Cursor CLI), doctor shall perform fail-closed catalogue discovery and project-style logical→exact resolution before the probe, and shall not report transport success when model resolution failed. Doctor does not create a run or persist a `run.config` snapshot. Runtimes without catalogue capability (currently Cursor SDK) are diagnosed without `agent models` resolution.
 
 ## Non-functional requirements
 

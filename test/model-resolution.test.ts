@@ -9,6 +9,8 @@ import {
   pickCatalogueModel,
   resolveConfigModels,
   resolveLogicalModelId,
+  resolveProjectModels,
+  validatePersistedExactModel,
 } from "../src/model-resolution.ts";
 import { FileRunStore } from "../src/store.ts";
 import { Orchestrator } from "../src/orchestrator.ts";
@@ -46,6 +48,77 @@ test("resolveLogicalModelId fails closed when no model matches", () => {
 
 test("resolveLogicalModelId fails closed on ambiguous cross-core matches", () => {
   assert.throws(() => resolveLogicalModelId("gpt-5", CATALOGUE), /Ambiguous model/);
+});
+
+test("resolveLogicalModelId keeps explicit high effort when high is available", () => {
+  const catalogue = ["cursor-gpt-5.6-sol-medium", "cursor-gpt-5.6-sol-high", "cursor-gpt-5.6-sol-low"];
+  assert.equal(resolveLogicalModelId("gpt-5.6-sol-high", catalogue), "cursor-gpt-5.6-sol-high");
+});
+
+test("resolveLogicalModelId fails closed when requested high effort is absent", () => {
+  const catalogue = ["cursor-gpt-5.6-sol-medium", "cursor-gpt-5.6-sol-low"];
+  assert.throws(
+    () => resolveLogicalModelId("gpt-5.6-sol-high", catalogue),
+    /effort.*high|high.*unavailable|requested effort/i,
+  );
+});
+
+test("resolveLogicalModelId fails closed when requested medium effort is absent (no silent upgrade)", () => {
+  const catalogue = ["cursor-gpt-5.6-sol-high", "cursor-gpt-5.6-sol-low"];
+  assert.throws(
+    () => resolveLogicalModelId("gpt-5.6-sol-medium", catalogue),
+    /effort.*medium|medium.*unavailable|requested effort/i,
+  );
+});
+
+test("resolveLogicalModelId selects deterministically among same-effort variants", () => {
+  const catalogue = [
+    "cursor-gpt-5.6-sol-high-fast",
+    "cursor-gpt-5.6-sol-high",
+    "cursor-gpt-5.6-sol-medium",
+  ];
+  assert.equal(resolveLogicalModelId("gpt-5.6-sol-high", catalogue), "cursor-gpt-5.6-sol-high");
+});
+
+test("resolveLogicalModelId without effort uses documented preference among same core", () => {
+  const catalogue = ["cursor-grok-4.5-medium", "cursor-grok-4.5-high", "cursor-grok-4.5-low"];
+  assert.equal(resolveLogicalModelId("grok-4.5", catalogue), "cursor-grok-4.5-high");
+});
+
+test("resolveProjectModels with rejectModelFallback does not silently downgrade effort", () => {
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.policy.rejectModelFallback = true;
+  config.roles.verifier.model = "gpt-5.6-sol-high";
+  assert.throws(
+    () => resolveLogicalModelId(config.roles.verifier.model, ["cursor-gpt-5.6-sol-medium"]),
+    /effort.*high|high.*unavailable|requested effort/i,
+  );
+  assert.equal(config.policy.rejectModelFallback, true);
+});
+
+test("validatePersistedExactModel refuses substitution when high disappears and medium remains", () => {
+  assert.throws(
+    () => validatePersistedExactModel("gpt-5.6-sol-high", ["cursor-gpt-5.6-sol-medium"]),
+    /no longer available|Refusing substitution/i,
+  );
+});
+
+test("doctor probe and start share effort-aware project resolution", () => {
+  const catalogue = [
+    "cursor-grok-4.5-high",
+    "cursor-claude-fable-5-high",
+    "cursor-claude-opus-4.8-high",
+    "cursor-gpt-5.6-sol-high",
+    "cursor-gpt-5.6-sol-medium",
+  ];
+  const forStart = resolveProjectModels(DEFAULT_CONFIG, catalogue);
+  const doctorProbeModel = resolveLogicalModelId(DEFAULT_CONFIG.roles.brainstormer.model, catalogue);
+  assert.equal(forStart.roles.brainstormer.model, doctorProbeModel);
+  assert.equal(forStart.roles.verifier.model, "cursor-gpt-5.6-sol-high");
+  assert.equal(
+    forStart.roles.verifier.model,
+    resolveLogicalModelId(DEFAULT_CONFIG.roles.verifier.model, catalogue),
+  );
 });
 
 test("resolveConfigModels rewrites all role models to exact IDs", () => {

@@ -24,7 +24,7 @@ export interface MasweConfig {
   runtime: {
     kind: RuntimeKind;
     command: string;
-    outputFormat: "json" | "text";
+    outputFormat: "json" | "text" | "stream-json";
   };
   roles: Record<RoleId, RoleConfig>;
   gates: {
