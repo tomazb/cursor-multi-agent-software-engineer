@@ -51,6 +51,11 @@ export const DEFAULT_CONFIG: MasweConfig = {
     maxBuildVerifyCycles: 3,
     maxCommentResolutionCycles: 2,
     allowDirtyWorkspace: false,
+    useIsolatedWorktree: true,
+    promptTransport: "stdin",
+    commandTimeoutMs: 600_000,
+    roleTimeoutMs: 1_800_000,
+    allowedPathGlobs: ["**"],
   },
 };
 
@@ -131,6 +136,24 @@ function assertConfig(config: MasweConfig): void {
   }
   if (config.policy.maxCommentResolutionCycles < 1) {
     throw new Error("policy.maxCommentResolutionCycles must be at least 1");
+  }
+  if (!["stdin", "argv"].includes(config.policy.promptTransport)) {
+    throw new Error("policy.promptTransport must be stdin or argv");
+  }
+  if (config.policy.commandTimeoutMs < 1) {
+    throw new Error("policy.commandTimeoutMs must be at least 1");
+  }
+  if (config.policy.roleTimeoutMs < 1) {
+    throw new Error("policy.roleTimeoutMs must be at least 1");
+  }
+  if (
+    config.policy.maxRunDurationMs !== undefined &&
+    config.policy.maxRunDurationMs < 1
+  ) {
+    throw new Error("policy.maxRunDurationMs must be at least 1 when set");
+  }
+  if (!Array.isArray(config.policy.allowedPathGlobs) || config.policy.allowedPathGlobs.length < 1) {
+    throw new Error("policy.allowedPathGlobs must contain at least one glob");
   }
 }
 

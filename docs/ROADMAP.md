@@ -23,6 +23,8 @@ Status: implemented in the initial repository bootstrap.
 
 ## v0.2 — Local hardening and git isolation
 
+Status: implemented.
+
 - `RunStore` interface and atomic file writes with lock/version checks.
 - Artifact digest validation on every read.
 - Attempt-specific immutable artifact history.

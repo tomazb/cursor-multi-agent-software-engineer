@@ -31,9 +31,24 @@ export class CursorCliRuntime implements AgentRuntime {
       request.roleConfig.model,
     ];
     if (request.roleConfig.permissions === "workspace-write") args.push("--force");
-    args.push(request.prompt);
 
-    const result = await spawnCaptured(this.config.runtime.command, args, { cwd: request.cwd });
+    const transport = this.config.policy.promptTransport;
+    const useStdin = transport === "stdin" || request.prompt.length > 100_000;
+    const spawnOptions: {
+      cwd: string;
+      input?: string;
+      timeoutMs: number;
+    } = {
+      cwd: request.cwd,
+      timeoutMs: request.timeoutMs ?? this.config.policy.roleTimeoutMs,
+    };
+    if (useStdin) {
+      spawnOptions.input = request.prompt;
+    } else {
+      args.push(request.prompt);
+    }
+
+    const result = await spawnCaptured(this.config.runtime.command, args, spawnOptions);
     const after = await gitWorkspaceFingerprint(request.cwd);
     if (request.roleConfig.permissions === "read-only" && before !== after) {
       throw new Error(
@@ -41,7 +56,7 @@ export class CursorCliRuntime implements AgentRuntime {
       );
     }
     return {
-      status: result.exitCode === 0 ? "finished" : "error",
+      status: result.exitCode === 0 && !result.timedOut ? "finished" : "error",
       output: extractOutput(result.stdout) || result.stderr,
       requestedModel: request.roleConfig.model,
       actualModel: request.roleConfig.model,
@@ -49,6 +64,8 @@ export class CursorCliRuntime implements AgentRuntime {
         exitCode: result.exitCode,
         stderr: result.stderr,
         durationMs: result.durationMs,
+        timedOut: result.timedOut ?? false,
+        promptTransport: useStdin ? "stdin" : "argv",
       },
     };
   }
@@ -57,6 +74,7 @@ export class CursorCliRuntime implements AgentRuntime {
     try {
       const version = await spawnCaptured(this.config.runtime.command, ["--version"], {
         cwd: process.cwd(),
+        timeoutMs: this.config.policy.commandTimeoutMs,
       });
       const cliOk = version.exitCode === 0;
       const checks: RuntimeDoctorResult["checks"] = [
@@ -67,10 +85,16 @@ export class CursorCliRuntime implements AgentRuntime {
             ? `${this.config.runtime.command} is available: ${version.stdout.trim() || version.stderr.trim()}`
             : `${this.config.runtime.command} returned exit code ${version.exitCode}: ${version.stderr.trim()}`,
         },
+        {
+          name: "prompt-transport",
+          ok: true,
+          message: `Configured prompt transport: ${this.config.policy.promptTransport}`,
+        },
       ];
       if (cliOk) {
         const models = await spawnCaptured(this.config.runtime.command, ["models"], {
           cwd: process.cwd(),
+          timeoutMs: this.config.policy.commandTimeoutMs,
         });
         const catalogue = `${models.stdout}
 ${models.stderr}`.toLowerCase();

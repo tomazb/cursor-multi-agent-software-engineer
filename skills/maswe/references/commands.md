@@ -61,12 +61,14 @@ maswe review-comment <run-id> --file /path/to/comment.md
 maswe resume-review <run-id>
 ```
 
-## Finish or stop
+## Finish, recover, or stop
 
 ```bash
 maswe merge-ready <run-id>
 maswe complete <run-id>
 maswe cancel <run-id>
+maswe retry <run-id>
+maswe supersede <run-id>
 ```
 
-These commands record workflow state; they do not merge or close a GitHub PR.
+These commands record workflow state; they do not merge or close a GitHub PR. `retry` resumes a `FAILED` run from `failure.resumeState`. `supersede` creates a linked replacement run.

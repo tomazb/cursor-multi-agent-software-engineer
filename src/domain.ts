@@ -10,6 +10,7 @@ export type RoleId = (typeof ROLE_IDS)[number];
 export type PermissionMode = "read-only" | "workspace-write";
 export type RuntimeKind = "mock" | "cursor-cli" | "cursor-sdk";
 export type ReasoningEffort = "low" | "medium" | "high";
+export type PromptTransport = "stdin" | "argv";
 
 export interface RoleConfig {
   model: string;
@@ -40,6 +41,12 @@ export interface MasweConfig {
     maxBuildVerifyCycles: number;
     maxCommentResolutionCycles: number;
     allowDirtyWorkspace: boolean;
+    useIsolatedWorktree: boolean;
+    promptTransport: PromptTransport;
+    commandTimeoutMs: number;
+    roleTimeoutMs: number;
+    maxRunDurationMs?: number;
+    allowedPathGlobs: string[];
   };
 }
 
@@ -87,6 +94,7 @@ export const WORKFLOW_EVENTS = [
   "COMPLETE",
   "FAIL",
   "CANCEL",
+  "RETRY_FROM_FAILED",
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENTS)[number];
@@ -103,13 +111,24 @@ export interface WorkflowEvent {
 
 export interface ArtifactReference {
   name: string;
+  logicalName: string;
+  attempt: number;
   path: string;
   sha256: string;
   createdAt: string;
 }
 
+export interface RunWorkspace {
+  baseSha: string;
+  headSha: string;
+  branch: string;
+  fingerprint: string;
+  worktreePath?: string;
+}
+
 export interface RunRecord {
   schemaVersion: 1;
+  version: number;
   id: string;
   title: string;
   request: string;
@@ -128,9 +147,13 @@ export interface RunRecord {
   config: MasweConfig;
   artifacts: ArtifactReference[];
   events: WorkflowEvent[];
+  workspace?: RunWorkspace;
+  supersedes?: string;
+  supersededBy?: string;
   failure?: {
     message: string;
     at: string;
+    resumeState?: WorkflowState;
   };
 }
 
@@ -140,6 +163,7 @@ export interface RuntimeRequest {
   prompt: string;
   cwd: string;
   roleConfig: RoleConfig;
+  timeoutMs?: number;
 }
 
 export interface RuntimeResult {

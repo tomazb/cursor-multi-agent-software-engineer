@@ -4,7 +4,7 @@ A durable, model-configurable software delivery orchestrator for Cursor and the 
 
 The system separates product discovery, specification, implementation, independent verification, and pull-request comment resolution into distinct roles. A deterministic state machine owns stage transitions and file-based artifacts preserve every handoff.
 
-> Project status: **v0.1 foundation**. The local CLI, workflow state machine, artifact store, Cursor CLI adapter, optional Cursor SDK adapter, quality gates, read-only checks, tests, and Cursor plugin skill are implemented. Native GitHub App automation and a hosted control plane are designed but intentionally scheduled for later milestones.
+> Project status: **v0.2 local hardening**. The local CLI now includes atomic run storage, git worktree isolation, deterministic commits/scope checks, marker enforcement, secret redaction, stdin prompt transport, budgets/timeouts, and retry/supersede recovery. Native GitHub App automation and a hosted control plane remain scheduled for later milestones.
 
 ## Why this exists
 
@@ -169,7 +169,7 @@ The v0.1 verifier is bound to the current local workspace fingerprint, not yet a
 
 ## Current limitations
 
-- The local CLI does not yet create branches, worktrees, commits, or pull requests. The builder may edit the current checkout; use a dedicated branch or worktree.
+- The local CLI creates isolated `maswe/<run-id>` branches/worktrees and deterministic commits by default. Pull request creation and GitHub check automation remain a later milestone.
 - GitHub webhooks and check runs are not yet wired to the CLI.
 - Human approvals are local commands rather than signed GitHub actions.
 - File-based state is suitable for one operator or CI job, not concurrent distributed workers.

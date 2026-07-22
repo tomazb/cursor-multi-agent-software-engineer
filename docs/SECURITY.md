@@ -60,7 +60,7 @@ MASWE must prevent untrusted requests, model output, repository content, and PR 
 - Out-of-scope comments stop for a human.
 - Deterministic quality and fresh independent verification follow edits.
 
-**Gap:** v0.1 does not mechanically restrict write paths. Future policy will calculate allowed file scopes and run in an isolated worktree.
+**Gap:** v0.2 isolates builders in a dedicated worktree and rejects commits outside `policy.allowedPathGlobs`. Fine-grained path policy derived from design artifacts remains future work.
 
 ### T4 — Self-verification
 
@@ -111,9 +111,9 @@ MASWE must prevent untrusted requests, model output, repository content, and PR 
 
 **Gaps and future work:**
 
-- No automatic secret redaction.
-- CLI prompt is currently passed as a process argument and may be visible in local process listings.
-- No data-loss prevention policy or provider-specific privacy controls.
+- Automatic secret redaction covers common token/PEM/Authorization patterns; it is best-effort, not a DLP product.
+- Default Cursor CLI prompt transport is stdin; argv remains available via `policy.promptTransport`.
+- No provider-specific privacy controls beyond local redaction.
 
 A near-term change should pass large prompts through stdin or SDK calls rather than command-line arguments where supported.
 
@@ -125,7 +125,7 @@ A near-term change should pass large prompts through stdin or SDK calls rather t
 
 - Artifacts have SHA-256 digests in the run record.
 
-**Gap:** Digests are not revalidated on read in v0.1 and are not signed. Future versions should verify hashes before every stage and bind approvals to artifact digests.
+**Gap:** Digests are revalidated on every read in v0.2 but are not cryptographically signed. Future versions should bind approvals to artifact digests with signatures where needed.
 
 ### T9 — Verification on stale code
 

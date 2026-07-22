@@ -1,9 +1,16 @@
-import type { AgentRuntime, RoleId, RunRecord, RuntimeResult } from "./domain.ts";
+import type { AgentRuntime, RoleId, RunRecord, RuntimeResult, WorkflowState } from "./domain.ts";
 import { buildCommentClassifierPrompt, buildRolePrompt } from "./prompt-builder.ts";
 import { isGitWorkspaceClean } from "./git-snapshot.ts";
+import {
+  assertChangeScope,
+  createDeterministicCommit,
+  ensureRunWorkspace,
+  workingDirectoryFor,
+} from "./git-workspace.ts";
+import { validateRoleMarkers } from "./markers.ts";
 import { renderQualityReport, runQualityChecks } from "./quality.ts";
 import { isHumanGate, isTerminal } from "./state-machine.ts";
-import { FileRunStore } from "./store.ts";
+import { FileRunStore, type RunStore } from "./store.ts";
 import type { MasweConfig } from "./domain.ts";
 
 function ensureSuccess(result: RuntimeResult, role: RoleId): void {
@@ -20,17 +27,48 @@ function commentIsInScope(output: string): boolean {
   return /SCOPE\s*:\s*IN_SCOPE\b/i.test(output);
 }
 
+export function extractVerifierDefects(report: string): string {
+  const lines = report.split(/\r?\n/);
+  const defects: string[] = [];
+  for (const line of lines) {
+    if (/^\s*([-*]|\d+\.)\s+/.test(line) || /\b(FAIL|BLOCK|DEFECT|FINDING)\b/i.test(line)) {
+      defects.push(line.trim());
+    }
+  }
+  if (defects.length === 0) {
+    return [
+      "# Verifier defects",
+      "",
+      "Verifier returned VERDICT: FAIL without a structured defect list.",
+      "Review the full verification report and address blocking findings.",
+      "",
+      report.trim(),
+      "",
+    ].join("\n");
+  }
+  return ["# Verifier defects", "", ...defects.map((line) => `- ${line}`), ""].join("\n");
+}
+
 export class Orchestrator {
-  readonly store: FileRunStore;
+  readonly store: RunStore;
   private readonly cwd: string;
   private readonly config: MasweConfig;
   private readonly runtime: AgentRuntime;
 
-  constructor(cwd: string, config: MasweConfig, runtime: AgentRuntime, store?: FileRunStore) {
+  constructor(cwd: string, config: MasweConfig, runtime: AgentRuntime, store?: RunStore) {
     this.cwd = cwd;
     this.config = config;
     this.runtime = runtime;
     this.store = store ?? new FileRunStore(cwd);
+  }
+
+  private assertWithinBudget(run: RunRecord): void {
+    const max = run.config.policy.maxRunDurationMs;
+    if (!max) return;
+    const elapsed = Date.now() - Date.parse(run.createdAt);
+    if (elapsed > max) {
+      throw new Error(`Run exceeded maxRunDurationMs (${max}).`);
+    }
   }
 
   async start(title: string, request: string): Promise<RunRecord> {
@@ -38,6 +76,8 @@ export class Orchestrator {
       throw new Error("Workspace is dirty. Commit, stash, or set policy.allowDirtyWorkspace=true.");
     }
     const run = await this.store.create(title, request, this.config);
+    run.workspace = await ensureRunWorkspace(this.cwd, run);
+    await this.store.save(run);
     await this.store.applyEvent(run, "START", "user");
     return this.runUntilBlocked(run.id);
   }
@@ -68,6 +108,7 @@ export class Orchestrator {
   async advance(runId: string): Promise<RunRecord> {
     const run = await this.store.load(runId);
     try {
+      this.assertWithinBudget(run);
       switch (run.state) {
         case "BRAINSTORMING": {
           const completed = await this.executeRole(
@@ -98,18 +139,22 @@ export class Orchestrator {
         case "BUILDING": {
           run.counters.buildVerifyCycles += 1;
           if (run.counters.buildVerifyCycles > run.config.policy.maxBuildVerifyCycles) {
-            run.failure = {
-              message: "Maximum build/verify cycles exceeded.",
-              at: new Date().toISOString(),
-            };
-            return this.store.applyEvent(run, "FAIL", "orchestrator", {
-              reason: run.failure.message,
-            });
+            return this.failRun(run, "Maximum build/verify cycles exceeded.");
           }
-          return await this.executeRole(run, "builder", "04-builder-report.md", "BUILD_COMPLETED");
+          const completed = await this.executeRole(
+            run,
+            "builder",
+            "04-builder-report.md",
+            "BUILD_COMPLETED",
+          );
+          await this.commitBuilderChanges(completed);
+          return completed;
         }
         case "CI_RUNNING": {
-          const report = await runQualityChecks(this.cwd, run.config.quality.commands);
+          const workdir = workingDirectoryFor(run);
+          const report = await runQualityChecks(workdir, run.config.quality.commands, {
+            timeoutMs: run.config.policy.commandTimeoutMs,
+          });
           await this.store.writeArtifact(run, "05-quality-report.md", renderQualityReport(report));
           const accepted = report.passed || !run.config.gates.requireCiPass;
           return this.store.applyEvent(
@@ -122,8 +167,17 @@ export class Orchestrator {
         case "VERIFYING": {
           const prompt = await buildRolePrompt("verifier", run, this.store);
           const result = await this.executeAgent(run, "verifier", prompt);
+          const markers = validateRoleMarkers("verifier", result.output);
+          if (!markers.ok) throw new Error(markers.message);
           await this.store.writeArtifact(run, "06-verification-report.md", result.output);
           const passed = verifierPassed(result.output);
+          if (!passed && run.config.gates.requireVerifierPass) {
+            await this.store.writeArtifact(
+              run,
+              "10-verifier-defects.md",
+              extractVerifierDefects(result.output),
+            );
+          }
           const accepted = passed || !run.config.gates.requireVerifierPass;
           const successEvent =
             run.counters.commentResolutionCycles > 0
@@ -150,6 +204,8 @@ export class Orchestrator {
             ...run.config.roles.prResolver,
             permissions: "read-only",
           });
+          const markers = validateRoleMarkers("prResolver", result.output, { mode: "classify" });
+          if (!markers.ok) throw new Error(markers.message);
           await this.store.writeArtifact(run, "08-comment-classification.md", result.output);
           return this.store.applyEvent(
             run,
@@ -160,29 +216,62 @@ export class Orchestrator {
         case "RESOLVING": {
           run.counters.commentResolutionCycles += 1;
           if (run.counters.commentResolutionCycles > run.config.policy.maxCommentResolutionCycles) {
-            run.failure = {
-              message: "Maximum PR comment resolution cycles exceeded.",
-              at: new Date().toISOString(),
-            };
-            return this.store.applyEvent(run, "FAIL", "orchestrator", {
-              reason: run.failure.message,
-            });
+            return this.failRun(run, "Maximum PR comment resolution cycles exceeded.");
           }
-          return await this.executeRole(run, "prResolver", "09-resolution-report.md", "RESOLUTION_COMPLETED");
+          const completed = await this.executeRole(
+            run,
+            "prResolver",
+            "09-resolution-report.md",
+            "RESOLUTION_COMPLETED",
+          );
+          await this.commitBuilderChanges(completed, "maswe: resolve review comment");
+          return completed;
         }
         default:
           throw new Error(`State ${run.state} requires a user or integration event.`);
       }
     } catch (error) {
-      run.failure = {
-        message: error instanceof Error ? error.message : String(error),
-        at: new Date().toISOString(),
-      };
-      await this.store.save(run);
-      if (!isTerminal(run.state)) {
-        return this.store.applyEvent(run, "FAIL", "orchestrator", { reason: run.failure.message });
+      const message = error instanceof Error ? error.message : String(error);
+      return this.failRun(run, message);
+    }
+  }
+
+  private async failRun(run: RunRecord, message: string): Promise<RunRecord> {
+    const resumeState = isTerminal(run.state) ? undefined : run.state;
+    run.failure = {
+      message,
+      at: new Date().toISOString(),
+      ...(resumeState ? { resumeState } : {}),
+    };
+    await this.store.save(run);
+    if (!isTerminal(run.state)) {
+      return this.store.applyEvent(run, "FAIL", "orchestrator", {
+        reason: message,
+        ...(resumeState ? { resumeState } : {}),
+      });
+    }
+    return run;
+  }
+
+  private async commitBuilderChanges(
+    run: RunRecord,
+    message = "maswe: builder changes",
+  ): Promise<void> {
+    const workdir = workingDirectoryFor(run);
+    if (!run.workspace || run.workspace.baseSha === "not-a-git-repository") return;
+    try {
+      const committed = await createDeterministicCommit(workdir, message, {
+        allowedPathGlobs: run.config.policy.allowedPathGlobs,
+      });
+      if (committed.files.length > 0) {
+        await assertChangeScope(workdir, run.workspace.baseSha, run.config.policy.allowedPathGlobs);
+        run.workspace.headSha = committed.headSha;
+        await this.store.save(run);
       }
-      return run;
+    } catch (error) {
+      // No git user config or empty commit is fine for non-git / clean workspaces.
+      const text = error instanceof Error ? error.message : String(error);
+      if (/Change-scope violation/i.test(text)) throw error;
     }
   }
 
@@ -190,10 +279,16 @@ export class Orchestrator {
     run: RunRecord,
     role: RoleId,
     artifactName: string,
-    successEvent: "BRAINSTORM_COMPLETED" | "DESIGN_COMPLETED" | "BUILD_COMPLETED" | "RESOLUTION_COMPLETED",
+    successEvent:
+      | "BRAINSTORM_COMPLETED"
+      | "DESIGN_COMPLETED"
+      | "BUILD_COMPLETED"
+      | "RESOLUTION_COMPLETED",
   ): Promise<RunRecord> {
     const prompt = await buildRolePrompt(role, run, this.store);
     const result = await this.executeAgent(run, role, prompt);
+    const markers = validateRoleMarkers(role, result.output);
+    if (!markers.ok) throw new Error(markers.message);
     await this.store.writeArtifact(run, artifactName, result.output);
     return this.store.applyEvent(run, successEvent, role, {
       requestedModel: result.requestedModel,
@@ -214,6 +309,7 @@ export class Orchestrator {
       ? [configured.model]
       : [configured.model, ...(configured.fallbackModels ?? [])];
     const failures: string[] = [];
+    const workdir = workingDirectoryFor(run);
 
     for (const model of candidates) {
       try {
@@ -221,8 +317,9 @@ export class Orchestrator {
           runId: run.id,
           role,
           prompt,
-          cwd: this.cwd,
+          cwd: workdir,
           roleConfig: { ...configured, model },
+          timeoutMs: run.config.policy.roleTimeoutMs,
         });
         ensureSuccess(result, role);
         if (
@@ -272,5 +369,51 @@ export class Orchestrator {
   async cancel(runId: string): Promise<RunRecord> {
     const run = await this.store.load(runId);
     return this.store.applyEvent(run, "CANCEL", "user");
+  }
+
+  async retryFromFailed(runId: string): Promise<RunRecord> {
+    const run = await this.store.load(runId);
+    const resumeState = run.failure?.resumeState;
+    if (run.state !== "FAILED" || !resumeState) {
+      throw new Error("retry requires a FAILED run with failure.resumeState");
+    }
+    const previousFailure = run.failure;
+    delete run.failure;
+    await this.store.applyEvent(run, "RETRY_FROM_FAILED", "user", {
+      resumeState,
+      previousFailure,
+    });
+    return this.runUntilBlocked(run.id);
+  }
+
+  async supersede(runId: string): Promise<RunRecord> {
+    const existing = await this.store.load(runId);
+    if (existing.supersededBy) {
+      throw new Error(`Run ${runId} was already superseded by ${existing.supersededBy}`);
+    }
+    const replacement = await this.store.create(
+      existing.title,
+      existing.request,
+      existing.config,
+    );
+    replacement.supersedes = existing.id;
+    replacement.workspace = await ensureRunWorkspace(this.cwd, replacement);
+    await this.store.save(replacement);
+    existing.supersededBy = replacement.id;
+    if (!isTerminal(existing.state)) {
+      existing.failure = {
+        message: `Superseded by ${replacement.id}`,
+        at: new Date().toISOString(),
+        resumeState: existing.state as WorkflowState,
+      };
+      await this.store.applyEvent(existing, "CANCEL", "user", {
+        reason: "superseded",
+        supersededBy: replacement.id,
+      });
+    } else {
+      await this.store.save(existing);
+    }
+    await this.store.applyEvent(replacement, "START", "user", { supersedes: existing.id });
+    return this.runUntilBlocked(replacement.id);
   }
 }

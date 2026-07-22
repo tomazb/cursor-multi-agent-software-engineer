@@ -249,7 +249,7 @@ See `docs/GITHUB_APP.md`.
 
 ## 9. Consistency and concurrency
 
-v0.1 assumes a single writer per run. Concurrent commands against the same `run.json` can lose updates.
+v0.2 uses optimistic `version` checks and atomic writes per run. Concurrent writers against the same run still fail closed rather than merge updates.
 
 The hosted design adds:
 
@@ -295,20 +295,17 @@ GitHub input (future)
 
 ## 12. Known architecture gaps
 
-- No branch/worktree manager.
-- No exact git SHA persisted in the run record.
-- No atomic file-store writes or locking.
-- No redaction pipeline for artifacts.
 - No structured telemetry exporter.
 - SDK adapter uses a one-shot local prompt and does not yet exploit durable SDK agents.
 - Reasoning effort is stored but not translated into provider-specific SDK parameters.
+- GitHub App check runs and authenticated PR automation remain v0.3+.
 
-These gaps are tracked in the roadmap rather than hidden behind implied guarantees.
+Closed in v0.2: branch/worktree manager, git SHA persistence on the run record, atomic file-store writes with optimistic versioning, artifact digest revalidation, attempt history, secret redaction, stdin prompt transport, budgets/timeouts, and retry/supersede recovery.
 
 ## 13. Extension points
 
 - Add a runtime by implementing `AgentRuntime` and extending `RuntimeKind` plus the factory.
-- Add a store by extracting a `RunStore` interface from `FileRunStore` before the first database implementation.
+- Add a store by implementing `RunStore` (see `FileRunStore`) before the first database implementation.
 - Add a stage by changing domain constants, transition table, orchestrator behavior, prompts, artifact contracts, tests, and docs together.
 - Add GitHub through an event adapter that calls public orchestrator operations; do not put webhook logic in the core.
 - Add policy through deterministic functions that take configuration and run state; avoid prompt-only policy.

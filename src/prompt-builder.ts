@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import type { RoleId, RunRecord } from "./domain.ts";
-import type { FileRunStore } from "./store.ts";
+import type { RunStore } from "./store.ts";
 
 const TEMPLATE_BY_ROLE: Record<RoleId, string> = {
   brainstormer: "brainstorm.md",
@@ -24,7 +24,7 @@ function replaceAll(template: string, values: Record<string, string>): string {
 export async function buildRolePrompt(
   role: RoleId,
   run: RunRecord,
-  store: FileRunStore,
+  store: RunStore,
   extra: Record<string, string> = {},
 ): Promise<string> {
   const template = await readTemplate(TEMPLATE_BY_ROLE[role]);
@@ -34,6 +34,8 @@ export async function buildRolePrompt(
   const qualityReport = (await store.readArtifact(run, "05-quality-report.md")) ?? "Not available.";
   const verificationReport =
     (await store.readArtifact(run, "06-verification-report.md")) ?? "Not available.";
+  const verifierDefects =
+    (await store.readArtifact(run, "10-verifier-defects.md")) ?? "No explicit defect list.";
   const comment = (await store.readArtifact(run, "07-review-comment.md")) ?? "Not available.";
   const classification =
     (await store.readArtifact(run, "08-comment-classification.md")) ?? "Not available.";
@@ -47,6 +49,7 @@ export async function buildRolePrompt(
     BUILDER_REPORT: builderReport,
     QUALITY_REPORT: qualityReport,
     VERIFICATION_REPORT: verificationReport,
+    VERIFIER_DEFECTS: verifierDefects,
     COMMENT: comment,
     CLASSIFICATION: classification,
     ...extra,
@@ -55,7 +58,7 @@ export async function buildRolePrompt(
 
 export async function buildCommentClassifierPrompt(
   run: RunRecord,
-  store: FileRunStore,
+  store: RunStore,
   comment: string,
 ): Promise<string> {
   const template = await readTemplate("pr-comment-classify.md");

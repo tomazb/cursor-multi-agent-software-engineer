@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tomazb/cursor-multi-agent-software-engineer/schemas/config.schema.json",
+  "title": "MasweConfig",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "runtime", "roles", "gates", "quality", "policy"],
+  "properties": {
+    "version": { "const": 1 },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "command", "outputFormat"],
+      "properties": {
+        "kind": { "enum": ["mock", "cursor-cli", "cursor-sdk"] },
+        "command": { "type": "string", "minLength": 1 },
+        "outputFormat": { "enum": ["json", "text"] }
+      }
+    },
+    "roles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["brainstormer", "designer", "builder", "verifier", "prResolver"],
+      "properties": {
+        "brainstormer": { "$ref": "#/$defs/role" },
+        "designer": { "$ref": "#/$defs/role" },
+        "builder": { "$ref": "#/$defs/role" },
+        "verifier": { "$ref": "#/$defs/role" },
+        "prResolver": { "$ref": "#/$defs/role" }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requireBrainstormApproval",
+        "requireDesignApproval",
+        "requireCiPass",
+        "requireVerifierPass"
+      ],
+      "properties": {
+        "requireBrainstormApproval": { "type": "boolean" },
+        "requireDesignApproval": { "type": "boolean" },
+        "requireCiPass": { "type": "boolean" },
+        "requireVerifierPass": { "type": "boolean" }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commands"],
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rejectModelFallback",
+        "maxBuildVerifyCycles",
+        "maxCommentResolutionCycles",
+        "allowDirtyWorkspace",
+        "useIsolatedWorktree",
+        "promptTransport",
+        "commandTimeoutMs",
+        "roleTimeoutMs",
+        "allowedPathGlobs"
+      ],
+      "properties": {
+        "rejectModelFallback": { "type": "boolean" },
+        "maxBuildVerifyCycles": { "type": "integer", "minimum": 1 },
+        "maxCommentResolutionCycles": { "type": "integer", "minimum": 1 },
+        "allowDirtyWorkspace": { "type": "boolean" },
+        "useIsolatedWorktree": { "type": "boolean" },
+        "promptTransport": { "enum": ["stdin", "argv"] },
+        "commandTimeoutMs": { "type": "integer", "minimum": 1 },
+        "roleTimeoutMs": { "type": "integer", "minimum": 1 },
+        "maxRunDurationMs": { "type": "integer", "minimum": 1 },
+        "allowedPathGlobs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "role": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "reasoning", "permissions"],
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "fallbackModels": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "reasoning": { "enum": ["low", "medium", "high"] },
+        "permissions": { "enum": ["read-only", "workspace-write"] }
+      }
+    }
+  }
+}

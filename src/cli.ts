@@ -23,6 +23,8 @@ Usage:
   maswe merge-ready <run-id>
   maswe complete <run-id>
   maswe cancel <run-id>
+  maswe retry <run-id>
+  maswe supersede <run-id>
 
 Options:
   --config <path>  Use a specific config file.
@@ -58,16 +60,22 @@ function renderRun(run: RunRecord): string {
   const artifacts = run.artifacts.length
     ? run.artifacts.map((artifact) => `  - ${artifact.name}: ${artifact.path}`).join("\n")
     : "  - none";
+  const workspace = run.workspace
+    ? `Workspace: branch=${run.workspace.branch}, head=${run.workspace.headSha.slice(0, 12)}, worktree=${run.workspace.worktreePath ?? "(repo)"}`
+    : "Workspace: (unset)";
   return [
     `Run: ${run.id}`,
     `Title: ${run.title}`,
     `State: ${run.state}`,
     `Updated: ${run.updatedAt}`,
+    workspace,
     `Approvals: brainstorm=${run.approvals.brainstorm}, design=${run.approvals.design}`,
     `Cycles: build/verify=${run.counters.buildVerifyCycles}, comments=${run.counters.commentResolutionCycles}`,
     "Artifacts:",
     artifacts,
     ...(run.failure ? [`Failure: ${run.failure.message}`] : []),
+    ...(run.supersedes ? [`Supersedes: ${run.supersedes}`] : []),
+    ...(run.supersededBy ? [`Superseded by: ${run.supersededBy}`] : []),
   ].join("\n");
 }
 
@@ -178,6 +186,18 @@ async function main(): Promise<void> {
       const runId = values[0];
       if (!runId) throw new Error("cancel requires <run-id>");
       console.log(renderRun(await orchestrator.cancel(runId)));
+      return;
+    }
+    case "retry": {
+      const runId = values[0];
+      if (!runId) throw new Error("retry requires <run-id>");
+      console.log(renderRun(await orchestrator.retryFromFailed(runId)));
+      return;
+    }
+    case "supersede": {
+      const runId = values[0];
+      if (!runId) throw new Error("supersede requires <run-id>");
+      console.log(renderRun(await orchestrator.supersede(runId)));
       return;
     }
     default:

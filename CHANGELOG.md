@@ -9,9 +9,30 @@ The project follows semantic versioning once a public release process is establi
 ### Planned
 
 - GitHub App webhooks, check runs, and review-thread automation.
-- SHA-bound verification and branch/worktree management.
 - SQLite and PostgreSQL stores.
 - Remote control-plane API and MCP server.
+
+## [0.2.0] - 2026-07-22
+
+### Added
+
+- `RunStore` interface with atomic file writes, lock files, and optimistic `version` checks.
+- Artifact digest revalidation on every read and attempt-scoped immutable artifact history.
+- Persisted workspace provenance: base SHA, head SHA, branch, fingerprint, optional worktree path.
+- Git worktree/branch manager with deterministic commits and change-scope checks.
+- Strict terminal marker validation for every role and classifier output.
+- Explicit verifier defect artifacts passed back into builder prompts.
+- Secret redaction for artifacts and quality command output.
+- Cursor CLI stdin prompt transport (argv fallback retained).
+- Command/role/run timeout budgets.
+- `maswe retry` and `maswe supersede` recovery commands.
+- JSON schemas for configuration and run records under `schemas/`.
+- Packaged CLI dry-run verification in CI via `npm ci` and `npm pack --dry-run`.
+
+### Changed
+
+- Default policy enables isolated worktrees and stdin prompt transport.
+- Builder prompt includes `{{VERIFIER_DEFECTS}}` on verification retries.
 
 ## [0.1.0] - 2026-07-22
 

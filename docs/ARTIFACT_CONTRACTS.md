@@ -4,12 +4,14 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
 
 ## General rules
 
-- Every artifact is UTF-8 Markdown in v0.1.
-- The store records file name, repository-relative path, creation timestamp, and SHA-256 digest.
-- An artifact is replaced by name when a stage is retried; event history retains the transition attempts.
+- Every artifact is UTF-8 Markdown in v0.1+.
+- The store records logical name, attempt number, repository-relative path, creation timestamp, and SHA-256 digest.
+- Retries write attempt-scoped immutable files (`*.attempt-<n>.md`) and keep a latest logical pointer by name.
+- Digests are recomputed and compared on every read; mismatches fail closed.
 - Agents must not rely on prior chat messages that are absent from the supplied prompt.
 - Model output cannot authorize a transition unless the orchestrator recognizes the required terminal marker.
-- Future versions will include prompt version, model identity, git SHA, attempt number, and immutable artifact version in metadata.
+- Common secrets are redacted before persistence.
+- JSON schemas live under `schemas/` for configuration and run records.
 
 ## Run record
 
@@ -18,6 +20,7 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
 ```json
 {
   "schemaVersion": 1,
+  "version": 3,
   "id": "20260722120000-1a2b3c4d",
   "title": "Add organization audit trail",
   "request": "...",
@@ -32,6 +35,13 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
   "counters": {
     "buildVerifyCycles": 0,
     "commentResolutionCycles": 0
+  },
+  "workspace": {
+    "baseSha": "abc...",
+    "headSha": "abc...",
+    "branch": "maswe/20260722120000-1a2b3c4d",
+    "fingerprint": "...",
+    "worktreePath": ".maswe/worktrees/20260722120000-1a2b3c4d"
   },
   "config": {},
   "artifacts": [],

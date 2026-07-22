@@ -6,7 +6,7 @@
 
 ## Status
 
-- Version: 0.1 foundation
+- Version: 0.2 local hardening
 - Date: 2026-07-22
 - Owner: repository maintainer
 - Intended first users: individual software engineers and small teams using Cursor and GitHub
@@ -97,7 +97,7 @@ Support Cursor CLI immediately, Cursor SDK through an adapter, Superpowers pract
 - General-purpose swarm or arbitrary recursive subagent framework.
 - Guaranteeing provider model availability or pricing.
 - Sandboxing untrusted repositories beyond the permissions supplied by Cursor and the local operating system.
-- Creating branches, worktrees, commits, or PRs automatically.
+- Creating pull requests or merging automatically (local branch/worktree/commit isolation is available in v0.2).
 
 ## Core principles
 

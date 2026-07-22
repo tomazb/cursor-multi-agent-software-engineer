@@ -28,6 +28,10 @@ Use Superpowers executing-plans, test-driven-development, and verification-befor
 
 {{VERIFICATION_REPORT}}
 
+## Explicit verifier defects to resolve (when retrying)
+
+{{VERIFIER_DEFECTS}}
+
 ## Working rules
 
 - Inspect the repository and current branch before changing anything.

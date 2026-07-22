@@ -32,7 +32,6 @@ export async function isGitRepository(cwd: string): Promise<boolean> {
   }
 }
 
-
 export async function isGitWorkspaceClean(cwd: string): Promise<boolean> {
   if (!(await isGitRepository(cwd))) return true;
   const result = await run("git", ["status", "--porcelain=v1", "--untracked-files=all"], cwd);
@@ -63,4 +62,31 @@ export async function gitWorkspaceFingerprint(cwd: string): Promise<string> {
     }
   }
   return hash.digest("hex");
+}
+
+export async function gitRevParse(cwd: string, rev = "HEAD"): Promise<string> {
+  const result = await run("git", ["rev-parse", rev], cwd);
+  if (result.exitCode !== 0) {
+    throw new Error(`git rev-parse ${rev} failed: ${result.stderr || result.stdout}`);
+  }
+  return result.stdout.trim();
+}
+
+export async function gitCurrentBranch(cwd: string): Promise<string> {
+  const result = await run("git", ["rev-parse", "--abbrev-ref", "HEAD"], cwd);
+  if (result.exitCode !== 0) {
+    throw new Error(`git branch lookup failed: ${result.stderr || result.stdout}`);
+  }
+  return result.stdout.trim();
+}
+
+export async function gitChangedFiles(cwd: string, baseSha: string, headSha = "HEAD"): Promise<string[]> {
+  const result = await run("git", ["diff", "--name-only", `${baseSha}...${headSha}`], cwd);
+  if (result.exitCode !== 0) {
+    throw new Error(`git diff failed: ${result.stderr || result.stdout}`);
+  }
+  return result.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
 }

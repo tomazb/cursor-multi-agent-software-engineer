@@ -71,15 +71,21 @@ Replace starter commands with commands that are authoritative for the target rep
 
 Commands execute with the system shell and are trusted code. Only repository administrators should change them. Never derive them from issues, model output, or PR comments.
 
-## 5. Use a dedicated branch or worktree
+## 5. Prefer isolated worktrees
 
-v0.1 does not create git isolation. Before approving design, create a feature branch or worktree:
+By default `policy.useIsolatedWorktree` is `true`. On `start`, MASWE creates branch `maswe/<run-id>` and a linked worktree under `.maswe/worktrees/<run-id>`. Builder and resolver roles execute in that worktree.
 
-```bash
-git switch -c feature/organization-audit-trail
+To opt out for a trusted checkout:
+
+```json
+{
+  "policy": {
+    "useIsolatedWorktree": false
+  }
+}
 ```
 
-Keep the workspace clean. A clean checkout makes read-only enforcement and recovery easier to reason about.
+Keep the primary workspace clean. Dirty checkouts are rejected unless `policy.allowDirtyWorkspace` is true.
 
 ## 6. Run lifecycle
 
@@ -172,12 +178,22 @@ maswe run <run-id>
 
 Inspect:
 
-- `run.failure` in `run.json`.
+- `run.failure` in `run.json` (includes `resumeState` when recoverable).
 - Last transition details.
 - Runtime stderr captured in the failure or stage output.
 - Cursor authentication and model availability.
 
-A failed run is terminal in v0.1. Copy the approved request/artifacts into a new run after fixing the cause. A formal retry-from-failed command is planned.
+Retry the same run after fixing the cause:
+
+```bash
+maswe retry <run-id>
+```
+
+Or start a linked replacement that cancels the original when it is still active:
+
+```bash
+maswe supersede <run-id>
+```
 
 ### Quality failure loop
 

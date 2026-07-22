@@ -27,3 +27,10 @@ test("cancel and fail are available from non-terminal states", () => {
 test("post-review verification returns to the existing PR review state", () => {
   assert.equal(transition("VERIFYING", "VERIFY_PASSED_AFTER_REVIEW"), "PR_REVIEW");
 });
+
+test("retry-from-failed resumes into the provided resumeState", () => {
+  assert.equal(transition("FAILED", "RETRY_FROM_FAILED", "BUILDING"), "BUILDING");
+  assert.throws(() => transition("PR_READY", "RETRY_FROM_FAILED", "BUILDING"), /not allowed/);
+  assert.throws(() => transition("FAILED", "RETRY_FROM_FAILED"), /resumeState/);
+  assert.deepEqual(allowedEvents("FAILED"), ["RETRY_FROM_FAILED"]);
+});
