@@ -54,6 +54,9 @@ class EditingBuilder implements AgentRuntime {
   doctor(): Promise<RuntimeDoctorResult> {
     return new MockRuntime().doctor();
   }
+  listModels(): Promise<string[]> {
+    return new MockRuntime().listModels();
+  }
 }
 
 test("quality command that edits a tracked file fails closed before verifier", async () => {

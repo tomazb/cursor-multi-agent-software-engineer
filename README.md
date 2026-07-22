@@ -165,7 +165,7 @@ The current implementation provides:
 - Scope classification before any PR comment is automatically resolved.
 - Re-running quality checks and a fresh verifier after every resolver edit.
 
-The v0.1 verifier is bound to the current local workspace fingerprint, not yet a remote git SHA/check run. SHA-bound GitHub checks are part of the GitHub App milestone.
+The v0.2 verifier and quality gates bind evidence to the current git **head SHA**. Read-only roles still use workspace fingerprinting to detect unauthorized edits. Remote GitHub check-run automation remains a later milestone.
 
 ## Current limitations
 
@@ -173,7 +173,7 @@ The v0.1 verifier is bound to the current local workspace fingerprint, not yet a
 - GitHub webhooks and check runs are not yet wired to the CLI.
 - Human approvals are local commands rather than signed GitHub actions.
 - File-based state is suitable for one operator or CI job, not concurrent distributed workers.
-- Model catalogue output differs across Cursor versions; `maswe doctor` performs a best-effort slug check.
+- Model catalogue output differs across Cursor versions; `maswe doctor` resolves logical names against exact catalogue IDs and fails closed on missing or ambiguous matches.
 - The Cursor SDK is a public beta and is kept behind an adapter boundary.
 
 These are deliberate boundaries rather than hidden behavior. See [the roadmap](docs/ROADMAP.md).

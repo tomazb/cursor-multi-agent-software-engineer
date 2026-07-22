@@ -253,3 +253,36 @@ test(
     assert.ok(run.artifacts.some((a) => a.logicalName === "02-brainstorm.md"));
   },
 );
+
+test(
+  "opt-in Cursor CLI smoke: DEFAULT json outputFormat brainstormer with marker extraction",
+  { skip: process.env.MASWE_CURSOR_SMOKE !== "1" },
+  async () => {
+    const cwd = await initRepo("maswe-smoke-json-");
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.runtime.kind = "cursor-cli";
+    // Explicitly exercise the DEFAULT execution path (json), including extractCursorCliOutput.
+    config.runtime.outputFormat = "json";
+    config.roles.brainstormer.model =
+      process.env.MASWE_MODEL_BRAINSTORMER?.trim() || "grok-4.5";
+    config.policy.trustManagedWorktrees = true;
+    config.policy.useIsolatedWorktree = true;
+    config.gates.requireBrainstormApproval = true;
+    config.quality.commands = [];
+
+    const orchestrator = new Orchestrator(cwd, config, createRuntime(config, cwd));
+    const run = await orchestrator.start(
+      "Smoke JSON",
+      "One-sentence brainstorm only. Keep the report short.",
+    );
+    assert.ok(run.workspace?.worktreePath, "managed worktree required");
+    assert.match(run.config.roles.brainstormer.model, /cursor-grok-4\.5|grok-4\.5/);
+    assert.equal(
+      run.state,
+      "WAITING_FOR_BRAINSTORM_APPROVAL",
+      `json smoke failed: state=${run.state} failure=${run.failure?.message ?? "(none)"}`,
+    );
+    assert.ok(run.artifacts.some((a) => a.logicalName === "02-brainstorm.md"));
+    assert.equal(run.failure, undefined);
+  },
+);

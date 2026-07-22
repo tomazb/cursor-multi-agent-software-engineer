@@ -77,6 +77,10 @@ class EditingRuntime implements AgentRuntime {
   doctor(): Promise<RuntimeDoctorResult> {
     return new MockRuntime().doctor();
   }
+
+  listModels(): Promise<string[]> {
+    return new MockRuntime().listModels();
+  }
 }
 
 test("BUILD_COMPLETED is emitted only after deterministic commit with input and output SHAs", async () => {

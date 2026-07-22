@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawnCaptured } from "./process.ts";
 
 interface ProcessResult {
   exitCode: number;
@@ -9,18 +9,22 @@ interface ProcessResult {
   stderr: string;
 }
 
-function run(command: string, args: string[], cwd: string): Promise<ProcessResult> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => (stdout += chunk));
-    child.stderr.on("data", (chunk: string) => (stderr += chunk));
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ exitCode: code ?? 1, stdout, stderr }));
-  });
+const GIT_TIMEOUT_MS = 120_000;
+
+/** Shared git spawn with a hard timeout so hung git cannot wedge the orchestrator. */
+export async function gitRun(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Promise<ProcessResult> {
+  const result = await spawnCaptured("git", args, { cwd, timeoutMs });
+  if (result.timedOut) {
+    throw new Error(`git ${args.join(" ")} timed out after ${timeoutMs}ms`);
+  }
+  return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+}
+
+async function run(command: string, args: string[], cwd: string): Promise<ProcessResult> {
+  if (command !== "git") {
+    throw new Error(`Unsupported command for git-snapshot run helper: ${command}`);
+  }
+  return gitRun(args, cwd);
 }
 
 export async function isGitRepository(cwd: string): Promise<boolean> {

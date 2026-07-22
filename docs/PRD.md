@@ -88,7 +88,9 @@ Classify review comments before editing, escalate scope changes, re-run CI after
 
 Support Cursor CLI immediately, Cursor SDK through an adapter, Superpowers practices in stage prompts, and a Cursor plugin skill as the editor entry point.
 
-## Non-goals for v0.1
+## Non-goals (historical v0.1) and remaining out of scope
+
+The following were non-goals for the original v0.1 CLI and remain out of scope for local v0.2 except where noted:
 
 - Fully autonomous requirement approval.
 - Automatic merging.
@@ -97,7 +99,7 @@ Support Cursor CLI immediately, Cursor SDK through an adapter, Superpowers pract
 - General-purpose swarm or arbitrary recursive subagent framework.
 - Guaranteeing provider model availability or pricing.
 - Sandboxing untrusted repositories beyond the permissions supplied by Cursor and the local operating system.
-- Creating pull requests or merging automatically (local branch/worktree/commit isolation is available in v0.2).
+- Creating pull requests or merging automatically. **v0.2 does provide local branch/worktree/commit isolation**; remote PR/merge automation remains a later milestone.
 
 ## Core principles
 

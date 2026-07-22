@@ -53,6 +53,7 @@
     "maxCommentResolutionCycles": 2,
     "allowDirtyWorkspace": false,
     "useIsolatedWorktree": true,
+    "trustManagedWorktrees": true,
     "promptTransport": "stdin",
     "commandTimeoutMs": 600000,
     "roleTimeoutMs": 1800000,

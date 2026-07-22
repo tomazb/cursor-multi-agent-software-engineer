@@ -9,6 +9,19 @@ const ROLE_MARKERS: Record<string, string> = {
 };
 
 export class MockRuntime implements AgentRuntime {
+  async listModels(): Promise<string[]> {
+    // Identity catalogue so logical defaults resolve to themselves in mock tests.
+    return [
+      "grok-4.5",
+      "claude-fable-5",
+      "claude-opus-4.8",
+      "gpt-5.6-sol-high",
+      "cursor-grok-4.5-high",
+      "cursor-claude-fable-5-high",
+      "cursor-claude-opus-4.8-high",
+    ];
+  }
+
   async execute(request: RuntimeRequest): Promise<RuntimeResult> {
     const classifying = request.prompt.includes("Role: PR comment scope classifier");
     const marker = classifying

@@ -2,6 +2,7 @@ import type { AgentRuntime, MasweConfig, RuntimeDoctorResult, RuntimeRequest, Ru
 import { gitWorkspaceFingerprint, isGitRepository } from "../git-snapshot.ts";
 import { spawnCaptured, type SpawnResult } from "../process.ts";
 import { ensureRunWorkspace, cleanupDoctorProbeResources } from "../git-workspace.ts";
+import { resolveLogicalModelId } from "../model-resolution.ts";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -96,6 +97,7 @@ export class CursorCliRuntime implements AgentRuntime {
   private readonly config: MasweConfig;
   private readonly cwd: string;
   private readonly spawnFn: RuntimeSpawnFn;
+  private catalogueCache: string[] | undefined;
 
   constructor(
     config: MasweConfig,
@@ -108,12 +110,14 @@ export class CursorCliRuntime implements AgentRuntime {
 
   async execute(request: RuntimeRequest): Promise<RuntimeResult> {
     const before = await gitWorkspaceFingerprint(request.cwd);
+    const catalogue = await this.listModels();
+    const resolvedModel = resolveLogicalModelId(request.roleConfig.model, catalogue);
     const args = [
       "-p",
       "--output-format",
       this.config.runtime.outputFormat,
       "--model",
-      request.roleConfig.model,
+      resolvedModel,
     ];
     if (shouldPassTrustFlag(this.config, request)) {
       args.push("--trust");
@@ -150,8 +154,8 @@ export class CursorCliRuntime implements AgentRuntime {
     return {
       status: result.exitCode === 0 && !result.timedOut ? "finished" : "error",
       output: extractOutput(result.stdout) || result.stderr,
-      requestedModel: request.roleConfig.model,
-      actualModel: request.roleConfig.model,
+      requestedModel: resolvedModel,
+      actualModel: resolvedModel,
       metadata: {
         exitCode: result.exitCode,
         stderr: result.stderr,
@@ -159,8 +163,25 @@ export class CursorCliRuntime implements AgentRuntime {
         timedOut: result.timedOut ?? false,
         promptTransport: useStdin ? "stdin" : "argv",
         trust: shouldPassTrustFlag(this.config, request),
+        configuredModel: request.roleConfig.model,
+        resolvedModel,
       },
     };
+  }
+
+  async listModels(): Promise<string[]> {
+    if (this.catalogueCache) return this.catalogueCache;
+    const models = await this.spawnFn(this.config.runtime.command, ["models"], {
+      cwd: this.cwd,
+      timeoutMs: this.config.policy.commandTimeoutMs,
+    });
+    if (models.exitCode !== 0) {
+      throw new Error(
+        `Failed to list models via '${this.config.runtime.command} models' (exit ${models.exitCode}): ${models.stderr.trim()}`,
+      );
+    }
+    this.catalogueCache = [...parseModelCatalogueIds(`${models.stdout}\n${models.stderr}`)];
+    return this.catalogueCache;
   }
 
   async doctor(): Promise<RuntimeDoctorResult> {
@@ -219,21 +240,43 @@ export class CursorCliRuntime implements AgentRuntime {
       }
 
       if (cliOk) {
-        const models = await this.spawnFn(this.config.runtime.command, ["models"], {
-          cwd: probeCwd,
-          timeoutMs: this.config.policy.commandTimeoutMs,
-        });
-        const ids = parseModelCatalogueIds(`${models.stdout}\n${models.stderr}`);
-        for (const [role, roleConfig] of Object.entries(this.config.roles)) {
-          const normalized = roleConfig.model.toLowerCase();
-          const available = models.exitCode === 0 && ids.has(normalized);
+        let ids: Set<string>;
+        try {
+          ids = new Set(await this.listModels());
+        } catch (error) {
           checks.push({
-            name: `model-${role}`,
-            ok: available,
-            message: available
-              ? `${roleConfig.model} is present as an exact model catalogue ID.`
-              : `Could not confirm exact model ID ${roleConfig.model}. Run '${this.config.runtime.command} models' and update the exact model slug in config.`,
+            name: "model-catalogue",
+            ok: false,
+            message: error instanceof Error ? error.message : String(error),
           });
+          ids = new Set();
+        }
+        for (const [role, roleConfig] of Object.entries(this.config.roles)) {
+          if (ids.size === 0) {
+            checks.push({
+              name: `model-${role}`,
+              ok: false,
+              message: `Could not resolve ${roleConfig.model}: model catalogue unavailable.`,
+            });
+            continue;
+          }
+          try {
+            const resolved = resolveLogicalModelId(roleConfig.model, ids);
+            checks.push({
+              name: `model-${role}`,
+              ok: true,
+              message:
+                resolved === roleConfig.model.toLowerCase()
+                  ? `${roleConfig.model} is present as an exact model catalogue ID.`
+                  : `${roleConfig.model} resolves to catalogue ID ${resolved}.`,
+            });
+          } catch (error) {
+            checks.push({
+              name: `model-${role}`,
+              ok: false,
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
         }
       }
     } catch (error) {

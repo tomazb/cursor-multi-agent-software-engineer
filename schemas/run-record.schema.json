@@ -56,7 +56,10 @@
           "logicalName": { "type": "string" },
           "attempt": { "type": "integer", "minimum": 1 },
           "path": { "type": "string" },
-          "sha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
           "createdAt": { "type": "string" }
         }
       }

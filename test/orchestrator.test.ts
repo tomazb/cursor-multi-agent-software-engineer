@@ -46,6 +46,10 @@ class FailingVerifierRuntime implements AgentRuntime {
   doctor(): Promise<RuntimeDoctorResult> {
     return this.delegate.doctor();
   }
+
+  listModels(): Promise<string[]> {
+    return this.delegate.listModels();
+  }
 }
 
 test("workflow reaches PR_READY after both approvals, CI, and verification", async () => {

@@ -72,3 +72,22 @@ test("createDeterministicCommit and assertChangeScope accept in-scope edits", as
   const files = await assertChangeScope(cwd, base, ["src/**"]);
   assert.deepEqual(files, ["src/ok.ts"]);
 });
+
+test("assertSafeRunId rejects path traversal run ids", async () => {
+  const { assertSafeRunId } = await import("../src/git-workspace.ts");
+  assert.throws(() => assertSafeRunId("../escape"), /Invalid run id/);
+  assert.throws(() => assertSafeRunId("a/b"), /Invalid run id/);
+  assert.doesNotThrow(() => assertSafeRunId("doctor-abcd1234"));
+});
+
+test("listWorkingTreePaths handles NUL-delimited rename entries", async () => {
+  const cwd = await initRepo();
+  await mkdir(path.join(cwd, "src"), { recursive: true });
+  await writeFile(path.join(cwd, "src", "old.ts"), "export const old = 1;\n", "utf8");
+  await execFileAsync("git", ["add", "src/old.ts"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "old"], { cwd });
+  await execFileAsync("git", ["mv", "src/old.ts", "src/new.ts"], { cwd });
+  const { listWorkingTreePaths } = await import("../src/git-workspace.ts");
+  const paths = await listWorkingTreePaths(cwd);
+  assert.ok(paths.includes("src/new.ts"), `expected rename dest in ${paths.join(",")}`);
+});

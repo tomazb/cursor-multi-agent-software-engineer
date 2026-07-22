@@ -53,6 +53,9 @@ class EditingBuilder implements AgentRuntime {
   doctor(): Promise<RuntimeDoctorResult> {
     return new MockRuntime().doctor();
   }
+  listModels(): Promise<string[]> {
+    return new MockRuntime().listModels();
+  }
 }
 
 test("failed run keeps branch ref and can recreate worktree from headSha on retry from CI_RUNNING", async () => {

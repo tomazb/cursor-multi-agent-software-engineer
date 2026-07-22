@@ -2,13 +2,13 @@ import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
 import type { RunRecord, RunWorkspace } from "./domain.ts";
 import {
   gitChangedFiles,
   gitCurrentBranch,
   gitRemoteUrl,
   gitRevParse,
+  gitRun,
   gitWorkspaceFingerprint,
   isGitRepository,
   isGitWorkspaceClean,
@@ -21,17 +21,19 @@ interface ProcessResult {
 }
 
 function gitExec(command: string, args: string[], cwd: string): Promise<ProcessResult> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => (stdout += chunk));
-    child.stderr.on("data", (chunk: string) => (stderr += chunk));
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ exitCode: code ?? 1, stdout, stderr }));
-  });
+  if (command !== "git") {
+    throw new Error(`Unsupported command for gitExec: ${command}`);
+  }
+  return gitRun(args, cwd);
+}
+
+/** Reject path-like or otherwise unsafe run IDs before filesystem joins. */
+export function assertSafeRunId(runId: string): void {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(runId)) {
+    throw new Error(
+      `Invalid run id '${runId}': must be 1-128 chars of [A-Za-z0-9._-] starting with alphanumeric`,
+    );
+  }
 }
 
 function matchGlob(filePath: string, glob: string): boolean {
@@ -50,6 +52,7 @@ export function pathAllowed(filePath: string, globs: string[]): boolean {
 }
 
 export function externalWorktreePath(repositoryPath: string, runId: string): string {
+  assertSafeRunId(runId);
   const repoKey = createHash("sha256").update(path.resolve(repositoryPath)).digest("hex").slice(0, 16);
   return path.join(os.tmpdir(), "maswe-worktrees", repoKey, runId);
 }
@@ -147,16 +150,27 @@ export function invalidateStaleEvidence(run: RunRecord, headSha: string): boolea
 }
 
 export async function listWorkingTreePaths(cwd: string): Promise<string[]> {
-  const status = await gitExec("git", ["status", "--porcelain=v1", "--untracked-files=all"], cwd);
+  const status = await gitExec(
+    "git",
+    ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    cwd,
+  );
   if (status.exitCode !== 0) throw new Error(`git status failed: ${status.stderr}`);
   const files: string[] = [];
-  for (const line of status.stdout.split("\n")) {
-    if (!line.trim()) continue;
-    const pathPart = line.slice(3);
-    if (pathPart.includes(" -> ")) {
-      files.push(pathPart.split(" -> ")[1]!.trim());
+  const parts = status.stdout.split("\0");
+  for (let index = 0; index < parts.length; index += 1) {
+    const entry = parts[index];
+    if (!entry) continue;
+    // Porcelain -z entries start with two status letters and a space.
+    if (entry.length < 3 || entry[2] !== " ") continue;
+    const code = entry.slice(0, 2);
+    const pathPart = entry.slice(3);
+    if (/[RC]/.test(code)) {
+      // Porcelain -z rename/copy: "XY dest\0origin\0" — keep destination, skip origin.
+      files.push(pathPart);
+      index += 1;
     } else {
-      files.push(pathPart.trim());
+      files.push(pathPart);
     }
   }
   return files;
@@ -233,9 +247,9 @@ export async function createDeterministicCommit(
   const add = await gitExec("git", ["add", "-A"], cwd);
   if (add.exitCode !== 0) throw new Error(`git add failed: ${add.stderr}`);
 
-  const staged = await gitExec("git", ["diff", "--cached", "--name-only"], cwd);
+  const staged = await gitExec("git", ["diff", "--cached", "--name-only", "-z"], cwd);
   const files = staged.stdout
-    .split("\n")
+    .split("\0")
     .map((line) => line.trim())
     .filter(Boolean);
   const disallowed = files.filter((file) => !pathAllowed(file, options.allowedPathGlobs));

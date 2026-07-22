@@ -16,7 +16,7 @@ The project follows semantic versioning once a public release process is establi
 
 ### Added
 
-- `RunStore` interface with atomic file writes, exclusive `wx` lock files (bounded retry + stale reclaim), and optimistic `version` checks.
+- `RunStore` interface with atomic file writes, exclusive data locks (temp+`link` complete `{pid,owner,at}` records), a dedicated `.admin.lock` serializing acquire/unlock, **no automatic stale reclaim** (use `maswe unlock`), and optimistic `version` checks.
 - Artifact digest revalidation on every read and attempt-scoped immutable artifact history.
 - Persisted workspace provenance: remote, base SHA, head SHA, branch, fingerprint, optional external worktree path.
 - Git worktree/branch manager with deterministic commits (input/output SHA provenance), change-scope checks, unexpected branch-movement rejection, and worktree cleanup on terminal runs.
@@ -30,6 +30,7 @@ The project follows semantic versioning once a public release process is establi
 - v0.1 run-record migration (synthesize `version` / attempt metadata) or fail-closed on invalid records.
 - JSON schemas for configuration and run records under `schemas/`.
 - Packaged CLI dry-run verification in CI via `npm ci` and `npm pack --dry-run`.
+- Deterministic logical→exact Cursor model resolution at `start`/`doctor`/`execute`, with resolved IDs persisted in the run config snapshot.
 
 ### Changed
 

@@ -155,19 +155,26 @@ function assertConfig(config: MasweConfig): void {
   if (typeof config.policy.trustManagedWorktrees !== "boolean") {
     throw new Error("policy.trustManagedWorktrees must be a boolean");
   }
-  if (config.policy.commandTimeoutMs < 1) {
+  if (typeof config.policy.useIsolatedWorktree !== "boolean") {
+    throw new Error("policy.useIsolatedWorktree must be a boolean");
+  }
+  if (!Number.isFinite(config.policy.commandTimeoutMs) || config.policy.commandTimeoutMs < 1) {
     throw new Error("policy.commandTimeoutMs must be at least 1");
   }
-  if (config.policy.roleTimeoutMs < 1) {
+  if (!Number.isFinite(config.policy.roleTimeoutMs) || config.policy.roleTimeoutMs < 1) {
     throw new Error("policy.roleTimeoutMs must be at least 1");
   }
   if (
     config.policy.maxRunDurationMs !== undefined &&
-    config.policy.maxRunDurationMs < 1
+    (!Number.isFinite(config.policy.maxRunDurationMs) || config.policy.maxRunDurationMs < 1)
   ) {
     throw new Error("policy.maxRunDurationMs must be at least 1 when set");
   }
-  if (!Array.isArray(config.policy.allowedPathGlobs) || config.policy.allowedPathGlobs.length < 1) {
+  if (
+    !Array.isArray(config.policy.allowedPathGlobs) ||
+    config.policy.allowedPathGlobs.length < 1 ||
+    !config.policy.allowedPathGlobs.every((glob) => typeof glob === "string" && glob.trim().length > 0)
+  ) {
     throw new Error("policy.allowedPathGlobs must contain at least one glob");
   }
 }

@@ -118,7 +118,7 @@ It does not contain Cursor SDK implementation details, shell output parsing, or 
     └── 09-resolution-report.md
 ```
 
-`run.json` is an event-bearing snapshot, not an event-sourced database. It stores enough history for audit and recovery in a single-process local deployment. Mutating operations take an exclusive lock with a random owner token; `writeArtifact` rejects stale caller versions and only mutates authoritative on-disk state so concurrent cancellation or state transitions cannot lose events, approvals, counters, evidence, or failure records.
+`run.json` is an event-bearing snapshot, not an event-sourced database. It stores enough history for audit and recovery in a single-process local deployment. Mutating operations take an exclusive data lock (temp+`link` complete `{pid,owner,at}` record) coordinated with explicit `unlock` through a dedicated `.admin.lock`. Automatic stale reclaim is not used. `writeArtifact` rejects stale caller versions and only mutates authoritative on-disk state so concurrent cancellation or state transitions cannot lose events, approvals, counters, evidence, or failure records.
 
 Artifacts are SHA-256 hashed when written. A future store can place content in object storage and keep the same reference contract.
 
@@ -140,7 +140,7 @@ doctor(): Promise<RuntimeDoctorResult>
 Implemented adapters:
 
 - `MockRuntime`: deterministic outputs for tests and workflow development.
-- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode; unwraps JSON/`stream-json` stdout into assistant text before marker parsing; adds `--mode ask` for read-only roles and `--force` only for write roles; adds `--trust` when `policy.trustManagedWorktrees` is set for MASWE-managed worktrees.
+- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode; resolves logical model names against the local catalogue before execution; unwraps JSON/`stream-json` stdout into assistant text before marker parsing; adds `--mode ask` for read-only roles and `--force` only for write roles; adds `--trust` when `policy.trustManagedWorktrees` is set for MASWE-managed worktrees.
 - `CursorSdkRuntime`: dynamically imports `@cursor/sdk` and runs a local one-shot `Agent.prompt` call.
 
 The optional SDK import means the CLI can build and run without installing the beta SDK.

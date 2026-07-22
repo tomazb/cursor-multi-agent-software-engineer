@@ -96,3 +96,84 @@ async function readLockOwner(lockPath: string): Promise<string | undefined> {
     return undefined;
   }
 }
+
+function deferred<T = void>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+test("admin lock serializes unlockers against replacement acquire (barrier)", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-lock-admin-"));
+  const store = new FileRunStore(cwd, { lockRetries: 20 });
+  const run = await store.create("admin", "serialize", DEFAULT_CONFIG);
+  const lockPath = path.join(cwd, ".maswe", "runs", run.id, ".lock");
+
+  await installLinkLock(lockPath, {
+    pid: 1_000_000_199,
+    owner: "stale-owner",
+    at: new Date(Date.now() - 180_000).toISOString(),
+  });
+
+  const aValidated = deferred();
+  const bValidated = deferred();
+  const allowARemove = deferred();
+  const allowBCleanup = deferred();
+
+  // Unlocker A validates stale lock, then waits before remove.
+  const unlockA = store.unlock(run.id, {
+    afterValidate: async (meta) => {
+      assert.equal(meta?.owner, "stale-owner");
+      aValidated.resolve();
+      await allowARemove.promise;
+    },
+  });
+
+  // Unlocker B validates the same stale lock, then waits before cleanup.
+  const unlockB = store.unlock(run.id, {
+    afterValidate: async (meta) => {
+      assert.equal(meta?.owner, "stale-owner");
+      bValidated.resolve();
+      await allowBCleanup.promise;
+    },
+  });
+
+  await Promise.all([aValidated.promise, bValidated.promise]);
+  assert.equal(await readLockOwner(lockPath), "stale-owner");
+
+  // Unlocker A removes the stale lock.
+  allowARemove.resolve();
+  await unlockA;
+  assert.equal(await readLockOwner(lockPath), undefined);
+
+  // Writer C acquires the replacement lock and holds it.
+  const replacementOwner = randomUUID();
+  await installLinkLock(lockPath, {
+    pid: process.pid,
+    owner: replacementOwner,
+    at: new Date().toISOString(),
+  });
+  assert.equal(await readLockOwner(lockPath), replacementOwner);
+
+  // Unlocker B attempts cleanup — must not delete C's replacement lock.
+  allowBCleanup.resolve();
+  await assert.rejects(() => unlockB, /live pid|lock changed|refusing|incomplete|missing/i);
+  assert.equal(await readLockOwner(lockPath), replacementOwner);
+
+  // Writer D attempts acquisition while C holds the lock.
+  const writerD = structuredClone(await store.load(run.id));
+  writerD.title = "writer-d";
+  await assert.rejects(
+    store.save(writerD),
+    /lock contention|exclusive lock|stale lock|maswe unlock/i,
+  );
+  assert.equal(await readLockOwner(lockPath), replacementOwner);
+  assert.equal((await store.load(run.id)).title, "admin");
+
+  await store.unlock(run.id, { force: true });
+});

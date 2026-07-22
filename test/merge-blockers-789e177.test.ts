@@ -54,6 +54,14 @@ test("CursorCliRuntime passes --trust for all roles in managed worktrees", async
   const runtime = new CursorCliRuntime(config, {
     cwd,
     spawnFn: async (command, args) => {
+      if (args[0] === "models") {
+        return {
+          exitCode: 0,
+          stdout: `${config.roles.brainstormer.model}\n${config.roles.builder.model}\n`,
+          stderr: "",
+          durationMs: 1,
+        };
+      }
       seen.push([command, ...args]);
       return { exitCode: 0, stdout: "ok\nREADY_FOR_BRAINSTORM_APPROVAL\n", stderr: "", durationMs: 1 };
     },

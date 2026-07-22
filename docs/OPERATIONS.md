@@ -53,12 +53,14 @@ maswe doctor --cwd /path/to/repo
 
 `doctor` probes the Cursor CLI from a MASWE-managed worktree when `trustManagedWorktrees` is enabled (passing `--trust`), then removes that ephemeral worktree **and** its `maswe/doctor-*` branch. Cleanup outcome is reported as a doctor check.
 
-If a run lock is abandoned (dead process), use explicit unlock — MASWE never auto-reclaims locks:
+If a run lock is abandoned (dead process), use explicit unlock — MASWE never auto-reclaims **data** locks. Acquire and unlock are serialized through a short-lived `.admin.lock` so a concurrent unlock cannot delete a replacement owner's lock:
 
 ```bash
 maswe unlock <run-id>
 maswe unlock <run-id> --force   # only when you are sure no writer is alive
 ```
+
+Configured role models may use logical names (for example `grok-4.5`). `doctor`, `start`, and Cursor CLI execution resolve them against the local `agent models` catalogue to exact IDs (preferring non-fast `-high` variants when a family has multiple matches). Resolved exact IDs are persisted into the run config snapshot; later stages reuse that snapshot and ignore later environment mutations. Ambiguous cross-family matches and missing models fail closed.
 
 A model check is best effort because catalogue formatting is controlled by the Cursor CLI. Treat a doctor failure as a reason to inspect `agent models`, not as proof the provider is unavailable.
 

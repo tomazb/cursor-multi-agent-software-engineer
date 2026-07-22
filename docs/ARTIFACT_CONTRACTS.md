@@ -42,7 +42,7 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
     "headSha": "abc...",
     "branch": "maswe/20260722120000-1a2b3c4d",
     "fingerprint": "...",
-    "worktreePath": ".maswe/worktrees/20260722120000-1a2b3c4d"
+    "worktreePath": "/tmp/maswe-worktrees/<repoKey>/20260722120000-1a2b3c4d"
   },
   "evidence": {
     "quality": { "headSha": "abc...", "passed": true, "at": "..." },

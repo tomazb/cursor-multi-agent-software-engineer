@@ -14,6 +14,7 @@ import {
   workingDirectoryFor,
 } from "./git-workspace.ts";
 import { parseRoleMarker } from "./markers.ts";
+import { resolveConfigModels } from "./model-resolution.ts";
 import { renderQualityReport, runQualityChecks } from "./quality.ts";
 import { isHumanGate, isTerminal } from "./state-machine.ts";
 import { FileRunStore, type RunStore } from "./store.ts";
@@ -86,7 +87,9 @@ export class Orchestrator {
     if (!this.config.policy.allowDirtyWorkspace && !(await isGitWorkspaceClean(this.cwd))) {
       throw new Error("Workspace is dirty. Commit, stash, or set policy.allowDirtyWorkspace=true.");
     }
-    const run = await this.store.create(title, request, this.config);
+    const catalogue = await this.runtime.listModels();
+    const resolvedConfig = resolveConfigModels(this.config, catalogue);
+    const run = await this.store.create(title, request, resolvedConfig);
     run.workspace = await ensureRunWorkspace(this.cwd, run);
     await this.store.save(run);
     await this.store.applyEvent(run, "START", "user");
@@ -532,7 +535,7 @@ export class Orchestrator {
   async markMergeReady(runId: string): Promise<RunRecord> {
     const run = await this.store.load(runId);
     const previousVerificationSha = run.evidence?.verification?.headSha;
-    const headSha = await this.syncWorkspace(run);
+    const headSha = (await this.syncWorkspace(run)) ?? run.workspace?.headSha;
     const workdir = workingDirectoryFor(run);
     if (run.workspace && run.workspace.baseSha !== "not-a-git-repository") {
       if (!(await isGitWorkspaceClean(workdir))) {

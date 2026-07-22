@@ -9,6 +9,7 @@ import type {
   WorkflowState,
 } from "./domain.ts";
 import { migrateConfig } from "./config.ts";
+import { assertSafeRunId } from "./git-workspace.ts";
 import { redactSecrets } from "./redaction.ts";
 import { transition } from "./state-machine.ts";
 
@@ -167,6 +168,7 @@ export class FileRunStore implements RunStore {
   }
 
   private runDirectory(runId: string): string {
+    assertSafeRunId(runId);
     return path.join(this.root, runId);
   }
 
@@ -178,9 +180,60 @@ export class FileRunStore implements RunStore {
     return path.join(this.runDirectory(runId), ".lock");
   }
 
+  private adminLockFile(runId: string): string {
+    return path.join(this.runDirectory(runId), ".admin.lock");
+  }
+
   private async readRunFile(runId: string): Promise<RunRecord> {
     const raw = await readFile(this.runFile(runId), "utf8");
     return migrateRunRecord(JSON.parse(raw));
+  }
+
+  /**
+   * Short-lived administrative mutex shared by data-lock acquisition and unlock.
+   * Dead admin holders are reclaimed (unlike the data lock) so a crashed unlock
+   * cannot permanently wedge the run.
+   */
+  private async withAdminLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+    const directory = this.runDirectory(runId);
+    await mkdir(directory, { recursive: true });
+    const adminPath = this.adminLockFile(runId);
+    const adminRetries = Math.max(this.lockRetries * 4, 100);
+    let owner: string | undefined;
+
+    for (let attempt = 0; attempt < adminRetries; attempt += 1) {
+      owner = randomUUID();
+      const meta: LockMeta = { pid: process.pid, owner, at: new Date().toISOString() };
+      const tmpPath = `${adminPath}.${owner}.tmp`;
+      await writeFile(tmpPath, `${JSON.stringify(meta)}\n`, "utf8");
+      try {
+        await link(tmpPath, adminPath);
+        await rm(tmpPath, { force: true });
+        break;
+      } catch (error) {
+        await rm(tmpPath, { force: true });
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "EEXIST") throw error;
+        const existing = await readLockMeta(adminPath);
+        if (existing && pidAlive(existing.pid)) {
+          owner = undefined;
+          await sleep(5 + attempt * 2);
+          continue;
+        }
+        // Dead or incomplete admin lock: safe to reclaim.
+        await rm(adminPath, { force: true });
+        owner = undefined;
+      }
+    }
+    if (!owner) {
+      throw new Error(`Run ${runId} admin lock contention: could not serialize unlock/acquire`);
+    }
+
+    try {
+      return await fn();
+    } finally {
+      await releaseOwnedLock(adminPath, owner);
+    }
   }
 
   private async acquireLock(runId: string): Promise<{ owner: string }> {
@@ -189,34 +242,37 @@ export class FileRunStore implements RunStore {
     const lockPath = this.lockFile(runId);
 
     for (let attempt = 0; attempt < this.lockRetries; attempt += 1) {
-      const owner = randomUUID();
-      const meta: LockMeta = { pid: process.pid, owner, at: new Date().toISOString() };
-      const tmpPath = `${lockPath}.${owner}.tmp`;
-      await writeFile(tmpPath, `${JSON.stringify(meta)}\n`, "utf8");
-      try {
-        // Atomic exclusive create of a complete lock record (no empty/partial window).
-        await link(tmpPath, lockPath);
-        await rm(tmpPath, { force: true });
-        return { owner };
-      } catch (error) {
-        await rm(tmpPath, { force: true });
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== "EEXIST") throw error;
+      const outcome = await this.withAdminLock(runId, async () => {
+        const owner = randomUUID();
+        const meta: LockMeta = { pid: process.pid, owner, at: new Date().toISOString() };
+        const tmpPath = `${lockPath}.${owner}.tmp`;
+        await writeFile(tmpPath, `${JSON.stringify(meta)}\n`, "utf8");
+        try {
+          // Atomic exclusive create of a complete lock record (no empty/partial window).
+          await link(tmpPath, lockPath);
+          await rm(tmpPath, { force: true });
+          return { kind: "acquired" as const, owner };
+        } catch (error) {
+          await rm(tmpPath, { force: true });
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code !== "EEXIST") throw error;
+          const existing = await readLockMeta(lockPath);
+          if (existing && pidAlive(existing.pid)) {
+            return { kind: "live" as const };
+          }
+          // Never auto-reclaim stale/incomplete data locks — that races with new owners.
+          return { kind: "stale" as const };
+        }
+      });
 
-        const existing = await readLockMeta(lockPath);
-        if (existing && pidAlive(existing.pid)) {
-          await sleep(20 + attempt * 10);
-          continue;
-        }
-        // Never auto-reclaim stale/incomplete locks — that races with new owners.
-        // Operator must run `maswe unlock <run-id>` after confirming the holder is dead.
-        if (attempt === this.lockRetries - 1) {
-          throw new Error(
-            `Run ${runId} lock contention: stale or incomplete lock at ${lockPath}. If the holder is dead, run: maswe unlock ${runId}`,
-          );
-        }
-        await sleep(20 + attempt * 10);
+      if (outcome.kind === "acquired") return { owner: outcome.owner };
+      if (outcome.kind === "stale" && attempt === this.lockRetries - 1) {
+        throw new Error(
+          `Run ${runId} lock contention: stale or incomplete lock at ${lockPath}. If the holder is dead, run: maswe unlock ${runId}`,
+        );
       }
+      // Sleep outside the admin lock so unlock can proceed.
+      await sleep(20 + attempt * 10);
     }
     throw new Error(
       `Run ${runId} lock contention: could not acquire exclusive lock. If the holder is dead, run: maswe unlock ${runId}`,
@@ -225,9 +281,17 @@ export class FileRunStore implements RunStore {
 
   /**
    * Explicit unlock for abandoned locks. Refuses to remove a live holder's lock
-   * unless `force` is set.
+   * unless `force` is set. Coordinates with acquisition through `.admin.lock` so
+   * a concurrent unlock can never delete a replacement owner's data lock.
    */
-  async unlock(runId: string, options: { force?: boolean } = {}): Promise<void> {
+  async unlock(
+    runId: string,
+    options: {
+      force?: boolean;
+      /** Test hook after initial validation, before the admin-protected remove. */
+      afterValidate?: (meta: LockMeta | undefined) => Promise<void>;
+    } = {},
+  ): Promise<void> {
     const lockPath = this.lockFile(runId);
     const meta = await readLockMeta(lockPath);
     if (!meta) {
@@ -237,29 +301,41 @@ export class FileRunStore implements RunStore {
           `Run ${runId} lock is incomplete or missing owner metadata. Re-run with --force only after confirming no writer is active.`,
         );
       }
-      await rm(lockPath, { force: true });
-      return;
-    }
-    if (pidAlive(meta.pid) && !options.force) {
+    } else if (pidAlive(meta.pid) && !options.force) {
       throw new Error(
         `Run ${runId} lock is held by live pid ${meta.pid}. Refusing unlock without --force.`,
       );
     }
-    // Re-read and only remove if the same owner token is still present (no rename dance).
-    const again = await readLockMeta(lockPath);
-    if (!again || again.owner !== meta.owner) {
-      throw new Error(`Run ${runId} lock changed during unlock; refusing to delete.`);
+
+    if (options.afterValidate) {
+      await options.afterValidate(meta);
     }
-    if (pidAlive(again.pid) && !options.force) {
-      throw new Error(
-        `Run ${runId} lock is held by live pid ${again.pid}. Refusing unlock without --force.`,
-      );
-    }
-    await rm(lockPath, { force: true });
-    const leftover = await readLockMeta(lockPath);
-    if (leftover) {
-      throw new Error(`Run ${runId} unlock failed: lock still present`);
-    }
+
+    await this.withAdminLock(runId, async () => {
+      const again = await readLockMeta(lockPath);
+      if (!meta) {
+        // Forced incomplete cleanup: remove whatever is present only if still incomplete
+        // or gone; never delete a complete replacement owner without matching the observe.
+        if (!again) {
+          await rm(lockPath, { force: true });
+          return;
+        }
+        throw new Error(`Run ${runId} lock changed during unlock; refusing to delete.`);
+      }
+      if (!again || again.owner !== meta.owner) {
+        throw new Error(`Run ${runId} lock changed during unlock; refusing to delete.`);
+      }
+      if (pidAlive(again.pid) && !options.force) {
+        throw new Error(
+          `Run ${runId} lock is held by live pid ${again.pid}. Refusing unlock without --force.`,
+        );
+      }
+      await rm(lockPath, { force: true });
+      const leftover = await readLockMeta(lockPath);
+      if (leftover) {
+        throw new Error(`Run ${runId} unlock failed: lock still present`);
+      }
+    });
   }
 
   private async releaseLock(runId: string, owner: string): Promise<void> {

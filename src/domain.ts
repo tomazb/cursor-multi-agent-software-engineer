@@ -206,6 +206,8 @@ export interface RuntimeDoctorResult {
 export interface AgentRuntime {
   execute(request: RuntimeRequest): Promise<RuntimeResult>;
   doctor(): Promise<RuntimeDoctorResult>;
+  /** Local provider model catalogue IDs for logical→exact resolution. */
+  listModels(): Promise<string[]>;
 }
 
 export interface QualityCommandResult {
