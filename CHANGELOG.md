@@ -16,17 +16,18 @@ The project follows semantic versioning once a public release process is establi
 
 ### Added
 
-- `RunStore` interface with atomic file writes, lock files, and optimistic `version` checks.
+- `RunStore` interface with atomic file writes, exclusive `wx` lock files (bounded retry + stale reclaim), and optimistic `version` checks.
 - Artifact digest revalidation on every read and attempt-scoped immutable artifact history.
-- Persisted workspace provenance: remote, base SHA, head SHA, branch, fingerprint, optional worktree path.
-- Git worktree/branch manager with deterministic commits, change-scope checks, and unexpected branch-movement rejection.
+- Persisted workspace provenance: remote, base SHA, head SHA, branch, fingerprint, optional external worktree path.
+- Git worktree/branch manager with deterministic commits (input/output SHA provenance), change-scope checks, unexpected branch-movement rejection, and worktree cleanup on terminal runs.
+- Strict final-line terminal marker parsing with typed results; conflicting/duplicate/embedded markers fail closed.
 - SHA-bound quality/verification evidence; new commits invalidate prior verification before merge-ready.
-- Strict terminal marker validation for every role and classifier output.
 - Explicit verifier defect artifacts passed back into builder prompts.
 - Secret redaction for artifacts and quality command output.
-- Cursor CLI stdin prompt transport (argv fallback retained).
+- Cursor CLI stdin prompt transport with doctor probe (argv fallback retained).
 - Command/role/run timeout budgets.
 - `maswe retry` and `maswe supersede` recovery commands.
+- v0.1 run-record migration (synthesize `version` / attempt metadata) or fail-closed on invalid records.
 - JSON schemas for configuration and run records under `schemas/`.
 - Packaged CLI dry-run verification in CI via `npm ci` and `npm pack --dry-run`.
 

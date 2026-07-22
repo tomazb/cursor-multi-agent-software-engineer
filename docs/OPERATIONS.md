@@ -73,7 +73,7 @@ Commands execute with the system shell and are trusted code. Only repository adm
 
 ## 5. Prefer isolated worktrees
 
-By default `policy.useIsolatedWorktree` is `true`. On `start`, MASWE creates branch `maswe/<run-id>` and a linked worktree under `.maswe/worktrees/<run-id>`. Builder and resolver roles execute in that worktree.
+By default `policy.useIsolatedWorktree` is `true`. On `start`, MASWE creates branch `maswe/<run-id>` and a linked worktree under an **external** directory (`$TMPDIR/maswe-worktrees/...`), not inside the operator checkout. `.maswe/` is appended to `.git/info/exclude` so local run storage does not dirty `git status`. Builder and resolver roles execute in that worktree. Completed, cancelled, failed, and superseded runs remove their worktrees.
 
 To opt out for a trusted checkout:
 

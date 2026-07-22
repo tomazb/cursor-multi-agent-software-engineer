@@ -1,16 +1,18 @@
 import type { AgentRuntime, RoleId, RunRecord, RuntimeResult, WorkflowState } from "./domain.ts";
 import { buildCommentClassifierPrompt, buildRolePrompt } from "./prompt-builder.ts";
-import { isGitWorkspaceClean } from "./git-snapshot.ts";
+import { gitRevParse, isGitWorkspaceClean } from "./git-snapshot.ts";
 import {
   assertChangeScope,
   assertExpectedBranch,
+  assertWorkingTreeScope,
+  cleanupRunWorkspace,
   createDeterministicCommit,
   ensureRunWorkspace,
   invalidateStaleEvidence,
   refreshWorkspaceHead,
   workingDirectoryFor,
 } from "./git-workspace.ts";
-import { validateRoleMarkers } from "./markers.ts";
+import { parseRoleMarker } from "./markers.ts";
 import { renderQualityReport, runQualityChecks } from "./quality.ts";
 import { isHumanGate, isTerminal } from "./state-machine.ts";
 import { FileRunStore, type RunStore } from "./store.ts";
@@ -20,14 +22,6 @@ function ensureSuccess(result: RuntimeResult, role: RoleId): void {
   if (result.status !== "finished") {
     throw new Error(`${role} failed: ${result.output || "No output was produced."}`);
   }
-}
-
-function verifierPassed(output: string): boolean {
-  return /VERDICT\s*:\s*PASS\b/i.test(output);
-}
-
-function commentIsInScope(output: string): boolean {
-  return /SCOPE\s*:\s*IN_SCOPE\b/i.test(output);
 }
 
 export function extractVerifierDefects(report: string): string {
@@ -72,6 +66,13 @@ export class Orchestrator {
     if (elapsed > max) {
       throw new Error(`Run exceeded maxRunDurationMs (${max}).`);
     }
+  }
+
+  private async finalizeTerminal(run: RunRecord): Promise<RunRecord> {
+    if (isTerminal(run.state)) {
+      await cleanupRunWorkspace(run).catch(() => undefined);
+    }
+    return run;
   }
 
   async start(title: string, request: string): Promise<RunRecord> {
@@ -174,20 +175,15 @@ export class Orchestrator {
           if (run.counters.buildVerifyCycles > run.config.policy.maxBuildVerifyCycles) {
             return this.failRun(run, "Maximum build/verify cycles exceeded.");
           }
-          const completed = await this.executeRole(
-            run,
-            "builder",
-            "04-builder-report.md",
-            "BUILD_COMPLETED",
-            headSha,
-          );
-          await this.commitBuilderChanges(completed);
-          return completed;
+          return await this.executeBuilderWithPublish(run, headSha);
         }
         case "CI_RUNNING": {
           const workdir = workingDirectoryFor(run);
           const evaluatedSha =
             (await refreshWorkspaceHead(run)) ?? headSha ?? "not-a-git-repository";
+          if (evaluatedSha !== "not-a-git-repository" && !(await isGitWorkspaceClean(workdir))) {
+            throw new Error(`CI requires a clean worktree at ${evaluatedSha}`);
+          }
           const report = await runQualityChecks(workdir, run.config.quality.commands, {
             timeoutMs: run.config.policy.commandTimeoutMs,
           });
@@ -219,10 +215,10 @@ export class Orchestrator {
           }
           const prompt = await buildRolePrompt("verifier", run, this.store);
           const result = await this.executeAgent(run, "verifier", prompt);
-          const markers = validateRoleMarkers("verifier", result.output);
+          const markers = parseRoleMarker("verifier", result.output);
           if (!markers.ok) throw new Error(markers.message);
           await this.store.writeArtifact(run, "06-verification-report.md", result.output);
-          const passed = verifierPassed(result.output);
+          const passed = markers.value === "PASS";
           if (!passed && run.config.gates.requireVerifierPass) {
             await this.store.writeArtifact(
               run,
@@ -248,6 +244,7 @@ export class Orchestrator {
               agentId: result.agentId,
               runtimeRunId: result.runId,
               headSha: evaluatedSha,
+              marker: markers.marker,
             },
           );
         }
@@ -258,14 +255,17 @@ export class Orchestrator {
             ...run.config.roles.prResolver,
             permissions: "read-only",
           });
-          const markers = validateRoleMarkers("prResolver", result.output, { mode: "classify" });
+          const markers = parseRoleMarker("prResolver", result.output, { mode: "classify" });
           if (!markers.ok) throw new Error(markers.message);
           await this.store.writeArtifact(run, "08-comment-classification.md", result.output);
           return this.store.applyEvent(
             run,
-            commentIsInScope(result.output) ? "COMMENT_IN_SCOPE" : "COMMENT_OUT_OF_SCOPE",
+            markers.value === "IN_SCOPE" ? "COMMENT_IN_SCOPE" : "COMMENT_OUT_OF_SCOPE",
             "pr-comment-classifier",
-            headSha ? { headSha } : undefined,
+            {
+              marker: markers.marker,
+              ...(headSha ? { headSha } : {}),
+            },
           );
         }
         case "RESOLVING": {
@@ -273,15 +273,7 @@ export class Orchestrator {
           if (run.counters.commentResolutionCycles > run.config.policy.maxCommentResolutionCycles) {
             return this.failRun(run, "Maximum PR comment resolution cycles exceeded.");
           }
-          const completed = await this.executeRole(
-            run,
-            "prResolver",
-            "09-resolution-report.md",
-            "RESOLUTION_COMPLETED",
-            headSha,
-          );
-          await this.commitBuilderChanges(completed, "maswe: resolve review comment");
-          return completed;
+          return await this.executeResolverWithPublish(run, headSha);
         }
         default:
           throw new Error(`State ${run.state} requires a user or integration event.`);
@@ -290,6 +282,107 @@ export class Orchestrator {
       const message = error instanceof Error ? error.message : String(error);
       return this.failRun(run, message);
     }
+  }
+
+  private async executeBuilderWithPublish(
+    run: RunRecord,
+    inputHeadSha: string | undefined,
+  ): Promise<RunRecord> {
+    const workdir = workingDirectoryFor(run);
+    const beforeSha =
+      inputHeadSha ??
+      (run.workspace && run.workspace.baseSha !== "not-a-git-repository"
+        ? await gitRevParse(workdir)
+        : undefined);
+
+    const prompt = await buildRolePrompt("builder", run, this.store);
+    const result = await this.executeAgent(run, "builder", prompt);
+    const markers = parseRoleMarker("builder", result.output);
+    if (!markers.ok) throw new Error(markers.message);
+    await this.store.writeArtifact(run, "04-builder-report.md", result.output);
+
+    let outputHeadSha = beforeSha;
+    if (run.workspace && run.workspace.baseSha !== "not-a-git-repository" && beforeSha) {
+      await assertExpectedBranch(workdir, run.workspace.branch);
+      const afterBuilderSha = await gitRevParse(workdir);
+      if (afterBuilderSha !== beforeSha) {
+        throw new Error(
+          "HEAD moved during builder execution (model-created commit, reset, or rebase is not allowed)",
+        );
+      }
+      await assertWorkingTreeScope(workdir, run.config.policy.allowedPathGlobs);
+      const committed = await createDeterministicCommit(workdir, "maswe: builder changes", {
+        allowedPathGlobs: run.config.policy.allowedPathGlobs,
+      });
+      if (!(await isGitWorkspaceClean(workdir))) {
+        throw new Error("worktree remained dirty after deterministic commit");
+      }
+      if (committed.files.length > 0) {
+        await assertChangeScope(workdir, run.workspace.baseSha, run.config.policy.allowedPathGlobs);
+      }
+      outputHeadSha = committed.headSha;
+      run.workspace.headSha = committed.headSha;
+      invalidateStaleEvidence(run, committed.headSha);
+    }
+
+    return this.store.applyEvent(run, "BUILD_COMPLETED", "builder", {
+      requestedModel: result.requestedModel,
+      actualModel: result.actualModel,
+      agentId: result.agentId,
+      runtimeRunId: result.runId,
+      marker: markers.marker,
+      ...(beforeSha ? { inputHeadSha: beforeSha, headSha: beforeSha } : {}),
+      ...(outputHeadSha ? { outputHeadSha } : {}),
+    });
+  }
+
+  private async executeResolverWithPublish(
+    run: RunRecord,
+    inputHeadSha: string | undefined,
+  ): Promise<RunRecord> {
+    const workdir = workingDirectoryFor(run);
+    const beforeSha =
+      inputHeadSha ??
+      (run.workspace && run.workspace.baseSha !== "not-a-git-repository"
+        ? await gitRevParse(workdir)
+        : undefined);
+
+    const prompt = await buildRolePrompt("prResolver", run, this.store);
+    const result = await this.executeAgent(run, "prResolver", prompt);
+    const markers = parseRoleMarker("prResolver", result.output);
+    if (!markers.ok) throw new Error(markers.message);
+    await this.store.writeArtifact(run, "09-resolution-report.md", result.output);
+
+    let outputHeadSha = beforeSha;
+    if (run.workspace && run.workspace.baseSha !== "not-a-git-repository" && beforeSha) {
+      await assertExpectedBranch(workdir, run.workspace.branch);
+      const afterSha = await gitRevParse(workdir);
+      if (afterSha !== beforeSha) {
+        throw new Error(
+          "HEAD moved during resolver execution (model-created commit, reset, or rebase is not allowed)",
+        );
+      }
+      await assertWorkingTreeScope(workdir, run.config.policy.allowedPathGlobs);
+      const committed = await createDeterministicCommit(workdir, "maswe: resolve review comment", {
+        allowedPathGlobs: run.config.policy.allowedPathGlobs,
+      });
+      if (!(await isGitWorkspaceClean(workdir))) {
+        throw new Error("worktree remained dirty after deterministic commit");
+      }
+      outputHeadSha = committed.headSha;
+      run.workspace.headSha = committed.headSha;
+      invalidateStaleEvidence(run, committed.headSha);
+    }
+
+    return this.store.applyEvent(run, "RESOLUTION_COMPLETED", "prResolver", {
+      requestedModel: result.requestedModel,
+      actualModel: result.actualModel,
+      agentId: result.agentId,
+      runtimeRunId: result.runId,
+      marker: markers.marker,
+      ...(beforeSha ? { inputHeadSha: beforeSha, headSha: beforeSha } : {}),
+      ...(outputHeadSha ? { outputHeadSha } : {}),
+    });
   }
 
   private async failRun(run: RunRecord, message: string): Promise<RunRecord> {
@@ -301,51 +394,25 @@ export class Orchestrator {
     };
     await this.store.save(run);
     if (!isTerminal(run.state)) {
-      return this.store.applyEvent(run, "FAIL", "orchestrator", {
+      const failed = await this.store.applyEvent(run, "FAIL", "orchestrator", {
         reason: message,
         ...(resumeState ? { resumeState } : {}),
       });
+      return this.finalizeTerminal(failed);
     }
-    return run;
-  }
-
-  private async commitBuilderChanges(
-    run: RunRecord,
-    message = "maswe: builder changes",
-  ): Promise<void> {
-    const workdir = workingDirectoryFor(run);
-    if (!run.workspace || run.workspace.baseSha === "not-a-git-repository") return;
-    try {
-      await assertExpectedBranch(workdir, run.workspace.branch);
-      const committed = await createDeterministicCommit(workdir, message, {
-        allowedPathGlobs: run.config.policy.allowedPathGlobs,
-      });
-      if (committed.files.length > 0) {
-        await assertChangeScope(workdir, run.workspace.baseSha, run.config.policy.allowedPathGlobs);
-        run.workspace.headSha = committed.headSha;
-        invalidateStaleEvidence(run, committed.headSha);
-        await this.store.save(run);
-      }
-    } catch (error) {
-      const text = error instanceof Error ? error.message : String(error);
-      if (/Change-scope violation|Unexpected branch movement/i.test(text)) throw error;
-    }
+    return this.finalizeTerminal(run);
   }
 
   private async executeRole(
     run: RunRecord,
     role: RoleId,
     artifactName: string,
-    successEvent:
-      | "BRAINSTORM_COMPLETED"
-      | "DESIGN_COMPLETED"
-      | "BUILD_COMPLETED"
-      | "RESOLUTION_COMPLETED",
+    successEvent: "BRAINSTORM_COMPLETED" | "DESIGN_COMPLETED",
     headSha?: string,
   ): Promise<RunRecord> {
     const prompt = await buildRolePrompt(role, run, this.store);
     const result = await this.executeAgent(run, role, prompt);
-    const markers = validateRoleMarkers(role, result.output);
+    const markers = parseRoleMarker(role, result.output);
     if (!markers.ok) throw new Error(markers.message);
     await this.store.writeArtifact(run, artifactName, result.output);
     const evaluatedSha = headSha ?? run.workspace?.headSha;
@@ -354,6 +421,7 @@ export class Orchestrator {
       actualModel: result.actualModel,
       agentId: result.agentId,
       runtimeRunId: result.runId,
+      marker: markers.marker,
       ...(evaluatedSha ? { headSha: evaluatedSha } : {}),
     });
   }
@@ -443,12 +511,14 @@ export class Orchestrator {
 
   async complete(runId: string): Promise<RunRecord> {
     const run = await this.store.load(runId);
-    return this.store.applyEvent(run, "COMPLETE", "user");
+    const completed = await this.store.applyEvent(run, "COMPLETE", "user");
+    return this.finalizeTerminal(completed);
   }
 
   async cancel(runId: string): Promise<RunRecord> {
     const run = await this.store.load(runId);
-    return this.store.applyEvent(run, "CANCEL", "user");
+    const cancelled = await this.store.applyEvent(run, "CANCEL", "user");
+    return this.finalizeTerminal(cancelled);
   }
 
   async retryFromFailed(runId: string): Promise<RunRecord> {
@@ -459,6 +529,18 @@ export class Orchestrator {
     }
     const previousFailure = run.failure;
     delete run.failure;
+    // Recreate workspace if cleanup removed it.
+    if (run.config.policy.useIsolatedWorktree && !run.workspace?.worktreePath) {
+      run.workspace = await ensureRunWorkspace(this.cwd, run);
+      await this.store.save(run);
+    } else if (run.workspace?.worktreePath) {
+      try {
+        await gitRevParse(run.workspace.worktreePath);
+      } catch {
+        run.workspace = await ensureRunWorkspace(this.cwd, run);
+        await this.store.save(run);
+      }
+    }
     await this.store.applyEvent(run, "RETRY_FROM_FAILED", "user", {
       resumeState,
       previousFailure,
@@ -486,12 +568,14 @@ export class Orchestrator {
         at: new Date().toISOString(),
         resumeState: existing.state as WorkflowState,
       };
-      await this.store.applyEvent(existing, "CANCEL", "user", {
+      const cancelled = await this.store.applyEvent(existing, "CANCEL", "user", {
         reason: "superseded",
         supersededBy: replacement.id,
       });
+      await this.finalizeTerminal(cancelled);
     } else {
       await this.store.save(existing);
+      await this.finalizeTerminal(existing);
     }
     await this.store.applyEvent(replacement, "START", "user", { supersedes: existing.id });
     return this.runUntilBlocked(replacement.id);

@@ -43,7 +43,8 @@ test("ensureRunWorkspace creates an isolated branch worktree", async () => {
 
   const workspace = await ensureRunWorkspace(cwd, run);
   assert.equal(workspace.branch, "maswe/run123");
-  assert.ok(workspace.worktreePath?.includes(path.join(".maswe", "worktrees", "run123")));
+  assert.ok(workspace.worktreePath);
+  assert.equal(path.resolve(workspace.worktreePath).startsWith(path.resolve(cwd) + path.sep), false);
   assert.match(workspace.headSha, /^[0-9a-f]{40}$/);
 });
 

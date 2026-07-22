@@ -1,4 +1,6 @@
-import { mkdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import type { RunRecord, RunWorkspace } from "./domain.ts";
@@ -9,6 +11,7 @@ import {
   gitRevParse,
   gitWorkspaceFingerprint,
   isGitRepository,
+  isGitWorkspaceClean,
 } from "./git-snapshot.ts";
 
 interface ProcessResult {
@@ -44,6 +47,26 @@ function matchGlob(filePath: string, glob: string): boolean {
 export function pathAllowed(filePath: string, globs: string[]): boolean {
   const normalized = filePath.replace(/\\/g, "/");
   return globs.some((glob) => matchGlob(normalized, glob.replace(/\\/g, "/")));
+}
+
+export function externalWorktreePath(repositoryPath: string, runId: string): string {
+  const repoKey = createHash("sha256").update(path.resolve(repositoryPath)).digest("hex").slice(0, 16);
+  return path.join(os.tmpdir(), "maswe-worktrees", repoKey, runId);
+}
+
+export async function ensureMasweGitExclude(repositoryPath: string): Promise<void> {
+  if (!(await isGitRepository(repositoryPath))) return;
+  const excludePath = path.join(repositoryPath, ".git", "info", "exclude");
+  await mkdir(path.dirname(excludePath), { recursive: true });
+  let existing = "";
+  try {
+    existing = await readFile(excludePath, "utf8");
+  } catch {
+    existing = "";
+  }
+  if (!existing.split(/\r?\n/).includes(".maswe/")) {
+    await appendFile(excludePath, `${existing.endsWith("\n") || existing.length === 0 ? "" : "\n"}.maswe/\n`, "utf8");
+  }
 }
 
 export async function captureWorkspace(cwd: string): Promise<RunWorkspace> {
@@ -104,10 +127,39 @@ export function invalidateStaleEvidence(run: RunRecord, headSha: string): boolea
   return invalidated;
 }
 
+export async function listWorkingTreePaths(cwd: string): Promise<string[]> {
+  const status = await gitExec("git", ["status", "--porcelain=v1", "--untracked-files=all"], cwd);
+  if (status.exitCode !== 0) throw new Error(`git status failed: ${status.stderr}`);
+  const files: string[] = [];
+  for (const line of status.stdout.split("\n")) {
+    if (!line.trim()) continue;
+    const pathPart = line.slice(3);
+    if (pathPart.includes(" -> ")) {
+      files.push(pathPart.split(" -> ")[1]!.trim());
+    } else {
+      files.push(pathPart.trim());
+    }
+  }
+  return files;
+}
+
+export async function assertWorkingTreeScope(
+  cwd: string,
+  allowedPathGlobs: string[],
+): Promise<string[]> {
+  const files = await listWorkingTreePaths(cwd);
+  const disallowed = files.filter((file) => !pathAllowed(file, allowedPathGlobs));
+  if (disallowed.length > 0) {
+    throw new Error(`Change-scope violation: ${disallowed.join(", ")}`);
+  }
+  return files;
+}
+
 export async function ensureRunWorkspace(
   repositoryPath: string,
   run: RunRecord,
 ): Promise<RunWorkspace> {
+  await ensureMasweGitExclude(repositoryPath);
   const base = await captureWorkspace(repositoryPath);
   if (!run.config.policy.useIsolatedWorktree) {
     return base;
@@ -117,7 +169,7 @@ export async function ensureRunWorkspace(
   }
 
   const branch = `maswe/${run.id}`;
-  const worktreePath = path.join(repositoryPath, ".maswe", "worktrees", run.id);
+  const worktreePath = externalWorktreePath(repositoryPath, run.id);
   await mkdir(path.dirname(worktreePath), { recursive: true });
 
   const createBranch = await gitExec("git", ["branch", branch, "HEAD"], repositoryPath);
@@ -151,6 +203,8 @@ export async function createDeterministicCommit(
   message: string,
   options: { allowedPathGlobs: string[] },
 ): Promise<{ headSha: string; files: string[] }> {
+  await assertWorkingTreeScope(cwd, options.allowedPathGlobs);
+
   const status = await gitExec("git", ["status", "--porcelain=v1", "--untracked-files=all"], cwd);
   if (status.exitCode !== 0) throw new Error(`git status failed: ${status.stderr}`);
   if (!status.stdout.trim()) {
@@ -171,10 +225,15 @@ export async function createDeterministicCommit(
     throw new Error(`Change-scope violation: ${disallowed.join(", ")}`);
   }
 
-  const commit = await gitExec("git", ["commit", "-m", message], cwd);
+  const commit = await gitExec("git", ["-c", "core.hooksPath=/dev/null", "commit", "-m", message], cwd);
   if (commit.exitCode !== 0) {
     throw new Error(`git commit failed: ${commit.stderr || commit.stdout}`);
   }
+
+  if (!(await isGitWorkspaceClean(cwd))) {
+    throw new Error("worktree remained dirty after deterministic commit");
+  }
+
   return { headSha: await gitRevParse(cwd, "HEAD"), files };
 }
 
@@ -189,6 +248,17 @@ export async function assertChangeScope(
     throw new Error(`Change-scope violation versus base: ${disallowed.join(", ")}`);
   }
   return files;
+}
+
+export async function cleanupRunWorkspace(run: RunRecord): Promise<void> {
+  if (!run.workspace?.worktreePath) return;
+  const repositoryPath = run.repositoryPath;
+  const worktreePath = run.workspace.worktreePath;
+  const branch = run.workspace.branch;
+  await gitExec("git", ["worktree", "remove", "--force", worktreePath], repositoryPath);
+  if (branch && branch.startsWith("maswe/")) {
+    await gitExec("git", ["branch", "-D", branch], repositoryPath);
+  }
 }
 
 export function workingDirectoryFor(run: RunRecord): string {
