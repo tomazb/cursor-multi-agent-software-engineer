@@ -80,6 +80,13 @@ export async function gitCurrentBranch(cwd: string): Promise<string> {
   return result.stdout.trim();
 }
 
+export async function gitRemoteUrl(cwd: string, name = "origin"): Promise<string | undefined> {
+  const result = await run("git", ["remote", "get-url", name], cwd);
+  if (result.exitCode !== 0) return undefined;
+  const url = result.stdout.trim();
+  return url.length > 0 ? url : undefined;
+}
+
 export async function gitChangedFiles(cwd: string, baseSha: string, headSha = "HEAD"): Promise<string[]> {
   const result = await run("git", ["diff", "--name-only", `${baseSha}...${headSha}`], cwd);
   if (result.exitCode !== 0) {

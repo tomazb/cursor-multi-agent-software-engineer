@@ -37,17 +37,24 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
     "commentResolutionCycles": 0
   },
   "workspace": {
+    "remote": "https://github.com/example/repo.git",
     "baseSha": "abc...",
     "headSha": "abc...",
     "branch": "maswe/20260722120000-1a2b3c4d",
     "fingerprint": "...",
     "worktreePath": ".maswe/worktrees/20260722120000-1a2b3c4d"
   },
+  "evidence": {
+    "quality": { "headSha": "abc...", "passed": true, "at": "..." },
+    "verification": { "headSha": "abc...", "passed": true, "at": "..." }
+  },
   "config": {},
   "artifacts": [],
   "events": []
 }
 ```
+
+Build, quality, and verification events include the evaluated `headSha`. When `headSha` changes, prior quality/verification evidence is invalidated and merge-ready fails closed until CI and verification are re-run.
 
 The run's configuration is a snapshot. Changing `.maswe/config.json` affects only later runs unless a future migration command explicitly updates a run.
 

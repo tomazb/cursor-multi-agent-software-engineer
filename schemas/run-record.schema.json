@@ -66,11 +66,19 @@
       "type": "object",
       "required": ["baseSha", "headSha", "branch", "fingerprint"],
       "properties": {
+        "remote": { "type": "string" },
         "baseSha": { "type": "string" },
         "headSha": { "type": "string" },
         "branch": { "type": "string" },
         "fingerprint": { "type": "string" },
         "worktreePath": { "type": "string" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "quality": { "$ref": "#/$defs/evidenceBinding" },
+        "verification": { "$ref": "#/$defs/evidenceBinding" }
       }
     },
     "supersedes": { "type": "string" },
@@ -82,6 +90,17 @@
         "message": { "type": "string" },
         "at": { "type": "string" },
         "resumeState": { "type": "string" }
+      }
+    }
+  },
+  "$defs": {
+    "evidenceBinding": {
+      "type": "object",
+      "required": ["headSha", "passed", "at"],
+      "properties": {
+        "headSha": { "type": "string" },
+        "passed": { "type": "boolean" },
+        "at": { "type": "string" }
       }
     }
   }

@@ -3,8 +3,11 @@ import { buildCommentClassifierPrompt, buildRolePrompt } from "./prompt-builder.
 import { isGitWorkspaceClean } from "./git-snapshot.ts";
 import {
   assertChangeScope,
+  assertExpectedBranch,
   createDeterministicCommit,
   ensureRunWorkspace,
+  invalidateStaleEvidence,
+  refreshWorkspaceHead,
   workingDirectoryFor,
 } from "./git-workspace.ts";
 import { validateRoleMarkers } from "./markers.ts";
@@ -105,10 +108,38 @@ export class Orchestrator {
     return run;
   }
 
+  private async syncWorkspace(run: RunRecord): Promise<string | undefined> {
+    if (!run.workspace || run.workspace.baseSha === "not-a-git-repository") return undefined;
+    const workdir = workingDirectoryFor(run);
+    await assertExpectedBranch(workdir, run.workspace.branch);
+    const headSha = await refreshWorkspaceHead(run);
+    if (headSha && invalidateStaleEvidence(run, headSha)) {
+      await this.store.save(run);
+    }
+    return headSha;
+  }
+
+  private bindEvidence(
+    run: RunRecord,
+    kind: "quality" | "verification",
+    headSha: string,
+    passed: boolean,
+  ): void {
+    run.evidence = {
+      ...(run.evidence ?? {}),
+      [kind]: {
+        headSha,
+        passed,
+        at: new Date().toISOString(),
+      },
+    };
+  }
+
   async advance(runId: string): Promise<RunRecord> {
     const run = await this.store.load(runId);
     try {
       this.assertWithinBudget(run);
+      const headSha = (await this.syncWorkspace(run)) ?? run.workspace?.headSha;
       switch (run.state) {
         case "BRAINSTORMING": {
           const completed = await this.executeRole(
@@ -116,6 +147,7 @@ export class Orchestrator {
             "brainstormer",
             "02-brainstorm.md",
             "BRAINSTORM_COMPLETED",
+            headSha,
           );
           if (!completed.config.gates.requireBrainstormApproval) {
             completed.approvals.brainstorm = true;
@@ -129,6 +161,7 @@ export class Orchestrator {
             "designer",
             "03-specification-and-design.md",
             "DESIGN_COMPLETED",
+            headSha,
           );
           if (!completed.config.gates.requireDesignApproval) {
             completed.approvals.design = true;
@@ -146,25 +179,44 @@ export class Orchestrator {
             "builder",
             "04-builder-report.md",
             "BUILD_COMPLETED",
+            headSha,
           );
           await this.commitBuilderChanges(completed);
           return completed;
         }
         case "CI_RUNNING": {
           const workdir = workingDirectoryFor(run);
+          const evaluatedSha =
+            (await refreshWorkspaceHead(run)) ?? headSha ?? "not-a-git-repository";
           const report = await runQualityChecks(workdir, run.config.quality.commands, {
             timeoutMs: run.config.policy.commandTimeoutMs,
           });
           await this.store.writeArtifact(run, "05-quality-report.md", renderQualityReport(report));
           const accepted = report.passed || !run.config.gates.requireCiPass;
+          this.bindEvidence(run, "quality", evaluatedSha, report.passed);
           return this.store.applyEvent(
             run,
             accepted ? "CI_PASSED" : "CI_FAILED",
             "quality-runner",
-            { passed: report.passed, required: run.config.gates.requireCiPass },
+            {
+              passed: report.passed,
+              required: run.config.gates.requireCiPass,
+              headSha: evaluatedSha,
+            },
           );
         }
         case "VERIFYING": {
+          const evaluatedSha =
+            (await refreshWorkspaceHead(run)) ?? headSha ?? "not-a-git-repository";
+          if (
+            run.config.gates.requireCiPass &&
+            run.evidence?.quality?.headSha &&
+            run.evidence.quality.headSha !== evaluatedSha
+          ) {
+            throw new Error(
+              `Quality evidence is stale for head SHA ${evaluatedSha}; re-run CI before verification.`,
+            );
+          }
           const prompt = await buildRolePrompt("verifier", run, this.store);
           const result = await this.executeAgent(run, "verifier", prompt);
           const markers = validateRoleMarkers("verifier", result.output);
@@ -179,6 +231,7 @@ export class Orchestrator {
             );
           }
           const accepted = passed || !run.config.gates.requireVerifierPass;
+          this.bindEvidence(run, "verification", evaluatedSha, passed);
           const successEvent =
             run.counters.commentResolutionCycles > 0
               ? "VERIFY_PASSED_AFTER_REVIEW"
@@ -194,6 +247,7 @@ export class Orchestrator {
               actualModel: result.actualModel,
               agentId: result.agentId,
               runtimeRunId: result.runId,
+              headSha: evaluatedSha,
             },
           );
         }
@@ -211,6 +265,7 @@ export class Orchestrator {
             run,
             commentIsInScope(result.output) ? "COMMENT_IN_SCOPE" : "COMMENT_OUT_OF_SCOPE",
             "pr-comment-classifier",
+            headSha ? { headSha } : undefined,
           );
         }
         case "RESOLVING": {
@@ -223,6 +278,7 @@ export class Orchestrator {
             "prResolver",
             "09-resolution-report.md",
             "RESOLUTION_COMPLETED",
+            headSha,
           );
           await this.commitBuilderChanges(completed, "maswe: resolve review comment");
           return completed;
@@ -260,18 +316,19 @@ export class Orchestrator {
     const workdir = workingDirectoryFor(run);
     if (!run.workspace || run.workspace.baseSha === "not-a-git-repository") return;
     try {
+      await assertExpectedBranch(workdir, run.workspace.branch);
       const committed = await createDeterministicCommit(workdir, message, {
         allowedPathGlobs: run.config.policy.allowedPathGlobs,
       });
       if (committed.files.length > 0) {
         await assertChangeScope(workdir, run.workspace.baseSha, run.config.policy.allowedPathGlobs);
         run.workspace.headSha = committed.headSha;
+        invalidateStaleEvidence(run, committed.headSha);
         await this.store.save(run);
       }
     } catch (error) {
-      // No git user config or empty commit is fine for non-git / clean workspaces.
       const text = error instanceof Error ? error.message : String(error);
-      if (/Change-scope violation/i.test(text)) throw error;
+      if (/Change-scope violation|Unexpected branch movement/i.test(text)) throw error;
     }
   }
 
@@ -284,17 +341,20 @@ export class Orchestrator {
       | "DESIGN_COMPLETED"
       | "BUILD_COMPLETED"
       | "RESOLUTION_COMPLETED",
+    headSha?: string,
   ): Promise<RunRecord> {
     const prompt = await buildRolePrompt(role, run, this.store);
     const result = await this.executeAgent(run, role, prompt);
     const markers = validateRoleMarkers(role, result.output);
     if (!markers.ok) throw new Error(markers.message);
     await this.store.writeArtifact(run, artifactName, result.output);
+    const evaluatedSha = headSha ?? run.workspace?.headSha;
     return this.store.applyEvent(run, successEvent, role, {
       requestedModel: result.requestedModel,
       actualModel: result.actualModel,
       agentId: result.agentId,
       runtimeRunId: result.runId,
+      ...(evaluatedSha ? { headSha: evaluatedSha } : {}),
     });
   }
 
@@ -358,7 +418,27 @@ export class Orchestrator {
 
   async markMergeReady(runId: string): Promise<RunRecord> {
     const run = await this.store.load(runId);
-    return this.store.applyEvent(run, "MARK_MERGE_READY", "user");
+    const previousVerificationSha = run.evidence?.verification?.headSha;
+    const headSha = await this.syncWorkspace(run);
+    if (
+      previousVerificationSha &&
+      (!run.evidence?.verification || run.evidence.verification.headSha !== headSha)
+    ) {
+      throw new Error(
+        `Verification evidence is stale for head SHA ${headSha}; re-run CI and verification before merge-ready.`,
+      );
+    }
+    if (
+      run.config.gates.requireVerifierPass &&
+      (!run.evidence?.verification || run.evidence.verification.headSha !== run.workspace?.headSha)
+    ) {
+      throw new Error(
+        "Merge-ready requires fresh verification evidence bound to the current head SHA.",
+      );
+    }
+    return this.store.applyEvent(run, "MARK_MERGE_READY", "user", {
+      ...(run.workspace?.headSha ? { headSha: run.workspace.headSha } : {}),
+    });
   }
 
   async complete(runId: string): Promise<RunRecord> {

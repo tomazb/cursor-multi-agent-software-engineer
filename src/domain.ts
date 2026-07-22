@@ -119,11 +119,23 @@ export interface ArtifactReference {
 }
 
 export interface RunWorkspace {
+  remote?: string;
   baseSha: string;
   headSha: string;
   branch: string;
   fingerprint: string;
   worktreePath?: string;
+}
+
+export interface EvidenceBinding {
+  headSha: string;
+  passed: boolean;
+  at: string;
+}
+
+export interface RunEvidence {
+  quality?: EvidenceBinding;
+  verification?: EvidenceBinding;
 }
 
 export interface RunRecord {
@@ -148,6 +160,7 @@ export interface RunRecord {
   artifacts: ArtifactReference[];
   events: WorkflowEvent[];
   workspace?: RunWorkspace;
+  evidence?: RunEvidence;
   supersedes?: string;
   supersededBy?: string;
   failure?: {

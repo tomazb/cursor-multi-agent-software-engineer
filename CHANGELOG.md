@@ -18,8 +18,9 @@ The project follows semantic versioning once a public release process is establi
 
 - `RunStore` interface with atomic file writes, lock files, and optimistic `version` checks.
 - Artifact digest revalidation on every read and attempt-scoped immutable artifact history.
-- Persisted workspace provenance: base SHA, head SHA, branch, fingerprint, optional worktree path.
-- Git worktree/branch manager with deterministic commits and change-scope checks.
+- Persisted workspace provenance: remote, base SHA, head SHA, branch, fingerprint, optional worktree path.
+- Git worktree/branch manager with deterministic commits, change-scope checks, and unexpected branch-movement rejection.
+- SHA-bound quality/verification evidence; new commits invalidate prior verification before merge-ready.
 - Strict terminal marker validation for every role and classifier output.
 - Explicit verifier defect artifacts passed back into builder prompts.
 - Secret redaction for artifacts and quality command output.

@@ -5,6 +5,7 @@ import type { RunRecord, RunWorkspace } from "./domain.ts";
 import {
   gitChangedFiles,
   gitCurrentBranch,
+  gitRemoteUrl,
   gitRevParse,
   gitWorkspaceFingerprint,
   isGitRepository,
@@ -55,12 +56,52 @@ export async function captureWorkspace(cwd: string): Promise<RunWorkspace> {
     };
   }
   const headSha = await gitRevParse(cwd, "HEAD");
+  const remote = await gitRemoteUrl(cwd);
   return {
+    ...(remote ? { remote } : {}),
     baseSha: headSha,
     headSha,
     branch: await gitCurrentBranch(cwd),
     fingerprint: await gitWorkspaceFingerprint(cwd),
   };
+}
+
+export async function assertExpectedBranch(cwd: string, expectedBranch: string): Promise<void> {
+  if (!(await isGitRepository(cwd))) return;
+  if (expectedBranch === "not-a-git-repository") return;
+  const actual = await gitCurrentBranch(cwd);
+  if (actual !== expectedBranch) {
+    throw new Error(
+      `Unexpected branch movement: expected ${expectedBranch}, currently on ${actual}`,
+    );
+  }
+}
+
+export async function refreshWorkspaceHead(run: RunRecord): Promise<string | undefined> {
+  if (!run.workspace || run.workspace.baseSha === "not-a-git-repository") return undefined;
+  const cwd = workingDirectoryFor(run);
+  await assertExpectedBranch(cwd, run.workspace.branch);
+  const headSha = await gitRevParse(cwd, "HEAD");
+  run.workspace.headSha = headSha;
+  run.workspace.fingerprint = await gitWorkspaceFingerprint(cwd);
+  return headSha;
+}
+
+export function invalidateStaleEvidence(run: RunRecord, headSha: string): boolean {
+  if (!run.evidence) return false;
+  let invalidated = false;
+  if (run.evidence.quality && run.evidence.quality.headSha !== headSha) {
+    delete run.evidence.quality;
+    invalidated = true;
+  }
+  if (run.evidence.verification && run.evidence.verification.headSha !== headSha) {
+    delete run.evidence.verification;
+    invalidated = true;
+  }
+  if (run.evidence && !run.evidence.quality && !run.evidence.verification) {
+    delete run.evidence;
+  }
+  return invalidated;
 }
 
 export async function ensureRunWorkspace(
@@ -90,7 +131,6 @@ export async function ensureRunWorkspace(
     repositoryPath,
   );
   if (addWorktree.exitCode !== 0 && !/already exists|already checked out/i.test(addWorktree.stderr)) {
-    // If worktree path already exists from a prior attempt, reuse it.
     const existing = await gitExec("git", ["rev-parse", "--is-inside-work-tree"], worktreePath);
     if (existing.exitCode !== 0) {
       throw new Error(`Failed to create worktree: ${addWorktree.stderr}`);
