@@ -84,6 +84,10 @@ export class CursorCliRuntime implements AgentRuntime {
     if (shouldPassTrustFlag(this.config, request)) {
       args.push("--trust");
     }
+    // Ask mode keeps read-only roles from mutating the managed worktree (fingerprint gate).
+    if (request.roleConfig.permissions === "read-only") {
+      args.push("--mode", "ask");
+    }
     if (request.roleConfig.permissions === "workspace-write") args.push("--force");
 
     const transport = this.config.policy.promptTransport;
@@ -157,7 +161,7 @@ export class CursorCliRuntime implements AgentRuntime {
               "-e",
               'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>process.exit(d==="maswe-stdin-probe"?0:1))',
             ]
-          : ["-p", "--output-format", "text", "--model", this.config.roles.brainstormer.model];
+          : ["-p", "--output-format", "text", "--model", this.config.roles.brainstormer.model, "--mode", "ask"];
         if (
           !looksLikeNode(this.config.runtime.command) &&
           this.config.policy.trustManagedWorktrees &&

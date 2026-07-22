@@ -69,12 +69,24 @@ test("CursorCliRuntime passes --trust for all roles in managed worktrees", async
   };
   await runtime.execute(request);
   assert.ok(seen.some((args) => args.includes("--trust")), "read-only managed worktree must pass --trust");
+  assert.ok(
+    seen.some((args) => args.includes("--mode") && args.includes("ask")),
+    "read-only roles must use --mode ask",
+  );
 
   seen.length = 0;
   request.role = "builder";
   request.roleConfig = config.roles.builder;
   await runtime.execute(request);
   assert.ok(seen.some((args) => args.includes("--trust")), "write managed worktree must pass --trust");
+  assert.equal(
+    seen.some((args) => {
+      const modeIdx = args.indexOf("--mode");
+      return modeIdx >= 0 && args[modeIdx + 1] === "ask";
+    }),
+    false,
+    "write roles must not use --mode ask",
+  );
 });
 
 test("migrateConfig does not apply environment overrides; loadConfig does", async () => {
@@ -242,7 +254,11 @@ test(
     const orchestrator = new Orchestrator(cwd, config, createRuntime(config, cwd));
     const run = await orchestrator.start("Smoke", "One-sentence brainstorm only.");
     assert.ok(run.workspace?.worktreePath);
-    assert.equal(run.state, "WAITING_FOR_BRAINSTORM_APPROVAL");
+    assert.equal(
+      run.state,
+      "WAITING_FOR_BRAINSTORM_APPROVAL",
+      `smoke failed: state=${run.state} failure=${run.failure?.message ?? "(none)"}`,
+    );
     assert.ok(run.artifacts.some((a) => a.logicalName === "02-brainstorm.md"));
   },
 );
