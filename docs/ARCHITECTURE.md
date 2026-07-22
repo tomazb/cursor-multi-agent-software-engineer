@@ -140,7 +140,7 @@ doctor(): Promise<RuntimeDoctorResult>
 Implemented adapters:
 
 - `MockRuntime`: deterministic outputs for tests and workflow development.
-- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode; adds `--mode ask` for read-only roles and `--force` only for write roles; adds `--trust` when `policy.trustManagedWorktrees` is set for MASWE-managed worktrees.
+- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode; unwraps JSON/`stream-json` stdout into assistant text before marker parsing; adds `--mode ask` for read-only roles and `--force` only for write roles; adds `--trust` when `policy.trustManagedWorktrees` is set for MASWE-managed worktrees.
 - `CursorSdkRuntime`: dynamically imports `@cursor/sdk` and runs a local one-shot `Agent.prompt` call.
 
 The optional SDK import means the CLI can build and run without installing the beta SDK.

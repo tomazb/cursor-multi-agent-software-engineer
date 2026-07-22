@@ -9,7 +9,7 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
 - Retries write attempt-scoped immutable files (`*.attempt-<n>.md`) and keep a latest logical pointer by name.
 - Digests are recomputed and compared on every read; mismatches fail closed.
 - Agents must not rely on prior chat messages that are absent from the supplied prompt.
-- Model output cannot authorize a transition unless the orchestrator recognizes the required terminal marker.
+- Model output cannot authorize a transition unless the orchestrator recognizes the required terminal marker: exactly one bare marker token on the final line (no backticks, quotes, or earlier mentions of the token).
 - Common secrets are redacted before persistence.
 - JSON schemas live under `schemas/` for configuration and run records.
 
@@ -76,7 +76,7 @@ Required terminal marker:
 READY_FOR_BRAINSTORM_APPROVAL
 ```
 
-v0.1 records the artifact even if the marker is absent; strict marker validation is a planned hardening item.
+Strict marker validation rejects missing, quoted, embedded, or non-final-line markers.
 
 ## `03-specification-and-design.md`
 
