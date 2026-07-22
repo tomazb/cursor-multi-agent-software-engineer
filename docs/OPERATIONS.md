@@ -245,7 +245,7 @@ A failed verifier returns to `BUILDING`. The next builder prompt includes the la
 
 ### Read-only violation
 
-The run fails if a read-only role changes workspace state, including authoritative `.maswe` run records and artifacts under the fingerprinted working directory (Git excludes do not hide that state from the fingerprint). Inspect `git status` and `.maswe/runs/<id>/`, and revert only changes attributable to that role. Preserve unrelated user work. Ephemeral `.lock` / `.admin.lock` / `*.tmp` churn under `.maswe` is excluded from the fingerprint by design.
+The run fails if a read-only role changes fingerprinted workspace state. In Git checkouts that includes git status/diffs/untracked content. In both Git and non-Git working directories it also includes authoritative `.maswe` run records, durable artifacts, and project config under the fingerprinted working directory (Git excludes do not hide that state from the fingerprint). Inspect `git status` (when applicable) and `.maswe/runs/<id>/`, and revert only changes attributable to that role. Preserve unrelated user work. Ephemeral `.lock` / `.admin.lock` / `.admin.lock.recovering` / `*.tmp` churn under `.maswe` is excluded from the fingerprint by design. The fingerprint is a before/after mutation detector, not an OS sandbox.
 
 ## 8. File-store backup and privacy
 

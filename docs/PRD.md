@@ -179,7 +179,7 @@ Each role shall have a configurable model. When fail-closed model fallback is en
 
 ### FR-16 — Read-only enforcement
 
-The system shall fingerprint git-tracked, staged, and untracked workspace state before and after read-only roles, and shall also fingerprint authoritative `.maswe` run state and artifacts under the fingerprinted working directory (independent of Git excludes). A difference shall fail the run. Ephemeral lock and `*.tmp` files under `.maswe` are excluded from that fingerprint so normal orchestration churn does not false-fail.
+The system shall fingerprint workspace state before and after read-only roles. In Git checkouts that includes git-tracked, staged, and untracked content. In both Git and non-Git working directories the system shall also fingerprint authoritative `.maswe` run state, durable artifacts, and project config under the fingerprinted working directory (independent of Git excludes). A difference shall fail the run. Ephemeral lock and `*.tmp` files under `.maswe` are excluded from that fingerprint so normal orchestration churn does not false-fail.
 
 ### FR-17 — Run inspection
 

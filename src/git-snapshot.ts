@@ -100,32 +100,46 @@ export async function isGitWorkspaceClean(cwd: string): Promise<boolean> {
   return result.exitCode === 0 && result.stdout.trim().length === 0;
 }
 
+/**
+ * Stable namespace hashed for non-Git working directories.
+ * Workspace identity fields (`baseSha` / `headSha` / `branch`) still use the
+ * literal sentinel `not-a-git-repository`; the read-only fingerprint is always
+ * a SHA-256 digest so authoritative `.maswe` mutations remain detectable.
+ */
+const NON_GIT_FINGERPRINT_NAMESPACE = "maswe:workspace-fingerprint:non-git\0";
+
 export async function gitWorkspaceFingerprint(cwd: string): Promise<string> {
-  if (!(await isGitRepository(cwd))) return "not-a-git-repository";
   const hash = createHash("sha256");
-  const commands = [
-    ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    ["diff", "--binary"],
-    ["diff", "--cached", "--binary"],
-  ];
-  for (const args of commands) {
-    const result = await run("git", args, cwd);
-    hash.update(result.stdout);
-    hash.update(result.stderr);
-  }
+  const isGit = await isGitRepository(cwd);
 
-  const untracked = await run("git", ["ls-files", "--others", "--exclude-standard", "-z"], cwd);
-  for (const relative of untracked.stdout.split("\0").filter(Boolean).sort()) {
-    try {
-      hash.update(relative);
-      hash.update(await readFile(path.join(cwd, relative)));
-    } catch {
-      hash.update("unreadable");
+  if (isGit) {
+    const commands = [
+      ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+      ["diff", "--binary"],
+      ["diff", "--cached", "--binary"],
+    ];
+    for (const args of commands) {
+      const result = await run("git", args, cwd);
+      hash.update(result.stdout);
+      hash.update(result.stderr);
     }
+
+    const untracked = await run("git", ["ls-files", "--others", "--exclude-standard", "-z"], cwd);
+    for (const relative of untracked.stdout.split("\0").filter(Boolean).sort()) {
+      try {
+        hash.update(relative);
+        hash.update(await readFile(path.join(cwd, relative)));
+      } catch {
+        hash.update("unreadable");
+      }
+    }
+  } else {
+    hash.update(NON_GIT_FINGERPRINT_NAMESPACE);
   }
 
-  // Git excludes hide `.maswe/`; hash authoritative run state separately so
-  // read-only roles cannot mutate handoffs without detection.
+  // Authoritative `.maswe` state is hashed in both Git and non-Git modes so
+  // read-only roles cannot mutate handoffs without detection. Git excludes
+  // hide `.maswe/` from porcelain/untracked hashing above.
   await hashMasweAuthoritativeState(cwd, hash);
   return hash.digest("hex");
 }

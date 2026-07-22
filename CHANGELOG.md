@@ -39,7 +39,8 @@ The project follows semantic versioning once a public release process is establi
 - Cursor `stream-json` extraction accepts only terminal `type: "result"` events; stderr is never successful assistant content.
 - Doctor probe cleanup is identity-based (branch + worktree) and runs in `finally` after partial creation failures.
 - Logical model resolution requires matching effort suffixes (`-high`/`-medium`/`-low`); missing effort fails closed.
-- Read-only workspace fingerprints include authoritative `.maswe` run/artifact state (locks/`*.tmp` excluded).
+- Read-only workspace fingerprints include authoritative `.maswe` run/artifact state (locks/`*.tmp` excluded) for both Git and non-Git working directories; non-Git no longer returns the invariant `not-a-git-repository` fingerprint sentinel.
+- Project-level model resolution errors identify the failing role.
 - `runtime.outputFormat` contracts accept `stream-json` in TypeScript types and `schemas/config.schema.json`.
 
 ## [0.1.0] - 2026-07-22

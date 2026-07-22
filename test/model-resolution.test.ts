@@ -88,12 +88,53 @@ test("resolveLogicalModelId without effort uses documented preference among same
 test("resolveProjectModels with rejectModelFallback does not silently downgrade effort", () => {
   const config = structuredClone(DEFAULT_CONFIG);
   config.policy.rejectModelFallback = true;
+  // Catalogue contains only medium for the gpt-5.6-sol family. Other roles use that
+  // exact ID so project-level iteration reaches the verifier effort failure.
+  config.roles.brainstormer.model = "cursor-gpt-5.6-sol-medium";
+  config.roles.designer.model = "cursor-gpt-5.6-sol-medium";
+  delete config.roles.designer.fallbackModels;
+  config.roles.builder.model = "cursor-gpt-5.6-sol-medium";
   config.roles.verifier.model = "gpt-5.6-sol-high";
+  config.roles.prResolver.model = "cursor-gpt-5.6-sol-medium";
+  const inputSnapshot = structuredClone(config);
+  const catalogue = ["cursor-gpt-5.6-sol-medium"];
+
   assert.throws(
-    () => resolveLogicalModelId(config.roles.verifier.model, ["cursor-gpt-5.6-sol-medium"]),
-    /effort.*high|high.*unavailable|requested effort/i,
+    () => resolveProjectModels(config, catalogue),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /role ['"]verifier['"]/i);
+      assert.match(error.message, /effort.*high|high.*unavailable|requested effort/i);
+      return true;
+    },
   );
-  assert.equal(config.policy.rejectModelFallback, true);
+  // Fail-closed: no partially resolved configuration is returned; input is not mutated.
+  assert.deepEqual(config, inputSnapshot);
+});
+
+test("resolveProjectModels succeeds with matching high effort and leaves input immutable", () => {
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.policy.rejectModelFallback = true;
+  config.roles.verifier.model = "gpt-5.6-sol-high";
+  const inputSnapshot = structuredClone(config);
+  const catalogue = [
+    "cursor-grok-4.5-high",
+    "cursor-claude-fable-5-high",
+    "cursor-claude-opus-4.8-high",
+    "cursor-gpt-5.6-sol-high",
+    "cursor-gpt-5.6-sol-medium",
+  ];
+
+  const resolved = resolveProjectModels(config, catalogue);
+  assert.equal(resolved.roles.verifier.model, "cursor-gpt-5.6-sol-high");
+  assert.equal(resolved.roles.brainstormer.model, "cursor-grok-4.5-high");
+  assert.equal(resolved.roles.designer.model, "cursor-claude-fable-5-high");
+  assert.equal(resolved.roles.designer.fallbackModels?.[0], "cursor-claude-opus-4.8-high");
+  assert.equal(resolved.roles.builder.model, "cursor-grok-4.5-high");
+  assert.equal(resolved.roles.prResolver.model, "cursor-gpt-5.6-sol-high");
+  assert.notEqual(resolved, config);
+  assert.deepEqual(config, inputSnapshot);
+  assert.equal(config.roles.verifier.model, "gpt-5.6-sol-high");
 });
 
 test("validatePersistedExactModel refuses substitution when high disappears and medium remains", () => {

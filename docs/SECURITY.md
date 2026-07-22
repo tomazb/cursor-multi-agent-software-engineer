@@ -44,10 +44,12 @@ MASWE must prevent untrusted requests, model output, repository content, and PR 
 **Controls:**
 
 - Cursor CLI omits `--force` for read-only roles.
-- All read-only adapters compare a workspace fingerprint before and after execution (git status/diffs/untracked plus authoritative `.maswe` state under `cwd`).
+- All read-only adapters compare a workspace fingerprint before and after execution.
+- In Git checkouts the fingerprint covers git status, unstaged/staged diffs, and untracked content (honoring excludes).
+- In both Git and non-Git working directories the fingerprint also covers authoritative `.maswe` state under `cwd` (project config, `runs/*/run.json`, durable artifacts) via the same hashing contract.
 - A mismatch fails the run.
 
-**Gap:** Detection occurs after the process runs; it is not a preventive OS sandbox. External side effects outside the repository are not fingerprinted. Ephemeral `.maswe` locks/`*.tmp` files are intentionally excluded from the fingerprint.
+**Gap:** Detection occurs after the process runs; it is a mutation detector, not a preventive OS-level sandbox. External side effects outside the fingerprinted working directory are not covered. Ephemeral `.maswe` locks (`.lock`, `.admin.lock`, `.admin.lock.recovering`) and `*.tmp` staging files are intentionally excluded from the fingerprint. Non-Git directories do not fingerprint ordinary files outside `.maswe` (there is no Git status/diff plane); workspace identity fields still use the `not-a-git-repository` sentinel separately from the digest fingerprint.
 
 ### T3 — Builder or resolver exceeds scope
 

@@ -123,11 +123,16 @@ export function resolveConfigModels(config: MasweConfig, catalogue: Iterable<str
   const resolved = structuredClone(config);
   for (const role of ROLE_IDS) {
     const roleConfig = resolved.roles[role as RoleId];
-    roleConfig.model = resolveLogicalModelId(roleConfig.model, catalogue);
-    if (roleConfig.fallbackModels?.length) {
-      roleConfig.fallbackModels = roleConfig.fallbackModels.map((model) =>
-        resolveLogicalModelId(model, catalogue),
-      );
+    try {
+      roleConfig.model = resolveLogicalModelId(roleConfig.model, catalogue);
+      if (roleConfig.fallbackModels?.length) {
+        roleConfig.fallbackModels = roleConfig.fallbackModels.map((model) =>
+          resolveLogicalModelId(model, catalogue),
+        );
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to resolve model for role '${role}': ${message}`);
     }
   }
   return resolved;

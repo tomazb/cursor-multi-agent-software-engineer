@@ -147,17 +147,15 @@ The optional SDK import means the CLI can build and run without installing the b
 
 ### 3.9 Read-only enforcement
 
-`src/git-snapshot.ts` computes a workspace fingerprint using:
+`src/git-snapshot.ts` computes a SHA-256 workspace fingerprint for both Git and non-Git working directories:
 
-- Git porcelain status including untracked files.
-- Unstaged binary diff.
-- Staged binary diff.
-- Paths and contents of untracked files (honoring Git excludes).
-- Authoritative `.maswe` state under the fingerprinted `cwd`, hashed independently of Git excludes: project config, `runs/*/run.json`, and durable artifact files.
+- **Git mode:** porcelain status including untracked files; unstaged binary diff; staged binary diff; paths and contents of untracked files (honoring Git excludes).
+- **Non-Git mode:** a stable namespace sentinel (not the invariant identity string) so the digest remains deterministic when nothing authoritative changes.
+- **Both modes:** authoritative `.maswe` state under the fingerprinted `cwd`, hashed independently of Git excludes: project config, `runs/*/run.json`, and durable artifact files.
 
-Intentionally excluded from the MASWE portion (expected orchestration churn): `.lock`, `.admin.lock`, `.admin.lock.recovering`, and `*.tmp` staging files. Other Git-excluded paths outside `.maswe` follow ordinary `--exclude-standard` policy and are not hashed. Isolated worktrees fingerprint their own `cwd` (typically without a local `.maswe` store); non-isolated checkouts include the operator-tree `.maswe` so read-only roles cannot mutate handoffs undetected.
+Intentionally excluded from the MASWE portion (expected orchestration churn): `.lock`, `.admin.lock`, `.admin.lock.recovering`, and `*.tmp` staging files. Other Git-excluded paths outside `.maswe` follow ordinary `--exclude-standard` policy and are not hashed. Isolated worktrees fingerprint their own `cwd` (typically without a local `.maswe` store); non-isolated checkouts include the operator-tree `.maswe` so read-only roles cannot mutate handoffs undetected. Workspace identity fields (`baseSha` / `headSha` / `branch`) may still record `not-a-git-repository` for non-Git trees; that sentinel is separate from the fingerprint digest.
 
-Read-only runtimes compare the fingerprint before and after execution. Any difference fails the run. This is a detection boundary, not an operating-system sandbox. A future sandbox can prevent writes rather than merely detecting them.
+Read-only runtimes compare the fingerprint before and after execution. Any difference fails the run. This is a mutation detector, not an operating-system sandbox. A future sandbox can prevent writes rather than merely detecting them.
 
 ### 3.10 Quality runner
 
