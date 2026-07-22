@@ -18,6 +18,7 @@ import { renderQualityReport, runQualityChecks } from "./quality.ts";
 import { isHumanGate, isTerminal } from "./state-machine.ts";
 import { FileRunStore, type RunStore } from "./store.ts";
 import type { MasweConfig } from "./domain.ts";
+import path from "node:path";
 
 function ensureSuccess(result: RuntimeResult, role: RoleId): void {
   if (result.status !== "finished") {
@@ -71,7 +72,12 @@ export class Orchestrator {
 
   private async finalizeTerminal(run: RunRecord): Promise<RunRecord> {
     if (isTerminal(run.state)) {
-      await cleanupRunWorkspace(run).catch(() => undefined);
+      try {
+        await cleanupRunWorkspace(run);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`Run reached ${run.state} but worktree cleanup failed: ${message}`);
+      }
     }
     return run;
   }
@@ -484,6 +490,9 @@ export class Orchestrator {
           cwd: workdir,
           roleConfig: { ...configured, model },
           timeoutMs: run.config.policy.roleTimeoutMs,
+          managedWorktree: Boolean(
+            run.workspace?.worktreePath && path.resolve(workdir) === path.resolve(run.workspace.worktreePath),
+          ),
         });
         ensureSuccess(result, role);
         if (
@@ -553,14 +562,60 @@ export class Orchestrator {
     ) {
       throw new Error("Merge-ready requires present, passing quality evidence for the current HEAD.");
     }
+    const mergeReadySha = run.workspace?.headSha;
+    if (mergeReadySha && mergeReadySha !== "not-a-git-repository") {
+      run.evidence = {
+        ...(run.evidence ?? {}),
+        mergeReady: {
+          headSha: mergeReadySha,
+          passed: true,
+          at: new Date().toISOString(),
+        },
+      };
+    }
     return this.store.applyEvent(run, "MARK_MERGE_READY", "user", {
-      ...(run.workspace?.headSha ? { headSha: run.workspace.headSha } : {}),
+      ...(mergeReadySha ? { headSha: mergeReadySha } : {}),
     });
   }
 
   async complete(runId: string): Promise<RunRecord> {
     const run = await this.store.load(runId);
-    const completed = await this.store.applyEvent(run, "COMPLETE", "user");
+    if (run.state !== "MERGE_READY") {
+      throw new Error(`complete requires MERGE_READY, currently ${run.state}`);
+    }
+    const mergeReadySha =
+      run.evidence?.mergeReady?.headSha ??
+      [...run.events].reverse().find((event) => event.type === "MARK_MERGE_READY")?.details?.headSha;
+    const headSha = await this.syncWorkspace(run);
+    const workdir = workingDirectoryFor(run);
+    if (run.workspace && run.workspace.baseSha !== "not-a-git-repository") {
+      if (!(await isGitWorkspaceClean(workdir))) {
+        throw new Error("Complete requires a clean worktree matching merge-ready evidence.");
+      }
+      if (!headSha || !mergeReadySha || headSha !== mergeReadySha) {
+        throw new Error(
+          `Complete rejected: HEAD ${headSha ?? "(unknown)"} does not match merge-ready SHA ${String(mergeReadySha)}.`,
+        );
+      }
+      if (
+        run.config.gates.requireCiPass &&
+        (!run.evidence?.quality?.passed || run.evidence.quality.headSha !== headSha)
+      ) {
+        throw new Error("Complete requires present, passing quality evidence for the current HEAD.");
+      }
+      if (
+        run.config.gates.requireVerifierPass &&
+        (!run.evidence?.verification?.passed || run.evidence.verification.headSha !== headSha)
+      ) {
+        throw new Error(
+          "Complete requires present, passing verification evidence for the current HEAD.",
+        );
+      }
+    }
+    const completed = await this.store.applyEvent(run, "COMPLETE", "user", {
+      ...(headSha ? { headSha } : {}),
+      ...(mergeReadySha ? { mergeReadySha } : {}),
+    });
     return this.finalizeTerminal(completed);
   }
 

@@ -131,7 +131,16 @@ export function invalidateStaleEvidence(run: RunRecord, headSha: string): boolea
     delete run.evidence.verification;
     invalidated = true;
   }
-  if (run.evidence && !run.evidence.quality && !run.evidence.verification) {
+  if (run.evidence.mergeReady && run.evidence.mergeReady.headSha !== headSha) {
+    delete run.evidence.mergeReady;
+    invalidated = true;
+  }
+  if (
+    run.evidence &&
+    !run.evidence.quality &&
+    !run.evidence.verification &&
+    !run.evidence.mergeReady
+  ) {
     delete run.evidence;
   }
   return invalidated;
@@ -265,7 +274,17 @@ export async function cleanupRunWorkspace(run: RunRecord): Promise<void> {
   const repositoryPath = run.repositoryPath;
   const worktreePath = run.workspace.worktreePath;
   // Preserve the failed/completed run branch ref for provenance; only remove the worktree directory.
-  await gitExec("git", ["worktree", "remove", "--force", worktreePath], repositoryPath);
+  const removed = await gitExec("git", ["worktree", "remove", "--force", worktreePath], repositoryPath);
+  if (removed.exitCode !== 0) {
+    const stillThere = await gitExec("git", ["rev-parse", "--is-inside-work-tree"], worktreePath).catch(
+      () => ({ exitCode: 1, stdout: "", stderr: "" }),
+    );
+    if (stillThere.exitCode === 0) {
+      throw new Error(
+        `Failed to remove managed worktree ${worktreePath}: ${removed.stderr || removed.stdout}`,
+      );
+    }
+  }
 }
 
 export async function restoreRunWorkspace(

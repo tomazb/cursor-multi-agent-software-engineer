@@ -19,11 +19,14 @@ test("exclusive lock blocks simultaneous multi-process writers", async () => {
   // Hold an exclusive lock in this process, then spawn a sibling that must fail or wait.
   const { open } = await import("node:fs/promises");
   const holder = await open(lockPath, "wx");
-  await holder.writeFile(JSON.stringify({
-    pid: process.pid,
-    owner: "holder-token",
-    at: new Date().toISOString(),
-  }));
+  await holder.writeFile(
+    `${JSON.stringify({
+      pid: process.pid,
+      owner: "holder-token",
+      at: new Date().toISOString(),
+    })}\n`,
+    "utf8",
+  );
 
   const child = spawn(
     process.execPath,
@@ -77,7 +80,11 @@ test("stale lock from dead pid is reclaimed after bounded wait", async () => {
   const lockPath = path.join(cwd, ".maswe", "runs", run.id, ".lock");
   await writeFile(
     lockPath,
-    `${JSON.stringify({ pid: 1_000_000_001, at: new Date(Date.now() - 60_000).toISOString() })}\n`,
+    `${JSON.stringify({
+      pid: 1_000_000_001,
+      owner: "dead-stale-owner",
+      at: new Date(Date.now() - 60_000).toISOString(),
+    })}\n`,
     "utf8",
   );
   run.title = "reclaimed";

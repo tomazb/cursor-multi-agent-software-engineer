@@ -42,6 +42,7 @@ test("deep-migrates v0.1 config snapshots missing policy hardening fields", () =
 
   const migrated = mergeConfigForTest(legacy);
   assert.equal(migrated.policy.useIsolatedWorktree, true);
+  assert.equal(migrated.policy.trustManagedWorktrees, true);
   assert.equal(migrated.policy.promptTransport, "stdin");
   assert.equal(typeof migrated.policy.commandTimeoutMs, "number");
   assert.equal(typeof migrated.policy.roleTimeoutMs, "number");
@@ -63,6 +64,7 @@ test("deep-migrates v0.1 config snapshots missing policy hardening fields", () =
     events: [],
   });
   assert.equal(run.config.policy.useIsolatedWorktree, true);
+  assert.equal(run.config.policy.trustManagedWorktrees, true);
   assert.equal(run.config.policy.promptTransport, "stdin");
 });
 

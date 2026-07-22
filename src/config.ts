@@ -52,6 +52,7 @@ export const DEFAULT_CONFIG: MasweConfig = {
     maxCommentResolutionCycles: 2,
     allowDirtyWorkspace: false,
     useIsolatedWorktree: true,
+    trustManagedWorktrees: true,
     promptTransport: "stdin",
     commandTimeoutMs: 600_000,
     roleTimeoutMs: 1_800_000,
@@ -82,12 +83,13 @@ function mergeRole(base: RoleConfig, incoming: unknown): RoleConfig {
   };
 }
 
-export function mergeConfig(raw: unknown): MasweConfig {
+/** Pure default migration without applying process environment overrides. */
+export function migrateConfig(raw: unknown): MasweConfig {
   const base = cloneDefaults();
-  if (!raw || typeof raw !== "object") return applyEnvironment(base);
+  if (!raw || typeof raw !== "object") return base;
   const value = raw as Partial<MasweConfig>;
 
-  const merged: MasweConfig = {
+  return {
     ...base,
     ...value,
     version: 1,
@@ -103,13 +105,16 @@ export function mergeConfig(raw: unknown): MasweConfig {
     quality: { ...base.quality, ...(value.quality ?? {}) },
     policy: { ...base.policy, ...(value.policy ?? {}) },
   };
+}
 
-  return applyEnvironment(merged);
+/** Project config load path: migrate defaults then apply environment overrides. */
+export function mergeConfig(raw: unknown): MasweConfig {
+  return applyEnvironment(migrateConfig(raw));
 }
 
 /** Test/helper alias: deep-migrate partial or v0.1 config snapshots onto current defaults. */
 export function mergeConfigForTest(raw: unknown): MasweConfig {
-  const config = mergeConfig(raw);
+  const config = migrateConfig(raw);
   assertConfig(config);
   return config;
 }
@@ -146,6 +151,9 @@ function assertConfig(config: MasweConfig): void {
   }
   if (!["stdin", "argv"].includes(config.policy.promptTransport)) {
     throw new Error("policy.promptTransport must be stdin or argv");
+  }
+  if (typeof config.policy.trustManagedWorktrees !== "boolean") {
+    throw new Error("policy.trustManagedWorktrees must be a boolean");
   }
   if (config.policy.commandTimeoutMs < 1) {
     throw new Error("policy.commandTimeoutMs must be at least 1");

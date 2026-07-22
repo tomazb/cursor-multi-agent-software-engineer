@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, readdir, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
+import { link, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type {
   ArtifactReference,
@@ -8,7 +8,7 @@ import type {
   WorkflowEventType,
   WorkflowState,
 } from "./domain.ts";
-import { mergeConfig } from "./config.ts";
+import { migrateConfig } from "./config.ts";
 import { redactSecrets } from "./redaction.ts";
 import { transition } from "./state-machine.ts";
 
@@ -51,6 +51,72 @@ interface LockMeta {
   pid: number;
   owner: string;
   at: string;
+}
+
+export interface ReclaimLockOptions {
+  /** Test barrier invoked after inspecting lock metadata, before rename/delete. */
+  afterInspect?: (meta: LockMeta) => Promise<void>;
+}
+
+async function readLockMeta(lockPath: string): Promise<LockMeta | undefined> {
+  try {
+    const raw = await readFile(lockPath, "utf8");
+    if (!raw.trim()) return undefined;
+    const meta = JSON.parse(raw) as Partial<LockMeta>;
+    if (typeof meta.pid !== "number" || typeof meta.owner !== "string" || typeof meta.at !== "string") {
+      return undefined;
+    }
+    return { pid: meta.pid, owner: meta.owner, at: meta.at };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Explicit stale unlock: rename the dead lock aside, verify the claimed owner,
+ * then delete. Never deletes incomplete/corrupt locks. If a replacement lock
+ * appears between inspect and rename, verification fails closed and restores.
+ */
+export async function reclaimStaleRunLock(
+  lockPath: string,
+  options: ReclaimLockOptions = {},
+): Promise<boolean> {
+  const meta = await readLockMeta(lockPath);
+  if (!meta) return false; // incomplete/corrupt: never auto-reclaim
+  if (pidAlive(meta.pid)) return false;
+  if (options.afterInspect) await options.afterInspect(meta);
+
+  const reclaimPath = `${lockPath}.reclaim.${meta.owner}`;
+  try {
+    await rename(lockPath, reclaimPath);
+  } catch {
+    return false;
+  }
+
+  const claimed = await readLockMeta(reclaimPath);
+  if (!claimed || claimed.owner !== meta.owner) {
+    await rename(reclaimPath, lockPath).catch(() => undefined);
+    return false;
+  }
+  await rm(reclaimPath, { force: true });
+  return true;
+}
+
+async function releaseOwnedLock(lockPath: string, owner: string): Promise<void> {
+  const meta = await readLockMeta(lockPath);
+  if (!meta || meta.owner !== owner) return;
+  const releasePath = `${lockPath}.release.${owner}`;
+  try {
+    await rename(lockPath, releasePath);
+  } catch {
+    return;
+  }
+  const claimed = await readLockMeta(releasePath);
+  if (!claimed || claimed.owner !== owner) {
+    await rename(releasePath, lockPath).catch(() => undefined);
+    return;
+  }
+  await rm(releasePath, { force: true });
 }
 
 export interface RunStore {
@@ -97,7 +163,7 @@ export function migrateRunRecord(raw: unknown): RunRecord {
     };
   });
 
-  const migratedConfig = mergeConfig(candidate.config);
+  const migratedConfig = migrateConfig(candidate.config);
 
   if (candidate.version === undefined) {
     return {
@@ -125,7 +191,6 @@ export function migrateRunRecord(raw: unknown): RunRecord {
 export class FileRunStore implements RunStore {
   readonly root: string;
   private readonly cwd: string;
-  private readonly lockStaleMs: number;
   private readonly lockRetries: number;
 
   constructor(
@@ -134,7 +199,8 @@ export class FileRunStore implements RunStore {
   ) {
     this.cwd = cwd;
     this.root = path.join(cwd, ".maswe", "runs");
-    this.lockStaleMs = options.lockStaleMs ?? 30_000;
+    // lockStaleMs retained for API compatibility; reclaim is ownership/PID based, not age based.
+    void options.lockStaleMs;
     this.lockRetries = options.lockRetries ?? 50;
   }
 
@@ -155,110 +221,53 @@ export class FileRunStore implements RunStore {
     return migrateRunRecord(JSON.parse(raw));
   }
 
-  private async readLockMeta(lockPath: string): Promise<LockMeta | undefined> {
-    try {
-      const raw = await readFile(lockPath, "utf8");
-      const meta = JSON.parse(raw) as Partial<LockMeta>;
-      if (typeof meta.pid !== "number" || typeof meta.owner !== "string" || typeof meta.at !== "string") {
-        return undefined;
-      }
-      return { pid: meta.pid, owner: meta.owner, at: meta.at };
-    } catch {
-      return undefined;
-    }
-  }
-
-  private async readLockPid(lockPath: string): Promise<number | undefined> {
-    try {
-      const raw = await readFile(lockPath, "utf8");
-      const meta = JSON.parse(raw) as { pid?: unknown };
-      return typeof meta.pid === "number" ? meta.pid : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
-  private async tryReclaimStaleLock(lockPath: string): Promise<boolean> {
-    const meta = await this.readLockMeta(lockPath);
-    if (!meta) {
-      // Incomplete/corrupt lock: never steal from a live PID; otherwise unlink once.
-      const pid = await this.readLockPid(lockPath);
-      if (pid !== undefined && pidAlive(pid)) return false;
-      try {
-        await rm(lockPath, { force: false });
-        return true;
-      } catch {
-        return false;
-      }
-    }
-    if (pidAlive(meta.pid)) {
-      return false;
-    }
-    // Ownership-safe reclaim: unlink only if the owner token is unchanged.
-    const again = await this.readLockMeta(lockPath);
-    if (!again || again.owner !== meta.owner) return false;
-    if (pidAlive(again.pid)) return false;
-    try {
-      await rm(lockPath, { force: false });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private async acquireLock(runId: string): Promise<{ handle: FileHandle; owner: string }> {
+  private async acquireLock(runId: string): Promise<{ owner: string }> {
     const directory = this.runDirectory(runId);
     await mkdir(directory, { recursive: true });
     const lockPath = this.lockFile(runId);
 
     for (let attempt = 0; attempt < this.lockRetries; attempt += 1) {
       const owner = randomUUID();
+      const meta: LockMeta = { pid: process.pid, owner, at: new Date().toISOString() };
+      const tmpPath = `${lockPath}.${owner}.tmp`;
+      await writeFile(tmpPath, `${JSON.stringify(meta)}\n`, "utf8");
       try {
-        const handle = await open(lockPath, "wx");
-        const meta: LockMeta = { pid: process.pid, owner, at: new Date().toISOString() };
-        await handle.writeFile(`${JSON.stringify(meta)}\n`, "utf8");
-        return { handle, owner };
+        // Atomic exclusive create of a complete lock record (no empty/partial window).
+        await link(tmpPath, lockPath);
+        await rm(tmpPath, { force: true });
+        return { owner };
       } catch (error) {
+        await rm(tmpPath, { force: true });
         const code = (error as NodeJS.ErrnoException).code;
         if (code !== "EEXIST") throw error;
 
-        const meta = await this.readLockMeta(lockPath);
-        if (meta && pidAlive(meta.pid)) {
-          // Never steal a live lock solely because it is old.
+        const existing = await readLockMeta(lockPath);
+        if (existing && pidAlive(existing.pid)) {
           await sleep(20 + attempt * 10);
           continue;
         }
-        const pid = meta?.pid ?? (await this.readLockPid(lockPath));
-        if (pid !== undefined && pidAlive(pid)) {
+        if (!existing) {
+          // Incomplete/corrupt lock: never steal; wait for owner or explicit cleanup.
           await sleep(20 + attempt * 10);
           continue;
         }
-        await this.tryReclaimStaleLock(lockPath);
+        await reclaimStaleRunLock(lockPath);
         await sleep(10 + attempt * 5);
       }
     }
     throw new Error(`Run ${runId} lock contention: could not acquire exclusive lock`);
   }
 
-  private async releaseLock(runId: string, handle: FileHandle, owner: string): Promise<void> {
-    const lockPath = this.lockFile(runId);
-    try {
-      const meta = await this.readLockMeta(lockPath);
-      await handle.close().catch(() => undefined);
-      if (meta?.owner === owner) {
-        await rm(lockPath, { force: true });
-      }
-    } catch {
-      await handle.close().catch(() => undefined);
-    }
+  private async releaseLock(runId: string, owner: string): Promise<void> {
+    await releaseOwnedLock(this.lockFile(runId), owner);
   }
 
   private async withLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
-    const { handle, owner } = await this.acquireLock(runId);
+    const { owner } = await this.acquireLock(runId);
     try {
       return await fn();
     } finally {
-      await this.releaseLock(runId, handle, owner);
+      await this.releaseLock(runId, owner);
     }
   }
 
@@ -350,7 +359,6 @@ export class FileRunStore implements RunStore {
         );
       }
 
-      // Mutate only the authoritative on-disk record; never copy stale caller workflow fields.
       const next = structuredClone(onDisk);
       const logicalName = name.replace(/[^a-zA-Z0-9._-]/g, "-");
       const priorAttempts = next.artifacts.filter((artifact) => artifact.logicalName === logicalName);
@@ -387,8 +395,6 @@ export class FileRunStore implements RunStore {
       next.updatedAt = now();
       await writeAtomic(this.runFile(run.id), `${JSON.stringify(next, null, 2)}\n`);
 
-      // Sync only fields owned by this write. Do not clobber unsaved in-memory
-      // caller mutations (counters, approvals, evidence, failure, state, events).
       run.version = next.version;
       run.updatedAt = next.updatedAt;
       run.artifacts = next.artifacts;

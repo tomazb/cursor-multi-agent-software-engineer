@@ -42,6 +42,8 @@ export interface MasweConfig {
     maxCommentResolutionCycles: number;
     allowDirtyWorkspace: boolean;
     useIsolatedWorktree: boolean;
+    /** Pass Cursor CLI `--trust` for MASWE-managed worktrees. */
+    trustManagedWorktrees: boolean;
     promptTransport: PromptTransport;
     commandTimeoutMs: number;
     roleTimeoutMs: number;
@@ -136,6 +138,7 @@ export interface EvidenceBinding {
 export interface RunEvidence {
   quality?: EvidenceBinding;
   verification?: EvidenceBinding;
+  mergeReady?: EvidenceBinding;
 }
 
 export interface RunRecord {
@@ -177,6 +180,8 @@ export interface RuntimeRequest {
   cwd: string;
   roleConfig: RoleConfig;
   timeoutMs?: number;
+  /** True when cwd is a MASWE-created isolated worktree. */
+  managedWorktree?: boolean;
 }
 
 export interface RuntimeResult {

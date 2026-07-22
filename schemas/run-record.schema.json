@@ -78,7 +78,8 @@
       "type": "object",
       "properties": {
         "quality": { "$ref": "#/$defs/evidenceBinding" },
-        "verification": { "$ref": "#/$defs/evidenceBinding" }
+        "verification": { "$ref": "#/$defs/evidenceBinding" },
+        "mergeReady": { "$ref": "#/$defs/evidenceBinding" }
       }
     },
     "supersedes": { "type": "string" },
