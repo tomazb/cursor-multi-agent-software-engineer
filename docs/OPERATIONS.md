@@ -245,7 +245,7 @@ A failed verifier returns to `BUILDING`. The next builder prompt includes the la
 
 ### Read-only violation
 
-The run fails if a read-only role changes workspace state. Inspect `git status` and revert only changes attributable to that role. Preserve unrelated user work.
+The run fails if a read-only role changes workspace state, including authoritative `.maswe` run records and artifacts under the fingerprinted working directory (Git excludes do not hide that state from the fingerprint). Inspect `git status` and `.maswe/runs/<id>/`, and revert only changes attributable to that role. Preserve unrelated user work. Ephemeral `.lock` / `.admin.lock` / `*.tmp` churn under `.maswe` is excluded from the fingerprint by design.
 
 ## 8. File-store backup and privacy
 
