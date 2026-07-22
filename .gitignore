@@ -6,5 +6,6 @@ coverage/
 !.env.example
 .maswe/runs/
 .maswe/logs/
+.worktrees/
 *.log
 .DS_Store
