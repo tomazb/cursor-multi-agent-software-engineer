@@ -725,7 +725,7 @@ test("doctor stdin probe uses the same resolved exact model as start", async () 
 
   const report = await runtime.doctor();
   const probe = report.checks.find((c) => c.name === "prompt-transport-probe");
-  assert.ok(probe?.ok, probe?.message);
+  assert.ok(probe?.ok, probe?.message ?? "missing prompt-transport-probe check");
   assert.equal(modelArgs[0], "cursor-grok-4.5-high");
   assert.match(probe!.message, /cursor-grok-4\.5-high/);
 
