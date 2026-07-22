@@ -60,18 +60,29 @@ function looksLikeNode(command: string): boolean {
 /** Parse exact model catalogue IDs from `agent models` text output. */
 export function parseModelCatalogueIds(catalogueText: string): Set<string> {
   const ids = new Set<string>();
-  for (const line of catalogueText.split(/\r?\n/)) {
+  const stripped = catalogueText.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
+  const skip = new Set([
+    "available",
+    "models",
+    "model",
+    "default",
+    "name",
+    "id",
+    "cursor",
+    "claude",
+    "gpt",
+    "grok",
+  ]);
+  for (const line of stripped.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    // Prefer first token that looks like a model slug (letters/digits/._-).
-    const match = trimmed.match(/(?:^|[\s*`"'([-])([a-zA-Z][a-zA-Z0-9._+-]{1,80})(?=$|[\s)`"'\],])/);
-    if (!match?.[1]) continue;
-    const id = match[1];
-    // Skip obvious non-model words.
-    if (["available", "models", "model", "default", "name", "id"].includes(id.toLowerCase())) {
-      continue;
+    for (const match of trimmed.matchAll(/\b([a-zA-Z][a-zA-Z0-9._+-]{2,80})\b/g)) {
+      const id = match[1]!.toLowerCase();
+      if (skip.has(id)) continue;
+      // Model slugs are versioned or hyphenated (avoid prose words).
+      if (!/[0-9]/.test(id)) continue;
+      ids.add(id);
     }
-    ids.add(id.toLowerCase());
   }
   return ids;
 }

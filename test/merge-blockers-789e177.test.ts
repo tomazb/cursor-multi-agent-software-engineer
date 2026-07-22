@@ -33,6 +33,19 @@ Available models:
   assert.equal(ids.has("opus"), false);
 });
 
+test("parseModelCatalogueIds strips ANSI and keeps cursor-* catalogue rows", () => {
+  const catalogue = [
+    "\x1b[1mAvailable models:\x1b[0m",
+    "\x1b[32mcursor-grok-4.5-high\x1b[0m - Cursor Grok 4.5",
+    "cursor-grok-4.5-high-fast - Cursor Grok 4.5 Fast",
+    "cursor-claude-fable-5-high - Claude Fable 5",
+  ].join("\n");
+  const ids = parseModelCatalogueIds(catalogue);
+  assert.equal(ids.has("cursor-grok-4.5-high"), true);
+  assert.equal(ids.has("cursor-grok-4.5-high-fast"), true);
+  assert.equal(ids.has("cursor-claude-fable-5-high"), true);
+});
+
 test("shouldPassTrustFlag is true for managed worktrees when policy enabled", () => {
   const config = structuredClone(DEFAULT_CONFIG);
   config.policy.trustManagedWorktrees = true;
@@ -255,14 +268,24 @@ test(
     const config = structuredClone(DEFAULT_CONFIG);
     config.runtime.kind = "cursor-cli";
     config.runtime.outputFormat = "text";
-    config.roles.brainstormer.model =
-      process.env.MASWE_MODEL_BRAINSTORMER?.trim() || "cursor-grok-4.5-high";
     config.policy.trustManagedWorktrees = true;
     config.policy.useIsolatedWorktree = true;
     config.gates.requireBrainstormApproval = true;
     config.quality.commands = [];
 
-    const orchestrator = new Orchestrator(cwd, config, createRuntime(config, cwd));
+    const runtime = createRuntime(config, cwd);
+    const { pickCatalogueModel } = await import("../src/model-resolution.ts");
+    const { ROLE_IDS } = await import("../src/domain.ts");
+    const model = pickCatalogueModel(
+      await runtime.listModels(),
+      process.env.MASWE_MODEL_BRAINSTORMER,
+    );
+    for (const role of ROLE_IDS) {
+      config.roles[role].model = model;
+      delete config.roles[role].fallbackModels;
+    }
+
+    const orchestrator = new Orchestrator(cwd, config, runtime);
     const run = await orchestrator.start("Smoke", "One-sentence brainstorm only. Keep the report short.");
     assert.ok(run.workspace?.worktreePath);
     assert.equal(

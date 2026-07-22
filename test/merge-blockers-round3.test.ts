@@ -235,14 +235,24 @@ test(
     const config = structuredClone(DEFAULT_CONFIG);
     config.runtime.kind = "cursor-cli";
     config.runtime.outputFormat = "text";
-    config.roles.brainstormer.model =
-      process.env.MASWE_MODEL_BRAINSTORMER?.trim() || "cursor-grok-4.5-high";
     config.policy.trustManagedWorktrees = true;
     config.policy.useIsolatedWorktree = true;
     config.gates.requireBrainstormApproval = true;
     config.quality.commands = [];
 
-    const orchestrator = new Orchestrator(cwd, config, createRuntime(config, cwd));
+    const runtime = createRuntime(config, cwd);
+    const { pickCatalogueModel } = await import("../src/model-resolution.ts");
+    const { ROLE_IDS } = await import("../src/domain.ts");
+    const model = pickCatalogueModel(
+      await runtime.listModels(),
+      process.env.MASWE_MODEL_BRAINSTORMER,
+    );
+    for (const role of ROLE_IDS) {
+      config.roles[role].model = model;
+      delete config.roles[role].fallbackModels;
+    }
+
+    const orchestrator = new Orchestrator(cwd, config, runtime);
     const run = await orchestrator.start("Smoke", "One-sentence brainstorm only. Keep the report short.");
     assert.ok(run.workspace?.worktreePath);
     assert.equal(
@@ -263,20 +273,30 @@ test(
     config.runtime.kind = "cursor-cli";
     // Explicitly exercise the DEFAULT execution path (json), including extractCursorCliOutput.
     config.runtime.outputFormat = "json";
-    config.roles.brainstormer.model =
-      process.env.MASWE_MODEL_BRAINSTORMER?.trim() || "grok-4.5";
     config.policy.trustManagedWorktrees = true;
     config.policy.useIsolatedWorktree = true;
     config.gates.requireBrainstormApproval = true;
     config.quality.commands = [];
 
-    const orchestrator = new Orchestrator(cwd, config, createRuntime(config, cwd));
+    const runtime = createRuntime(config, cwd);
+    const { pickCatalogueModel } = await import("../src/model-resolution.ts");
+    const { ROLE_IDS } = await import("../src/domain.ts");
+    const model = pickCatalogueModel(
+      await runtime.listModels(),
+      process.env.MASWE_MODEL_BRAINSTORMER ?? "grok-4.5",
+    );
+    for (const role of ROLE_IDS) {
+      config.roles[role].model = model;
+      delete config.roles[role].fallbackModels;
+    }
+
+    const orchestrator = new Orchestrator(cwd, config, runtime);
     const run = await orchestrator.start(
       "Smoke JSON",
       "One-sentence brainstorm only. Keep the report short.",
     );
     assert.ok(run.workspace?.worktreePath, "managed worktree required");
-    assert.match(run.config.roles.brainstormer.model, /cursor-grok-4\.5|grok-4\.5/);
+    assert.equal(run.config.roles.brainstormer.model, model);
     assert.equal(
       run.state,
       "WAITING_FOR_BRAINSTORM_APPROVAL",

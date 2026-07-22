@@ -6,6 +6,7 @@ import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import {
   logicalModelCore,
+  pickCatalogueModel,
   resolveConfigModels,
   resolveLogicalModelId,
 } from "../src/model-resolution.ts";
@@ -53,6 +54,12 @@ test("resolveConfigModels rewrites all role models to exact IDs", () => {
   assert.equal(resolved.roles.designer.model, "cursor-claude-fable-5-high");
   assert.equal(resolved.roles.designer.fallbackModels?.[0], "cursor-claude-opus-4.8-high");
   assert.equal(resolved.roles.verifier.model, "gpt-5.6-sol-high");
+});
+
+test("pickCatalogueModel prefers env override when present, else grok family", () => {
+  assert.equal(pickCatalogueModel(CATALOGUE, "cursor-grok-4.5-low"), "cursor-grok-4.5-low");
+  assert.equal(pickCatalogueModel(CATALOGUE, "missing-model"), "cursor-grok-4.5-high");
+  assert.equal(pickCatalogueModel(CATALOGUE), "cursor-grok-4.5-high");
 });
 
 test("persisted run continues using resolved model after environment changes", async () => {

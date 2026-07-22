@@ -62,8 +62,9 @@ export function resolveLogicalModelId(requested: string, catalogue: Iterable<str
   // No same-core family. Reject weak substring hits across different cores.
   const weak = ids.filter((id) => id.includes(needle));
   if (weak.length === 0) {
+    const sample = ids.slice(0, 8).join(", ") || "(none)";
     throw new Error(
-      `Unknown model '${requested}': no matching catalogue ID. Run 'agent models' and update config.`,
+      `Unknown model '${requested}': no matching catalogue ID among ${ids.length} entries (sample: ${sample}). Run 'agent models' and update config.`,
     );
   }
   throw new Error(
@@ -83,4 +84,30 @@ export function resolveConfigModels(config: MasweConfig, catalogue: Iterable<str
     }
   }
   return resolved;
+}
+
+/**
+ * Pick a concrete catalogue model for smoke/doctor helpers.
+ * Honors an optional preferred logical or exact id when it resolves.
+ */
+export function pickCatalogueModel(catalogue: Iterable<string>, preferred?: string): string {
+  const ids = [...new Set([...catalogue].map((id) => id.trim().toLowerCase()).filter(Boolean))];
+  if (ids.length === 0) {
+    throw new Error("Model catalogue is empty. Run 'agent models' and confirm Cursor CLI auth.");
+  }
+  if (preferred?.trim()) {
+    try {
+      return resolveLogicalModelId(preferred, ids);
+    } catch {
+      // Fall through to deterministic defaults.
+    }
+  }
+  for (const logical of ["grok-4.5", "gpt-5.6-sol-high", "claude-fable-5"]) {
+    try {
+      return resolveLogicalModelId(logical, ids);
+    } catch {
+      // try next
+    }
+  }
+  return [...ids].sort(comparePreference)[0]!;
 }
