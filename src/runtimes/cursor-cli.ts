@@ -1,7 +1,7 @@
 import type { AgentRuntime, MasweConfig, RuntimeDoctorResult, RuntimeRequest, RuntimeResult } from "../domain.ts";
 import { gitWorkspaceFingerprint, isGitRepository } from "../git-snapshot.ts";
 import { spawnCaptured, type SpawnResult } from "../process.ts";
-import { ensureRunWorkspace, cleanupRunWorkspace } from "../git-workspace.ts";
+import { ensureRunWorkspace, cleanupDoctorProbeResources } from "../git-workspace.ts";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -126,29 +126,30 @@ export class CursorCliRuntime implements AgentRuntime {
   }
 
   async doctor(): Promise<RuntimeDoctorResult> {
+    let probeCwd = this.cwd;
+    let managedProbe = false;
+    const checks: RuntimeDoctorResult["checks"] = [];
     try {
       const version = await this.spawnFn(this.config.runtime.command, ["--version"], {
         cwd: this.cwd,
         timeoutMs: this.config.policy.commandTimeoutMs,
       });
       const cliOk = version.exitCode === 0;
-      const checks: RuntimeDoctorResult["checks"] = [
-        {
-          name: "cursor-cli",
-          ok: cliOk,
-          message: cliOk
-            ? `${this.config.runtime.command} is available: ${version.stdout.trim() || version.stderr.trim()}`
-            : `${this.config.runtime.command} returned exit code ${version.exitCode}: ${version.stderr.trim()}`,
-        },
-        {
-          name: "prompt-transport",
-          ok: true,
-          message: `Configured prompt transport: ${this.config.policy.promptTransport}`,
-        },
-      ];
+      checks.push({
+        name: "cursor-cli",
+        ok: cliOk,
+        message: cliOk
+          ? `${this.config.runtime.command} is available: ${version.stdout.trim() || version.stderr.trim()}`
+          : `${this.config.runtime.command} returned exit code ${version.exitCode}: ${version.stderr.trim()}`,
+      });
+      checks.push({
+        name: "prompt-transport",
+        ok: true,
+        message: `Configured prompt transport: ${this.config.policy.promptTransport}`,
+      });
 
-      const probeCwd = await this.resolveDoctorProbeCwd();
-      const managedProbe = probeCwd !== this.cwd;
+      probeCwd = await this.resolveDoctorProbeCwd();
+      managedProbe = probeCwd !== this.cwd;
 
       if (this.config.policy.promptTransport === "stdin") {
         const probeArgs = looksLikeNode(this.config.runtime.command)
@@ -197,21 +198,18 @@ export class CursorCliRuntime implements AgentRuntime {
           });
         }
       }
-
-      await this.cleanupDoctorProbe(probeCwd);
-      return { ok: checks.every((check) => check.ok), checks };
     } catch (error) {
-      return {
+      checks.push({
+        name: "cursor-cli",
         ok: false,
-        checks: [
-          {
-            name: "cursor-cli",
-            ok: false,
-            message: error instanceof Error ? error.message : String(error),
-          },
-        ],
-      };
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      const cleanup = await this.cleanupDoctorProbeSafe(probeCwd);
+      checks.push(cleanup);
     }
+
+    return { ok: checks.every((check) => check.ok), checks };
   }
 
   private doctorProbeRunId: string | undefined;
@@ -246,34 +244,31 @@ export class CursorCliRuntime implements AgentRuntime {
     return workspace.worktreePath ?? this.cwd;
   }
 
-  private async cleanupDoctorProbe(probeCwd: string): Promise<void> {
-    if (!this.doctorProbeRunId || probeCwd === this.cwd) return;
+  private async cleanupDoctorProbeSafe(
+    probeCwd: string,
+  ): Promise<{ name: string; ok: boolean; message: string }> {
+    if (!this.doctorProbeRunId || probeCwd === this.cwd) {
+      return {
+        name: "doctor-probe-cleanup",
+        ok: true,
+        message: "No ephemeral doctor probe worktree was created.",
+      };
+    }
     try {
-      await cleanupRunWorkspace({
-        schemaVersion: 1,
-        version: 1,
-        id: this.doctorProbeRunId,
-        title: "doctor-probe",
-        request: "doctor",
-        repositoryPath: this.cwd,
-        state: "CANCELLED",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        approvals: { brainstorm: false, design: false },
-        counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
-        config: this.config,
-        artifacts: [],
-        events: [],
-        workspace: {
-          baseSha: "doctor",
-          headSha: "doctor",
-          branch: `maswe/${this.doctorProbeRunId}`,
-          fingerprint: "doctor",
-          worktreePath: probeCwd,
-        },
-      });
-    } catch {
-      // Best-effort cleanup of ephemeral doctor probe worktree.
+      await cleanupDoctorProbeResources(this.cwd, this.doctorProbeRunId, probeCwd);
+      return {
+        name: "doctor-probe-cleanup",
+        ok: true,
+        message: `Removed doctor probe worktree and branch maswe/${this.doctorProbeRunId}.`,
+      };
+    } catch (error) {
+      return {
+        name: "doctor-probe-cleanup",
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+      };
+    } finally {
+      this.doctorProbeRunId = undefined;
     }
   }
 }

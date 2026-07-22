@@ -242,12 +242,7 @@ test(
     const orchestrator = new Orchestrator(cwd, config, createRuntime(config, cwd));
     const run = await orchestrator.start("Smoke", "One-sentence brainstorm only.");
     assert.ok(run.workspace?.worktreePath);
-    assert.ok(
-      ["WAITING_FOR_BRAINSTORM_APPROVAL", "FAILED", "BRAINSTORMING"].includes(run.state),
-      `unexpected state ${run.state}`,
-    );
-    if (run.state === "WAITING_FOR_BRAINSTORM_APPROVAL") {
-      assert.ok(run.artifacts.some((a) => a.logicalName === "02-brainstorm.md"));
-    }
+    assert.equal(run.state, "WAITING_FOR_BRAINSTORM_APPROVAL");
+    assert.ok(run.artifacts.some((a) => a.logicalName === "02-brainstorm.md"));
   },
 );

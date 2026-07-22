@@ -54,7 +54,7 @@ interface LockMeta {
 }
 
 export interface ReclaimLockOptions {
-  /** Test barrier invoked after inspecting lock metadata, before rename/delete. */
+  /** @deprecated Automatic reclaim is removed; use FileRunStore.unlock. */
   afterInspect?: (meta: LockMeta) => Promise<void>;
 }
 
@@ -72,51 +72,13 @@ async function readLockMeta(lockPath: string): Promise<LockMeta | undefined> {
   }
 }
 
-/**
- * Explicit stale unlock: rename the dead lock aside, verify the claimed owner,
- * then delete. Never deletes incomplete/corrupt locks. If a replacement lock
- * appears between inspect and rename, verification fails closed and restores.
- */
-export async function reclaimStaleRunLock(
-  lockPath: string,
-  options: ReclaimLockOptions = {},
-): Promise<boolean> {
-  const meta = await readLockMeta(lockPath);
-  if (!meta) return false; // incomplete/corrupt: never auto-reclaim
-  if (pidAlive(meta.pid)) return false;
-  if (options.afterInspect) await options.afterInspect(meta);
-
-  const reclaimPath = `${lockPath}.reclaim.${meta.owner}`;
-  try {
-    await rename(lockPath, reclaimPath);
-  } catch {
-    return false;
-  }
-
-  const claimed = await readLockMeta(reclaimPath);
-  if (!claimed || claimed.owner !== meta.owner) {
-    await rename(reclaimPath, lockPath).catch(() => undefined);
-    return false;
-  }
-  await rm(reclaimPath, { force: true });
-  return true;
-}
-
 async function releaseOwnedLock(lockPath: string, owner: string): Promise<void> {
   const meta = await readLockMeta(lockPath);
   if (!meta || meta.owner !== owner) return;
-  const releasePath = `${lockPath}.release.${owner}`;
-  try {
-    await rename(lockPath, releasePath);
-  } catch {
-    return;
-  }
-  const claimed = await readLockMeta(releasePath);
-  if (!claimed || claimed.owner !== owner) {
-    await rename(releasePath, lockPath).catch(() => undefined);
-    return;
-  }
-  await rm(releasePath, { force: true });
+  // Owner-verified release: delete only if the token still matches (no rename-aside window).
+  const again = await readLockMeta(lockPath);
+  if (!again || again.owner !== owner) return;
+  await rm(lockPath, { force: true });
 }
 
 export interface RunStore {
@@ -246,16 +208,58 @@ export class FileRunStore implements RunStore {
           await sleep(20 + attempt * 10);
           continue;
         }
-        if (!existing) {
-          // Incomplete/corrupt lock: never steal; wait for owner or explicit cleanup.
-          await sleep(20 + attempt * 10);
-          continue;
+        // Never auto-reclaim stale/incomplete locks — that races with new owners.
+        // Operator must run `maswe unlock <run-id>` after confirming the holder is dead.
+        if (attempt === this.lockRetries - 1) {
+          throw new Error(
+            `Run ${runId} lock contention: stale or incomplete lock at ${lockPath}. If the holder is dead, run: maswe unlock ${runId}`,
+          );
         }
-        await reclaimStaleRunLock(lockPath);
-        await sleep(10 + attempt * 5);
+        await sleep(20 + attempt * 10);
       }
     }
-    throw new Error(`Run ${runId} lock contention: could not acquire exclusive lock`);
+    throw new Error(
+      `Run ${runId} lock contention: could not acquire exclusive lock. If the holder is dead, run: maswe unlock ${runId}`,
+    );
+  }
+
+  /**
+   * Explicit unlock for abandoned locks. Refuses to remove a live holder's lock
+   * unless `force` is set.
+   */
+  async unlock(runId: string, options: { force?: boolean } = {}): Promise<void> {
+    const lockPath = this.lockFile(runId);
+    const meta = await readLockMeta(lockPath);
+    if (!meta) {
+      // Incomplete/corrupt: only removable with force.
+      if (!options.force) {
+        throw new Error(
+          `Run ${runId} lock is incomplete or missing owner metadata. Re-run with --force only after confirming no writer is active.`,
+        );
+      }
+      await rm(lockPath, { force: true });
+      return;
+    }
+    if (pidAlive(meta.pid) && !options.force) {
+      throw new Error(
+        `Run ${runId} lock is held by live pid ${meta.pid}. Refusing unlock without --force.`,
+      );
+    }
+    // Re-read and only remove if the same owner token is still present (no rename dance).
+    const again = await readLockMeta(lockPath);
+    if (!again || again.owner !== meta.owner) {
+      throw new Error(`Run ${runId} lock changed during unlock; refusing to delete.`);
+    }
+    if (pidAlive(again.pid) && !options.force) {
+      throw new Error(
+        `Run ${runId} lock is held by live pid ${again.pid}. Refusing unlock without --force.`,
+      );
+    }
+    await rm(lockPath, { force: true });
+    const leftover = await readLockMeta(lockPath);
+    if (leftover) {
+      throw new Error(`Run ${runId} unlock failed: lock still present`);
+    }
   }
 
   private async releaseLock(runId: string, owner: string): Promise<void> {

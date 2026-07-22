@@ -51,7 +51,14 @@ maswe doctor
 maswe doctor --cwd /path/to/repo
 ```
 
-`doctor` probes the Cursor CLI from the resolved `--cwd` target (not the process launch directory), including the configured stdin prompt-transport probe.
+`doctor` probes the Cursor CLI from a MASWE-managed worktree when `trustManagedWorktrees` is enabled (passing `--trust`), then removes that ephemeral worktree **and** its `maswe/doctor-*` branch. Cleanup outcome is reported as a doctor check.
+
+If a run lock is abandoned (dead process), use explicit unlock — MASWE never auto-reclaims locks:
+
+```bash
+maswe unlock <run-id>
+maswe unlock <run-id> --force   # only when you are sure no writer is alive
+```
 
 A model check is best effort because catalogue formatting is controlled by the Cursor CLI. Treat a doctor failure as a reason to inspect `agent models`, not as proof the provider is unavailable.
 

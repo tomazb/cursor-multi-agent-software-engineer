@@ -73,9 +73,9 @@ test("exclusive lock blocks simultaneous multi-process writers", async () => {
   assert.notEqual(loaded.title, "child-writer");
 });
 
-test("stale lock from dead pid is reclaimed after bounded wait", async () => {
+test("stale lock from dead pid requires explicit unlock", async () => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-stale-"));
-  const store = new FileRunStore(cwd);
+  const store = new FileRunStore(cwd, { lockRetries: 4 });
   const run = await store.create("stale", "lock", DEFAULT_CONFIG);
   const lockPath = path.join(cwd, ".maswe", "runs", run.id, ".lock");
   await writeFile(
@@ -87,6 +87,9 @@ test("stale lock from dead pid is reclaimed after bounded wait", async () => {
     })}\n`,
     "utf8",
   );
+  run.title = "blocked";
+  await assert.rejects(store.save(run), /stale lock|maswe unlock|lock contention/i);
+  await store.unlock(run.id);
   run.title = "reclaimed";
   await store.save(run);
   const loaded = await store.load(run.id);

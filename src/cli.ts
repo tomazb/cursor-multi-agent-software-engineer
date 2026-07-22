@@ -26,11 +26,13 @@ Usage:
   maswe cancel <run-id>
   maswe retry <run-id>
   maswe supersede <run-id>
+  maswe unlock <run-id> [--force]
 
 Options:
   --config <path>  Use a specific config file.
   --cwd <path>     Run against a different repository directory.
   --json           Print machine-readable output.
+  --force          Force unlock even if the lock pid appears live.
 `;
 }
 
@@ -96,6 +98,8 @@ async function orchestratorForRun(
   return { orchestrator, runtime, run };
 }
 
+const PROJECT_CONFIG_COMMANDS = new Set(["doctor", "start"]);
+
 async function main(): Promise<void> {
   const rawArgs = process.argv.slice(2);
   const command = rawArgs[0] ?? "help";
@@ -115,13 +119,18 @@ async function main(): Promise<void> {
     return;
   }
 
-  const config = await loadConfig(cwd, configPath);
   const store = new FileRunStore(cwd);
   const values = positional(args);
 
+  // Existing-run commands must not depend on current project config / env.
+  let projectConfig: MasweConfig | undefined;
+  if (PROJECT_CONFIG_COMMANDS.has(command)) {
+    projectConfig = await loadConfig(cwd, configPath);
+  }
+
   switch (command) {
     case "doctor": {
-      const runtime = createRuntime(config, cwd);
+      const runtime = createRuntime(projectConfig!, cwd);
       const report = await runtime.doctor();
       for (const check of report.checks) {
         console.log(`${check.ok ? "PASS" : "FAIL"} ${check.name}: ${check.message}`);
@@ -135,7 +144,7 @@ async function main(): Promise<void> {
       const requestFile = option(args, "--request-file");
       if (!title || (!requestText && !requestFile)) throw new Error("start requires --title and a request");
       const request = requestFile ? await readFile(path.resolve(cwd, requestFile), "utf8") : requestText!;
-      const orchestrator = orchestratorForProject(cwd, config, store);
+      const orchestrator = orchestratorForProject(cwd, projectConfig!, store);
       const run = await orchestrator.start(title, request);
       console.log(has(args, "--json") ? JSON.stringify(run, null, 2) : renderRun(run));
       return;
@@ -225,6 +234,13 @@ async function main(): Promise<void> {
       if (!runId) throw new Error("supersede requires <run-id>");
       const { orchestrator } = await orchestratorForRun(cwd, store, runId);
       console.log(renderRun(await orchestrator.supersede(runId)));
+      return;
+    }
+    case "unlock": {
+      const runId = values[0];
+      if (!runId) throw new Error("unlock requires <run-id>");
+      await store.unlock(runId, { force: has(args, "--force") });
+      console.log(`Unlocked run ${runId}`);
       return;
     }
     default:

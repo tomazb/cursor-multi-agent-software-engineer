@@ -24,7 +24,7 @@ test("live lock older than stale threshold is not stolen", async () => {
   );
 
   run.title = "should-fail";
-  await assert.rejects(store.save(run), /lock contention|exclusive lock/i);
+  await assert.rejects(store.save(run), /lock contention|exclusive lock|stale lock|maswe unlock/i);
 
   const onDisk = JSON.parse(await readFile(lockPath, "utf8")) as { owner?: string };
   assert.equal(onDisk.owner, token);
@@ -32,10 +32,10 @@ test("live lock older than stale threshold is not stolen", async () => {
   await rm(lockPath, { force: true });
 });
 
-test("two simultaneous stale reclaimers cannot delete each other's new lock", async () => {
+test("dead lock is not auto-reclaimed; explicit unlock is required", async () => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-reclaim-"));
-  const storeA = new FileRunStore(cwd, { lockStaleMs: 10, lockRetries: 30 });
-  const storeB = new FileRunStore(cwd, { lockStaleMs: 10, lockRetries: 30 });
+  const storeA = new FileRunStore(cwd, { lockRetries: 4 });
+  const storeB = new FileRunStore(cwd, { lockRetries: 4 });
   const run = await storeA.create("race", "reclaim", DEFAULT_CONFIG);
   const lockPath = path.join(cwd, ".maswe", "runs", run.id, ".lock");
 
@@ -55,11 +55,12 @@ test("two simultaneous stale reclaimers cannot delete each other's new lock", as
   b.title = "writer-b";
 
   const results = await Promise.allSettled([storeA.save(a), storeB.save(b)]);
-  const fulfilled = results.filter((r) => r.status === "fulfilled");
-  const rejected = results.filter((r) => r.status === "rejected");
-  assert.equal(fulfilled.length, 1);
-  assert.equal(rejected.length, 1);
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 0);
+  assert.equal(results.filter((r) => r.status === "rejected").length, 2);
 
+  await storeA.unlock(run.id);
+  a.title = "writer-a";
+  await storeA.save(a);
   const loaded = await storeA.load(run.id);
-  assert.ok(loaded.title === "writer-a" || loaded.title === "writer-b");
+  assert.equal(loaded.title, "writer-a");
 });

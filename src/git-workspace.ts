@@ -287,6 +287,33 @@ export async function cleanupRunWorkspace(run: RunRecord): Promise<void> {
   }
 }
 
+export async function cleanupDoctorProbeResources(
+  repositoryPath: string,
+  probeId: string,
+  worktreePath: string,
+): Promise<void> {
+  const branch = `maswe/${probeId}`;
+  const removed = await gitExec("git", ["worktree", "remove", "--force", worktreePath], repositoryPath);
+  if (removed.exitCode !== 0) {
+    const stillThere = await gitExec("git", ["rev-parse", "--is-inside-work-tree"], worktreePath).catch(
+      () => ({ exitCode: 1, stdout: "", stderr: "" }),
+    );
+    if (stillThere.exitCode === 0) {
+      throw new Error(
+        `Failed to remove doctor probe worktree ${worktreePath}: ${removed.stderr || removed.stdout}`,
+      );
+    }
+  }
+  const deleted = await gitExec("git", ["branch", "-D", branch], repositoryPath);
+  if (deleted.exitCode !== 0 && !/not found|doesn't exist/i.test(deleted.stderr)) {
+    // Branch may already be gone if worktree remove pruned it; confirm.
+    const still = await gitExec("git", ["rev-parse", "--verify", branch], repositoryPath);
+    if (still.exitCode === 0) {
+      throw new Error(`Failed to delete doctor probe branch ${branch}: ${deleted.stderr}`);
+    }
+  }
+}
+
 export async function restoreRunWorkspace(
   repositoryPath: string,
   run: RunRecord,
@@ -315,10 +342,9 @@ export async function restoreRunWorkspace(
       throw new Error(`Failed to recreate branch ${branch} at ${headSha}: ${create.stderr}`);
     }
   } else if (existing.stdout.trim() !== headSha) {
-    const force = await gitExec("git", ["branch", "-f", branch, headSha], repositoryPath);
-    if (force.exitCode !== 0) {
-      throw new Error(`Failed to point ${branch} at preserved headSha ${headSha}: ${force.stderr}`);
-    }
+    throw new Error(
+      `Run branch ${branch} moved to ${existing.stdout.trim()} but run.workspace.headSha is ${headSha}. Refusing to discard branch commits; supersede the run or recover manually.`,
+    );
   }
 
   const probe = await gitExec("git", ["rev-parse", "--is-inside-work-tree"], worktreePath).catch(

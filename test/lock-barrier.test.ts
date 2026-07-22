@@ -1,10 +1,21 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, readFile, open, rm, mkdir } from "node:fs/promises";
+import { link, mkdtemp, writeFile, readFile, open, rm, mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { randomUUID } from "node:crypto";
 import { DEFAULT_CONFIG } from "../src/config.ts";
-import { FileRunStore, reclaimStaleRunLock } from "../src/store.ts";
+import { FileRunStore } from "../src/store.ts";
+
+async function installLinkLock(
+  lockPath: string,
+  meta: { pid: number; owner: string; at: string },
+): Promise<void> {
+  const tmp = `${lockPath}.${meta.owner}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(meta)}\n`, "utf8");
+  await link(tmp, lockPath);
+  await rm(tmp, { force: true });
+}
 
 test("incomplete lock is never auto-reclaimed while a live owner may still be initializing", async () => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-lock-incomplete-"));
@@ -12,13 +23,11 @@ test("incomplete lock is never auto-reclaimed while a live owner may still be in
   const run = await store.create("incomplete", "lock", DEFAULT_CONFIG);
   const lockPath = path.join(cwd, ".maswe", "runs", run.id, ".lock");
 
-  // Simulate exclusive create before metadata write completes.
   const holder = await open(lockPath, "wx");
-  // Empty / incomplete content — no owner token yet.
   await holder.writeFile("", "utf8");
 
   run.title = "must-not-steal";
-  await assert.rejects(store.save(run), /lock contention|exclusive lock/i);
+  await assert.rejects(store.save(run), /lock contention|stale lock|maswe unlock/i);
 
   const raw = await readFile(lockPath, "utf8");
   assert.equal(raw, "");
@@ -26,36 +35,64 @@ test("incomplete lock is never auto-reclaimed while a live owner may still be in
   await rm(lockPath, { force: true });
 });
 
-test("replacement lock created between reclaim inspect and delete is preserved", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-lock-toctou-"));
-  await mkdir(path.join(cwd, ".maswe", "runs", "r1"), { recursive: true });
-  const lockPath = path.join(cwd, ".maswe", "runs", "r1", ".lock");
+test("four-actor race: two unlockers cannot hand the lock to a second acquirer over a replacement owner", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-lock-four-"));
+  const store = new FileRunStore(cwd, { lockRetries: 8 });
+  const run = await store.create("four", "actors", DEFAULT_CONFIG);
+  const lockPath = path.join(cwd, ".maswe", "runs", run.id, ".lock");
 
-  await writeFile(
-    lockPath,
-    `${JSON.stringify({
-      pid: 1_000_000_042,
-      owner: "dead-owner",
-      at: new Date(Date.now() - 60_000).toISOString(),
-    })}\n`,
-    "utf8",
-  );
-
-  const liveMeta = {
-    pid: process.pid,
-    owner: "live-replacement",
-    at: new Date().toISOString(),
-  };
-
-  const reclaimed = await reclaimStaleRunLock(lockPath, {
-    afterInspect: async () => {
-      // A new holder won the race and wrote a live lock before deletion.
-      await writeFile(lockPath, `${JSON.stringify(liveMeta)}\n`, "utf8");
-    },
+  await installLinkLock(lockPath, {
+    pid: 1_000_000_099,
+    owner: "dead-owner",
+    at: new Date(Date.now() - 120_000).toISOString(),
   });
 
-  assert.equal(reclaimed, false);
-  const onDisk = JSON.parse(await readFile(lockPath, "utf8")) as { owner: string; pid: number };
-  assert.equal(onDisk.owner, "live-replacement");
-  assert.equal(onDisk.pid, process.pid);
+  // Automatic acquire must not reclaim the dead lock.
+  const blocked = structuredClone(run);
+  blocked.title = "auto-reclaim-forbidden";
+  await assert.rejects(store.save(blocked), /stale lock|maswe unlock|lock contention/i);
+  assert.equal((await readLockOwner(lockPath)), "dead-owner");
+
+  // Explicit unlock removes the dead lock once.
+  await store.unlock(run.id);
+
+  // Replacement owner acquires via normal link-based save.
+  const replacement = structuredClone(await store.load(run.id));
+  replacement.title = "replacement-owner";
+  await store.save(replacement);
+  assert.equal((await store.load(run.id)).title, "replacement-owner");
+
+  // Hold the lock as the replacement owner would during a critical section.
+  const holdOwner = randomUUID();
+  await installLinkLock(lockPath, {
+    pid: process.pid,
+    owner: holdOwner,
+    at: new Date().toISOString(),
+  });
+
+  // Two concurrent unlock attempts must not remove a live replacement lock.
+  const unlockResults = await Promise.allSettled([
+    store.unlock(run.id),
+    store.unlock(run.id),
+  ]);
+  assert.equal(unlockResults.filter((r) => r.status === "rejected").length, 2);
+  assert.equal((await readLockOwner(lockPath)), holdOwner);
+
+  // Second acquiring owner cannot steal while replacement holds the lock.
+  const second = structuredClone(await store.load(run.id));
+  second.title = "second-acquirer";
+  await assert.rejects(store.save(second), /lock contention|exclusive lock|live/i);
+  assert.equal((await readLockOwner(lockPath)), holdOwner);
+  assert.equal((await store.load(run.id)).title, "replacement-owner");
+
+  await store.unlock(run.id, { force: true });
 });
+
+async function readLockOwner(lockPath: string): Promise<string | undefined> {
+  try {
+    const meta = JSON.parse(await readFile(lockPath, "utf8")) as { owner?: string };
+    return meta.owner;
+  } catch {
+    return undefined;
+  }
+}
