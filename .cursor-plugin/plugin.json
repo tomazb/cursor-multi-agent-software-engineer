@@ -1,0 +1,29 @@
+{
+  "name": "cursor-multi-agent-software-engineer",
+  "displayName": "Multi-Agent Software Engineer",
+  "version": "0.1.0",
+  "description": "Drive a durable brainstorm, design, build, CI, independent verification, and scoped PR review workflow from Cursor.",
+  "author": {
+    "name": "tomazb"
+  },
+  "homepage": "https://github.com/tomazb/cursor-multi-agent-software-engineer",
+  "repository": "https://github.com/tomazb/cursor-multi-agent-software-engineer",
+  "license": "MIT",
+  "keywords": [
+    "cursor",
+    "multi-agent",
+    "orchestration",
+    "software-engineering",
+    "superpowers",
+    "verification",
+    "pull-requests"
+  ],
+  "category": "developer-tools",
+  "tags": [
+    "agents",
+    "automation",
+    "developer-tools",
+    "software-delivery"
+  ],
+  "skills": "./skills/"
+}

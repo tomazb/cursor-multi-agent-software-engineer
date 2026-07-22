@@ -1,0 +1,21 @@
+---
+description: Architectural and safety constraints for the MASWE repository
+globs:
+  - "src/**/*.ts"
+  - "test/**/*.ts"
+  - "prompts/**/*.md"
+  - "docs/**/*.md"
+alwaysApply: true
+---
+
+# MASWE repository constraints
+
+- The deterministic orchestrator owns state transitions, approvals, retries, and policy. Models never authorize their own transitions.
+- Keep all legal transitions in `src/state-machine.ts`.
+- Keep Cursor/provider code behind `AgentRuntime` in `src/runtimes/`.
+- Preserve separate builder and verifier roles. A write role cannot approve its own edits.
+- Preserve mechanical read-only checks for brainstormer, designer, verifier, and comment classifier.
+- Untrusted request, repository, or review text must never become a shell command.
+- Quality commands come only from trusted project configuration.
+- Every workflow behavior change requires tests and relevant PRD/architecture/artifact documentation updates.
+- Run `npm run check` before claiming completion.

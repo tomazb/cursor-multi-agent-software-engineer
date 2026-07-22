@@ -1,0 +1,192 @@
+# Security architecture and threat model
+
+## Security objective
+
+MASWE must prevent untrusted requests, model output, repository content, and PR comments from crossing approval, permission, model, shell, or merge boundaries without deterministic authorization.
+
+## Assets
+
+- Source code and repository history.
+- Credentials for Cursor, GitHub, package registries, cloud providers, and CI.
+- Approved product requirements and architecture.
+- Model configuration and team policy.
+- Run artifacts and reviewer comments.
+- Verification and merge-readiness evidence.
+- Cost and quota associated with model usage.
+
+## Trust assumptions
+
+- Project configuration and quality commands are controlled by trusted maintainers.
+- The local operating system and current user account are trusted.
+- Cursor CLI/SDK and model providers are external trusted dependencies, but their output is untrusted.
+- Feature requests, repository text, dependency code, and PR comments may be malicious.
+- A model may misunderstand policy, hallucinate evidence, or follow prompt injection.
+
+## Threats and controls
+
+### T1 — Prompt injection from repository content
+
+**Threat:** A source file or documentation tells an agent to ignore the approved task, reveal secrets, or perform unrelated actions.
+
+**Controls:**
+
+- System-level role prompts restate scope and permissions.
+- Deterministic state and quality logic do not accept model-generated commands or transitions.
+- Human approvals are outside the model.
+- Verifier and comment classifier receive explicit untrusted-input warnings.
+
+**Gap:** Prompt-level controls cannot fully neutralize injection. Future sandbox and tool policy should restrict file and network access per role.
+
+### T2 — Read-only role modifies code
+
+**Threat:** Brainstormer, designer, verifier, or classifier writes files or stages changes.
+
+**Controls:**
+
+- Cursor CLI omits `--force` for read-only roles.
+- All read-only adapters compare a git workspace fingerprint before and after execution.
+- A mismatch fails the run.
+
+**Gap:** Detection occurs after the process runs; it is not a preventive OS sandbox. External side effects outside the repository are not fingerprinted.
+
+### T3 — Builder or resolver exceeds scope
+
+**Threat:** A write role refactors unrelated code, changes APIs, or follows a reviewer request that broadens requirements.
+
+**Controls:**
+
+- Builder receives approved artifacts and explicit non-goals.
+- PR comments require a read-only scope classification before resolution.
+- Out-of-scope comments stop for a human.
+- Deterministic quality and fresh independent verification follow edits.
+
+**Gap:** v0.1 does not mechanically restrict write paths. Future policy will calculate allowed file scopes and run in an isolated worktree.
+
+### T4 — Self-verification
+
+**Threat:** The builder asserts success and the system accepts it.
+
+**Controls:**
+
+- Builder report is explicitly untrusted.
+- A separate verifier role runs after deterministic quality checks.
+- Resolver edits trigger a fresh verifier.
+- Verifier is read-only and must emit a strict verdict.
+
+### T5 — Model substitution or fallback
+
+**Threat:** Runtime silently uses a cheaper, blocked, or less capable model.
+
+**Controls:**
+
+- Requested model is stored in configuration and event details.
+- Default policy does not attempt configured fallbacks.
+- Reported actual-model mismatch fails the run.
+- Doctor checks available model catalogue on a best-effort basis.
+
+**Gap:** Not every runtime reports actual model identity. Provider-side substitution may remain opaque.
+
+### T6 — Shell injection
+
+**Threat:** Issue text or a PR comment becomes a shell command.
+
+**Controls:**
+
+- Quality commands come only from trusted JSON configuration.
+- Request and comment content is passed only as prompt text.
+- Runtime command and model values are argument arrays rather than shell interpolation.
+
+**Risk:** Quality commands execute with `shell: true`; malicious configuration is equivalent to local code execution. Protect config review and branch permissions.
+
+### T7 — Secret leakage
+
+**Threat:** Agents read `.env`, credentials, or CI secrets and include them in prompts, artifacts, or logs.
+
+**Controls:**
+
+- Credentials come from environment variables.
+- `.env*` is ignored except the example file.
+- SDK API key is passed through process environment/options, not persisted in run config.
+- Documentation instructs teams not to commit run artifacts by default.
+
+**Gaps and future work:**
+
+- No automatic secret redaction.
+- CLI prompt is currently passed as a process argument and may be visible in local process listings.
+- No data-loss prevention policy or provider-specific privacy controls.
+
+A near-term change should pass large prompts through stdin or SDK calls rather than command-line arguments where supported.
+
+### T8 — Artifact tampering
+
+**Threat:** A user or process changes a design or verification report after approval.
+
+**Controls:**
+
+- Artifacts have SHA-256 digests in the run record.
+
+**Gap:** Digests are not revalidated on read in v0.1 and are not signed. Future versions should verify hashes before every stage and bind approvals to artifact digests.
+
+### T9 — Verification on stale code
+
+**Threat:** New commits are added after verifier pass, but old evidence is treated as current.
+
+**Controls:**
+
+- Local read-only checks cover the workspace during the verifier execution.
+
+**Gap:** v0.1 lacks exact git-SHA binding and GitHub check runs. Production GitHub integration must invalidate verification on every head-SHA change.
+
+### T10 — Webhook replay or forged GitHub event
+
+**Future threat:** An attacker replays a review or approval event.
+
+**Planned controls:**
+
+- Verify GitHub webhook signatures.
+- Store delivery IDs and reject duplicates.
+- Use installation-scoped tokens.
+- Authorize approvals by repository role/team.
+- Use idempotency keys for side effects.
+
+### T11 — Resource and cost exhaustion
+
+**Threat:** A loop or malicious comment triggers repeated expensive model calls.
+
+**Controls:**
+
+- Build/verify and comment-resolution cycles are bounded.
+- Automatic loop has a hard transition limit.
+- Fallback models are disabled by default.
+
+**Future controls:** per-run token, time, and monetary budgets; concurrency quotas; organization-level kill switch.
+
+## Least-privilege target design
+
+| Role | Repository read | Repository write | Shell | Network/integrations |
+|---|---:|---:|---:|---:|
+| Brainstormer | Yes | No | Read-only inspection | Limited |
+| Designer | Yes | Documentation artifact only | Read-only inspection | Limited |
+| Builder | Yes | Feature worktree | Project commands | Approved integrations |
+| Verifier | Yes | No | Test commands only | None by default |
+| PR resolver | Yes | Allowed files only | Targeted tests | GitHub reply through orchestrator only |
+
+v0.1 approximates this policy through prompts, Cursor CLI flags, and post-run fingerprinting. It does not yet enforce the full matrix.
+
+## Dependency and supply-chain policy
+
+- Pin released dependencies with a lock file when registry access is available.
+- Keep `@cursor/sdk` optional and behind an adapter.
+- Use Dependabot and CI.
+- Review all GitHub Actions by commit SHA for high-assurance deployments; starter workflow uses major tags for maintainability and should be hardened before production.
+- Do not execute code downloaded by an agent without review.
+
+## Incident response
+
+1. Stop active runs and revoke affected tokens.
+2. Preserve `run.json`, artifacts, command logs, git reflog, and provider request IDs.
+3. Determine whether workspace or remote side effects occurred.
+4. Rotate exposed credentials.
+5. Revert unauthorized code and invalidate verification/check results.
+6. Patch policy or runtime controls and add a regression test.
+7. Document impact and notify affected users according to organizational policy.
