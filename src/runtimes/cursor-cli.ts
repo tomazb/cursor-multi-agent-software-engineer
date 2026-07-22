@@ -22,9 +22,11 @@ function looksLikeNode(command: string): boolean {
 
 export class CursorCliRuntime implements AgentRuntime {
   private readonly config: MasweConfig;
+  private readonly cwd: string;
 
-  constructor(config: MasweConfig) {
+  constructor(config: MasweConfig, options: { cwd?: string } = {}) {
     this.config = config;
+    this.cwd = options.cwd ?? process.cwd();
   }
 
   async execute(request: RuntimeRequest): Promise<RuntimeResult> {
@@ -79,7 +81,7 @@ export class CursorCliRuntime implements AgentRuntime {
   async doctor(): Promise<RuntimeDoctorResult> {
     try {
       const version = await spawnCaptured(this.config.runtime.command, ["--version"], {
-        cwd: process.cwd(),
+        cwd: this.cwd,
         timeoutMs: this.config.policy.commandTimeoutMs,
       });
       const cliOk = version.exitCode === 0;
@@ -107,7 +109,7 @@ export class CursorCliRuntime implements AgentRuntime {
                 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>process.exit(d==="maswe-stdin-probe"?0:1))',
               ],
               {
-                cwd: process.cwd(),
+                cwd: this.cwd,
                 input: "maswe-stdin-probe",
                 timeoutMs: Math.min(5_000, this.config.policy.commandTimeoutMs),
               },
@@ -116,7 +118,7 @@ export class CursorCliRuntime implements AgentRuntime {
               this.config.runtime.command,
               ["-p", "--output-format", "text", "--model", this.config.roles.brainstormer.model],
               {
-                cwd: process.cwd(),
+                cwd: this.cwd,
                 input: "maswe-stdin-probe",
                 timeoutMs: Math.min(5_000, this.config.policy.commandTimeoutMs),
               },
@@ -126,14 +128,14 @@ export class CursorCliRuntime implements AgentRuntime {
           name: "prompt-transport-probe",
           ok: probeOk,
           message: probeOk
-            ? "Configured stdin prompt execution path accepted a probe payload."
-            : `stdin prompt probe failed (exit ${probe.exitCode}${probe.timedOut ? ", timed out" : ""}).`,
+            ? `Configured stdin prompt execution path accepted a probe payload in cwd ${this.cwd}.`
+            : `stdin prompt probe failed in cwd ${this.cwd} (exit ${probe.exitCode}${probe.timedOut ? ", timed out" : ""}).`,
         });
       }
 
       if (cliOk) {
         const models = await spawnCaptured(this.config.runtime.command, ["models"], {
-          cwd: process.cwd(),
+          cwd: this.cwd,
           timeoutMs: this.config.policy.commandTimeoutMs,
         });
         const catalogue = `${models.stdout}

@@ -19,7 +19,11 @@ test("exclusive lock blocks simultaneous multi-process writers", async () => {
   // Hold an exclusive lock in this process, then spawn a sibling that must fail or wait.
   const { open } = await import("node:fs/promises");
   const holder = await open(lockPath, "wx");
-  await holder.writeFile(JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  await holder.writeFile(JSON.stringify({
+    pid: process.pid,
+    owner: "holder-token",
+    at: new Date().toISOString(),
+  }));
 
   const child = spawn(
     process.execPath,

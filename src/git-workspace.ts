@@ -56,7 +56,13 @@ export function externalWorktreePath(repositoryPath: string, runId: string): str
 
 export async function ensureMasweGitExclude(repositoryPath: string): Promise<void> {
   if (!(await isGitRepository(repositoryPath))) return;
-  const excludePath = path.join(repositoryPath, ".git", "info", "exclude");
+  const resolved = await gitExec("git", ["rev-parse", "--git-path", "info/exclude"], repositoryPath);
+  if (resolved.exitCode !== 0) {
+    throw new Error(`Failed to resolve info/exclude: ${resolved.stderr}`);
+  }
+  const excludePath = path.isAbsolute(resolved.stdout.trim())
+    ? resolved.stdout.trim()
+    : path.resolve(repositoryPath, resolved.stdout.trim());
   await mkdir(path.dirname(excludePath), { recursive: true });
   let existing = "";
   try {
@@ -65,7 +71,11 @@ export async function ensureMasweGitExclude(repositoryPath: string): Promise<voi
     existing = "";
   }
   if (!existing.split(/\r?\n/).includes(".maswe/")) {
-    await appendFile(excludePath, `${existing.endsWith("\n") || existing.length === 0 ? "" : "\n"}.maswe/\n`, "utf8");
+    await appendFile(
+      excludePath,
+      `${existing.endsWith("\n") || existing.length === 0 ? "" : "\n"}.maswe/\n`,
+      "utf8",
+    );
   }
 }
 
@@ -254,11 +264,68 @@ export async function cleanupRunWorkspace(run: RunRecord): Promise<void> {
   if (!run.workspace?.worktreePath) return;
   const repositoryPath = run.repositoryPath;
   const worktreePath = run.workspace.worktreePath;
-  const branch = run.workspace.branch;
+  // Preserve the failed/completed run branch ref for provenance; only remove the worktree directory.
   await gitExec("git", ["worktree", "remove", "--force", worktreePath], repositoryPath);
-  if (branch && branch.startsWith("maswe/")) {
-    await gitExec("git", ["branch", "-D", branch], repositoryPath);
+}
+
+export async function restoreRunWorkspace(
+  repositoryPath: string,
+  run: RunRecord,
+): Promise<RunWorkspace> {
+  await ensureMasweGitExclude(repositoryPath);
+  if (!run.workspace || run.workspace.baseSha === "not-a-git-repository") {
+    return captureWorkspace(repositoryPath);
   }
+  if (!run.config.policy.useIsolatedWorktree) {
+    return {
+      ...run.workspace,
+      headSha: await gitRevParse(repositoryPath, "HEAD"),
+      fingerprint: await gitWorkspaceFingerprint(repositoryPath),
+    };
+  }
+
+  const branch = run.workspace.branch;
+  const headSha = run.workspace.headSha;
+  const worktreePath = externalWorktreePath(repositoryPath, run.id);
+  await mkdir(path.dirname(worktreePath), { recursive: true });
+
+  const existing = await gitExec("git", ["rev-parse", "--verify", branch], repositoryPath);
+  if (existing.exitCode !== 0) {
+    const create = await gitExec("git", ["branch", branch, headSha], repositoryPath);
+    if (create.exitCode !== 0) {
+      throw new Error(`Failed to recreate branch ${branch} at ${headSha}: ${create.stderr}`);
+    }
+  } else if (existing.stdout.trim() !== headSha) {
+    const force = await gitExec("git", ["branch", "-f", branch, headSha], repositoryPath);
+    if (force.exitCode !== 0) {
+      throw new Error(`Failed to point ${branch} at preserved headSha ${headSha}: ${force.stderr}`);
+    }
+  }
+
+  const probe = await gitExec("git", ["rev-parse", "--is-inside-work-tree"], worktreePath).catch(
+    () => ({ exitCode: 1, stdout: "", stderr: "missing worktree" }),
+  );
+  if (probe.exitCode !== 0) {
+    const add = await gitExec("git", ["worktree", "add", worktreePath, branch], repositoryPath);
+    if (add.exitCode !== 0) {
+      throw new Error(`Failed to restore worktree at ${headSha}: ${add.stderr}`);
+    }
+  }
+
+  const restoredHead = await gitRevParse(worktreePath, "HEAD");
+  if (restoredHead !== headSha) {
+    throw new Error(
+      `Restored worktree HEAD ${restoredHead} does not match preserved headSha ${headSha}`,
+    );
+  }
+
+  return {
+    ...run.workspace,
+    branch,
+    worktreePath,
+    headSha: restoredHead,
+    fingerprint: await gitWorkspaceFingerprint(worktreePath),
+  };
 }
 
 export function workingDirectoryFor(run: RunRecord): string {

@@ -99,7 +99,7 @@ async function main(): Promise<void> {
   }
 
   const config = await loadConfig(cwd, configPath);
-  const runtime = createRuntime(config);
+  const runtime = createRuntime(config, cwd);
   const orchestrator = new Orchestrator(cwd, config, runtime);
   const store = new FileRunStore(cwd);
   const values = positional(args);

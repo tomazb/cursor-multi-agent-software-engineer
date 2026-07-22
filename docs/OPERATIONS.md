@@ -48,7 +48,10 @@ Run diagnostics:
 
 ```bash
 maswe doctor
+maswe doctor --cwd /path/to/repo
 ```
+
+`doctor` probes the Cursor CLI from the resolved `--cwd` target (not the process launch directory), including the configured stdin prompt-transport probe.
 
 A model check is best effort because catalogue formatting is controlled by the Cursor CLI. Treat a doctor failure as a reason to inspect `agent models`, not as proof the provider is unavailable.
 
@@ -73,7 +76,7 @@ Commands execute with the system shell and are trusted code. Only repository adm
 
 ## 5. Prefer isolated worktrees
 
-By default `policy.useIsolatedWorktree` is `true`. On `start`, MASWE creates branch `maswe/<run-id>` and a linked worktree under an **external** directory (`$TMPDIR/maswe-worktrees/...`), not inside the operator checkout. `.maswe/` is appended to `.git/info/exclude` so local run storage does not dirty `git status`. Builder and resolver roles execute in that worktree. Completed, cancelled, failed, and superseded runs remove their worktrees.
+By default `policy.useIsolatedWorktree` is `true`. On `start`, MASWE creates branch `maswe/<run-id>` and a linked worktree under an **external** directory (`$TMPDIR/maswe-worktrees/...`), not inside the operator checkout. `.maswe/` is appended via `git rev-parse --git-path info/exclude` so local run storage does not dirty `git status` even when the operator is already inside a linked worktree. Builder and resolver roles execute in that worktree. Completed, cancelled, failed, and superseded runs remove their worktrees but **preserve** the `maswe/<run-id>` branch ref so failed-run provenance (builder `outputHeadSha`) can be restored on `retry`.
 
 To opt out for a trusted checkout:
 

@@ -118,7 +118,7 @@ It does not contain Cursor SDK implementation details, shell output parsing, or 
     └── 09-resolution-report.md
 ```
 
-`run.json` is an event-bearing snapshot, not an event-sourced database. It stores enough history for audit and recovery in a single-process local deployment.
+`run.json` is an event-bearing snapshot, not an event-sourced database. It stores enough history for audit and recovery in a single-process local deployment. Mutating operations take an exclusive lock with a random owner token; `writeArtifact` rejects stale caller versions and only mutates authoritative on-disk state so concurrent cancellation or state transitions cannot lose events, approvals, counters, evidence, or failure records.
 
 Artifacts are SHA-256 hashed when written. A future store can place content in object storage and keep the same reference contract.
 

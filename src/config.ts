@@ -82,7 +82,7 @@ function mergeRole(base: RoleConfig, incoming: unknown): RoleConfig {
   };
 }
 
-function mergeConfig(raw: unknown): MasweConfig {
+export function mergeConfig(raw: unknown): MasweConfig {
   const base = cloneDefaults();
   if (!raw || typeof raw !== "object") return applyEnvironment(base);
   const value = raw as Partial<MasweConfig>;
@@ -105,6 +105,13 @@ function mergeConfig(raw: unknown): MasweConfig {
   };
 
   return applyEnvironment(merged);
+}
+
+/** Test/helper alias: deep-migrate partial or v0.1 config snapshots onto current defaults. */
+export function mergeConfigForTest(raw: unknown): MasweConfig {
+  const config = mergeConfig(raw);
+  assertConfig(config);
+  return config;
 }
 
 function applyEnvironment(config: MasweConfig): MasweConfig {

@@ -10,6 +10,7 @@ import {
   ensureRunWorkspace,
   invalidateStaleEvidence,
   refreshWorkspaceHead,
+  restoreRunWorkspace,
   workingDirectoryFor,
 } from "./git-workspace.ts";
 import { parseRoleMarker } from "./markers.ts";
@@ -187,6 +188,17 @@ export class Orchestrator {
           const report = await runQualityChecks(workdir, run.config.quality.commands, {
             timeoutMs: run.config.policy.commandTimeoutMs,
           });
+          if (evaluatedSha !== "not-a-git-repository") {
+            if (!(await isGitWorkspaceClean(workdir))) {
+              throw new Error("Quality commands left the worktree dirty; evidence is not trustworthy.");
+            }
+            const afterQualitySha = await gitRevParse(workdir);
+            if (afterQualitySha !== evaluatedSha) {
+              throw new Error(
+                `HEAD moved during quality commands (before ${evaluatedSha}, after ${afterQualitySha})`,
+              );
+            }
+          }
           await this.store.writeArtifact(run, "05-quality-report.md", renderQualityReport(report));
           const accepted = report.passed || !run.config.gates.requireCiPass;
           this.bindEvidence(run, "quality", evaluatedSha, report.passed);
@@ -202,10 +214,23 @@ export class Orchestrator {
           );
         }
         case "VERIFYING": {
+          const workdir = workingDirectoryFor(run);
           const evaluatedSha =
             (await refreshWorkspaceHead(run)) ?? headSha ?? "not-a-git-repository";
-          if (
-            run.config.gates.requireCiPass &&
+          if (evaluatedSha !== "not-a-git-repository" && !(await isGitWorkspaceClean(workdir))) {
+            throw new Error(`Verifier requires a clean worktree at ${evaluatedSha}`);
+          }
+          if (run.config.gates.requireCiPass) {
+            if (
+              !run.evidence?.quality ||
+              !run.evidence.quality.passed ||
+              run.evidence.quality.headSha !== evaluatedSha
+            ) {
+              throw new Error(
+                "VERIFYING requires present, passing quality evidence for the current HEAD",
+              );
+            }
+          } else if (
             run.evidence?.quality?.headSha &&
             run.evidence.quality.headSha !== evaluatedSha
           ) {
@@ -215,6 +240,17 @@ export class Orchestrator {
           }
           const prompt = await buildRolePrompt("verifier", run, this.store);
           const result = await this.executeAgent(run, "verifier", prompt);
+          if (evaluatedSha !== "not-a-git-repository") {
+            if (!(await isGitWorkspaceClean(workdir))) {
+              throw new Error("Verifier left the worktree dirty; evidence is not trustworthy.");
+            }
+            const afterVerifySha = await gitRevParse(workdir);
+            if (afterVerifySha !== evaluatedSha) {
+              throw new Error(
+                `HEAD moved during verification (before ${evaluatedSha}, after ${afterVerifySha})`,
+              );
+            }
+          }
           const markers = parseRoleMarker("verifier", result.output);
           if (!markers.ok) throw new Error(markers.message);
           await this.store.writeArtifact(run, "06-verification-report.md", result.output);
@@ -488,6 +524,12 @@ export class Orchestrator {
     const run = await this.store.load(runId);
     const previousVerificationSha = run.evidence?.verification?.headSha;
     const headSha = await this.syncWorkspace(run);
+    const workdir = workingDirectoryFor(run);
+    if (run.workspace && run.workspace.baseSha !== "not-a-git-repository") {
+      if (!(await isGitWorkspaceClean(workdir))) {
+        throw new Error("Merge-ready requires a clean worktree with fresh verification evidence.");
+      }
+    }
     if (
       previousVerificationSha &&
       (!run.evidence?.verification || run.evidence.verification.headSha !== headSha)
@@ -498,11 +540,18 @@ export class Orchestrator {
     }
     if (
       run.config.gates.requireVerifierPass &&
-      (!run.evidence?.verification || run.evidence.verification.headSha !== run.workspace?.headSha)
+      (!run.evidence?.verification?.passed ||
+        run.evidence.verification.headSha !== run.workspace?.headSha)
     ) {
       throw new Error(
         "Merge-ready requires fresh verification evidence bound to the current head SHA.",
       );
+    }
+    if (
+      run.config.gates.requireCiPass &&
+      (!run.evidence?.quality?.passed || run.evidence.quality.headSha !== run.workspace?.headSha)
+    ) {
+      throw new Error("Merge-ready requires present, passing quality evidence for the current HEAD.");
     }
     return this.store.applyEvent(run, "MARK_MERGE_READY", "user", {
       ...(run.workspace?.headSha ? { headSha: run.workspace.headSha } : {}),
@@ -529,17 +578,9 @@ export class Orchestrator {
     }
     const previousFailure = run.failure;
     delete run.failure;
-    // Recreate workspace if cleanup removed it.
-    if (run.config.policy.useIsolatedWorktree && !run.workspace?.worktreePath) {
-      run.workspace = await ensureRunWorkspace(this.cwd, run);
+    if (run.config.policy.useIsolatedWorktree) {
+      run.workspace = await restoreRunWorkspace(this.cwd, run);
       await this.store.save(run);
-    } else if (run.workspace?.worktreePath) {
-      try {
-        await gitRevParse(run.workspace.worktreePath);
-      } catch {
-        run.workspace = await ensureRunWorkspace(this.cwd, run);
-        await this.store.save(run);
-      }
     }
     await this.store.applyEvent(run, "RETRY_FROM_FAILED", "user", {
       resumeState,
