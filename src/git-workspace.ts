@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { RunRecord, RunWorkspace } from "./domain.ts";
@@ -307,7 +307,10 @@ export async function cleanupDoctorProbeResources(
   worktreePath: string,
 ): Promise<void> {
   const branch = `maswe/${probeId}`;
-  const removed = await gitExec("git", ["worktree", "remove", "--force", worktreePath], repositoryPath);
+  // Missing worktree is not itself a cleanup failure.
+  const removed = await gitExec("git", ["worktree", "remove", "--force", worktreePath], repositoryPath).catch(
+    () => ({ exitCode: 1, stdout: "", stderr: "worktree remove unavailable" }),
+  );
   if (removed.exitCode !== 0) {
     const stillThere = await gitExec("git", ["rev-parse", "--is-inside-work-tree"], worktreePath).catch(
       () => ({ exitCode: 1, stdout: "", stderr: "" }),
@@ -317,6 +320,8 @@ export async function cleanupDoctorProbeResources(
         `Failed to remove doctor probe worktree ${worktreePath}: ${removed.stderr || removed.stdout}`,
       );
     }
+    // Directory may exist without git registration — best-effort rimraf via worktree remove already failed.
+    await rm(worktreePath, { recursive: true, force: true }).catch(() => undefined);
   }
   const deleted = await gitExec("git", ["branch", "-D", branch], repositoryPath);
   if (deleted.exitCode !== 0 && !/not found|doesn't exist/i.test(deleted.stderr)) {

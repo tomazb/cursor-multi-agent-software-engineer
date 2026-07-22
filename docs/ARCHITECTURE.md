@@ -118,7 +118,7 @@ It does not contain Cursor SDK implementation details, shell output parsing, or 
     └── 09-resolution-report.md
 ```
 
-`run.json` is an event-bearing snapshot, not an event-sourced database. It stores enough history for audit and recovery in a single-process local deployment. Mutating operations take an exclusive data lock (temp+`link` complete `{pid,owner,at}` record) coordinated with explicit `unlock` through a dedicated `.admin.lock`. Automatic stale reclaim is not used. `writeArtifact` rejects stale caller versions and only mutates authoritative on-disk state so concurrent cancellation or state transitions cannot lose events, approvals, counters, evidence, or failure records.
+`run.json` is an event-bearing snapshot, not an event-sourced database. It stores enough history for audit and recovery in a single-process local deployment. Mutating operations take an exclusive data lock (temp+`link` complete `{pid,owner,at}` record) coordinated with explicit `unlock` through a dedicated `.admin.lock`. Automatic stale reclaim is not used for data locks **or** admin locks; operators use `maswe unlock` / `maswe unlock-admin`. `writeArtifact` rejects stale caller versions and only mutates authoritative on-disk state so concurrent cancellation or state transitions cannot lose events, approvals, counters, evidence, or failure records.
 
 Artifacts are SHA-256 hashed when written. A future store can place content in object storage and keep the same reference contract.
 
@@ -140,8 +140,8 @@ doctor(): Promise<RuntimeDoctorResult>
 Implemented adapters:
 
 - `MockRuntime`: deterministic outputs for tests and workflow development.
-- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode; resolves logical model names against the local catalogue before execution; unwraps JSON/`stream-json` stdout into assistant text before marker parsing; adds `--mode ask` for read-only roles and `--force` only for write roles; adds `--trust` when `policy.trustManagedWorktrees` is set for MASWE-managed worktrees.
-- `CursorSdkRuntime`: dynamically imports `@cursor/sdk` and runs a local one-shot `Agent.prompt` call.
+- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode. **New runs** resolve logical model names via `resolveProjectModels` against a fail-closed structured catalogue parse; **existing-run stages** call `validatePersistedExactModel` and never substitute. Unwraps JSON/`stream-json` stdout using only terminal `type: "result"` events (text mode keeps raw stdout); never treats stderr as successful assistant content. Adds `--mode ask` for read-only roles and `--force` only for write roles; adds `--trust` when `policy.trustManagedWorktrees` is set for MASWE-managed worktrees. Doctor discovers the catalogue before the stdin probe and cleans probe branch/worktree by recorded probe identity in `finally`.
+- `CursorSdkRuntime`: dynamically imports `@cursor/sdk` and runs a local one-shot `Agent.prompt` call (no catalogue capability; empty-catalogue pass-through stays SDK-only).
 
 The optional SDK import means the CLI can build and run without installing the beta SDK.
 
@@ -204,7 +204,7 @@ With `rejectModelFallback: true`, only the primary candidate is attempted. If a 
 
 With `rejectModelFallback: false`, runtime or startup failure may advance through configured candidates. Every attempt remains visible in the failure message and successful event metadata.
 
-Model aliases are project configuration. Exact provider slugs must be validated against the user's current Cursor catalogue.
+Model aliases are project configuration for **new runs only**. `start`/`doctor` resolve logical names to exact catalogue IDs and persist those exact IDs in `run.config`. Existing-run stages validate the persisted exact ID and never substitute same-core or same-family survivors when the catalogue drifts.
 
 ## 6. Superpowers integration
 

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { link, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, readdir, rename, rm, writeFile, access } from "node:fs/promises";
 import path from "node:path";
 import type {
   ArtifactReference,
@@ -8,7 +8,7 @@ import type {
   WorkflowEventType,
   WorkflowState,
 } from "./domain.ts";
-import { migrateConfig } from "./config.ts";
+import { assertConfig, migrateConfig } from "./config.ts";
 import { assertSafeRunId } from "./git-workspace.ts";
 import { redactSecrets } from "./redaction.ts";
 import { transition } from "./state-machine.ts";
@@ -82,6 +82,10 @@ async function releaseOwnedLock(lockPath: string, owner: string): Promise<void> 
   await rm(lockPath, { force: true });
 }
 
+async function accessRecoveryMarker(markerPath: string): Promise<void> {
+  await access(markerPath);
+}
+
 export interface RunStore {
   create(title: string, request: string, config: MasweConfig): Promise<RunRecord>;
   save(run: RunRecord): Promise<void>;
@@ -127,6 +131,8 @@ export function migrateRunRecord(raw: unknown): RunRecord {
   });
 
   const migratedConfig = migrateConfig(candidate.config);
+  // Same type/range assertion as project config load — never apply env overrides here.
+  assertConfig(migratedConfig);
 
   if (candidate.version === undefined) {
     return {
@@ -184,6 +190,10 @@ export class FileRunStore implements RunStore {
     return path.join(this.runDirectory(runId), ".admin.lock");
   }
 
+  private adminRecoveryMarker(runId: string): string {
+    return path.join(this.runDirectory(runId), ".admin.lock.recovering");
+  }
+
   private async readRunFile(runId: string): Promise<RunRecord> {
     const raw = await readFile(this.runFile(runId), "utf8");
     return migrateRunRecord(JSON.parse(raw));
@@ -191,17 +201,28 @@ export class FileRunStore implements RunStore {
 
   /**
    * Short-lived administrative mutex shared by data-lock acquisition and unlock.
-   * Dead admin holders are reclaimed (unlike the data lock) so a crashed unlock
-   * cannot permanently wedge the run.
+   *
+   * Stale/corrupt/incomplete admin locks are NEVER auto-reclaimed (that raced with
+   * replacement owners). Operators must run `maswe unlock-admin <run-id>`.
    */
   private async withAdminLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
     const directory = this.runDirectory(runId);
     await mkdir(directory, { recursive: true });
     const adminPath = this.adminLockFile(runId);
-    const adminRetries = Math.max(this.lockRetries * 4, 100);
+    const recoveryMarker = this.adminRecoveryMarker(runId);
+    const adminRetries = Math.max(this.lockRetries * 4, 8);
     let owner: string | undefined;
 
     for (let attempt = 0; attempt < adminRetries; attempt += 1) {
+      try {
+        await accessRecoveryMarker(recoveryMarker);
+        owner = undefined;
+        await sleep(5 + attempt * 2);
+        continue;
+      } catch {
+        // No recovery in progress.
+      }
+
       owner = randomUUID();
       const meta: LockMeta = { pid: process.pid, owner, at: new Date().toISOString() };
       const tmpPath = `${adminPath}.${owner}.tmp`;
@@ -220,19 +241,131 @@ export class FileRunStore implements RunStore {
           await sleep(5 + attempt * 2);
           continue;
         }
-        // Dead or incomplete admin lock: safe to reclaim.
-        await rm(adminPath, { force: true });
-        owner = undefined;
+        // Dead, corrupt, or incomplete admin lock: fail closed — never delete by path
+        // based on a previously observed owner token.
+        throw new Error(
+          `Run ${runId} admin lock is stale, corrupt, or incomplete at ${adminPath}. ` +
+            `Refusing automatic reclaim. After confirming no maswe writer is active, run: maswe unlock-admin ${runId}`,
+        );
       }
     }
     if (!owner) {
-      throw new Error(`Run ${runId} admin lock contention: could not serialize unlock/acquire`);
+      throw new Error(
+        `Run ${runId} admin lock contention: could not serialize unlock/acquire. ` +
+          `If a stale admin lock or recovery marker remains, run: maswe unlock-admin ${runId}`,
+      );
     }
 
     try {
       return await fn();
     } finally {
       await releaseOwnedLock(adminPath, owner);
+    }
+  }
+
+  /** Test hook exposing the admin critical section with barrier-friendly acquisition. */
+  async withAdminLockForTest<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+    return this.withAdminLock(runId, fn);
+  }
+
+  /**
+   * Explicit administrative recovery for `.admin.lock`.
+   *
+   * Serialized through an exclusive recovery marker directory so two reclaimers
+   * cannot both proceed, and a stale observer cannot delete a replacement owner.
+   * Never deletes `.admin.lock` based only on a previously observed owner token.
+   */
+  async unlockAdmin(
+    runId: string,
+    options: {
+      force?: boolean;
+      /** Test hook after observing the current admin lock, before recovery proceeds. */
+      afterObserve?: (meta: LockMeta | undefined) => Promise<void>;
+    } = {},
+  ): Promise<void> {
+    assertSafeRunId(runId);
+    const directory = this.runDirectory(runId);
+    await mkdir(directory, { recursive: true });
+    const adminPath = this.adminLockFile(runId);
+    const recoveryMarker = this.adminRecoveryMarker(runId);
+
+    const observed = await readLockMeta(adminPath);
+    let adminExists = true;
+    try {
+      await readFile(adminPath);
+    } catch {
+      adminExists = false;
+    }
+
+    if (!adminExists) {
+      // Clear a leftover recovery marker with force.
+      if (options.force) {
+        await rm(recoveryMarker, { recursive: true, force: true });
+      }
+      return;
+    }
+
+    if (!observed) {
+      if (!options.force) {
+        throw new Error(
+          `Run ${runId} admin lock is corrupt or incomplete. Re-run with --force only after confirming no writer is active: maswe unlock-admin ${runId} --force`,
+        );
+      }
+    } else if (pidAlive(observed.pid) && !options.force) {
+      throw new Error(
+        `Run ${runId} admin lock is held by live pid ${observed.pid}. Refusing unlock-admin without --force.`,
+      );
+    }
+
+    if (options.afterObserve) {
+      await options.afterObserve(observed);
+    }
+
+    // Exclusive recovery marker — only one recoverer proceeds.
+    try {
+      await mkdir(recoveryMarker);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EEXIST") {
+        if (!options.force) {
+          throw new Error(
+            `Run ${runId} admin recovery already in progress (${recoveryMarker}). ` +
+              `If recovery is abandoned, re-run with --force after confirming no writer is active.`,
+          );
+        }
+        // Force: remove abandoned recovery marker and retry once.
+        await rm(recoveryMarker, { recursive: true, force: true });
+        await mkdir(recoveryMarker);
+      } else {
+        throw error;
+      }
+    }
+
+    try {
+      const again = await readLockMeta(adminPath);
+      if (!observed) {
+        // Forced incomplete/corrupt cleanup: remove only if still incomplete.
+        if (!again) {
+          await rm(adminPath, { force: true });
+          return;
+        }
+        throw new Error(`Run ${runId} admin lock changed during recovery; refusing to delete.`);
+      }
+      if (!again || again.owner !== observed.owner) {
+        throw new Error(`Run ${runId} admin lock changed during recovery; refusing to delete.`);
+      }
+      if (pidAlive(again.pid) && !options.force) {
+        throw new Error(
+          `Run ${runId} admin lock is held by live pid ${again.pid}. Refusing unlock-admin without --force.`,
+        );
+      }
+      await rm(adminPath, { force: true });
+      const leftover = await readLockMeta(adminPath);
+      if (leftover) {
+        throw new Error(`Run ${runId} unlock-admin failed: admin lock still present`);
+      }
+    } finally {
+      await rm(recoveryMarker, { recursive: true, force: true });
     }
   }
 

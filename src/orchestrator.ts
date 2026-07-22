@@ -14,7 +14,7 @@ import {
   workingDirectoryFor,
 } from "./git-workspace.ts";
 import { parseRoleMarker } from "./markers.ts";
-import { resolveConfigModels } from "./model-resolution.ts";
+import { resolveProjectModels } from "./model-resolution.ts";
 import { renderQualityReport, runQualityChecks } from "./quality.ts";
 import { isHumanGate, isTerminal } from "./state-machine.ts";
 import { FileRunStore, type RunStore } from "./store.ts";
@@ -88,7 +88,7 @@ export class Orchestrator {
       throw new Error("Workspace is dirty. Commit, stash, or set policy.allowDirtyWorkspace=true.");
     }
     const catalogue = await this.runtime.listModels();
-    const resolvedConfig = resolveConfigModels(this.config, catalogue);
+    const resolvedConfig = resolveProjectModels(this.config, catalogue);
     const run = await this.store.create(title, request, resolvedConfig);
     run.workspace = await ensureRunWorkspace(this.cwd, run);
     await this.store.save(run);

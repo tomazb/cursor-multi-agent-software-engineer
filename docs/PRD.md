@@ -195,7 +195,7 @@ The core shall support a mock runtime, Cursor CLI runtime, and optional Cursor S
 
 ### FR-20 — Environment diagnostics
 
-The system shall provide a doctor command that checks runtime availability, credentials where applicable, and configured model slugs on a best-effort basis.
+The system shall provide a doctor command that checks runtime availability, credentials where applicable, and configured model slugs after fail-closed catalogue discovery and project-style resolution. Doctor shall not report transport success when model resolution failed.
 
 ## Non-functional requirements
 

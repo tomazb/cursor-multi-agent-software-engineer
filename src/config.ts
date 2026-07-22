@@ -131,22 +131,59 @@ function applyEnvironment(config: MasweConfig): MasweConfig {
   return result;
 }
 
-function assertConfig(config: MasweConfig): void {
+/** Fail-closed validation shared by project config load and persisted run migration. */
+export function assertConfig(config: MasweConfig): void {
   const runtimes: RuntimeKind[] = ["mock", "cursor-cli", "cursor-sdk"];
   if (!runtimes.includes(config.runtime.kind)) {
     throw new Error(`Unsupported runtime.kind: ${config.runtime.kind}`);
   }
-  if (!config.runtime.command.trim()) throw new Error("runtime.command must not be empty");
+  if (typeof config.runtime.command !== "string" || !config.runtime.command.trim()) {
+    throw new Error("runtime.command must not be empty");
+  }
+  if (!["text", "json", "stream-json"].includes(config.runtime.outputFormat)) {
+    throw new Error("runtime.outputFormat must be text, json, or stream-json");
+  }
   for (const [role, roleConfig] of Object.entries(config.roles)) {
-    if (!roleConfig.model.trim()) throw new Error(`roles.${role}.model must not be empty`);
+    if (typeof roleConfig.model !== "string" || !roleConfig.model.trim()) {
+      throw new Error(`roles.${role}.model must not be empty`);
+    }
+    if (!["read-only", "workspace-write"].includes(roleConfig.permissions)) {
+      throw new Error(`roles.${role}.permissions must be read-only or workspace-write`);
+    }
+    if (!["low", "medium", "high"].includes(roleConfig.reasoning)) {
+      throw new Error(`roles.${role}.reasoning must be low, medium, or high`);
+    }
+    if (
+      roleConfig.fallbackModels !== undefined &&
+      (!Array.isArray(roleConfig.fallbackModels) ||
+        !roleConfig.fallbackModels.every((model) => typeof model === "string" && model.trim().length > 0))
+    ) {
+      throw new Error(`roles.${role}.fallbackModels must be an array of non-empty strings when set`);
+    }
+  }
+  for (const [gate, value] of Object.entries(config.gates)) {
+    if (typeof value !== "boolean") {
+      throw new Error(`gates.${gate} must be a boolean`);
+    }
   }
   if (!Array.isArray(config.quality.commands)) {
     throw new Error("quality.commands must be an array");
   }
-  if (config.policy.maxBuildVerifyCycles < 1) {
+  if (!config.quality.commands.every((command) => typeof command === "string")) {
+    throw new Error("quality.commands must contain only strings");
+  }
+  if (
+    typeof config.policy.maxBuildVerifyCycles !== "number" ||
+    !Number.isFinite(config.policy.maxBuildVerifyCycles) ||
+    config.policy.maxBuildVerifyCycles < 1
+  ) {
     throw new Error("policy.maxBuildVerifyCycles must be at least 1");
   }
-  if (config.policy.maxCommentResolutionCycles < 1) {
+  if (
+    typeof config.policy.maxCommentResolutionCycles !== "number" ||
+    !Number.isFinite(config.policy.maxCommentResolutionCycles) ||
+    config.policy.maxCommentResolutionCycles < 1
+  ) {
     throw new Error("policy.maxCommentResolutionCycles must be at least 1");
   }
   if (!["stdin", "argv"].includes(config.policy.promptTransport)) {
@@ -157,6 +194,12 @@ function assertConfig(config: MasweConfig): void {
   }
   if (typeof config.policy.useIsolatedWorktree !== "boolean") {
     throw new Error("policy.useIsolatedWorktree must be a boolean");
+  }
+  if (typeof config.policy.allowDirtyWorkspace !== "boolean") {
+    throw new Error("policy.allowDirtyWorkspace must be a boolean");
+  }
+  if (typeof config.policy.rejectModelFallback !== "boolean") {
+    throw new Error("policy.rejectModelFallback must be a boolean");
   }
   if (!Number.isFinite(config.policy.commandTimeoutMs) || config.policy.commandTimeoutMs < 1) {
     throw new Error("policy.commandTimeoutMs must be at least 1");

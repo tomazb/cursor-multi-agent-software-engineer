@@ -53,16 +53,41 @@ maswe doctor --cwd /path/to/repo
 
 `doctor` probes the Cursor CLI from a MASWE-managed worktree when `trustManagedWorktrees` is enabled (passing `--trust`), then removes that ephemeral worktree **and** its `maswe/doctor-*` branch. Cleanup outcome is reported as a doctor check.
 
-If a run lock is abandoned (dead process), use explicit unlock — MASWE never auto-reclaims **data** locks. Acquire and unlock are serialized through a short-lived `.admin.lock` so a concurrent unlock cannot delete a replacement owner's lock:
+If a run **data** lock is abandoned (dead process), use explicit unlock — MASWE never auto-reclaims data locks. Acquire and unlock are serialized through a short-lived `.admin.lock` so a concurrent unlock cannot delete a replacement owner's lock:
 
 ```bash
 maswe unlock <run-id>
 maswe unlock <run-id> --force   # only when you are sure no writer is alive
 ```
 
-Configured role models may use logical names (for example `grok-4.5`). `doctor`, `start`, and Cursor CLI execution resolve them against the local `agent models` catalogue to exact IDs (preferring non-fast `-high` variants when a family has multiple matches). Resolved exact IDs are persisted into the run config snapshot; later stages reuse that snapshot and ignore later environment mutations. Ambiguous cross-family matches and missing models fail closed.
+If `.admin.lock` itself is stale, corrupt, or incomplete, MASWE **fails closed** and does **not** automatically reclaim it (automatic reclaim previously raced with replacement owners). Clear it explicitly:
 
-A model check is best effort because catalogue formatting is controlled by the Cursor CLI. Treat a doctor failure as a reason to inspect `agent models`, not as proof the provider is unavailable.
+```bash
+maswe unlock-admin <run-id>
+maswe unlock-admin <run-id> --force   # corrupt/incomplete/live only after confirming no writer
+```
+
+Admin recovery is serialized through an exclusive `.admin.lock.recovering` marker and re-checks the observed owner token before deletion, so a stale observer cannot delete a live replacement admin lock.
+
+### Model resolution invariants
+
+Configured role models may use logical names (for example `grok-4.5`).
+
+- **New runs (`doctor` / `start`):** logical names are resolved against the local `agent models` catalogue to exact executable IDs (preferring non-fast `-high` variants within the same logical family). Catalogue parsing is fail-closed: only recognized catalogue rows contribute IDs; headings, aliases, metadata, and prose are ignored. Empty/unparseable catalogues are discovery failures.
+- **Run snapshot:** `run.config` stores those exact IDs. Environment and project-config mutations after start do not rewrite them.
+- **Existing-run stages (`run`, `approve`, `retry`, …):** validate the persisted exact ID against the live catalogue and use it as-is. Same-core / same-family / provider / reasoning-level substitution is forbidden. If the persisted exact ID disappears from the catalogue, execution fails closed naming that ID.
+- **Doctor stdin probe:** discovers the catalogue first, resolves the brainstormer model with the same project-resolution logic as `start`, then probes with that exact ID.
+
+Ambiguous cross-family matches and missing models fail closed. Treat a doctor catalogue failure as a reason to inspect `agent models` output format/auth, not as proof the provider is unavailable.
+
+Doctor probe cleanup is based on recorded probe identity: once a `doctor-*` probe ID is assigned, final cleanup removes the probe worktree (if present) and `maswe/doctor-*` branch even when worktree creation failed after the branch was created. Cleanup is idempotent; cleanup failures surface as a `doctor-probe-cleanup` check without erasing the original doctor failure.
+
+Cursor CLI assistant extraction:
+
+- `stream-json`: only terminal NDJSON events with `type: "result"` (last wins).
+- `json`: only result-bearing objects.
+- Text mode: raw stdout.
+- Exit 0 with no valid stdout assistant result fails closed; stderr is never treated as successful assistant content.
 
 ## 4. Configure quality commands
 

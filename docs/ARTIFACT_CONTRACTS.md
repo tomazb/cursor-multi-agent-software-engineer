@@ -12,6 +12,7 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
 - Model output cannot authorize a transition unless the orchestrator recognizes the required terminal marker: exactly one bare marker token on the final line (no backticks, quotes, or earlier mentions of the token).
 - Common secrets are redacted before persistence.
 - JSON schemas live under `schemas/` for configuration and run records.
+- Persisted `run.config.roles.*.model` values are exact executable catalogue IDs after `start`. Loading a run migrates defaults then runs the same config assertions as project load (without applying process environment overrides).
 
 ## Run record
 

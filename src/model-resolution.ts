@@ -33,6 +33,9 @@ function comparePreference(a: string, b: string): number {
 /**
  * Resolve a configured logical model name to exactly one catalogue ID.
  * Fail closed when no candidate exists or unrelated candidates tie.
+ *
+ * Empty catalogue pass-through is for providers without catalogue capability
+ * (e.g. Cursor SDK). Cursor CLI must never call this with an empty catalogue.
  */
 export function resolveLogicalModelId(requested: string, catalogue: Iterable<string>): string {
   const needle = requested.trim().toLowerCase();
@@ -72,6 +75,15 @@ export function resolveLogicalModelId(requested: string, catalogue: Iterable<str
   );
 }
 
+/**
+ * Project / new-run resolution: map logical role models to exact catalogue IDs
+ * before the run snapshot becomes authoritative.
+ */
+export function resolveProjectModels(config: MasweConfig, catalogue: Iterable<string>): MasweConfig {
+  return resolveConfigModels(config, catalogue);
+}
+
+/** @deprecated Prefer resolveProjectModels for new-run paths. */
 export function resolveConfigModels(config: MasweConfig, catalogue: Iterable<string>): MasweConfig {
   const resolved = structuredClone(config);
   for (const role of ROLE_IDS) {
@@ -87,27 +99,71 @@ export function resolveConfigModels(config: MasweConfig, catalogue: Iterable<str
 }
 
 /**
- * Pick a concrete catalogue model for smoke/doctor helpers.
- * Honors an optional preferred logical or exact id when it resolves.
+ * Existing-run validation: the persisted exact ID must still exist in the live
+ * catalogue. Never substitute same-core, same-family, provider, or reasoning variants.
+ */
+export function validatePersistedExactModel(
+  persistedExactId: string,
+  catalogue: Iterable<string>,
+): string {
+  const needle = persistedExactId.trim().toLowerCase();
+  if (!needle) {
+    throw new Error("Persisted model id must not be empty");
+  }
+  const ids = [...new Set([...catalogue].map((id) => id.trim().toLowerCase()).filter(Boolean))];
+  if (ids.length === 0) {
+    throw new Error(
+      `Persisted exact model '${persistedExactId}' cannot be validated: model catalogue is empty or unparseable.`,
+    );
+  }
+  if (!ids.includes(needle)) {
+    throw new Error(
+      `Persisted exact model '${persistedExactId}' is no longer available in the Cursor catalogue. Refusing substitution; update the run only via a new start after correcting catalogue/auth.`,
+    );
+  }
+  return needle;
+}
+
+/** Ordered allowlist of logical families acceptable for deterministic smoke selection. */
+export const SMOKE_MODEL_FAMILY_ALLOWLIST = [
+  "grok-4.5",
+  "gpt-5.6-sol-high",
+  "claude-fable-5",
+] as const;
+
+/**
+ * Pick a concrete catalogue model for smoke helpers.
+ * Resolves only within the ordered allowlist of approved logical families.
+ * Never falls back to an unrelated provider/family via global sort.
  */
 export function pickCatalogueModel(catalogue: Iterable<string>, preferred?: string): string {
   const ids = [...new Set([...catalogue].map((id) => id.trim().toLowerCase()).filter(Boolean))];
   if (ids.length === 0) {
     throw new Error("Model catalogue is empty. Run 'agent models' and confirm Cursor CLI auth.");
   }
+
+  const errors: string[] = [];
   if (preferred?.trim()) {
     try {
-      return resolveLogicalModelId(preferred, ids);
-    } catch {
-      // Fall through to deterministic defaults.
+      return resolveLogicalModelId(preferred.trim().toLowerCase(), ids);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // Ambiguous preferred family must fail closed (no cross-family fallback).
+      if (/Ambiguous/i.test(message)) throw error;
+      errors.push(message);
     }
   }
-  for (const logical of ["grok-4.5", "gpt-5.6-sol-high", "claude-fable-5"]) {
+
+  for (const family of SMOKE_MODEL_FAMILY_ALLOWLIST) {
+    if (preferred?.trim() && family === preferred.trim().toLowerCase()) continue;
     try {
-      return resolveLogicalModelId(logical, ids);
-    } catch {
-      // try next
+      return resolveLogicalModelId(family, ids);
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
     }
   }
-  return [...ids].sort(comparePreference)[0]!;
+
+  throw new Error(
+    `No approved smoke model family available in the catalogue (allowlist: ${SMOKE_MODEL_FAMILY_ALLOWLIST.join(", ")}). ${errors[errors.length - 1] ?? ""}`.trim(),
+  );
 }

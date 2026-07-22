@@ -92,12 +92,9 @@ export async function gitRemoteUrl(cwd: string, name = "origin"): Promise<string
 }
 
 export async function gitChangedFiles(cwd: string, baseSha: string, headSha = "HEAD"): Promise<string[]> {
-  const result = await run("git", ["diff", "--name-only", `${baseSha}...${headSha}`], cwd);
+  const result = await run("git", ["diff", "--name-only", "-z", `${baseSha}...${headSha}`], cwd);
   if (result.exitCode !== 0) {
     throw new Error(`git diff failed: ${result.stderr || result.stdout}`);
   }
-  return result.stdout
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
+  return result.stdout.split("\0").filter(Boolean);
 }

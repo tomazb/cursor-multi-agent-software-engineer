@@ -82,7 +82,7 @@ MASWE must prevent untrusted requests, model output, repository content, and PR 
 - Requested model is stored in configuration and event details.
 - Default policy does not attempt configured fallbacks.
 - Reported actual-model mismatch fails the run.
-- Doctor checks available model catalogue on a best-effort basis.
+- Doctor checks available model catalogue with fail-closed structured row parsing. Empty or unparseable catalogues are failures. Logical names resolve only for new runs; existing runs validate persisted exact IDs without substitution.
 
 **Gap:** Not every runtime reports actual model identity. Provider-side substitution may remain opaque.
 

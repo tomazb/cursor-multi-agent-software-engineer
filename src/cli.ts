@@ -27,6 +27,7 @@ Usage:
   maswe retry <run-id>
   maswe supersede <run-id>
   maswe unlock <run-id> [--force]
+  maswe unlock-admin <run-id> [--force]
 
 Options:
   --config <path>  Use a specific config file.
@@ -241,6 +242,13 @@ async function main(): Promise<void> {
       if (!runId) throw new Error("unlock requires <run-id>");
       await store.unlock(runId, { force: has(args, "--force") });
       console.log(`Unlocked run ${runId}`);
+      return;
+    }
+    case "unlock-admin": {
+      const runId = values[0];
+      if (!runId) throw new Error("unlock-admin requires <run-id>");
+      await store.unlockAdmin(runId, { force: has(args, "--force") });
+      console.log(`Cleared admin lock for run ${runId}`);
       return;
     }
     default:

@@ -28,6 +28,11 @@ test("extractCursorCliOutput unwraps stream-json NDJSON terminal result", () => 
   assert.equal(parseRoleMarker("brainstormer", text).ok, true);
 });
 
+test("extractCursorCliOutput keeps text-mode stdout", () => {
+  const raw = "# Brainstorm\n\nReady.\nREADY_FOR_BRAINSTORM_APPROVAL\n";
+  assert.equal(extractCursorCliOutput(raw), raw);
+});
+
 test("raw json stdout without extraction would look like an embedded marker", () => {
   const raw = JSON.stringify({
     type: "result",
