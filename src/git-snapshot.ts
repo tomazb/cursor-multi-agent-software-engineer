@@ -78,26 +78,48 @@ export async function gitRun(args: string[], cwd: string, timeoutMs = GIT_TIMEOU
   return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
 }
 
-async function run(command: string, args: string[], cwd: string): Promise<ProcessResult> {
+async function run(
+  command: string,
+  args: string[],
+  cwd: string,
+  timeoutMs = GIT_TIMEOUT_MS,
+): Promise<ProcessResult> {
   if (command !== "git") {
     throw new Error(`Unsupported command for git-snapshot run helper: ${command}`);
   }
-  return gitRun(args, cwd);
+  return gitRun(args, cwd, timeoutMs);
 }
 
-export async function isGitRepository(cwd: string): Promise<boolean> {
-  try {
-    const result = await run("git", ["rev-parse", "--is-inside-work-tree"], cwd);
-    return result.exitCode === 0 && result.stdout.trim() === "true";
-  } catch {
-    return false;
-  }
+function gitFailure(args: string[], result: ProcessResult): Error {
+  const details = (result.stderr || result.stdout).trim();
+  return new Error(
+    `git ${args.join(" ")} failed with exit ${result.exitCode}${details ? `: ${details}` : ""}`,
+  );
 }
 
-export async function isGitWorkspaceClean(cwd: string): Promise<boolean> {
-  if (!(await isGitRepository(cwd))) return true;
-  const result = await run("git", ["status", "--porcelain=v1", "--untracked-files=all"], cwd);
-  return result.exitCode === 0 && result.stdout.trim().length === 0;
+/**
+ * Probe repository identity. A completed nonzero rev-parse means "not Git";
+ * execution failures (spawn errors/timeouts) propagate so callers fail closed.
+ */
+export async function isGitRepository(cwd: string, timeoutMs = GIT_TIMEOUT_MS): Promise<boolean> {
+  const result = await run("git", ["rev-parse", "--is-inside-work-tree"], cwd, timeoutMs);
+  return result.exitCode === 0 && result.stdout.trim() === "true";
+}
+
+export async function isGitWorkspaceClean(cwd: string, timeoutMs = GIT_TIMEOUT_MS): Promise<boolean> {
+  if (!(await isGitRepository(cwd, timeoutMs))) return true;
+  const args = [
+    "status",
+    "--porcelain=v1",
+    "--untracked-files=all",
+    "--",
+    ".",
+    ":(exclude).maswe",
+    ":(exclude).maswe/**",
+  ];
+  const result = await run("git", args, cwd, timeoutMs);
+  if (result.exitCode !== 0) throw gitFailure(args, result);
+  return result.stdout.trim().length === 0;
 }
 
 /**
@@ -108,9 +130,12 @@ export async function isGitWorkspaceClean(cwd: string): Promise<boolean> {
  */
 const NON_GIT_FINGERPRINT_NAMESPACE = "maswe:workspace-fingerprint:non-git\0";
 
-export async function gitWorkspaceFingerprint(cwd: string): Promise<string> {
+export async function gitWorkspaceFingerprint(
+  cwd: string,
+  timeoutMs = GIT_TIMEOUT_MS,
+): Promise<string> {
   const hash = createHash("sha256");
-  const isGit = await isGitRepository(cwd);
+  const isGit = await isGitRepository(cwd, timeoutMs);
 
   if (isGit) {
     const commands = [
@@ -119,12 +144,15 @@ export async function gitWorkspaceFingerprint(cwd: string): Promise<string> {
       ["diff", "--cached", "--binary"],
     ];
     for (const args of commands) {
-      const result = await run("git", args, cwd);
+      const result = await run("git", args, cwd, timeoutMs);
+      if (result.exitCode !== 0) throw gitFailure(args, result);
       hash.update(result.stdout);
       hash.update(result.stderr);
     }
 
-    const untracked = await run("git", ["ls-files", "--others", "--exclude-standard", "-z"], cwd);
+    const untrackedArgs = ["ls-files", "--others", "--exclude-standard", "-z"];
+    const untracked = await run("git", untrackedArgs, cwd, timeoutMs);
+    if (untracked.exitCode !== 0) throw gitFailure(untrackedArgs, untracked);
     for (const relative of untracked.stdout.split("\0").filter(Boolean).sort()) {
       try {
         hash.update(relative);
