@@ -2,7 +2,7 @@
 
 **Issue:** GitHub #11 — Harden forced lock recovery and ownership-safe release
 **Date:** 2026-07-23
-**Status:** Revised; awaiting repository-owner design reapproval
+**Status:** Approved for Phase B implementation
 **Branch:** `issue/11-lock-recovery`
 **Base:** `dab10487baf7f05867b54895ec5db109ad3a3e65` (freshly fetched `origin/main`)
 **Original Phase-A head:** `8d1fb5fa32b4392f27d04eff0717cb1bce411efd`
