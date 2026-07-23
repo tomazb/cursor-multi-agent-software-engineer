@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { link, mkdir, readFile, readdir, rename, rm, writeFile, access } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type {
   ArtifactReference,
@@ -12,6 +12,15 @@ import { assertConfig, migrateConfig } from "./config.ts";
 import { assertSafeRunId } from "./git-workspace.ts";
 import { redactSecrets } from "./redaction.ts";
 import { transition } from "./state-machine.ts";
+import {
+  acquireDirectoryLock,
+  classifyLockPath,
+  LockProtocolError,
+  recoverClassifiedLock,
+  removeOwnedDirectory,
+  type ClassifiedLock,
+  type LockOwnershipHandle,
+} from "./lock-protocol.ts";
 
 function now(): string {
   return new Date().toISOString();
@@ -28,16 +37,6 @@ function sha256(content: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function pidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 async function writeAtomic(filePath: string, content: string): Promise<void> {
@@ -59,31 +58,20 @@ export interface ReclaimLockOptions {
   afterInspect?: (meta: LockMeta) => Promise<void>;
 }
 
-async function readLockMeta(lockPath: string): Promise<LockMeta | undefined> {
-  try {
-    const raw = await readFile(lockPath, "utf8");
-    if (!raw.trim()) return undefined;
-    const meta = JSON.parse(raw) as Partial<LockMeta>;
-    if (typeof meta.pid !== "number" || typeof meta.owner !== "string" || typeof meta.at !== "string") {
-      return undefined;
-    }
-    return { pid: meta.pid, owner: meta.owner, at: meta.at };
-  } catch {
-    return undefined;
+function lockMetaFromClassified(classified: ClassifiedLock): LockMeta | undefined {
+  if (
+    classified.state === "valid-live" ||
+    classified.state === "valid-dead" ||
+    classified.state === "legacy-live" ||
+    classified.state === "legacy-dead"
+  ) {
+    return {
+      pid: classified.record.pid,
+      owner: classified.record.owner,
+      at: classified.record.at,
+    };
   }
-}
-
-async function releaseOwnedLock(lockPath: string, owner: string): Promise<void> {
-  const meta = await readLockMeta(lockPath);
-  if (!meta || meta.owner !== owner) return;
-  // Owner-verified release: delete only if the token still matches (no rename-aside window).
-  const again = await readLockMeta(lockPath);
-  if (!again || again.owner !== owner) return;
-  await rm(lockPath, { force: true });
-}
-
-async function accessRecoveryMarker(markerPath: string): Promise<void> {
-  await access(markerPath);
+  return undefined;
 }
 
 export interface RunStore {
@@ -211,56 +199,86 @@ export class FileRunStore implements RunStore {
     const adminPath = this.adminLockFile(runId);
     const recoveryMarker = this.adminRecoveryMarker(runId);
     const adminRetries = Math.max(this.lockRetries * 4, 8);
-    let owner: string | undefined;
+    let ownership: LockOwnershipHandle | undefined;
 
     for (let attempt = 0; attempt < adminRetries; attempt += 1) {
-      try {
-        await accessRecoveryMarker(recoveryMarker);
-        owner = undefined;
-        await sleep(5 + attempt * 2);
-        continue;
-      } catch {
-        // No recovery in progress.
-      }
-
-      owner = randomUUID();
-      const meta: LockMeta = { pid: process.pid, owner, at: new Date().toISOString() };
-      const tmpPath = `${adminPath}.${owner}.tmp`;
-      await writeFile(tmpPath, `${JSON.stringify(meta)}\n`, "utf8");
-      try {
-        await link(tmpPath, adminPath);
-        await rm(tmpPath, { force: true });
-        break;
-      } catch (error) {
-        await rm(tmpPath, { force: true });
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== "EEXIST") throw error;
-        const existing = await readLockMeta(adminPath);
-        if (existing && pidAlive(existing.pid)) {
-          owner = undefined;
+      const marker = await classifyLockPath(recoveryMarker, "admin-recovery");
+      if (marker.state !== "absent") {
+        if (marker.state === "valid-live") {
+          ownership = undefined;
           await sleep(5 + attempt * 2);
           continue;
         }
-        // Dead, corrupt, or incomplete admin lock: fail closed — never delete by path
-        // based on a previously observed owner token.
-        throw new Error(
-          `Run ${runId} admin lock is stale, corrupt, or incomplete at ${adminPath}. ` +
-            `Refusing automatic reclaim. After confirming no maswe writer is active, run: maswe unlock-admin ${runId}`,
+        throw new LockProtocolError(
+          marker.state === "unsafe"
+            ? "LOCK_UNSAFE_PATH_TYPE"
+            : marker.state === "multiple" || marker.state === "corrupt" || marker.state === "legacy-corrupt"
+              ? "LOCK_CORRUPT"
+              : "LOCK_INCOMPLETE",
+          `Run ${runId} administrative recovery marker is not safely absent at ${recoveryMarker}. ` +
+            `After confirming no recovery actor is active, run: maswe unlock-admin ${runId} --force`,
+          { state: marker.state },
         );
       }
+
+      try {
+        ownership = await acquireDirectoryLock(adminPath, "admin");
+      } catch (error) {
+        if (
+          error instanceof LockProtocolError &&
+          error.code === "LOCK_LIVE_OWNER"
+        ) {
+          ownership = undefined;
+          await sleep(5 + attempt * 2);
+          continue;
+        }
+        throw error;
+      }
+
+      const markerAfter = await classifyLockPath(recoveryMarker, "admin-recovery");
+      if (markerAfter.state === "absent") break;
+      try {
+        await removeOwnedDirectory(ownership);
+      } finally {
+        ownership = undefined;
+      }
+      if (markerAfter.state === "valid-live") {
+        await sleep(5 + attempt * 2);
+        continue;
+      }
+      throw new LockProtocolError(
+        "LOCK_INCOMPLETE",
+        `Run ${runId} administrative recovery marker appeared during admin acquisition; refusing entry`,
+        { state: markerAfter.state },
+      );
     }
-    if (!owner) {
+    if (!ownership) {
       throw new Error(
         `Run ${runId} admin lock contention: could not serialize unlock/acquire. ` +
           `If a stale admin lock or recovery marker remains, run: maswe unlock-admin ${runId}`,
       );
     }
 
+    let value: T | undefined;
+    let primaryError: unknown;
     try {
-      return await fn();
-    } finally {
-      await releaseOwnedLock(adminPath, owner);
+      value = await fn();
+    } catch (error) {
+      primaryError = error;
     }
+    try {
+      await removeOwnedDirectory(ownership);
+    } catch (cleanupError) {
+      if (primaryError !== undefined) {
+        throw new AggregateError(
+          [primaryError, cleanupError],
+          `Run ${runId} admin operation and owned-lock cleanup both failed`,
+        );
+      }
+      throw cleanupError;
+    }
+    if (primaryError !== undefined) throw primaryError;
+    return value as T;
   }
 
   /** Test hook exposing the admin critical section with barrier-friendly acquisition. */
@@ -288,122 +306,126 @@ export class FileRunStore implements RunStore {
     await mkdir(directory, { recursive: true });
     const adminPath = this.adminLockFile(runId);
     const recoveryMarker = this.adminRecoveryMarker(runId);
-
-    const observed = await readLockMeta(adminPath);
-    let adminExists = true;
-    try {
-      await readFile(adminPath);
-    } catch {
-      adminExists = false;
-    }
-
-    if (!adminExists) {
-      // Clear a leftover recovery marker with force.
-      if (options.force) {
-        await rm(recoveryMarker, { recursive: true, force: true });
-      }
-      return;
-    }
-
-    if (!observed) {
-      if (!options.force) {
-        throw new Error(
-          `Run ${runId} admin lock is corrupt or incomplete. Re-run with --force only after confirming no writer is active: maswe unlock-admin ${runId} --force`,
+    const markerRetries = Math.max(this.lockRetries, 8);
+    let markerOwnership: LockOwnershipHandle | undefined;
+    let joinedBootstrapRace = false;
+    for (let attempt = 0; attempt < markerRetries; attempt += 1) {
+      try {
+        markerOwnership = await acquireDirectoryLock(
+          recoveryMarker,
+          "admin-recovery",
+          {
+            recovery: {
+              mode: "admin-unlock",
+              force: options.force === true,
+            },
+          },
         );
+        break;
+      } catch (error) {
+        if (!(error instanceof LockProtocolError)) throw error;
+        const existing = await classifyLockPath(recoveryMarker, "admin-recovery");
+        if (existing.state === "valid-live") {
+          throw new LockProtocolError(
+            "ADMIN_RECOVERY_CONCURRENT",
+            `Run ${runId} administrative recovery is owned by live pid ${existing.record.pid}; --force never revokes a live recovery marker`,
+            { state: existing.state },
+          );
+        }
+        if (
+          joinedBootstrapRace &&
+          existing.state !== "absent" &&
+          existing.state !== "valid-dead"
+        ) {
+          throw new LockProtocolError(
+            "ADMIN_RECOVERY_CONCURRENT",
+            `Run ${runId} administrative recovery bootstrap was won by another actor`,
+            { state: existing.state },
+          );
+        }
+        if (!options.force) throw error;
+        if (
+          existing.state === "unsafe" ||
+          existing.state === "multiple" ||
+          existing.state === "legacy-live" ||
+          existing.state === "legacy-dead" ||
+          existing.state === "legacy-corrupt"
+        ) {
+          throw error;
+        }
+        if (existing.state !== "absent") {
+          try {
+            await recoverClassifiedLock(existing, { force: true });
+          } catch (cleanupError) {
+            if (
+              !(
+                cleanupError instanceof LockProtocolError &&
+                cleanupError.code === "LOCK_OWNERSHIP_LOST"
+              )
+            ) {
+              throw cleanupError;
+            }
+          }
+        }
+        joinedBootstrapRace = true;
+        // Cleanup is not ownership. Every contender returns to exclusive mkdir.
+        continue;
       }
-    } else if (pidAlive(observed.pid) && !options.force) {
-      throw new Error(
-        `Run ${runId} admin lock is held by live pid ${observed.pid}. Refusing unlock-admin without --force.`,
+    }
+    if (!markerOwnership) {
+      throw new LockProtocolError(
+        "ADMIN_RECOVERY_CONCURRENT",
+        `Run ${runId} administrative recovery contention exhausted before a marker was owned`,
       );
     }
 
-    if (options.afterObserve) {
-      await options.afterObserve(observed);
-    }
-
-    // Exclusive recovery marker — only one recoverer proceeds.
+    let primaryError: unknown;
     try {
-      await mkdir(recoveryMarker);
+      const current = await classifyLockPath(adminPath, "admin");
+      const observed = lockMetaFromClassified(current);
+      if (options.afterObserve) await options.afterObserve(observed);
+      await recoverClassifiedLock(current, { force: options.force === true });
     } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "EEXIST") {
-        if (!options.force) {
-          throw new Error(
-            `Run ${runId} admin recovery already in progress (${recoveryMarker}). ` +
-              `If recovery is abandoned, re-run with --force after confirming no writer is active.`,
-          );
-        }
-        // Force: remove abandoned recovery marker and retry once.
-        await rm(recoveryMarker, { recursive: true, force: true });
-        await mkdir(recoveryMarker);
-      } else {
-        throw error;
-      }
+      primaryError = error;
     }
-
     try {
-      const again = await readLockMeta(adminPath);
-      if (!observed) {
-        // Forced incomplete/corrupt cleanup: remove only if still incomplete.
-        if (!again) {
-          await rm(adminPath, { force: true });
-          return;
-        }
-        throw new Error(`Run ${runId} admin lock changed during recovery; refusing to delete.`);
-      }
-      if (!again || again.owner !== observed.owner) {
-        throw new Error(`Run ${runId} admin lock changed during recovery; refusing to delete.`);
-      }
-      if (pidAlive(again.pid) && !options.force) {
-        throw new Error(
-          `Run ${runId} admin lock is held by live pid ${again.pid}. Refusing unlock-admin without --force.`,
+      await removeOwnedDirectory(markerOwnership);
+    } catch (cleanupError) {
+      if (primaryError !== undefined) {
+        throw new AggregateError(
+          [primaryError, cleanupError],
+          `Run ${runId} admin recovery and marker cleanup both failed`,
         );
       }
-      await rm(adminPath, { force: true });
-      const leftover = await readLockMeta(adminPath);
-      if (leftover) {
-        throw new Error(`Run ${runId} unlock-admin failed: admin lock still present`);
-      }
-    } finally {
-      await rm(recoveryMarker, { recursive: true, force: true });
+      throw cleanupError;
     }
+    if (primaryError !== undefined) throw primaryError;
   }
 
-  private async acquireLock(runId: string): Promise<{ owner: string }> {
+  private async acquireLock(runId: string): Promise<LockOwnershipHandle> {
     const directory = this.runDirectory(runId);
     await mkdir(directory, { recursive: true });
     const lockPath = this.lockFile(runId);
 
     for (let attempt = 0; attempt < this.lockRetries; attempt += 1) {
       const outcome = await this.withAdminLock(runId, async () => {
-        const owner = randomUUID();
-        const meta: LockMeta = { pid: process.pid, owner, at: new Date().toISOString() };
-        const tmpPath = `${lockPath}.${owner}.tmp`;
-        await writeFile(tmpPath, `${JSON.stringify(meta)}\n`, "utf8");
         try {
-          // Atomic exclusive create of a complete lock record (no empty/partial window).
-          await link(tmpPath, lockPath);
-          await rm(tmpPath, { force: true });
-          return { kind: "acquired" as const, owner };
+          return {
+            kind: "acquired" as const,
+            ownership: await acquireDirectoryLock(lockPath, "data"),
+          };
         } catch (error) {
-          await rm(tmpPath, { force: true });
-          const code = (error as NodeJS.ErrnoException).code;
-          if (code !== "EEXIST") throw error;
-          const existing = await readLockMeta(lockPath);
-          if (existing && pidAlive(existing.pid)) {
+          if (
+            error instanceof LockProtocolError &&
+            error.code === "LOCK_LIVE_OWNER"
+          ) {
             return { kind: "live" as const };
           }
-          // Never auto-reclaim stale/incomplete data locks — that races with new owners.
-          return { kind: "stale" as const };
+          throw error;
         }
       });
 
-      if (outcome.kind === "acquired") return { owner: outcome.owner };
-      if (outcome.kind === "stale" && attempt === this.lockRetries - 1) {
-        throw new Error(
-          `Run ${runId} lock contention: stale or incomplete lock at ${lockPath}. If the holder is dead, run: maswe unlock ${runId}`,
-        );
-      }
+      if (outcome.kind === "acquired") return outcome.ownership;
       // Sleep outside the admin lock so unlock can proceed.
       await sleep(20 + attempt * 10);
     }
@@ -426,62 +448,43 @@ export class FileRunStore implements RunStore {
     } = {},
   ): Promise<void> {
     const lockPath = this.lockFile(runId);
-    const meta = await readLockMeta(lockPath);
-    if (!meta) {
-      // Incomplete/corrupt: only removable with force.
-      if (!options.force) {
-        throw new Error(
-          `Run ${runId} lock is incomplete or missing owner metadata. Re-run with --force only after confirming no writer is active.`,
-        );
-      }
-    } else if (pidAlive(meta.pid) && !options.force) {
-      throw new Error(
-        `Run ${runId} lock is held by live pid ${meta.pid}. Refusing unlock without --force.`,
-      );
-    }
-
-    if (options.afterValidate) {
-      await options.afterValidate(meta);
-    }
+    const observed = await classifyLockPath(lockPath, "data");
+    if (options.afterValidate) await options.afterValidate(lockMetaFromClassified(observed));
 
     await this.withAdminLock(runId, async () => {
-      const again = await readLockMeta(lockPath);
-      if (!meta) {
-        // Forced incomplete cleanup: remove whatever is present only if still incomplete
-        // or gone; never delete a complete replacement owner without matching the observe.
-        if (!again) {
-          await rm(lockPath, { force: true });
-          return;
-        }
-        throw new Error(`Run ${runId} lock changed during unlock; refusing to delete.`);
-      }
-      if (!again || again.owner !== meta.owner) {
-        throw new Error(`Run ${runId} lock changed during unlock; refusing to delete.`);
-      }
-      if (pidAlive(again.pid) && !options.force) {
-        throw new Error(
-          `Run ${runId} lock is held by live pid ${again.pid}. Refusing unlock without --force.`,
-        );
-      }
-      await rm(lockPath, { force: true });
-      const leftover = await readLockMeta(lockPath);
-      if (leftover) {
-        throw new Error(`Run ${runId} unlock failed: lock still present`);
-      }
+      const current = await classifyLockPath(lockPath, "data");
+      await recoverClassifiedLock(current, { force: options.force === true });
     });
   }
 
-  private async releaseLock(runId: string, owner: string): Promise<void> {
-    await releaseOwnedLock(this.lockFile(runId), owner);
+  private async releaseLock(runId: string, ownership: LockOwnershipHandle): Promise<void> {
+    await this.withAdminLock(runId, async () => {
+      await removeOwnedDirectory(ownership);
+    });
   }
 
   private async withLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
-    const { owner } = await this.acquireLock(runId);
+    const ownership = await this.acquireLock(runId);
+    let value: T | undefined;
+    let primaryError: unknown;
     try {
-      return await fn();
-    } finally {
-      await this.releaseLock(runId, owner);
+      value = await fn();
+    } catch (error) {
+      primaryError = error;
     }
+    try {
+      await this.releaseLock(runId, ownership);
+    } catch (cleanupError) {
+      if (primaryError !== undefined) {
+        throw new AggregateError(
+          [primaryError, cleanupError],
+          `Run ${runId} protected operation and data-lock cleanup both failed`,
+        );
+      }
+      throw cleanupError;
+    }
+    if (primaryError !== undefined) throw primaryError;
+    return value as T;
   }
 
   async create(title: string, request: string, config: MasweConfig): Promise<RunRecord> {

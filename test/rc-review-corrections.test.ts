@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { link, mkdtemp, mkdir, writeFile, readFile, rm, access, open } from "node:fs/promises";
+import { link, mkdtemp, mkdir, writeFile, readFile, readdir, rm, access, open } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -68,7 +68,16 @@ async function readLockOwner(lockPath: string): Promise<string | undefined> {
     const meta = JSON.parse(await readFile(lockPath, "utf8")) as { owner?: string };
     return meta.owner;
   } catch {
-    return undefined;
+    try {
+      const entries = await readdir(lockPath);
+      if (entries.length !== 1) return undefined;
+      const meta = JSON.parse(
+        await readFile(path.join(lockPath, entries[0]!), "utf8"),
+      ) as { owner?: string };
+      return meta.owner;
+    } catch {
+      return undefined;
+    }
   }
 }
 
@@ -369,9 +378,7 @@ test("stale admin lock is not auto-reclaimed; explicit recovery is owner-safe (b
   assert.equal(await readLockOwner(adminPath), staleOwner);
 
   const aObserved = deferred();
-  const bObserved = deferred();
   const allowARecover = deferred();
-  const allowBResume = deferred();
   const cEntered = deferred();
   const allowCExit = deferred();
 
@@ -382,15 +389,13 @@ test("stale admin lock is not auto-reclaimed; explicit recovery is owner-safe (b
       await allowARecover.promise;
     },
   });
-  const recoverB = store.unlockAdmin(run.id, {
-    afterObserve: async (meta) => {
-      assert.equal(meta?.owner, staleOwner);
-      bObserved.resolve();
-      await allowBResume.promise;
-    },
-  });
+  await aObserved.promise;
 
-  await Promise.all([aObserved.promise, bObserved.promise]);
+  // B cannot inspect or recover admin state because A already owns the live recovery marker.
+  await assert.rejects(
+    store.unlockAdmin(run.id, { force: true }),
+    /concurrent|recovery.*live|never revokes/i,
+  );
 
   allowARecover.resolve();
   await recoverA;
@@ -409,9 +414,11 @@ test("stale admin lock is not auto-reclaimed; explicit recovery is owner-safe (b
   assert.notEqual(liveOwner, staleOwner);
   holdN.resolve();
 
-  // B resumes — must not delete N.
-  allowBResume.resolve();
-  await assert.rejects(() => recoverB, /changed|live|refusing|recovery/i);
+  // A delayed forced recovery attempt must not delete N.
+  await assert.rejects(
+    store.unlockAdmin(run.id),
+    /live pid|refusing|recovery/i,
+  );
   assert.equal(await readLockOwner(adminPath), liveOwner);
 
   // D cannot enter while C holds N.

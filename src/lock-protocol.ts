@@ -1,9 +1,14 @@
+import { randomUUID } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import {
   lstat,
+  mkdir,
   open,
   readFile,
   readdir,
+  rename,
+  rmdir,
+  unlink,
 } from "node:fs/promises";
 import path from "node:path";
 
@@ -315,6 +320,14 @@ export async function classifyLockPath(
     };
   }
   if (canonicalStat.isFile()) {
+    if (kind === "admin-recovery") {
+      return {
+        state: "unsafe",
+        lockPath,
+        kind,
+        reason: "Administrative recovery marker cannot use the legacy regular-file format",
+      };
+    }
     return classifyLegacy(lockPath, kind, canonicalStat);
   }
   if (!canonicalStat.isDirectory()) {
@@ -452,5 +465,533 @@ export async function readLegacyLockForCompatibility(
     return parseLegacy(JSON.parse(raw));
   } catch {
     return undefined;
+  }
+}
+
+export type LockTransition =
+  | "DIRECTORY_CLAIMED"
+  | "TEMP_RECORD_CREATED"
+  | "RECORD_PARTIALLY_WRITTEN"
+  | "RECORD_SYNCED"
+  | "TOKEN_PUBLISHED"
+  | "OWNERSHIP_VALIDATED"
+  | "OWNER_VALIDATED"
+  | "TOKEN_REMOVED"
+  | "DIRECTORY_EMPTY"
+  | "RECOVERY_MARKER_OBSERVED"
+  | "RECOVERY_MARKER_VALIDATED"
+  | "RECOVERY_CLEANUP_COMPLETE"
+  | "RECOVERY_CLAIM_COMPLETE"
+  | "RECOVERY_ENTERED";
+
+export interface LockOwnershipHandle {
+  lockPath: string;
+  kind: LockKind;
+  owner: string;
+  directoryIdentity: LockIdentity;
+}
+
+export interface AcquireDirectoryLockOptions {
+  recovery?: LockRecoveryMetadata | null;
+  transition?: (transition: LockTransition, owner: string) => Promise<void>;
+}
+
+function recoveryCommand(kind: LockKind, lockPath: string): string {
+  const runId = path.basename(path.dirname(lockPath));
+  return kind === "data"
+    ? `maswe unlock ${runId}`
+    : `maswe unlock-admin ${runId}`;
+}
+
+function errorForExisting(classified: ClassifiedLock): LockProtocolError {
+  const command = recoveryCommand(classified.kind, classified.lockPath);
+  switch (classified.state) {
+    case "valid-live":
+    case "legacy-live":
+      return new LockProtocolError(
+        "LOCK_LIVE_OWNER",
+        `${classified.kind} lock at ${classified.lockPath} is held by live pid ${classified.record.pid}; refusing automatic reclaim`,
+        { state: classified.state },
+      );
+    case "valid-dead":
+    case "legacy-dead":
+      return new LockProtocolError(
+        "LOCK_DEAD_OWNER",
+        `${classified.kind} lock at ${classified.lockPath} has a dead owner; recover explicitly with: ${command}`,
+        { state: classified.state },
+      );
+    case "incomplete-empty":
+    case "incomplete-temporary":
+      return new LockProtocolError(
+        "LOCK_INCOMPLETE",
+        `${classified.kind} lock publication is incomplete at ${classified.lockPath}; fail closed and recover explicitly with: ${command}`,
+        { state: classified.state },
+      );
+    case "unsafe":
+      return new LockProtocolError(
+        "LOCK_UNSAFE_PATH_TYPE",
+        `${classified.kind} lock has an unsafe path type at ${classified.lockPath}: ${classified.reason}`,
+        { state: classified.state },
+      );
+    case "corrupt":
+    case "legacy-corrupt":
+    case "multiple":
+      return new LockProtocolError(
+        "LOCK_CORRUPT",
+        `${classified.kind} lock is corrupt at ${classified.lockPath}; refusing automatic reclaim; recover with: ${command}`,
+        { state: classified.state },
+      );
+    case "absent":
+      return new LockProtocolError(
+        "LOCK_OWNERSHIP_LOST",
+        `${classified.kind} lock disappeared while acquiring ${classified.lockPath}`,
+        { state: classified.state },
+      );
+  }
+}
+
+async function currentDirectoryIdentity(lockPath: string): Promise<LockIdentity> {
+  let stat: BigIntStats;
+  try {
+    stat = await lstatBigInt(lockPath);
+  } catch (error) {
+    if (errno(error) === "ENOENT") {
+      throw new LockProtocolError(
+        "LOCK_OWNERSHIP_LOST",
+        `Claimed lock directory disappeared at ${lockPath}`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new LockProtocolError(
+      "LOCK_OWNERSHIP_LOST",
+      `Claimed lock path changed type at ${lockPath}`,
+    );
+  }
+  return identityFromStat(stat, lockPath);
+}
+
+async function requireDirectoryIdentity(
+  lockPath: string,
+  expected: LockIdentity,
+): Promise<void> {
+  const actual = await currentDirectoryIdentity(lockPath);
+  if (!sameIdentity(actual, expected)) {
+    throw new LockProtocolError(
+      "LOCK_OWNERSHIP_LOST",
+      `Claimed lock directory identity changed at ${lockPath}`,
+    );
+  }
+}
+
+async function cleanupOwnTemporary(
+  lockPath: string,
+  directoryIdentity: LockIdentity,
+  tempBasename: string,
+  tempIdentity: LockIdentity | undefined,
+): Promise<void> {
+  if (!tempIdentity) return;
+  await requireDirectoryIdentity(lockPath, directoryIdentity);
+  const tempPath = path.join(lockPath, tempBasename);
+  let stat: BigIntStats;
+  try {
+    stat = await lstatBigInt(tempPath);
+  } catch (error) {
+    if (errno(error) === "ENOENT") return;
+    throw error;
+  }
+  if (
+    stat.isSymbolicLink() ||
+    !stat.isFile() ||
+    !sameIdentity(identityFromStat(stat, tempPath), tempIdentity)
+  ) {
+    throw new LockProtocolError(
+      "LOCK_OWNERSHIP_LOST",
+      `Temporary lock entry identity changed at ${tempPath}`,
+    );
+  }
+  await unlink(tempPath);
+}
+
+export async function acquireDirectoryLock(
+  lockPath: string,
+  kind: LockKind,
+  options: AcquireDirectoryLockOptions = {},
+): Promise<LockOwnershipHandle> {
+  const owner = randomUUID();
+  try {
+    await mkdir(lockPath, { mode: 0o700 });
+  } catch (error) {
+    if (errno(error) === "EEXIST") {
+      throw errorForExisting(await classifyLockPath(lockPath, kind));
+    }
+    throw new LockProtocolError(
+      "LOCK_UNSUPPORTED_FILESYSTEM",
+      `Exclusive lock-directory claim failed for ${lockPath}`,
+      { cause: error },
+    );
+  }
+
+  let directoryIdentity: LockIdentity;
+  try {
+    directoryIdentity = await currentDirectoryIdentity(lockPath);
+  } catch (error) {
+    throw new LockProtocolError(
+      "LOCK_OWNERSHIP_LOST",
+      `Could not validate newly claimed lock directory ${lockPath}`,
+      { cause: error },
+    );
+  }
+  await options.transition?.("DIRECTORY_CLAIMED", owner);
+
+  const tempBasename = `.record-${owner}-${randomUUID()}`;
+  const tempPath = path.join(lockPath, tempBasename);
+  let handle;
+  let tempIdentity: LockIdentity | undefined;
+  let handleClosed = false;
+  try {
+    handle = await open(tempPath, "wx", 0o600);
+    const tempStat = await handle.stat({ bigint: true });
+    if (!tempStat.isFile()) {
+      throw new LockProtocolError(
+        "LOCK_UNSAFE_PATH_TYPE",
+        `Exclusive temporary lock entry is not a regular file at ${tempPath}`,
+      );
+    }
+    tempIdentity = identityFromStat(tempStat, tempPath);
+    await options.transition?.("TEMP_RECORD_CREATED", owner);
+
+    // A remover can replace only the initially empty claimed directory. Verify immediately after
+    // the exclusive child create and fail before writing if that create landed in a replacement.
+    await requireDirectoryIdentity(lockPath, directoryIdentity);
+
+    const recovery =
+      kind === "admin-recovery"
+        ? (options.recovery ?? { mode: "admin-unlock", force: false })
+        : null;
+    const record: LockRecordV2 = {
+      format: 2,
+      pid: process.pid,
+      owner,
+      at: new Date().toISOString(),
+      kind,
+      recovery,
+    };
+    const content = `${JSON.stringify(record)}\n`;
+    const split = Math.max(1, Math.floor(content.length / 2));
+    await handle.write(content.slice(0, split), undefined, "utf8");
+    await options.transition?.("RECORD_PARTIALLY_WRITTEN", owner);
+    await handle.write(content.slice(split), undefined, "utf8");
+    await handle.sync();
+    await handle.close();
+    handleClosed = true;
+    await options.transition?.("RECORD_SYNCED", owner);
+
+    await requireDirectoryIdentity(lockPath, directoryIdentity);
+    await rename(tempPath, path.join(lockPath, owner));
+    await options.transition?.("TOKEN_PUBLISHED", owner);
+
+    const classified = await classifyLockPath(lockPath, kind);
+    if (
+      (classified.state !== "valid-live" && classified.state !== "valid-dead") ||
+      classified.record.owner !== owner ||
+      !sameIdentity(classified.directoryIdentity, directoryIdentity)
+    ) {
+      throw new LockProtocolError(
+        "LOCK_OWNERSHIP_LOST",
+        `Final ownership validation failed for ${kind} lock at ${lockPath}`,
+        { state: classified.state },
+      );
+    }
+    await options.transition?.("OWNERSHIP_VALIDATED", owner);
+    return { lockPath, kind, owner, directoryIdentity };
+  } catch (primaryError) {
+    if (handle && !handleClosed) {
+      try {
+        await handle.close();
+      } catch {
+        // The exact cleanup error below remains authoritative.
+      }
+    }
+    try {
+      await requireDirectoryIdentity(lockPath, directoryIdentity);
+      await cleanupOwnTemporary(
+        lockPath,
+        directoryIdentity,
+        tempBasename,
+        tempIdentity,
+      );
+      await requireDirectoryIdentity(lockPath, directoryIdentity);
+      try {
+        await rmdir(lockPath);
+      } catch (cleanupDirectoryError) {
+        if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes(errno(cleanupDirectoryError) ?? "")) {
+          throw cleanupDirectoryError;
+        }
+      }
+    } catch (cleanupError) {
+      const combined = new AggregateError(
+        [primaryError, cleanupError],
+        `Lock acquisition and exact temporary cleanup both failed at ${lockPath}`,
+      );
+      if (
+        errno(primaryError) === "ENOENT" ||
+        (primaryError instanceof LockProtocolError &&
+          primaryError.code === "LOCK_OWNERSHIP_LOST") ||
+        (cleanupError instanceof LockProtocolError &&
+          cleanupError.code === "LOCK_OWNERSHIP_LOST")
+      ) {
+        throw new LockProtocolError(
+          "LOCK_OWNERSHIP_LOST",
+          `Claimed ${kind} lock namespace was replaced before ownership at ${lockPath}`,
+          { cause: combined },
+        );
+      }
+      throw new AggregateError(
+        [primaryError, cleanupError],
+        `Lock acquisition and exact temporary cleanup both failed at ${lockPath}`,
+      );
+    }
+    throw primaryError;
+  }
+}
+
+export interface ReleaseOwnedDirectoryOptions {
+  transition?: (transition: LockTransition, owner: string) => Promise<void>;
+}
+
+export async function removeOwnedDirectory(
+  ownership: LockOwnershipHandle,
+  options: ReleaseOwnedDirectoryOptions = {},
+): Promise<void> {
+  const classified = await classifyLockPath(ownership.lockPath, ownership.kind);
+  if (
+    (classified.state !== "valid-live" && classified.state !== "valid-dead") ||
+    classified.record.owner !== ownership.owner ||
+    classified.basename !== ownership.owner ||
+    !sameIdentity(classified.directoryIdentity, ownership.directoryIdentity)
+  ) {
+    throw new LockProtocolError(
+      "LOCK_OWNERSHIP_LOST",
+      `${ownership.kind} lock ownership was lost at ${ownership.lockPath}; expected token ${ownership.owner} was not removed`,
+      { state: classified.state },
+    );
+  }
+  await options.transition?.("OWNER_VALIDATED", ownership.owner);
+
+  const tokenPath = path.join(ownership.lockPath, ownership.owner);
+  try {
+    await unlink(tokenPath);
+  } catch (error) {
+    if (errno(error) === "ENOENT") {
+      throw new LockProtocolError(
+        "LOCK_OWNERSHIP_LOST",
+        `${ownership.kind} lock token ${ownership.owner} disappeared before release`,
+        { cause: error },
+      );
+    }
+    throw new LockProtocolError(
+      "LOCK_CLEANUP_FAILED",
+      `Failed to unlink exact ${ownership.kind} lock token ${ownership.owner}`,
+      { cause: error },
+    );
+  }
+  await options.transition?.("TOKEN_REMOVED", ownership.owner);
+
+  try {
+    await rmdir(ownership.lockPath);
+    await options.transition?.("DIRECTORY_EMPTY", ownership.owner);
+  } catch (error) {
+    const code = errno(error);
+    let current: ClassifiedLock | undefined;
+    try {
+      current = await classifyLockPath(ownership.lockPath, ownership.kind);
+    } catch {
+      // The original cleanup failure remains the cause.
+    }
+    if (
+      current &&
+      current.state !== "absent" &&
+      "directoryIdentity" in current &&
+      !sameIdentity(current.directoryIdentity, ownership.directoryIdentity)
+    ) {
+      throw new LockProtocolError(
+        "LOCK_OWNERSHIP_LOST",
+        `A replacement ${ownership.kind} lock survived delayed cleanup at ${ownership.lockPath}`,
+        { cause: error, state: current.state },
+      );
+    }
+    if (["EBUSY", "EPERM", "EACCES"].includes(code ?? "")) {
+      throw new LockProtocolError(
+        "LOCK_DELETION_PENDING",
+        `${ownership.kind} lock directory deletion is pending or busy at ${ownership.lockPath}`,
+        current
+          ? { cause: error, state: current.state }
+          : { cause: error },
+      );
+    }
+    throw new LockProtocolError(
+      "LOCK_CLEANUP_FAILED",
+      `${ownership.kind} token was removed but its directory cleanup failed at ${ownership.lockPath}`,
+      current
+        ? { cause: error, state: current.state }
+        : { cause: error },
+    );
+  }
+}
+
+async function removeObservedDirectoryEntry(
+  classified:
+    | Extract<ClassifiedLock, { state: "incomplete-temporary" }>
+    | Extract<ClassifiedLock, { state: "corrupt" }>,
+): Promise<void> {
+  if (!classified.basename || !classified.entryIdentity) {
+    throw new LockProtocolError(
+      "LOCK_CORRUPT",
+      `No exact regular singleton is eligible for cleanup at ${classified.lockPath}`,
+      { state: classified.state },
+    );
+  }
+  await requireDirectoryIdentity(classified.lockPath, classified.directoryIdentity);
+  const entryPath = path.join(classified.lockPath, classified.basename);
+  let current: BigIntStats;
+  try {
+    current = await lstatBigInt(entryPath);
+  } catch (error) {
+    throw new LockProtocolError(
+      "LOCK_OWNERSHIP_LOST",
+      `Observed singleton disappeared before cleanup at ${entryPath}`,
+      { cause: error, state: classified.state },
+    );
+  }
+  if (
+    current.isSymbolicLink() ||
+    !current.isFile() ||
+    !sameIdentity(identityFromStat(current, entryPath), classified.entryIdentity)
+  ) {
+    throw new LockProtocolError(
+      "LOCK_OWNERSHIP_LOST",
+      `Observed singleton identity changed before cleanup at ${entryPath}`,
+      { state: classified.state },
+    );
+  }
+  try {
+    await unlink(entryPath);
+  } catch (error) {
+    throw new LockProtocolError(
+      errno(error) === "ENOENT" ? "LOCK_OWNERSHIP_LOST" : "LOCK_CLEANUP_FAILED",
+      `Exact observed singleton cleanup failed at ${entryPath}`,
+      { cause: error, state: classified.state },
+    );
+  }
+  try {
+    await rmdir(classified.lockPath);
+  } catch (error) {
+    throw new LockProtocolError(
+      "LOCK_CLEANUP_FAILED",
+      `Observed singleton was removed but empty-directory cleanup failed at ${classified.lockPath}`,
+      { cause: error, state: classified.state },
+    );
+  }
+}
+
+async function removeObservedEmptyDirectory(
+  classified: Extract<ClassifiedLock, { state: "incomplete-empty" }>,
+): Promise<void> {
+  await requireDirectoryIdentity(classified.lockPath, classified.directoryIdentity);
+  try {
+    await rmdir(classified.lockPath);
+  } catch (error) {
+    throw new LockProtocolError(
+      errno(error) === "ENOTEMPTY" || errno(error) === "EEXIST"
+        ? "LOCK_OWNERSHIP_LOST"
+        : "LOCK_CLEANUP_FAILED",
+      `Empty-only recovery failed at ${classified.lockPath}`,
+      { cause: error, state: classified.state },
+    );
+  }
+}
+
+async function removeObservedLegacy(
+  classified:
+    | Extract<ClassifiedLock, { state: "legacy-live" | "legacy-dead" }>
+    | Extract<ClassifiedLock, { state: "legacy-corrupt" }>,
+): Promise<void> {
+  let current: BigIntStats;
+  try {
+    current = await lstatBigInt(classified.lockPath);
+  } catch (error) {
+    throw new LockProtocolError(
+      "LOCK_OWNERSHIP_LOST",
+      `Legacy lock disappeared before serialized recovery at ${classified.lockPath}`,
+      { cause: error, state: classified.state },
+    );
+  }
+  if (
+    current.isSymbolicLink() ||
+    !current.isFile() ||
+    !sameIdentity(identityFromStat(current, classified.lockPath), classified.entryIdentity)
+  ) {
+    throw new LockProtocolError(
+      "LOCK_OWNERSHIP_LOST",
+      `Legacy lock identity changed before serialized recovery at ${classified.lockPath}`,
+      { state: classified.state },
+    );
+  }
+  try {
+    await unlink(classified.lockPath);
+  } catch (error) {
+    throw new LockProtocolError(
+      errno(error) === "ENOENT" ? "LOCK_OWNERSHIP_LOST" : "LOCK_CLEANUP_FAILED",
+      `Legacy lock cleanup failed at ${classified.lockPath}`,
+      { cause: error, state: classified.state },
+    );
+  }
+}
+
+export async function recoverClassifiedLock(
+  classified: ClassifiedLock,
+  options: { force: boolean },
+): Promise<void> {
+  switch (classified.state) {
+    case "absent":
+      return;
+    case "valid-live":
+      if (!options.force) throw errorForExisting(classified);
+      return removeOwnedDirectory({
+        lockPath: classified.lockPath,
+        kind: classified.kind,
+        owner: classified.record.owner,
+        directoryIdentity: classified.directoryIdentity,
+      });
+    case "valid-dead":
+      return removeOwnedDirectory({
+        lockPath: classified.lockPath,
+        kind: classified.kind,
+        owner: classified.record.owner,
+        directoryIdentity: classified.directoryIdentity,
+      });
+    case "legacy-live":
+      if (!options.force) throw errorForExisting(classified);
+      return removeObservedLegacy(classified);
+    case "legacy-dead":
+      return removeObservedLegacy(classified);
+    case "incomplete-empty":
+      if (!options.force) throw errorForExisting(classified);
+      return removeObservedEmptyDirectory(classified);
+    case "incomplete-temporary":
+      if (!options.force) throw errorForExisting(classified);
+      return removeObservedDirectoryEntry(classified);
+    case "corrupt":
+      if (!options.force) throw errorForExisting(classified);
+      return removeObservedDirectoryEntry(classified);
+    case "legacy-corrupt":
+      if (!options.force) throw errorForExisting(classified);
+      return removeObservedLegacy(classified);
+    case "unsafe":
+    case "multiple":
+      throw errorForExisting(classified);
   }
 }
