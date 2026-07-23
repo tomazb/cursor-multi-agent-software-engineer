@@ -6,6 +6,19 @@ The project follows semantic versioning once a public release process is establi
 
 ## [Unreleased]
 
+### Added
+
+- Version-2 local lock directories with cryptographic owner tokens, exclusive `mkdir` namespace
+  claims, final namespace-identity validation, typed lock failures, and deterministic
+  multi-process contention coverage.
+- Ownership-safe administrative recovery-marker bootstrap and read compatibility for PR #10
+  regular-file locks.
+
+### Changed
+
+- Lock release and forced recovery unlink only exact token/singleton entries and use non-recursive
+  empty-directory removal. Live recovery markers are never revoked, including with `--force`.
+
 ### Planned
 
 - GitHub App webhooks, check runs, and review-thread automation.

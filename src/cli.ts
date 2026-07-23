@@ -33,7 +33,7 @@ Options:
   --config <path>  Use a specific config file.
   --cwd <path>     Run against a different repository directory.
   --json           Print machine-readable output.
-  --force          Force unlock even if the lock pid appears live.
+  --force          Assert lock/recovery quiescence; never revokes a live recovery marker.
 `;
 }
 

@@ -53,21 +53,63 @@ maswe doctor --cwd /path/to/repo
 
 `doctor` probes the Cursor CLI from a MASWE-managed worktree when `trustManagedWorktrees` is enabled (passing `--trust`), then removes that ephemeral worktree **and** its `maswe/doctor-*` branch. Cleanup outcome is reported as a doctor check.
 
-If a run **data** lock is abandoned (dead process), use explicit unlock — MASWE never auto-reclaims data locks. Acquire and unlock are serialized through a short-lived `.admin.lock` so a concurrent unlock cannot delete a replacement owner's lock:
+If a run **data** lock is abandoned (dead process), use explicit unlock — MASWE never
+auto-reclaims data locks. New locks are directories containing one UUID-named version-2 record.
+An empty directory or `.record-*` singleton means publication was interrupted and remains
+fail-closed. Acquire, release, and unlock are serialized through a short-lived `.admin.lock`:
 
 ```bash
 maswe unlock <run-id>
-maswe unlock <run-id> --force   # only when you are sure no writer is alive
+maswe unlock <run-id> --force   # quiescence assertion; only when no writer/initializer is active
 ```
 
-If `.admin.lock` itself is stale, corrupt, or incomplete, MASWE **fails closed** and does **not** automatically reclaim it (automatic reclaim previously raced with replacement owners). Clear it explicitly:
+If `.admin.lock` itself is stale, corrupt, or incomplete, MASWE **fails closed** and does **not**
+automatically reclaim it. Clear it explicitly:
 
 ```bash
 maswe unlock-admin <run-id>
-maswe unlock-admin <run-id> --force   # corrupt/incomplete/live only after confirming no writer
+maswe unlock-admin <run-id> --force   # quiescence assertion for admin writer/initializer
 ```
 
-Admin recovery is serialized through an exclusive `.admin.lock.recovering` marker and re-checks the observed owner token before deletion, so a stale observer cannot delete a live replacement admin lock.
+Administrative recovery first publishes and validates its own UUID inside
+`.admin.lock.recovering`, then freshly inspects `.admin.lock`. A live recovery marker returns
+`ADMIN_RECOVERY_CONCURRENT` even with `--force`; force never revokes it. A dead marker is cleaned by
+its exact token, while an incomplete empty marker uses only empty `rmdir`. Cleaning a marker does
+not grant recovery ownership: contenders return to exclusive `mkdir`, and only the actor that
+publishes and validates a fresh token enters.
+
+Common semantic failures are:
+
+- `LOCK_LIVE_OWNER` / `LOCK_DEAD_OWNER`: live owners block non-force recovery; dead owners require
+  the explicit command.
+- `LOCK_INCOMPLETE` / `LOCK_CORRUPT`: do not mutate without the documented force/quiescence
+  procedure.
+- `LOCK_UNSAFE_PATH_TYPE`: a link, reparse point, unexpected type, or multiple-entry structure
+  requires quiescent manual inspection; MASWE does not unlink it.
+- `LOCK_OWNERSHIP_LOST`: the expected token or directory identity changed. A replacement was not
+  removed.
+- `LOCK_DELETION_PENDING` / `LOCK_CLEANUP_FAILED`: cleanup is unresolved and success was not
+  reported.
+- `LOCK_UNSUPPORTED_FILESYSTEM`: stable identity or non-following primitives could not be proven.
+
+Release performs no timed correctness retry: exact-token unlink and empty-only removal either
+succeed or return a typed error. Normal live contention uses the configured bounded retry budget
+(default 50 data attempts; admin serialization uses at most 200). On Windows, a directory can
+remain deletion-pending until open handles close; `EBUSY`, `EPERM`, access-denied, non-empty, and
+platform equivalents are reclassified semantically, never fed to recursive deletion. Operators
+may retry the command only after the liveness condition is resolved.
+
+### Upgrade, rollback, and manual repair
+
+PR #10 regular-file data/admin locks remain readable and explicitly recoverable, but new code
+writes only version-2 directories. Mixed old and new MASWE processes are unsupported during active
+locking. Stop all MASWE processes before upgrading or rolling back.
+
+Before rollback, use the new binary to recover all version-2 `.lock`, `.admin.lock`, and
+`.admin.lock.recovering` directories and confirm those paths are absent. Only then start the old
+binary. For a link, reparse point, multiple entries, or unexpected type, establish full
+quiescence, inspect the path without following links, preserve evidence, and repair it manually;
+MASWE intentionally has no recursive repair fallback.
 
 ### Model resolution invariants
 

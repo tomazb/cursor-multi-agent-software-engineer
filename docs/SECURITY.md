@@ -166,6 +166,34 @@ A near-term change should pass large prompts through stdin or SDK calls rather t
 
 **Future controls:** per-run token, time, and monetary budgets; concurrency quotas; organization-level kill switch.
 
+### T12 — Forced lock recovery deletes a replacement owner
+
+**Threat:** An old owner validates its lock, a forced operator removes it, a replacement owner
+acquires the same canonical path, and the old owner resumes cleanup. Concurrent forced
+administrative recoverers could also mistake marker cleanup for critical-section ownership.
+
+**Controls:**
+
+- Exclusive non-recursive `mkdir` claims each canonical lock namespace. Ownership begins only
+  after UUID token publication and final directory-identity/record validation.
+- Release authority is the cryptographically random UUID retained from acquisition. Release
+  unlinks only that UUID entry, then uses empty-only `rmdir`; it never recursively removes a public
+  lock directory.
+- Validation uses non-following inspection. Symbolic links, detectable junctions/reparse points,
+  unexpected object types, multiple entries, and unstable identity fail closed.
+- `.admin.lock.recovering` uses the same owned-token format. A live recovery marker is never
+  revoked, including with `--force`; abandoned-marker cleanup is conditional and all contenders
+  must subsequently win and validate a fresh `mkdir` claim.
+- Dead-owner recovery is explicit. Age never authorizes reclaim, and cleanup success never grants
+  ownership.
+
+**Trust boundary and residual risk:** `--force` is an operator assertion of quiescence, not process
+fencing. PID is only a liveness hint; UUID is the ownership identity. Cooperating new binaries on
+a coherent same-host local filesystem are required. Mixed old/new binaries, NFS, SMB, distributed
+FUSE/object-store mounts, cross-host locking, and direct adversarial filesystem mutation are
+unsupported. On Windows, detectable reparse paths are rejected; if Node/libuv cannot prove stable
+identity or non-following behavior, the operation fails with `LOCK_UNSUPPORTED_FILESYSTEM`.
+
 ## Least-privilege target design
 
 | Role | Repository read | Repository write | Shell | Network/integrations |

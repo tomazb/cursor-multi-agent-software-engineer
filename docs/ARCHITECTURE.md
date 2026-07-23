@@ -118,7 +118,34 @@ It does not contain Cursor SDK implementation details, shell output parsing, or 
     └── 09-resolution-report.md
 ```
 
-`run.json` is an event-bearing snapshot, not an event-sourced database. It stores enough history for audit and recovery in a single-process local deployment. Mutating operations take an exclusive data lock (temp+`link` complete `{pid,owner,at}` record) coordinated with explicit `unlock` through a dedicated `.admin.lock`. Automatic stale reclaim is not used for data locks **or** admin locks; operators use `maswe unlock` / `maswe unlock-admin`. `writeArtifact` rejects stale caller versions and only mutates authoritative on-disk state so concurrent cancellation or state transitions cannot lose events, approvals, counters, evidence, or failure records.
+`run.json` is an event-bearing snapshot, not an event-sourced database. It stores enough history
+for audit and recovery in a single-process local deployment. Mutating operations use version-2
+local lock directories:
+
+```text
+.lock/<owner-uuid>
+.admin.lock/<owner-uuid>
+.admin.lock.recovering/<owner-uuid>
+```
+
+Non-recursive exclusive `mkdir` claims a canonical namespace, but does not grant ownership.
+Ownership begins only after the actor has written and synced a complete UUID-named record,
+published it inside the directory, and revalidated the original directory identity, sole entry,
+record schema, owner UUID, PID, timestamp, and lock kind. A crash before that boundary leaves an
+incomplete lock that fails closed.
+
+Release unlinks only the retained owner UUID entry and then calls empty-only `rmdir`. It never
+recursively removes or unlinks a new-format canonical lock path. A replacement owner's different
+token therefore makes a delayed old `rmdir` fail non-empty. Normal data acquisition and release,
+plus explicit data recovery, are coordinated by `.admin.lock`. Administrative recovery must first
+publish and validate its own `.admin.lock.recovering` token; cleaning an abandoned marker never
+grants entry, so all contenders return to exclusive `mkdir`.
+
+Automatic stale reclaim is not used for data, admin, or recovery locks. Operators use `maswe
+unlock` / `maswe unlock-admin`. PR #10 regular-file locks remain read-only compatibility inputs;
+new code writes only the directory format. `writeArtifact` retains its optimistic version check
+and only mutates authoritative on-disk state, so this locking change does not weaken concurrency,
+atomic-write, artifact, approval, model, scope, or verification behavior.
 
 Artifacts are SHA-256 hashed when written. A future store can place content in object storage and keep the same reference contract.
 
