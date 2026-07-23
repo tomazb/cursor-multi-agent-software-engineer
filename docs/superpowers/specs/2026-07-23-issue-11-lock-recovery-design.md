@@ -2,9 +2,10 @@
 
 **Issue:** GitHub #11 — Harden forced lock recovery and ownership-safe release
 **Date:** 2026-07-23
-**Status:** Awaiting repository-owner design approval
+**Status:** Revised; awaiting repository-owner design reapproval
 **Branch:** `issue/11-lock-recovery`
 **Base:** `dab10487baf7f05867b54895ec5db109ad3a3e65` (freshly fetched `origin/main`)
+**Original Phase-A head:** `8d1fb5fa32b4392f27d04eff0717cb1bce411efd`
 
 ## Problem and scope
 
@@ -99,49 +100,53 @@ finally cleanup are not conditional on marker ownership.
 
 ### A — Put normal release under the existing admin lock
 
-This closes the reported data race as long as `.admin.lock` cannot be forcibly revoked. It is not a
-complete solution: `unlock-admin --force` is explicitly allowed to revoke an admin owner, after
-which the same compare-then-unlink race exists on `.admin.lock`. Safety would depend on a higher
-level mutex with the same recovery problem.
+This narrows the data-lock race but does not solve revocation of `.admin.lock` itself. A higher
+mutex would reproduce the same bootstrap problem.
 
 **Rejected as insufficient.**
 
-### B — Tokenized files with another read, inode check, or rename-aside
+### B — Read, compare, then unlink the canonical path
 
-An additional content read or `stat` still precedes an unconditional pathname unlink. Node does not
-expose a portable compare-and-unlink primitive. Renaming the shared path aside before checking it
-can move a replacement owner out of the lock path and create a lock-free window even if the
-replacement is later restored.
+An additional read, `stat`, or inode comparison still precedes an unconditional pathname unlink.
+Renaming the canonical path aside can move a replacement and create a lock-free window.
 
-**Rejected because validation and removal remain separable or a replacement is disrupted.**
+**Rejected because ownership validation and destructive action remain separable.**
 
-### C — OS advisory locks or a native compare-delete helper
+### C — Publish a prepared directory with ordinary `rename`
 
-`flock`, `fcntl`/open-file-description locks, and Windows handle locks could provide stronger
-kernel ownership, but Node core does not expose one portable primitive with the required explicit
-dead/corrupt recovery semantics. A native addon or platform helper would add deployment and
-packaging scope not justified for this local TypeScript CLI.
+POSIX `rename()` is atomic but is not a portable no-clobber primitive: it may remove and replace an
+existing empty destination directory. Linux adds `renameat2(RENAME_NOREPLACE)`, but that operation
+is Linux-specific, depends on filesystem support, and is not exposed by the supported Node
+`fsPromises.rename(oldPath, newPath)` API. Windows reports an error when the destination is an
+existing directory, so its conflict behavior also differs from POSIX.
+
+**Rejected because ordinary directory rename cannot supply one cross-platform acquisition
+invariant.**
+
+### D — OS advisory locks or a native compare-delete helper
+
+`flock`, `fcntl`/open-file-description locks, and Windows handle locks could provide kernel
+ownership, but Node core does not expose one portable primitive with the required explicit
+dead/corrupt recovery behavior. A native addon or platform helper is outside Issue #11.
 
 **Rejected for portability and scope.**
 
-### D — Non-empty ownership directories with token-addressed removal
+### E — Exclusive directory claim plus token-addressed removal
 
-Publish a complete, non-empty directory for each lock. Its sole entry is named by the unique owner
-token. Release may unlink only that exact entry and may remove the shared directory only with
-non-recursive `rmdir`, which succeeds only while the directory is empty.
-
-If a forced actor removes `O` and replacement `N` is installed, `O`'s token entry does not exist in
-`N`'s directory. If replacement occurs after `O` removes its own entry, `N` makes the directory
-non-empty before `O` can `rmdir` it. In neither ordering can `O` remove `N`.
+Non-recursive `mkdir` exclusively claims the canonical namespace. The claimer then publishes one
+UUID-named record inside it. Release unlinks only that exact UUID entry and attempts only
+non-recursive `rmdir`. A replacement's different token makes its directory non-empty and
+unremovable by the earlier owner.
 
 **Selected.**
 
-## Selected ownership identity and on-disk representation
+## Selected ownership identity and representation
 
-Every lock acquisition generates a cryptographically random UUID owner token. The token, not PID or
-age, is authoritative ownership identity. PID is used only for live/dead recovery policy.
+Every acquisition generates a cryptographically random UUID with `crypto.randomUUID()`. This token,
+not PID, timestamp, directory identity, or age, is the ownership identity. PID is only a liveness
+signal for recovery policy.
 
-Version-2 locks are directories:
+Each new-format lock kind uses the same directory shape:
 
 ```text
 .lock/
@@ -154,478 +159,632 @@ Version-2 locks are directories:
 └── <owner-uuid>
 ```
 
-The sole token-named entry is a regular UTF-8 JSON file:
+The token entry is a regular UTF-8 JSON file:
 
 ```json
 {
   "format": 2,
   "pid": 12345,
   "owner": "550e8400-e29b-41d4-a716-446655440000",
-  "at": "2026-07-23T18:00:00.000Z"
+  "at": "2026-07-23T18:00:00.000Z",
+  "kind": "data",
+  "recovery": null
 }
 ```
 
-The filename and JSON `owner` must match. A complete owned directory has exactly one token entry,
-valid format-2 JSON, a positive integer PID, a matching UUID owner, and an ISO timestamp.
+`kind` is exactly `data`, `admin`, or `admin-recovery`. `recovery` is `null` for ordinary data and
+admin acquisition; an administrative recovery record contains the recovery mode and, when known,
+the observed admin owner token/state. The schema rejects unknown required fields, an invalid UUID,
+a non-positive PID, a non-ISO timestamp, a kind/path mismatch, or a filename that differs from
+`owner`.
 
-Lock parsing returns a discriminated state rather than collapsing failures:
+A valid owned lock has exactly one non-link regular token entry. The in-memory acquisition result
+retains the exact UUID. Ownership loss is a typed `LOCK_OWNERSHIP_LOST` result and never grants
+permission to delete another pathname or entry.
 
-- `absent`;
-- `owned` with format, token, PID, timestamp, and `live`/`dead` policy state;
-- `legacy-owned` for the PR #10 regular-file format;
-- `incomplete` for an empty directory or interrupted initialization;
-- `corrupt` for malformed JSON, filename/content mismatch, unexpected type, or multiple entries.
+## Exclusive `mkdir`-first acquisition
 
-An expected token that no longer names the sole entry is represented by a typed
-`LOCK_OWNERSHIP_LOST` error. It is never treated as permission to remove the current shared path.
+One helper is used for `.lock`, `.admin.lock`, and `.admin.lock.recovering`:
 
-## Acquisition protocol
+1. Generate cryptographically random UUID token `T`.
+2. Call non-recursive `mkdir(lockPath, {mode: 0o700})`. The mode is restrictive where the platform
+   honors POSIX mode bits. `recursive` is never enabled.
+3. `EEXIST`, or the platform-equivalent “name already exists”, enters lock-state inspection. It
+   never causes overwrite, rename-over, or recursive removal. Acquisition either reports the
+   classified state or performs only the separately authorized recovery protocol.
+4. After successful `mkdir`, capture the claimed directory's stable identity. Create a uniquely
+   named temporary regular file such as `.record-<T>-<random>` inside the claimed directory with
+   exclusive creation (`open(..., "wx", 0o600)`).
+5. Immediately after exclusive creation, compare the canonical directory's `lstat` identity with
+   the captured identity. On POSIX use `dev` and `ino`; on supported Windows use the stable file
+   identity surfaced by Node/libuv. If identity is unavailable, changed, or ambiguous, unlink only
+   this actor's unique temporary entry and fail with `LOCK_OWNERSHIP_LOST` or
+   `LOCK_UNSUPPORTED_FILESYSTEM`. This check matters if an explicitly forced empty-directory
+   recovery races a stale initializer. Once the temporary entry exists in the verified directory,
+   empty-only `rmdir` cannot replace that directory.
+6. Write the complete JSON record containing schema version, PID, owner token, creation timestamp,
+   lock kind, and required recovery metadata.
+7. Flush the file handle and close it. This matches the repository durability boundary: file
+   contents are synchronized before publication; Issue #11 does not add a parent-directory fsync
+   guarantee beyond the existing local-store durability contract.
+8. Rename the internal temporary entry to `lockPath/T`. The destination name is a fresh UUID and
+   must not exist. An existing destination or any identity change is corruption/ownership loss,
+   not permission to replace it.
+9. Re-inspect with non-following operations and require the canonical directory to have the same
+   stable identity and exactly one valid entry `T`. Only then return an owned lock and enter the
+   critical section.
 
-For `.lock`, `.admin.lock`, and `.admin.lock.recovering`, one shared helper publishes an owned
-directory:
+The atomic acquisition property is only the exclusive canonical namespace claim performed by
+`mkdir`. The complete non-empty directory does **not** appear atomically. A crash after `mkdir` and
+before valid token publication leaves an incomplete lock, which all ordinary actors treat as
+locked. Explicit recovery is required.
 
-1. Generate token `T` and metadata.
-2. Create a unique sibling staging directory ending in `.tmp`.
-3. Write its single `T` entry completely.
-4. Inspect the public path. Any existing path is classified and blocks normal acquisition;
-   incomplete and corrupt states fail closed.
-5. Rename the non-empty staging directory to the public path in the same parent directory.
-6. If another actor won, the rename fails because the destination is a non-empty directory (or,
-   on Windows, because the destination exists). Classify the winner; do not replace it.
-7. Re-read the public directory and require token `T` before entering the critical section.
-8. Remove only the caller's unique staging path after failed publication.
+Temporary-record cleanup unlinks only the exact unique temporary name created by the current
+actor. It never removes a canonical directory. If cleanup fails, acquisition fails with both the
+primary and cleanup errors preserved.
 
-The same-parent rename is the atomic publication boundary: no conforming observer sees a valid
-format-2 lock without its token record. A destination that exists before step 4 is never
-automatically replaced. If the filesystem does not provide the required same-directory rename and
-non-empty-directory semantics, acquisition fails closed; there is no regular-file or recursive-rm
-fallback.
+Normal data acquisition remains inside `.admin.lock`. `withAdminLock` checks
+`.admin.lock.recovering` before attempting `.admin.lock` and again after fully owning it. If a
+recovery marker appeared, it conditionally releases only its own admin token and does not enter.
 
-Normal data acquisition remains inside `.admin.lock`. `withAdminLock` checks the recovery marker
-both before publishing its admin lock and immediately after publication. If recovery appeared in
-between, it conditionally releases its own admin token and does not enter the critical section.
+## Owner-conditional release
 
-## Owner-conditional removal protocol
+`removeOwnedDirectory(lockPath, expectedToken)` is the only release operation for a valid
+new-format lock or marker:
 
-`removeOwnedDirectory(path, expectedToken)` is the only removal operation for a valid format-2
-lock or marker:
+1. Retain and use the exact UUID returned by acquisition; do not rediscover ownership from the
+   canonical record.
+2. Inspect `lockPath` and `lockPath/expectedToken` without following links. Require the expected
+   token entry to be the sole valid regular entry and its JSON owner to equal `expectedToken`.
+3. Unlink only `lockPath/expectedToken`.
+4. `ENOENT`, a token mismatch, a changed directory identity, or a different current entry is
+   `LOCK_OWNERSHIP_LOST`. Do not unlink any other entry and do not call `rmdir`.
+5. After successful token unlink, call non-recursive `rmdir(lockPath)`.
+6. `ENOTEMPTY`, `EEXIST`, `EBUSY`, `EPERM`, sharing violations, access denial, or platform
+   equivalents never trigger recursive deletion. Re-inspect without following links and classify
+   replacement, deletion-pending, or cleanup failure.
+7. Surface every cleanup failure. Do not report successful release while a cleanup or
+   ownership-loss error remains.
 
-1. Parse `path`.
-2. Require `owned.owner === expectedToken`.
-3. `unlink(path/expectedToken)`.
-4. If step 3 reports `ENOENT`, report `LOCK_OWNERSHIP_LOST` and stop. Do not call `rmdir`.
-5. Call non-recursive `rmdir(path)`.
-6. Treat `ENOENT` as released: another actor removed the now-empty old directory.
-7. On `ENOTEMPTY`/`EEXIST`, parse the directory:
-   - if it is a valid different owner, `O` was released and a replacement is present; return a
-     released-with-replacement result without modifying it;
-   - otherwise report `LOCK_CLEANUP_FAILED` and leave the path fail-closed.
-8. Any permission, I/O, unsupported-filesystem, or unexpected error is
-   `LOCK_CLEANUP_FAILED`; never retry with recursive removal.
+`unlink(lockPath/expectedToken)` ties the authority to the object removed: a token mismatch selects
+a different pathname, so it cannot be removed. `rmdir(lockPath)` is mechanically conditional on
+emptiness. There is no `rm({recursive:true})`, `rm -r`, canonical-path `unlink`, rename-aside, or
+“delete whatever is now there” fallback.
 
-The unlink in step 3 is the owner comparison. It is not preceded by a comparison followed by
-unconditional shared-path deletion: the expected token is part of the pathname being deleted.
-The `rmdir` in step 5 is conditional on the shared directory still being empty.
+Normal data-lock release remains admin-serialized, then uses this helper. Admin-lock and marker
+release use the helper directly because they are the serialization primitives. If protected work
+and cleanup both fail, preserve both with `AggregateError`.
 
-Normal data-lock release enters `.admin.lock`, revalidates the expected data token, and uses this
-helper. Admin-lock and recovery-marker cleanup use the helper directly because they are themselves
-the serialization primitives.
+### Force-only cleanup of one unowned regular entry
 
-If the protected operation and cleanup both fail, preserve both failures in an `AggregateError`;
-never hide a lock cleanup or ownership-loss error behind the original operation error.
+Owner release and corrupt/incomplete recovery are different operations. A force operation may
+recover an empty directory with empty-only `rmdir`, or one recognized temporary/corrupt **regular**
+entry with a separate observed-singleton protocol:
 
-## Why an earlier owner cannot remove a replacement
+1. Require the appropriate serializer (`.admin.lock` for data, the recovery marker for admin) and
+   the documented quiescence assertion. The recovery marker itself has no higher serializer.
+2. Require exactly one non-link regular child and capture stable identities for the canonical
+   directory and that child plus its exact basename.
+3. Revalidate both identities immediately before unlink. A change, missing entry, second entry, or
+   unsafe type aborts/reclassifies; it does not broaden the deletion set.
+4. Unlink only the captured singleton basename, then call only non-recursive `rmdir`.
+5. Cleanup success does not authorize critical-section entry. Recovery-marker contenders must
+   still return to exclusive `mkdir`, publish their own token, and validate it.
 
-Let `L/O` be `O`'s token entry and `L/N` be `N`'s.
+This protocol allows explicit recovery after a crash during temporary-record publication without
+recursive deletion. A valid replacement uses a fresh cryptographic UUID, so it cannot be selected
+by the captured old basename under the protocol's collision-resistance assumption. Symlinks,
+junctions/reparse points, multiple entries, and unstable identity are not eligible.
 
-### Replacement exists before `O` removes its token
+## Mechanical race proof
 
-Forced actor `F` removes `L/O` and the empty directory, then `N` atomically publishes a non-empty
-new `L` containing `L/N`. When `O` resumes, `unlink(L/O)` returns `ENOENT`. The protocol stops before
-`rmdir`; `L/N` remains.
+Let `L/O` and `L/N` denote the token entries of original owner `O` and replacement `N`.
 
-### Replacement arrives after `O` removes its token
+### Forced replacement precedes old release
 
-`O` successfully unlinks `L/O`, so the old directory is empty and `O` has relinquished ownership.
-Before `O` executes `rmdir`, `N` publishes its complete non-empty directory at `L` (on POSIX this
-may replace the empty old directory; on Windows it may wait/retry until the old directory is
-removed). `O`'s `rmdir(L)` then fails because `L/N` makes `L` non-empty. `O` does not recurse and
-cannot delete `N`.
+`F` unlinks only `L/O` and removes the now-empty old `L`. `N` wins `mkdir(L)`, publishes `L/N`, and
+enters. When `O` resumes, `unlink(L/O)` returns `ENOENT`; `O` stops before `rmdir`. `L/N` survives.
 
-### Forced actor and owner remove the same token concurrently
+### Old release is paused after token unlink
 
-Only one `unlink(L/O)` succeeds. The loser receives `ENOENT` and stops. If a new owner publishes
-between the winning unlink and `rmdir`, the non-empty rule protects the new owner as above.
+After `O` unlinks `L/O`, old `L` is empty. `N` calls `mkdir(L)`, receives the exists semantic, and
+does not overwrite it. `N` may retry only after classification and within the normal bounded
+contention policy. Once `O` calls `rmdir(L)`, exactly one later `mkdir(L)` can succeed. Thus there is
+no ordering in which `N` replaces an empty directory before `O`'s `rmdir`.
 
-These cases cover every ordering around the two removal operations. Safety depends on unique,
-unguessable owner tokens, valid locks containing exactly one token entry, and non-recursive
-directory removal.
+### Replacement exists before a delayed `rmdir`
 
-## Precise data-lock race model
+This can occur when another actor removed the empty old directory and `N` won the following
+`mkdir`. `N` publishes its token before it is fully owned. A delayed `rmdir(L)` then encounters a
+non-empty directory and fails. It never recurses, so `L/N` survives.
 
-The required `O`/forced actor/`N` race is:
+### Owner and recoverer unlink the same token
 
-| State | Owner `O` | Forced actor `F` | Replacement `N` | Public `.lock` |
+At most one `unlink(L/O)` succeeds. The loser gets ownership loss and stops before `rmdir`. The
+winner can remove only an empty directory; a non-empty replacement is protected.
+
+The proof depends on exclusive non-recursive `mkdir`, unguessable unique tokens, exclusive internal
+file creation, non-following validation, and non-recursive `rmdir`. It does not depend on ordinary
+directory-rename conflict behavior.
+
+The precise `O`/`F`/`N` state ordering used by the deterministic test is:
+
+| Step | Owner `O` | Forced actor `F` | Replacement `N` | Canonical state |
 |---|---|---|---|---|
-| D0 | holds critical section | idle | idle | `O` |
-| D1 | begins release, observes `O`, pauses at barrier | idle | idle | `O` |
-| D2 | paused | acquires admin lock, revalidates `O`, conditionally removes `O` | idle | absent |
-| D3 | paused | exits admin lock | publishes and holds `N` | `N` |
-| D4 | resumes, acquires admin lock, expects `O` | idle | holds | `N` |
-| D5 | gets `LOCK_OWNERSHIP_LOST`; performs no unlink/rmdir on `N` | idle | still holds | `N` |
+| R0 | Holds retained token `O` | Idle | Idle | Valid owned `L/O` |
+| R1 | Non-following validation proves `L/O`; pauses before exact-token unlink | Idle | Idle | Valid owned `L/O` |
+| R2 | Paused | Owns serializer, revalidates and unlinks exactly `L/O`, then empty-only `rmdir(L)` | Idle | Absent |
+| R3 | Paused | Leaves serializer | Wins exclusive `mkdir`, publishes and validates `L/N` | Valid owned `L/N` |
+| R4 | Attempts exact `unlink(L/O)` | Idle | Holds `N` | Valid owned `L/N` |
+| R5 | Gets ownership loss; performs no `rmdir` | Idle | Still holds `N` | Valid owned `L/N` |
 
-The pre-admin observation in D1 is informational and provides the deterministic test barrier. The
-authoritative comparison occurs under the admin lock and, ultimately, in `unlink(.lock/O)`.
+If `O` instead wins its token unlink before `F`, `F` observes empty/incomplete or absent state and
+cannot remove any replacement token. If `F` and `O` race the same exact token, only one unlink
+succeeds; neither ordering permits an unconditional canonical-path deletion.
 
-## Administrative recovery serialization
+## State model
 
-### Acquisition
+The classifier maps platform-specific filesystem results into semantic states. “Valid” always
+means one non-link regular token entry with matching schema, owner, and kind.
 
-`unlockAdmin` must own a format-2 `.admin.lock.recovering` directory before it examines or removes
-`.admin.lock`. Marker acquisition uses the same complete-directory publication protocol.
+### Data lock `.lock`
 
-If no marker exists, the actor publishes its own token and enters. If a complete marker exists:
+| State | Representation and allowed transition |
+|---|---|
+| Absent | Acquisition may attempt exclusive `mkdir`; explicit unlock is idempotently absent. |
+| Directory claimed, no record | Empty directory after `mkdir`; `LOCK_INCOMPLETE`, fail closed until explicit force recovery. |
+| Temporary record present | One `.record-*` entry, including partial or complete content; `LOCK_INCOMPLETE`; explicit force may use observed-singleton cleanup. |
+| Valid owned lock | Matching live PID/token; owner may work and conditionally release. Other actors contend. |
+| Valid dead-owner lock | Valid token, dead PID; automatic acquisition refuses; ordinary explicit unlock may recover under `.admin.lock`. |
+| Corrupt record | Malformed/invalid singleton JSON or schema; non-force refuses; force is operator-quiescent and observed-singleton only. |
+| Unexpected entry type | Canonical non-directory, link/reparse point, or non-regular child; fail closed, no automatic deletion. |
+| Multiple entries | More than one child of any type; corrupt, no recursive recovery. |
+| Releasing | Expected token unlink is in progress; no other entry may be removed. |
+| Empty directory awaiting removal | Token unlink succeeded; only non-recursive `rmdir`; contenders see incomplete and do not overwrite. |
+| Deletion pending on Windows | Empty removal accepted/delayed or blocked by handles; bounded liveness retry only. |
+| Lost ownership | Expected token/path identity no longer matches; stop all removal. |
+| Recovery in progress | A verified `.admin.lock.recovering` owner and `.admin.lock` serialize inspection/removal. |
+| Recovered | Old token and old empty directory are gone; recoverer reports completion only after cleanup succeeds. |
 
-- if its PID is live, report `ADMIN_RECOVERY_CONCURRENT` and do not remove it, even with
-  `--force`;
-- if its PID is dead, require `--force`, observe its token, conditionally remove that token, and
-  attempt exactly once to publish the caller's marker;
-- if the observed token disappears or another actor publishes first, report
-  `ADMIN_RECOVERY_CONCURRENT`/`LOCK_OWNERSHIP_LOST` and do not enter.
+### Administrative lock `.admin.lock`
 
-`--force` never revokes a live recovery marker. Otherwise the previous recoverer could still be
-inside the critical section and no pathname protocol could prevent overlap. Force authorizes
-recovery of dead, corrupt, or incomplete markers and live-looking data/admin locks after the
-documented operator check; it does not authorize recursive deletion or entry without marker
-ownership.
+| State | Representation and allowed transition |
+|---|---|
+| Absent | `withAdminLock` may attempt exclusive `mkdir` only if recovery marker policy permits. |
+| Directory claimed, no record | Empty directory; incomplete and fail closed; only marker-owned explicit recovery may act. |
+| Temporary record present | Partial/unpublished `.record-*`; incomplete; marker-owned force may use observed-singleton cleanup. |
+| Valid owned lock | Live verified admin owner; contenders retry/refuse. |
+| Valid dead-owner lock | Valid token, dead PID; `unlock-admin` may recover only while owning the marker. |
+| Corrupt record | Invalid singleton JSON/schema/kind; non-force refuses; marker-owned force may use observed-singleton cleanup. |
+| Unexpected entry type | File/link/reparse/non-regular child; fail closed; legacy regular files follow compatibility rules only. |
+| Multiple entries | Corrupt; marker ownership does not authorize recursive deletion. |
+| Releasing | Admin owner or marker owner unlinks only the expected token. |
+| Empty directory awaiting removal | Only non-recursive `rmdir`; new admin acquisition receives exists and waits/refuses. |
+| Deletion pending on Windows | Bounded transient retry; no critical-section entry until absence is observed and own `mkdir` succeeds. |
+| Lost ownership | Expected token or directory identity changed; stop cleanup and surface error. |
+| Recovery in progress | Caller owns the valid `.admin.lock.recovering` token and is inspecting/removing admin state. |
+| Recovered | Prior admin token/directory absent; marker cleanup must still succeed before success is claimed. |
 
-### Two forced actors racing
+### Recovery marker `.admin.lock.recovering`
 
-If active marker owner `R` is live, forced actors `A` and `B` are both rejected and neither enters.
-If `R` has crashed, `A` and `B` can both observe the dead marker, but only one can unlink
-`.admin.lock.recovering/R`. The loser stops on `ENOENT`. The winner removes the empty old marker and
-attempts to publish its own complete marker. If a third actor publishes first, the winner also
-stops. Therefore, only the actor whose token is verified in the public marker enters recovery.
+| State | Representation and allowed transition |
+|---|---|
+| Absent | Any recoverer may race exclusive `mkdir`; exactly one namespace claim succeeds. |
+| Directory claimed, no record | Empty incomplete marker; force plus quiescence may use empty-only `rmdir`, then all contenders retry `mkdir`. |
+| Temporary record present | Partial/unpublished singleton marker; force may use observed-singleton cleanup, never recursion. |
+| Valid owned lock | A live marker owner exclusively owns recovery; even `--force` cannot revoke it. |
+| Valid dead-owner lock | Force may unlink only its exact token, then empty-only `rmdir`, then contenders retry `mkdir`. |
+| Corrupt record | Invalid singleton regular marker; force plus quiescence may use observed-singleton cleanup; never recursion. |
+| Unexpected entry type | Link/reparse/file/non-regular child; fail closed and reject automatic recovery. |
+| Multiple entries | Corrupt; no child set is treated as ownership and no recursive removal is allowed. |
+| Releasing | Marker owner or dead-marker recoverer unlinks only the expected token. |
+| Empty directory awaiting removal | Empty-only `rmdir`; no actor may enter recovery yet. |
+| Deletion pending on Windows | Retry only bounded transient absence/creation checks; nobody enters without a new verified token. |
+| Lost ownership | Expected marker token/path identity changed; actor cannot enter or clean another marker. |
+| Recovery in progress | Equivalent to a valid live marker whose exact token was verified immediately before entry. |
+| Recovered | Old marker is gone and exactly one contender has acquired/validated a new marker, or no recovery was needed and owned-marker cleanup completed. |
 
-### Stale/dead and forced recovery
+## Explicit unlock and recovery behavior
 
-A dead complete marker is not reclaimed automatically by ordinary store operations. Non-force
-`unlockAdmin` reports an abandoned recovery marker and directs the operator to `--force`. Forced
-recovery uses the same conditional token removal and one-shot reacquisition.
+Ordinary `maswe unlock <run-id>` observes `.lock`, enters `.admin.lock`, and then discards the
+pre-lock observation in favor of a fresh non-following classification. A valid dead owner is
+recoverable without force by exact-token removal. A valid live owner, corrupt singleton, or
+incomplete state is rejected without force. Force may remove a valid live token only after the
+operator quiescence confirmation, may empty-remove an incomplete empty directory, and may apply
+observed-singleton cleanup to one regular corrupt/temp entry. Unsafe types and multiple entries
+remain manual, fail-closed cases.
 
-An empty legacy or interrupted marker is `incomplete`. With `--force`, `rmdir` is the conditional
-claim: only one actor can remove the empty directory. An actor that observed it but receives
-`ENOENT` stops as a concurrent loser rather than proceeding. A non-empty malformed marker is
-`corrupt`; recovery removes only the exact entries observed, stops on any missing entry, and then
-uses non-recursive `rmdir`. A conforming replacement's unique token entry therefore prevents
-deletion. Regular-file/symlink marker types fail closed and require operator-quiescent manual
-repair because no portable safe directory-conditional primitive applies.
+Ordinary `maswe unlock-admin <run-id>` first owns the recovery marker described below, then freshly
+classifies `.admin.lock`. The same live/dead/corrupt/incomplete policy applies, but all removal
+occurs while that exact recovery token remains valid. Absence of `.admin.lock` is idempotent only
+after marker ownership is established; success is not printed until marker cleanup also succeeds.
 
-### Admin-lock removal
+Normal acquisition never reclaims dead, corrupt, incomplete, or deletion-pending states. Existing
+automatic contention retry for a valid live owner remains bounded and does not mutate the lock.
 
-Once it owns the marker, `unlockAdmin` classifies the current `.admin.lock`:
+## Administrative recovery-marker bootstrap
 
-- absent: recovery is already complete;
-- live complete owner: refuse without force, conditionally remove with force;
-- dead complete owner: conditionally remove;
-- corrupt/incomplete: refuse without force, remove only through the conditional corrupt/incomplete
-  directory protocol with force;
-- changed since any earlier observation: use the current marker-protected state, never stale
-  metadata.
+`unlockAdmin` must own and validate `.admin.lock.recovering` before inspecting or removing
+`.admin.lock`. There is no recovery lock above it.
 
-Legacy regular-file admin locks remain recoverable only while the owned recovery marker blocks all
-new-version admin acquisition. See compatibility below.
+1. Actor `A` generates token `A` and attempts exclusive non-recursive `mkdir(markerPath)`.
+2. On success, `A` completes the normal internal-record protocol and enters only after verifying
+   the public marker contains exactly `A`.
+3. On exists, `A` classifies with `lstat`-style, non-following inspection.
+4. A valid live marker always yields `ADMIN_RECOVERY_CONCURRENT`, including with `--force`.
+5. A valid dead marker requires force. A contender may unlink only the exact dead token it
+   observed. Missing token or mismatch is ownership loss; it removes nothing else.
+6. An incomplete empty marker requires force and the documented quiescence assertion. Recovery is
+   one non-recursive `rmdir(markerPath)`. A single regular temporary or malformed entry may use the
+   force-only observed-singleton protocol. Multiple entries, links, reparse points, and unexpected
+   types fail closed. No malformed non-empty marker is recursively deleted.
+7. After successful dead-token cleanup, successful empty `rmdir`, `ENOENT` caused by a competing
+   cleanup, or a Windows deletion-pending transition, every contender returns to a bounded
+   acquisition loop and retries exclusive `mkdir`. At most one succeeds. The loop is bounded by
+   the existing lock retry budget; retries improve liveness but are not the mutual-exclusion
+   mechanism.
+8. A loser that observes the winner's valid marker returns `ADMIN_RECOVERY_CONCURRENT`, including
+   actual owner PID/token metadata when safe. It never enters merely because it helped remove the
+   abandoned marker.
+9. On exit, the winner unlinks only `markerPath/A`, then calls non-recursive `rmdir`. Cleanup
+   ownership loss or failure is visible and prevents a success claim.
 
-### Conditional cleanup
+For two actors `A` and `B` recovering dead marker `R`, only one can unlink `R`; both may then join
+the `mkdir` retry loop, but only one `mkdir` can claim the absent namespace. For an empty incomplete
+marker, only one `rmdir` succeeds, yet both again join the same exclusive `mkdir` race. In both
+cases entry requires final validation of one's own UUID, so cleanup victory cannot be confused
+with recovery ownership.
 
-The recoverer releases `.admin.lock.recovering` only by removing its own token entry followed by
-non-recursive `rmdir`. Token mismatch is a visible ownership-loss failure. Recursive marker removal
-is forbidden.
+The concurrent bootstrap state ordering is:
 
-### Crash behavior
+| Step | Actor `A` | Actor `B` | Recovery marker |
+|---|---|---|---|
+| A0 | Observes recoverable dead `R` or empty incomplete state; pauses | Observes the same state; pauses | Dead `R` or empty |
+| A1 | Races exact-token unlink or empty-only `rmdir` | Races the same conditional cleanup | At most one cleanup operation succeeds |
+| A2 | Joins bounded exclusive-`mkdir` retry | Joins bounded exclusive-`mkdir` retry | Absent, empty-awaiting-removal, or deletion-pending |
+| A3 | One actor wins `mkdir` and publishes its UUID | Other receives exists and inspects | Winner's valid marker |
+| A4 | Winner verifies its UUID and enters | Loser returns `ADMIN_RECOVERY_CONCURRENT` | Exactly one recovery owner |
 
-- Crash before marker publication: only a uniquely named `.tmp` staging directory can remain; no
-  recovery critical section was entered.
-- Crash after marker publication: a complete marker with the crashed PID remains. Normal writers
-  fail closed; `unlockAdmin --force` conditionally recovers it.
-- Crash after admin-lock removal but before marker cleanup: the complete dead marker remains and is
-  recovered the same way; absence of `.admin.lock` is then an idempotent success.
-- Crash after token unlink but before `rmdir`: an empty incomplete directory remains. Normal
-  operations fail closed; force recovery may remove it with atomic `rmdir`.
-- Staging directories and their descendants are excluded from read-only fingerprints and are
-  best-effort cleaned by their creator. Orphan staging directories are inert and may be removed
-  during explicit recovery; they never authorize entry. Explicit recovery bounds cleanup to
-  staging names in the selected run directory and never recursively targets a public lock path.
+Crash outcomes are fail-closed:
+
+- crash after marker `mkdir` and before temp creation leaves an incomplete empty marker;
+- crash during temp write or after close but before internal rename leaves an incomplete non-empty
+  singleton marker; force may remove only that observed regular entry and then use `rmdir`;
+- crash after token publication leaves a valid dead marker recoverable token-conditionally;
+- crash after admin removal leaves the valid dead marker, making retry idempotently observe absent
+  admin state;
+- crash after marker-token unlink leaves an empty directory recoverable only by empty `rmdir`.
+
+Multiple-entry and unsafe-type cases require a documented, quiescent manual repair procedure
+because no singleton can be selected safely. This safety choice introduces no recursive
+recovery-lock hierarchy.
+
+## Path-type and non-following policy
+
+Validation starts with `lstat(lockPath)`, enumerates exactly one directory level, and `lstat`s the
+selected child. It never follows a link while validating or removing a lock structure.
+
+| Observed structure | Semantic classification and action |
+|---|---|
+| Symbolic link at canonical path | `LOCK_UNSAFE_PATH_TYPE`; refuse acquisition/recovery/removal and do not follow or unlink it automatically. |
+| Windows junction or reparse point | `LOCK_UNSAFE_PATH_TYPE`; explicitly unsupported and never treated as a lock directory. |
+| Regular file where directory is expected | Legacy classifier only if it is a valid PR #10 record; otherwise corrupt/unsafe and fail closed. |
+| Directory containing a symlink | `LOCK_UNSAFE_PATH_TYPE`; do not follow or unlink the symlink automatically. |
+| Directory containing a junction/reparse child | `LOCK_UNSAFE_PATH_TYPE`; fail closed. |
+| Directory containing another unexpected type | `LOCK_CORRUPT`; no automatic cleanup. |
+| Multiple entries | `LOCK_CORRUPT`; no entry is assumed authoritative. |
+| Token filename differs from JSON owner | `LOCK_CORRUPT`; expected-owner release removes nothing; force may use observed-singleton cleanup under the required serializer. |
+
+On Windows, implementation must use a supported non-following reparse-point check. If Node/libuv
+cannot prove that a canonical path and child are ordinary directory/regular-file objects, the
+operation is `LOCK_UNSUPPORTED_FILESYSTEM`; it must not approximate by following the path.
 
 ## Failure taxonomy and user-visible errors
 
-Errors retain the run ID, lock kind, path, expected/actual token when safe, and recovery command.
-The stable category appears in the message and on the typed error:
+Errors include run ID, lock kind, canonical path, expected/actual token when safe, semantic state,
+and the appropriate recovery command. Platform codes remain causes, not the portable API.
 
 | Category | Required behavior and message intent |
 |---|---|
-| `LOCK_LIVE_OWNER` | Non-force refuses: lock is held by live PID; use force only after confirming no writer is active. |
-| `LOCK_DEAD_OWNER` | Automatic acquisition refuses and identifies an abandoned lock; explicit non-force `unlock`/`unlock-admin` may recover it. |
-| `LOCK_CORRUPT` | Explain the invalid type/content/token mismatch; non-force refuses and points to force or manual repair as appropriate. |
-| `LOCK_INCOMPLETE` | Explain the empty/interrupted directory; non-force refuses because an initializer or interrupted cleanup may exist. |
-| `LOCK_OWNERSHIP_LOST` | “Expected owner O, found N/absent; replacement was not removed.” No shared-path deletion follows. |
-| `ADMIN_RECOVERY_CONCURRENT` | Another recovery token owns or won the marker; at most one actor entered. Include live/dead PID when parseable. |
-| `LOCK_CLEANUP_FAILED` | State whether the token entry was removed, name the remaining path, preserve the OS error, and leave the path fail-closed. |
-| `LOCK_UNSUPPORTED_FILESYSTEM` | Required atomic publication/empty-directory removal semantics are unavailable; no unsafe fallback was attempted. |
+| `LOCK_LIVE_OWNER` | Live data/admin owner blocks non-force recovery; force requires confirmation that no writer is active. |
+| `LOCK_DEAD_OWNER` | Automatic acquisition refuses; explicit recovery is available under the required serializer. |
+| `LOCK_CORRUPT` | Invalid content, schema, token mismatch, or multiple entries; refuse without force and never recurse. |
+| `LOCK_INCOMPLETE` | Empty or temporary-record state; another initializer may exist, so fail closed. |
+| `LOCK_UNSAFE_PATH_TYPE` | Link, junction/reparse point, or unexpected object; no link-following or automatic removal. |
+| `LOCK_OWNERSHIP_LOST` | Expected token/path identity is absent or changed; replacement was not removed and no further removal occurs. |
+| `ADMIN_RECOVERY_CONCURRENT` | Another verified marker owns or won recovery; this actor did not enter. |
+| `LOCK_DELETION_PENDING` | Windows or equivalent filesystem deletion is not yet observable as absent; bounded retry exhausted without an ownership conclusion. |
+| `LOCK_CLEANUP_FAILED` | State what was removed, what remains, retain the OS cause, and do not claim successful release/recovery. |
+| `LOCK_UNSUPPORTED_FILESYSTEM` | A required exclusive, identity, non-following, or empty-only primitive cannot be established; no fallback attempted. |
 
-Success output for `unlock` and `unlock-admin` remains compatible. A no-lock idempotent admin
-recovery remains success only after the caller owns and conditionally cleans its marker.
+Dead versus live is a recovery-policy distinction. Corrupt means content cannot establish a token.
+Incomplete means publication or cleanup did not reach a valid owned state. Lost ownership means a
+caller once had/expected a specific token but the current structure no longer proves it.
 
 ## Platform and filesystem semantics
 
-### Linux and POSIX
+### POSIX and Linux
 
-The protocol relies on same-filesystem directory `rename`, token-entry `unlink`, and non-recursive
-`rmdir`. POSIX requires `rename` to be atomic and to reject replacing a non-empty destination
-directory with `EEXIST` or `ENOTEMPTY`; `rmdir` removes only empty directories and otherwise fails.
-Staging and public paths are siblings, preventing `EXDEV`.
+The required primitives are exclusive non-recursive `mkdir`, exclusive regular-file creation,
+internal same-directory file rename to a unique destination, token `unlink`, stable directory
+identity, and non-recursive `rmdir`.
 
-References:
+Ordinary POSIX `rename()` is deliberately not the lock-directory publication primitive. POSIX
+allows an existing empty destination directory to be removed and replaced. Linux
+`renameat2(RENAME_NOREPLACE)` supplies no-replace behavior only on Linux and only on supporting
+filesystems; the supported Node promise API exposes no flags argument for it.
 
-- [POSIX `rename`](https://pubs.opengroup.org/onlinepubs/000095399/functions/rename.html)
-- [POSIX `rmdir`](https://pubs.opengroup.org/onlinepubs/009696799/functions/rmdir.html)
-- [Node.js file-system promises](https://nodejs.org/download/release/v25.9.0/docs/api/fs.html)
+`mkdir` claims one pathname or reports that it already exists, including when the existing object
+is a symlink. `rmdir` removes an empty directory and reports a non-empty semantic as `ENOTEMPTY` or
+permitted equivalent `EEXIST`. Error-code spelling is mapped to the semantic categories above.
 
-Local Linux filesystems with ordinary POSIX rename semantics (including the test environment's
-local temporary filesystem) are supported. NFS, SMB mounts, FUSE implementations, object-store
-mounts, and other network/distributed filesystems are not assumed to provide the required
-cross-client cache consistency or atomicity and are outside Issue #11.
+Supported deployment assumes a local filesystem with coherent same-host namespace operations and
+stable object identity. NFS, SMB, FUSE/object-store mounts, and broader distributed-store behavior
+are outside Issue #11 unless independently proven to meet every invariant.
 
 ### Supported Windows behavior
 
-The same directory layout and token removal are used. Staging and public directories must be on the
-same volume. Windows directory move/rename refuses an existing destination, and
-`RemoveDirectoryW` requires an empty directory. Antivirus/indexer sharing violations, open-handle
-behavior, `EPERM`, or `EBUSY`-equivalent failures are cleanup/contention failures, not reasons to
-fall back to recursive deletion.
+Windows uses the same `mkdir` namespace claim and token-addressed release, not directory rename.
+`MoveFileEx` reports an error when the destination names an existing directory, unlike POSIX's
+empty-directory replacement rule; this difference is why rename behavior is not a shared
+invariant.
 
-References:
+`RemoveDirectoryW` marks a directory for deletion on close; it may remain visible or unavailable
+until open handles close. During this deletion-pending interval, a new `mkdir` may fail even though
+no owner can safely be identified. Sharing violations, access denial, `EBUSY`, `EPERM`,
+`ENOTEMPTY`, or other platform equivalents are mapped by reinspection to one of:
 
-- [Windows `MoveFileEx`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexa)
-- [Windows `RemoveDirectoryW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-removedirectoryw)
+- **contention:** a valid current owner exists;
+- **deletion pending/liveness delay:** the old directory is empty/removing and no different token
+  is established;
+- **ownership failure:** the expected token or stable directory identity changed;
+- **cleanup failure:** state cannot be safely classified.
 
-Windows tests use the same IPC barriers and assert outcomes rather than exact platform error codes.
-Retries may handle transient sharing violations, but correctness never depends on a sleep or retry
-winning.
+Only deletion-pending/liveness-delay results are retried. The retry count uses the repository's
+existing bounded lock-retry budget and bounded delay policy; Phase B must document the exact bound
+in code and tests. Exhaustion yields `LOCK_DELETION_PENDING` or `LOCK_CLEANUP_FAILED`, never
+success. Correctness does not depend on delay duration or eventual retry. Junctions and all
+detectable reparse-point lock paths are explicitly rejected.
 
 ### Primitive unavailable
 
-If atomic same-parent publication, token unlink, or empty-only directory removal is unsupported or
-returns an unexpected semantic result, MASWE reports `LOCK_UNSUPPORTED_FILESYSTEM` or
-`LOCK_CLEANUP_FAILED` and leaves the lock fail-closed. It must not:
+If the implementation cannot establish exclusive `mkdir`, exclusive child creation, stable
+directory identity, non-following inspection, unique internal rename, token unlink, or empty-only
+directory removal, it fails closed. It must not:
 
-- fall back to `rm -r`/recursive `fs.rm` on a public lock or marker;
-- fall back to read-token-then-unlink-path;
-- move a replacement aside and restore it;
-- auto-reclaim by age.
+- publish a prepared directory using ordinary rename;
+- use `renameat2` only on one platform while silently weakening others;
+- recursively remove a public lock or recovery marker;
+- read a token and then unlink the canonical path;
+- follow a symlink/junction/reparse point;
+- move a current owner aside;
+- reclaim by age.
+
+## Authoritative semantics and supported property
+
+| Source | Property used by this design |
+|---|---|
+| [POSIX `rename`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/rename.html) | An existing empty destination directory may be removed/replaced; atomic rename therefore is not no-clobber publication. |
+| [Linux `renameat2(2)`](https://man7.org/linux/man-pages/man2/rename.2.html) | `RENAME_NOREPLACE` rejects an existing destination, is Linux-specific, and requires filesystem support. |
+| [POSIX `mkdir`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/mkdir.html) and [Linux `mkdir(2)`](https://man7.org/linux/man-pages/man2/mkdir.2.html) | Creating an existing pathname fails; Linux `EEXIST` includes an existing symlink. This is the exclusive namespace claim. |
+| [POSIX `rmdir`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/rmdir.html) and [Linux `rmdir(2)`](https://man7.org/linux/man-pages/man2/rmdir.2.html) | Only an empty directory is removable; non-empty may report `ENOTEMPTY` or `EEXIST`. |
+| [Node.js 22.22 `fsPromises.rename`](https://nodejs.org/download/release/v22.22.0/docs/api/fs.html#fspromisesrenameoldpath-newpath) | The supported signature accepts only old and new paths; it exposes no no-replace flag. |
+| [Windows `MoveFileExW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw) | Moving a directory is same-drive and an existing destination directory is an error, demonstrating different conflict semantics. |
+| [Windows `RemoveDirectoryW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-removedirectoryw) | Removal is deletion-on-close; the directory remains pending until its last handle closes, and junction removal has special link semantics. |
+
+If a POSIX page is temporarily unavailable to tooling, the implementation review must still verify
+the linked current standard text rather than substituting an old edition.
 
 ## Compatibility
 
-PR #10 regular-file locks remain readable as `legacy-owned`:
+PR #10 regular-file locks remain readable but block new `mkdir` acquisition:
 
-- live legacy data/admin owners still refuse non-force recovery;
-- dead legacy data locks remain explicitly recoverable;
-- dead legacy admin locks remain explicitly recoverable;
-- corrupt/incomplete legacy files remain rejected without force;
-- force remains an operator-quiescent escape hatch.
+- valid live legacy data/admin records retain live-owner rejection;
+- valid dead legacy data/admin records retain explicit dead-owner recovery;
+- corrupt/incomplete legacy records remain rejected without force;
+- legacy recovery occurs only under the new serializer: `.admin.lock` for data and the owned
+  recovery marker for admin;
+- after the serialized legacy pathname unlink, the actor never unlinks that canonical path again.
 
-New acquisition never writes the legacy format. It creates a format-2 directory only when the
-public path is absent. A live legacy lock is not migrated in place. Operators upgrading with an
-active legacy lock must stop the old MASWE process, recover the legacy path with the documented
-command, and then start a new operation.
+This is a compatibility path, not ownership-safe mixed-version operation. A new process never
+writes legacy format. Mixed old/new MASWE binaries are unsupported because an old binary can still
+perform unconditional pathname deletion. Upgrade and rollback require a quiescent run directory.
 
-Mixed old/new MASWE processes against one run directory are unsupported: an old binary can still
-perform unconditional pathname deletion and cannot honor the new ownership proof.
+The PR #10 empty `.admin.lock.recovering` directory is classified as incomplete. Non-force fails
+closed. Force may use only empty `rmdir`, after which all contenders retry exclusive `mkdir`; only
+the actor that publishes and validates its new token enters.
 
-The PR #10 `.admin.lock.recovering` marker is an empty directory. It is treated as
-legacy/incomplete: non-force fails closed; force claims it through empty-only `rmdir`, and a loser
-that receives `ENOENT` does not enter. Existing CLI command names and `--force` flags do not change.
+Existing CLI names and `--force` flags remain. Force remains an operator assertion that the
+apparently live data/admin writer or incomplete initializer is quiescent; it is not process
+fencing. A malformed non-empty recovery marker requires manual quiescent repair because automatic
+recursive recovery is forbidden.
 
-Rollback to PR #10 code requires a quiescent run directory with no format-2 public locks or markers.
-Because locks are ephemeral rather than durable run records, no run-schema migration is needed:
-stop all MASWE processes, recover any remaining format-2 paths with the new binary, confirm the
-three public paths are absent, then roll back. Do not use the old binary as a format-2 cleanup tool.
-
-Read-only fingerprint exclusions must recognize lock staging directories and all their descendants,
-while continuing to exclude `.lock`, `.admin.lock`, and `.admin.lock.recovering`. Durable run and
-artifact fingerprint coverage is unchanged.
+No durable run schema changes. Rollback requires stopping all processes, using the new binary to
+recover new-format paths, confirming all three canonical paths are absent, and only then running
+the old binary.
 
 ## Deterministic test design
 
-Correctness tests use real Node child processes created with an IPC channel. A dedicated fixture
-worker receives commands and emits state messages containing actor name, run ID, lock kind, and
-owner token. The parent advances an explicit barrier state machine. No correctness assertion uses a
-timing sleep. A bounded watchdog may fail a hung test but never advances a barrier.
+Correctness tests use real Node child processes with explicit IPC and filesystem barriers. Each
+worker reports actor, lock kind, UUID, and reached transition. The parent alone releases barriers.
+A bounded watchdog may fail a hung test but cannot advance the protocol; arbitrary sleeps are not
+the correctness mechanism. Injectable filesystem operations are used only to create platform
+semantic states such as deletion pending, never to replace the real multi-process races.
 
-Planned files:
+Planned files remain focused:
 
-- `test/fixtures/lock-worker.ts` — child modes for hold/release, forced unlock, admin recovery,
-  crash, and marker inspection;
-- `test/issue11-lock-recovery.test.ts` — focused state/error/compatibility regressions;
-- `test/issue11-lock-contention.test.ts` — real-process barrier races and repeated contention;
-- existing `test/store-locking.test.ts`, `test/lock-ownership.test.ts`,
-  `test/lock-barrier.test.ts`, and the admin-recovery section of
-  `test/rc-review-corrections.test.ts` updated to the format-2 helpers without weakening their
-  assertions.
+- `test/fixtures/lock-worker.ts` for acquisition, release, recovery, crash, and barrier modes;
+- `test/issue11-lock-recovery.test.ts` for state/path/error/compatibility cases;
+- `test/issue11-lock-contention.test.ts` for real-process races and repetitions;
+- existing lock/admin tests updated only as required by the new representation.
 
-### Race 1: old owner versus forced replacement
+### Old owner, force, and replacement
 
-1. Child `O` acquires data lock and reports `O_ACQUIRED`.
-2. Parent commands release; `O` observes its token and reports `O_RELEASE_VALIDATED`, then waits.
-3. Child `F` runs forced unlock and reports `F_REMOVED_O`.
-4. Child `N` acquires and holds the replacement, reporting `N_ACQUIRED`.
-5. Parent releases `O`'s barrier.
-6. Assert `O` reports `LOCK_OWNERSHIP_LOST`, `N`'s token entry still exists, and a fourth writer
-   cannot enter.
-7. Release `N` and assert normal acquisition resumes.
+1. `O` acquires and holds `L/O`.
+2. `O` begins release and pauses before its token unlink.
+3. `F` owns the required serializer, unlinks `L/O`, and removes the empty old directory.
+4. `N` wins `mkdir(L)`, publishes `L/N`, validates ownership, and pauses.
+5. `O` resumes. Its exact `unlink(L/O)` returns absent/mismatch, so it reports
+   `LOCK_OWNERSHIP_LOST` and never calls `rmdir`.
+6. Assert `N` remains exclusive and releases normally.
 
-### Race 2: two forced administrative recoverers
+A second barrier pauses `O` after successful token unlink but before `rmdir`. `N` receives exists
+against the empty directory and cannot overwrite it. After `O` removes it, one bounded retry may
+win `mkdir`; a delayed old `rmdir` is injected only after `N` publishes and must fail non-empty.
 
-1. A holder child publishes recovery marker `R`, reports its token, and crashes so the public
-   marker is complete but its owner is dead.
-2. Children `A` and `B` both observe dead `R` and report `RECOVERY_OBSERVED`.
-3. Parent releases both conditional-removal barriers.
-4. Exactly one actor may report `RECOVERY_ENTERED` with its verified token. Keep it paused inside
-   the critical section.
-5. The loser must report `ADMIN_RECOVERY_CONCURRENT` or `LOCK_OWNERSHIP_LOST`.
-6. Assert the public marker token equals the winner and no normal admin owner enters.
-7. Release the winner; assert conditional marker cleanup.
+### Two recovery actors
 
-A separate live-marker test keeps `R` running and proves that both forced actors receive
-`ADMIN_RECOVERY_CONCURRENT`; force never creates overlap with a live recovery critical section.
+For both a valid dead marker and an empty incomplete marker:
 
-### Crash and interruption
+1. `A` and `B` observe the same recoverable state and pause.
+2. Release both cleanup attempts. Exactly one token unlink or empty `rmdir` succeeds.
+3. Both actors join the explicit `mkdir` retry barrier.
+4. Exactly one reports `RECOVERY_ENTERED` after validating its own marker token.
+5. The loser reports `ADMIN_RECOVERY_CONCURRENT`.
+6. Keep the winner paused and prove no admin owner or second recoverer enters.
+7. Release winner and assert token-conditional cleanup.
 
-- Crash a child after marker publication. Verify non-force refusal, then forced recovery and normal
-  operation.
-- Crash after admin-lock removal but before marker cleanup. Verify idempotent forced recovery.
-- Interrupt cleanup after token unlink, leaving an empty directory. Verify normal fail-closed
-  behavior and forced empty-directory recovery.
-- Kill a data owner child. Verify automatic acquisition refuses and ordinary explicit dead-owner
-  recovery succeeds.
+### Required acceptance-test matrix
 
-### Repeated contention
+| # | Required case | Deterministic planned evidence |
+|---:|---|---|
+| 1 | Existing empty lock directory is never overwritten | Precreate empty canonical directory; acquiring child gets `LOCK_INCOMPLETE`; inode/file identity and contents stay unchanged. |
+| 2 | Existing incomplete directory remains fail-closed | Precreate partial-temp states for each kind; normal acquisition and non-force recovery do not mutate them. |
+| 3 | Acquisition versus old-owner empty-directory release window | Pause `O` after token unlink; `N`'s `mkdir` gets exists and cannot publish until `O`'s `rmdir` barrier completes. |
+| 4 | Old owner cannot remove replacement directory | Force removes `O`, `N` fully acquires, then resume `O`; assert ownership loss and surviving `N`. |
+| 5 | Two acquirers racing exclusive `mkdir` | Release two child `mkdir` calls from one IPC barrier; exactly one claims, publishes, and enters. |
+| 6 | Crash after `mkdir` before record creation | Kill child at `DIRECTORY_CLAIMED`; classify empty incomplete; normal actors fail closed. |
+| 7 | Crash while temporary record is partial | Kill child after acknowledged partial write; classify incomplete, not corrupt-owned; no automatic deletion. |
+| 8 | Crash after record close before internal rename | Kill at `RECORD_SYNCED`; complete temp remains incomplete; no actor treats it as owned. |
+| 9 | Token-entry mismatch | Filename `X`, JSON owner `Y`; corrupt classification; releases for `X` or `Y` remove nothing. |
+| 10 | Multiple token entries | Two regular UUID entries; corrupt classification and no child removal. |
+| 11 | Symlink lock path | Canonical symlink targets a sentinel; all operations reject and sentinel remains unchanged. |
+| 12 | Symlink token entry | Directory contains symlink named as UUID; reject without following or unlinking target. |
+| 13 | Windows junction/reparse classification | On Windows create testable junction/reparse fixture; otherwise exercise injected classifier and mark native coverage not run. |
+| 14 | Windows deletion-pending/injected equivalent | Hold directory handle on Windows or inject semantic error; bounded retry never becomes success/ownership loss and never recurses. |
+| 15 | Two actors recover dead recovery marker | Dead `R` token barrier followed by shared `mkdir` barrier; exactly one enters. |
+| 16 | Two actors recover incomplete empty marker | Empty `rmdir` barrier followed by shared `mkdir` barrier; exactly one enters. |
+| 17 | Live recovery marker rejected even with force | Keep marker child live; two forced children both get `ADMIN_RECOVERY_CONCURRENT`; marker unchanged. |
+| 18 | No recursive deletion anywhere | Instrument removal adapter and scan production call sites; every release/recovery path records only exact `unlink` and non-recursive `rmdir`. |
+| 19 | Repeated 25-iteration focused contention | Run real-process acquisition/recovery contention 25 times with fresh paths; record 25/25 and zero dual owners. |
+| 20 | Repeated 100-iteration release/replacement | Run the exact old-owner/force/replacement barriers 100 times; record 100/100 replacement survival. |
 
-The two multi-process barrier scenarios run 25 iterations in the normal focused test file.
-Phase-B validation additionally runs each scenario for 100 iterations through an environment
-override, recording exact totals and failures in the PR. Each iteration uses fresh directories and
-tokens. IPC ordering is deterministic; iteration count looks for implementation nondeterminism,
-not sleep-sensitive scheduling.
+### Issue #11 acceptance criteria mapping
 
-## Issue #11 acceptance criteria to planned tests
-
-| Acceptance criterion | Planned deterministic evidence |
+| Acceptance criterion | Planned tests |
 |---|---|
-| Reproduce normal release versus forced unlock/replacement | `old owner versus forced replacement` IPC sequence reaches the exact D1-D5 barriers. |
-| Original releaser cannot remove replacement | Assert `LOCK_OWNERSHIP_LOST`, `N` token/path survives, and another writer remains excluded. |
-| Reproduce two concurrent forced admin recoverers | Two child recoverers observe the same active marker and are released concurrently. |
-| At most one owns recovery critical section | Count exactly one `RECOVERY_ENTERED`; marker token equals winner; loser has a concurrency/ownership error. |
-| Preserve live-owner rejection without force | Focused data/admin/marker tests with live child PID and no force. |
-| Preserve corrupt-lock rejection without force | Format-2 malformed JSON, token mismatch, multiple entry, and legacy corrupt-file cases. |
-| Preserve incomplete-lock rejection without force | Empty data/admin/marker directory cases. |
-| Preserve explicit dead-owner recovery | Kill holder child, reject automatic acquire, then non-force explicit unlock succeeds. |
-| Repeated multi-process barriers | 25 normal iterations and explicit 100-iteration Phase-B evidence for both races. |
-| Update SECURITY, OPERATIONS, lock/recovery docs | Documentation file matrix below. |
-| `npm run check` and packaging pass | Required clean-worktree verification commands recorded at exact PR head. |
+| Reproduce old owner versus forced replacement | Matrix 4 and 20 reach the precise pre-unlink and post-replacement barriers. |
+| Earlier owner cannot remove replacement | Matrix 3, 4, and 20 assert token/path survival and no recursive fallback. |
+| Reproduce two concurrent forced recoverers | Matrix 15 and 16 cover dead-token and incomplete-empty bootstrap. |
+| At most one recovery critical-section owner | Matrix 5, 15, 16, and 17 count verified entries; never infer ownership from cleanup success. |
+| Preserve live-owner rejection | Matrix 17 plus live data/admin focused regressions. |
+| Preserve dead-owner recovery | Matrix 15 plus child-crash data/admin regressions under the correct serializer. |
+| Preserve corrupt/incomplete rejection without force | Matrix 1, 2, 6–10, and 12 cover all publication and validation failures. |
+| Ownership loss and cleanup fail closed | Matrix 4, 9, 14, and 18 assert typed errors and no success claim. |
+| Platform-safe primitives and path handling | Matrix 1, 3, 5, and 11–14 validate mkdir/no-follow/rmdir semantics. |
+| Repeated contention evidence | Matrix 19 and 20 record exact iteration totals at the exact Phase-B head. |
+| Documentation and full verification | Documentation matrix and Phase-B verification list below. |
 
-Additional required cases:
+Additional focused regressions cover marker ownership loss, crash after published marker, cleanup
+interruption after token unlink, ordinary acquisition/release, explicit dead-owner recovery,
+legacy live/dead/corrupt records, existing optimistic concurrency, and preservation of
+`AggregateError` when protected work and cleanup both fail. Crash cases 7 and 8 also assert that
+force recovers only the observed regular singleton and then wins a fresh exclusive `mkdir`.
 
-| Required case | Planned test |
-|---|---|
-| Owner-token mismatch | Call conditional removal with token `X` against owner `Y`; assert `Y` unchanged. |
-| Marker ownership loss | Replace/force-recover marker before old cleanup; assert old cleanup cannot remove winner. |
-| Child-process crash | Crash immediately after owned marker publication; recover by dead PID/token. |
-| Cleanup interruption | Leave empty directory after token unlink; non-force fails closed and force uses `rmdir`. |
-| Normal acquisition/release regression | Save/load/artifact paths acquire and conditionally release format-2 data/admin locks. |
-| Existing optimistic concurrency | Existing CAS/version tests remain unchanged and passing. |
-| Legacy compatibility | Complete live/dead, corrupt, incomplete regular-file lock and empty legacy marker tests. |
-| Filesystem primitive failure | Inject rename/unlink/rmdir errors; assert no recursive or pathname-unlink fallback. |
+## Phase-B baseline and environment record
+
+Before writing a failing test, the implementation agent must establish a clean baseline from the
+approved branch using the repository-supported Node environment, preferably Node `22.22.2`. Record
+separately:
+
+- host operating system and version;
+- filesystem type for the worktree and test temporary directory where available;
+- exact `node --version`, `npm --version`, and `git --version`;
+- whether nested Git ref writes are permitted, using a disposable nested repository/probe;
+- `npm ci` outcome and baseline focused/full test outcomes before Issue #11 changes;
+- sandbox, antivirus, mount, credential, or permission restrictions that affect commands.
+
+If the current shell selects unrelated Node 24 or a sandbox denies nested ref writes, report those
+results separately, switch to the supported Node when available, and rerun the relevant baseline.
+Do not label environment-only failures as Issue #11 regressions, and do not omit them.
 
 ## Planned Phase-B changes
 
-The smallest expected production change is concentrated in `src/store.ts`:
+The smallest expected production change remains concentrated in `src/store.ts`:
 
-- discriminated lock-state parser for legacy files and format-2 directories;
-- complete-directory publisher;
-- token-addressed conditional removal;
-- admin-guarded normal data release;
-- owned administrative recovery marker;
-- typed failure categories and deterministic test hooks.
+- discriminated non-following state classifier;
+- exclusive `mkdir` acquisition and internal record publication;
+- exact-token release with non-recursive `rmdir`;
+- bounded semantic retry mapping;
+- owned recovery-marker bootstrap;
+- legacy compatibility under the existing serializers;
+- typed failures and deterministic test barriers.
 
-`src/git-snapshot.ts` changes only to exclude descendants of lock staging directories. `src/cli.ts`
-retains command syntax and updates force/recovery guidance. No state-machine, runtime adapter,
-model, approval, artifact-CAS, or git-workspace behavior changes.
+`src/cli.ts` changes only for error/help guidance. No state-machine, runtime adapter, model,
+approval, optimistic-concurrency, atomic run/artifact write, scope, or verification behavior
+changes. No lock staging directory is introduced, so no new snapshot exclusion is needed.
 
-The Phase-B TDD order after approval is:
-
-1. Add IPC worker and failing race reproductions.
-2. Add failing token-mismatch, marker-loss, crash, interruption, and primitive-failure tests.
-3. Implement format-2 parser/publication/removal and make focused tests pass.
-4. Route data, admin, and recovery marker operations through the shared protocol.
-5. Add legacy compatibility and normal/dead-owner regressions.
-6. Run repeated contention and the full required verification matrix.
-7. Update documentation and create a draft PR only after exact-head verification.
-
-A detailed Superpowers implementation plan will be written after repository-owner approval of this
-spec, before any production or test implementation begins.
+After reapproval, the Superpowers writing-plans workflow will produce the implementation plan.
+Phase B then follows test-driven development: add failing process/barrier tests, implement the
+smallest protocol, run focused/repeated tests, update documentation, and perform exact-head
+verification. No PR is opened during this design revision.
 
 ## Documentation changes after approval
 
-- `docs/SECURITY.md`: add the forced-recovery threat, owner-token directory invariant,
-  fail-closed ownership-loss/cleanup behavior, filesystem trust assumptions, and mixed-version
-  warning.
-- `docs/OPERATIONS.md`: document format-2 paths, live/dead/corrupt/incomplete decisions, force
-  preconditions, crash/interrupted cleanup, exact recovery commands, and unsupported filesystem
-  behavior.
-- `docs/ARCHITECTURE.md`: replace the regular-file lock description with the acquisition/removal
-  protocol and administrative recovery serialization.
-- `docs/adr/0006-ownership-safe-local-lock-directories.md` and `docs/adr/README.md`: record the
-  storage protocol decision, platform constraints, consequences, and rejected alternatives.
-- `skills/maswe/references/commands.md`: update CLI recovery guidance and ownership-loss messages.
-- `src/cli.ts`: clarify `--force` help without changing command syntax.
-- `CHANGELOG.md`: record the Issue #11 hardening under the unreleased section.
+- `docs/SECURITY.md`: forced-recovery threat model, UUID authority, no-follow/no-recursion
+  invariants, force/quiescence limitation, mixed-version and filesystem trust boundaries.
+- `docs/OPERATIONS.md`: directory states, semantic errors, recovery commands, incomplete and
+  malformed singleton and manual unsafe/multiple-entry procedures, Windows deletion-pending
+  behavior, retry exhaustion, and rollback.
+- `docs/ARCHITECTURE.md`: exclusive `mkdir` claim, internal publication boundary,
+  owner-conditional release, and marker bootstrap.
+- `docs/adr/0006-ownership-safe-local-lock-directories.md` plus ADR index: decision, platform
+  semantics, rejected rename publication, consequences, and compatibility.
+- `skills/maswe/references/commands.md` and CLI guidance: live/dead/corrupt/incomplete,
+  concurrent-recovery, unsafe-path, ownership-loss, and cleanup-failure messages.
+- `CHANGELOG.md`: Issue #11 hardening under the unreleased section.
 
-`docs/PRD.md` requires no requirement change: this design strengthens NFR-1 reliability and the
-existing fail-closed principle without changing product scope.
+`docs/PRD.md` requires no scope change; this strengthens NFR-1 and fail-closed behavior.
 
 ## Residual risks and operator preconditions
 
-- `--force` against a live data or admin owner is not process fencing. The old process may continue
-  its protected work after its token is revoked. This design prevents its delayed cleanup from
-  deleting a replacement, but it cannot make concurrent writes safe. Operators must still confirm
-  that the apparent live owner is not performing work before forcing data/admin recovery.
-- PID liveness can be conservative or misleading because of PID reuse and platform permission
-  behavior. PID never authorizes removal; it only chooses whether explicit force is required.
-- Correctness is limited to cooperating new-version processes on a supported local filesystem.
-  Mixed binaries, direct filesystem mutation, and network/distributed mounts remain unsupported.
-- A crash can leave fail-closed public directories or inert staging directories that require
-  explicit operator recovery. This favors safety over automatic availability and may create small
-  per-run filesystem cleanup toil.
-- Windows sharing violations may delay cleanup and require retry after the process holding the
-  handle exits. They must remain visible; they cannot trigger a recursive fallback.
+- Force is not process fencing. Before forcing a live data/admin owner or an incomplete initializer,
+  the operator must establish quiescence. The protocol prevents delayed cleanup from removing a
+  replacement but cannot prevent an unfenced old process from continuing protected writes.
+- A stale initializer can briefly create its unique temp entry in a replacement directory if
+  force violated quiescence between `mkdir` and temp creation. The mandatory post-create directory
+  identity check prevents it from publishing or entering and allows it to remove only its own
+  unique temp entry; other actors fail closed during the transient.
+- PID reuse/permission can misclassify liveness. PID never authorizes removal.
+- Correctness is limited to cooperating new binaries on supported coherent local filesystems.
+  Mixed binaries, direct mutation, network mounts, and distributed stores are unsupported.
+- Multiple-entry and unsafe-type markers intentionally require manual quiescent repair. A single
+  regular corrupt/temp entry is recoverable only by exact observed-singleton cleanup.
+- Windows deletion-pending and sharing violations can exhaust bounded retries. The visible cleanup
+  error is safer than claiming release.
 
 ## Design invariants
 
-1. A valid public lock or marker is always a non-empty directory containing exactly one
-   token-named record.
-2. Token identity, not PID or timestamp, authorizes removal.
-3. Valid lock/marker removal never recursively deletes a public path.
-4. A caller unlinks only its expected token entry and calls `rmdir` only after that succeeds.
-5. `ENOENT` on the expected token is ownership loss, never permission to remove the directory.
-6. `ENOTEMPTY` protects a replacement owner.
-7. No data/admin/marker stale reclaim is automatic.
-8. Only a verified recovery-marker owner enters administrative recovery.
-9. Force changes recovery policy, not ownership proof.
-10. Unsupported filesystem semantics fail closed without fallback.
+1. Only exclusive non-recursive `mkdir` claims a canonical new-format lock namespace.
+2. A lock is owned only after one valid UUID entry is fully published and revalidated.
+3. The exact retained UUID, not PID/timestamp/path presence, authorizes token removal.
+4. Release unlinks only `lockPath/expectedToken`, then uses only non-recursive `rmdir`.
+5. Missing/mismatched token or changed directory identity is ownership loss and stops removal.
+6. Existing empty/incomplete directories are never overwritten.
+7. A replacement's non-empty directory survives every earlier owner's release ordering.
+8. A live recovery marker is never revoked, even with force.
+9. Cleanup success does not confer recovery ownership; only winning `mkdir` plus token validation
+   permits entry.
+10. No public lock or marker is recursively deleted or followed through a link/reparse point.
+11. Platform errors map to semantic categories; retry affects liveness only.
+12. Unsupported primitives and ambiguous states fail closed.
+13. Force may select at most one identity-stable regular singleton; it never turns cleanup into
+    ownership.
 
 ## Approval gate
 
-No production code or tests will be changed until the repository owner explicitly approves this
-design. After approval, the implementation plan and tests precede production changes.
+No production code or tests will be changed until the repository owner explicitly reapproves this
+revised design. After reapproval, a detailed implementation plan and failing tests precede
+production changes.
 
-`WAITING_FOR_DESIGN_APPROVAL`
+`WAITING_FOR_DESIGN_REAPPROVAL`
