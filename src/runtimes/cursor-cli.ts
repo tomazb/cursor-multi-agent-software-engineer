@@ -68,7 +68,13 @@ export function extractCursorCliOutput(stdout: string): string {
   return stdout;
 }
 
-function extractOutput(stdout: string): string {
+function extractOutput(
+  stdout: string,
+  outputFormat: MasweConfig["runtime"]["outputFormat"],
+): string {
+  // Text is an explicit raw-output contract. JSON snippets in Markdown must not
+  // trigger the NDJSON detector used for json/stream-json modes.
+  if (outputFormat === "text") return stdout;
   return extractCursorCliOutput(stdout);
 }
 
@@ -212,7 +218,7 @@ export class CursorCliRuntime implements AgentRuntime {
       );
     }
 
-    const extracted = extractOutput(result.stdout);
+    const extracted = extractOutput(result.stdout, this.config.runtime.outputFormat);
     const success = result.exitCode === 0 && !result.timedOut;
     if (success && !extracted) {
       return {
