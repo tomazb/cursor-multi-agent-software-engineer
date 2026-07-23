@@ -149,17 +149,17 @@ The optional SDK import means the CLI can build and run without installing the b
 
 `src/git-snapshot.ts` computes a SHA-256 workspace fingerprint for both Git and non-Git working directories:
 
-- **Git mode:** porcelain status including untracked files; unstaged binary diff; staged binary diff; paths and contents of untracked files (honoring Git excludes).
+- **Git mode:** porcelain status including untracked files; unstaged binary diff; staged binary diff; paths and contents of untracked files. Git-plane probes always pathspec-exclude `.maswe/` (they do not rely on `.git/info/exclude`). Other paths still honor ordinary `--exclude-standard` policy.
 - **Non-Git mode:** a stable namespace sentinel (not the invariant identity string) so the digest remains deterministic when nothing authoritative changes.
-- **Both modes:** authoritative `.maswe` state under the fingerprinted `cwd`, hashed independently of Git excludes: project config, `runs/*/run.json`, and durable artifact files.
+- **Both modes:** authoritative `.maswe` state under the fingerprinted `cwd`, hashed only through the MASWE-plane hasher: project config, `runs/*/run.json`, and durable artifact files.
 
-Intentionally excluded from the MASWE portion (expected orchestration churn): `.lock`, `.admin.lock`, `.admin.lock.recovering`, and `*.tmp` staging files. Other Git-excluded paths outside `.maswe` follow ordinary `--exclude-standard` policy and are not hashed. Isolated worktrees fingerprint their own `cwd` (typically without a local `.maswe` store); non-isolated checkouts include the operator-tree `.maswe` so read-only roles cannot mutate handoffs undetected. Workspace identity fields (`baseSha` / `headSha` / `branch`) may still record `not-a-git-repository` for non-Git trees; that sentinel is separate from the fingerprint digest.
+Intentionally excluded from the MASWE portion (expected orchestration churn): `.lock`, `.admin.lock`, `.admin.lock.recovering`, and `*.tmp` staging files. Isolated worktrees fingerprint their own `cwd` (typically without a local `.maswe` store); non-isolated checkouts include the operator-tree `.maswe` so read-only roles cannot mutate handoffs undetected. Workspace identity fields (`baseSha` / `headSha` / `branch`) may still record `not-a-git-repository` for non-Git trees; that sentinel is separate from the fingerprint digest.
 
 Read-only runtimes compare the fingerprint before and after execution. Any difference fails the run. This is a mutation detector, not an operating-system sandbox. A future sandbox can prevent writes rather than merely detecting them.
 
 ### 3.10 Quality runner
 
-`src/quality.ts` runs trusted project commands sequentially with the system shell. It records exit code, stdout, stderr, and duration. It stops after the first failure.
+`src/quality.ts` runs trusted project commands sequentially with the system shell. It records exit code, stdout, stderr, and duration. It stops after the first failure. Timeouts use `src/process.ts`, which terminates the shell process tree (POSIX process group / Windows `taskkill /T`) and bounds Promise settlement even if a descendant held pipes open.
 
 Quality commands never come from model output, issue text, or PR comments.
 

@@ -45,8 +45,8 @@ MASWE must prevent untrusted requests, model output, repository content, and PR 
 
 - Cursor CLI omits `--force` for read-only roles.
 - All read-only adapters compare a workspace fingerprint before and after execution.
-- In Git checkouts the fingerprint covers git status, unstaged/staged diffs, and untracked content (honoring excludes).
-- In both Git and non-Git working directories the fingerprint also covers authoritative `.maswe` state under `cwd` (project config, `runs/*/run.json`, durable artifacts) via the same hashing contract.
+- In Git checkouts the fingerprint covers git status, unstaged/staged diffs, and untracked content, with `.maswe/` excluded from those Git-plane probes via explicit pathspecs (independent of `.git/info/exclude`).
+- In both Git and non-Git working directories the fingerprint also covers authoritative `.maswe` state under `cwd` (project config, `runs/*/run.json`, durable artifacts) via the MASWE-plane hashing contract.
 - A mismatch fails the run.
 
 **Gap:** Detection occurs after the process runs; it is a mutation detector, not a preventive OS-level sandbox. External side effects outside the fingerprinted working directory are not covered. Ephemeral `.maswe` locks (`.lock`, `.admin.lock`, `.admin.lock.recovering`) and `*.tmp` staging files are intentionally excluded from the fingerprint. Non-Git directories do not fingerprint ordinary files outside `.maswe` (there is no Git status/diff plane); workspace identity fields still use the `not-a-git-repository` sentinel separately from the digest fingerprint.
@@ -109,6 +109,7 @@ MASWE must prevent untrusted requests, model output, repository content, and PR 
 - Credentials come from environment variables.
 - `.env*` is ignored except the example file.
 - SDK API key is passed through process environment/options, not persisted in run config.
+- Persisted workspace `remote` provenance is sanitized at capture time: HTTP(S)/`ssh://` userinfo is stripped; malformed credential-like remotes are omitted rather than stored raw.
 - Documentation instructs teams not to commit run artifacts by default.
 
 **Gaps and future work:**

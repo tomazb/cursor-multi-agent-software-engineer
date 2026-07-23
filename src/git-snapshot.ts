@@ -28,8 +28,9 @@ const MASWE_EPHEMERAL_BASENAMES = new Set([
  * - `.lock`, `.admin.lock`, `.admin.lock.recovering`
  * - `*.tmp` write staging files
  *
- * Git-excluded files outside `.maswe` are not hashed here; they follow ordinary
- * git status/`--exclude-standard` policy. Isolated worktrees fingerprint their
+ * The Git-plane fingerprint pathspec-excludes `.maswe/` entirely; this hasher is
+ * the sole `.maswe` input. Other Git-excluded paths outside `.maswe` follow
+ * ordinary `--exclude-standard` policy. Isolated worktrees fingerprint their
  * own `cwd` (typically without a local `.maswe` store).
  */
 async function hashMasweAuthoritativeState(cwd: string, hash: Hash): Promise<void> {
@@ -97,6 +98,8 @@ function gitFailure(args: string[], result: ProcessResult): Error {
   );
 }
 
+const MASWE_GIT_PATHSPEC_EXCLUDES = [".", ":(exclude).maswe", ":(exclude).maswe/**"] as const;
+
 /**
  * Probe repository identity. A completed nonzero rev-parse means "not Git";
  * execution failures (spawn errors/timeouts) propagate so callers fail closed.
@@ -113,9 +116,7 @@ export async function isGitWorkspaceClean(cwd: string, timeoutMs = GIT_TIMEOUT_M
     "--porcelain=v1",
     "--untracked-files=all",
     "--",
-    ".",
-    ":(exclude).maswe",
-    ":(exclude).maswe/**",
+    ...MASWE_GIT_PATHSPEC_EXCLUDES,
   ];
   const result = await run("git", args, cwd, timeoutMs);
   if (result.exitCode !== 0) throw gitFailure(args, result);
@@ -138,10 +139,13 @@ export async function gitWorkspaceFingerprint(
   const isGit = await isGitRepository(cwd, timeoutMs);
 
   if (isGit) {
+    // Explicit pathspecs exclude `.maswe` from the Git plane so fingerprinting
+    // does not depend on `.git/info/exclude` having been modified beforehand.
+    // Authoritative `.maswe` state is hashed separately below.
     const commands = [
-      ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-      ["diff", "--binary"],
-      ["diff", "--cached", "--binary"],
+      ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...MASWE_GIT_PATHSPEC_EXCLUDES],
+      ["diff", "--binary", "--", ...MASWE_GIT_PATHSPEC_EXCLUDES],
+      ["diff", "--cached", "--binary", "--", ...MASWE_GIT_PATHSPEC_EXCLUDES],
     ];
     for (const args of commands) {
       const result = await run("git", args, cwd, timeoutMs);
@@ -150,7 +154,14 @@ export async function gitWorkspaceFingerprint(
       hash.update(result.stderr);
     }
 
-    const untrackedArgs = ["ls-files", "--others", "--exclude-standard", "-z"];
+    const untrackedArgs = [
+      "ls-files",
+      "--others",
+      "--exclude-standard",
+      "-z",
+      "--",
+      ...MASWE_GIT_PATHSPEC_EXCLUDES,
+    ];
     const untracked = await run("git", untrackedArgs, cwd, timeoutMs);
     if (untracked.exitCode !== 0) throw gitFailure(untrackedArgs, untracked);
     for (const relative of untracked.stdout.split("\0").filter(Boolean).sort()) {
@@ -166,8 +177,8 @@ export async function gitWorkspaceFingerprint(
   }
 
   // Authoritative `.maswe` state is hashed in both Git and non-Git modes so
-  // read-only roles cannot mutate handoffs without detection. Git excludes
-  // hide `.maswe/` from porcelain/untracked hashing above.
+  // read-only roles cannot mutate handoffs without detection. The Git-plane
+  // probes above already pathspec-exclude `.maswe/`; do not double-count it.
   await hashMasweAuthoritativeState(cwd, hash);
   return hash.digest("hex");
 }
@@ -188,11 +199,49 @@ export async function gitCurrentBranch(cwd: string): Promise<string> {
   return result.stdout.trim();
 }
 
+/**
+ * Sanitize a Git remote URL for durable provenance.
+ * Removes username/password userinfo from parsed URLs. Preserves SCP-style
+ * `git@host:path` remotes. Omits malformed credential-like values rather than
+ * persisting raw secrets when parsing fails.
+ */
+export function sanitizeGitRemoteUrl(url: string): string | undefined {
+  const trimmed = url.trim();
+  if (!trimmed) return undefined;
+
+  // SCP-style SSH: git@host:path (optional user@). Not equivalent to password userinfo.
+  const scpStyle = /^(?:[\w.-]+@)?[\w.-]+:(?!\/\/).+$/;
+  if (scpStyle.test(trimmed) && !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) {
+    return trimmed;
+  }
+
+  const looksCredentialBearing = /(?:\/\/|@)[^/@\s]*:[^/@\s]+@/.test(trimmed) || /:\/\/[^/@\s]+:[^/@\s]+@/.test(trimmed);
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.username || parsed.password) {
+      parsed.username = "";
+      parsed.password = "";
+      // URL() may leave an empty "://" userinfo marker; normalize away.
+      return parsed.toString().replace(/^(https?:\/\/)@/i, "$1").replace(/^(ssh:\/\/)@/i, "$1");
+    }
+    return trimmed;
+  } catch {
+    if (looksCredentialBearing || /:\/\/[^/]*@/.test(trimmed)) {
+      return undefined;
+    }
+    // Non-URL remotes without obvious credentials (e.g. local paths) stay as-is.
+    return trimmed;
+  }
+}
+
 export async function gitRemoteUrl(cwd: string, name = "origin"): Promise<string | undefined> {
-  const result = await run("git", ["remote", "get-url", name], cwd);
+  // Read the configured remote URL (not the insteadOf-rewritten effective URL)
+  // so environment credential helpers cannot inject secrets into provenance.
+  const result = await run("git", ["config", "--get", `remote.${name}.url`], cwd);
   if (result.exitCode !== 0) return undefined;
   const url = result.stdout.trim();
-  return url.length > 0 ? url : undefined;
+  return url.length > 0 ? sanitizeGitRemoteUrl(url) : undefined;
 }
 
 export async function gitChangedFiles(cwd: string, baseSha: string, headSha = "HEAD"): Promise<string[]> {

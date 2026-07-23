@@ -42,6 +42,9 @@ The project follows semantic versioning once a public release process is establi
 - Read-only workspace fingerprints include authoritative `.maswe` run/artifact state (locks/`*.tmp` excluded) for both Git and non-Git working directories; non-Git no longer returns the invariant `not-a-git-repository` fingerprint sentinel.
 - Project-level model resolution errors identify the failing role.
 - `runtime.outputFormat` contracts accept `stream-json` in TypeScript types and `schemas/config.schema.json`.
+- Shell command timeouts terminate the process tree (POSIX process group / Windows `taskkill /T`) and bound Promise settlement when descendants hold pipes.
+- Workspace remote provenance strips URL userinfo before persistence; SCP-style `git@host:path` remotes remain intact.
+- Git-plane fingerprint probes pathspec-exclude `.maswe/` explicitly and no longer rely on `.git/info/exclude` for that isolation.
 
 ## [0.1.0] - 2026-07-22
 
