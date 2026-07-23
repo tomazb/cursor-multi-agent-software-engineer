@@ -23,12 +23,15 @@ Status: implemented in the initial repository bootstrap.
 
 ## v0.2 — Local hardening and git isolation
 
+Status: implemented.
+
 - `RunStore` interface and atomic file writes with lock/version checks.
 - Artifact digest validation on every read.
 - Attempt-specific immutable artifact history.
-- Persist base SHA, head SHA, branch, and workspace fingerprint.
-- Worktree/branch manager.
+- Persist repository remote, branch, base SHA, head SHA, and workspace fingerprint.
+- Worktree/branch manager with unexpected branch-movement rejection.
 - Deterministic commit creation and change-scope checks.
+- SHA-bound quality/verification evidence that invalidates when head SHA changes.
 - Pass verifier defects explicitly back to the builder.
 - Strict validation of all required terminal markers.
 - Redaction of common secrets in artifacts and logs.

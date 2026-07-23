@@ -48,9 +48,49 @@ Run diagnostics:
 
 ```bash
 maswe doctor
+maswe doctor --cwd /path/to/repo
 ```
 
-A model check is best effort because catalogue formatting is controlled by the Cursor CLI. Treat a doctor failure as a reason to inspect `agent models`, not as proof the provider is unavailable.
+`doctor` probes the Cursor CLI from a MASWE-managed worktree when `trustManagedWorktrees` is enabled (passing `--trust`), then removes that ephemeral worktree **and** its `maswe/doctor-*` branch. Cleanup outcome is reported as a doctor check.
+
+If a run **data** lock is abandoned (dead process), use explicit unlock — MASWE never auto-reclaims data locks. Acquire and unlock are serialized through a short-lived `.admin.lock` so a concurrent unlock cannot delete a replacement owner's lock:
+
+```bash
+maswe unlock <run-id>
+maswe unlock <run-id> --force   # only when you are sure no writer is alive
+```
+
+If `.admin.lock` itself is stale, corrupt, or incomplete, MASWE **fails closed** and does **not** automatically reclaim it (automatic reclaim previously raced with replacement owners). Clear it explicitly:
+
+```bash
+maswe unlock-admin <run-id>
+maswe unlock-admin <run-id> --force   # corrupt/incomplete/live only after confirming no writer
+```
+
+Admin recovery is serialized through an exclusive `.admin.lock.recovering` marker and re-checks the observed owner token before deletion, so a stale observer cannot delete a live replacement admin lock.
+
+### Model resolution invariants
+
+Configured role models may use logical names (for example `grok-4.5`).
+
+Fail-closed catalogue discovery and logical→exact resolution apply to runtimes that implement catalogue discovery — currently **`CursorCliRuntime`** (`agent models`).
+
+- **New runs (`start`, Cursor CLI):** logical names are resolved against the local catalogue to exact executable IDs. When a configured logical model explicitly includes an effort suffix (`-high` / `-medium` / `-low`), only same-core catalogue IDs with that same effort are eligible; missing effort fails closed (no silent upgrade or downgrade). When no effort is specified, preference selects non-fast, then high>medium>low, then `cursor-` prefixed IDs within the same logical family. Catalogue parsing is fail-closed: only recognized catalogue rows contribute IDs; headings, aliases, metadata, and prose are ignored. Empty/unparseable catalogues are discovery failures.
+- **Run snapshot:** `start` stores those exact IDs in `run.config`. Environment and project-config mutations after start do not rewrite them.
+- **Existing-run stages (`run`, `approve`, `retry`, …):** validate the persisted exact ID against the live catalogue and use it as-is. Same-core / same-family / provider / effort-level substitution is forbidden. If the persisted exact ID disappears from the catalogue, execution fails closed naming that ID.
+- **Doctor (Cursor CLI):** discovers the catalogue first, resolves the brainstormer model with the same project-resolution logic as `start`, then probes with that exact ID. Doctor does **not** create a run and does **not** persist a `run.config` snapshot.
+- **`CursorSdkRuntime`:** has no catalogue capability. Doctor/start do not call `agent models`; empty-catalogue pass-through keeps configured IDs as-is. SDK doctor must not be described as resolving through the CLI catalogue.
+
+Ambiguous cross-family matches and missing models fail closed. Treat a Cursor CLI doctor catalogue failure as a reason to inspect `agent models` output format/auth, not as proof the provider is unavailable.
+
+Doctor probe cleanup is based on recorded probe identity: once a `doctor-*` probe ID is assigned, final cleanup removes the probe worktree (if present) and `maswe/doctor-*` branch even when worktree creation failed after the branch was created. Cleanup is idempotent; cleanup failures surface as a `doctor-probe-cleanup` check without erasing the original doctor failure.
+
+Cursor CLI assistant extraction:
+
+- `stream-json`: only terminal NDJSON events with `type: "result"` (last wins).
+- `json`: only result-bearing objects.
+- Text mode: raw stdout.
+- Exit 0 with no valid stdout assistant result fails closed; stderr is never treated as successful assistant content.
 
 ## 4. Configure quality commands
 
@@ -71,15 +111,21 @@ Replace starter commands with commands that are authoritative for the target rep
 
 Commands execute with the system shell and are trusted code. Only repository administrators should change them. Never derive them from issues, model output, or PR comments.
 
-## 5. Use a dedicated branch or worktree
+## 5. Prefer isolated worktrees
 
-v0.1 does not create git isolation. Before approving design, create a feature branch or worktree:
+By default `policy.useIsolatedWorktree` is `true`. On `start`, MASWE creates branch `maswe/<run-id>` and a linked worktree under an **external** directory (`$TMPDIR/maswe-worktrees/...`), not inside the operator checkout. `.maswe/` is appended via `git rev-parse --git-path info/exclude` so local run storage does not dirty `git status` even when the operator is already inside a linked worktree. Builder and resolver roles execute in that worktree. With `policy.trustManagedWorktrees` (default `true`), Cursor CLI invocations pass `--trust` for every role in MASWE-created worktrees. Completed, cancelled, failed, and superseded runs remove their worktrees but **preserve** the `maswe/<run-id>` branch ref so failed-run provenance (builder `outputHeadSha`) can be restored on `retry`. Cleanup failures are surfaced to the operator.
 
-```bash
-git switch -c feature/organization-audit-trail
+To opt out for a trusted checkout:
+
+```json
+{
+  "policy": {
+    "useIsolatedWorktree": false
+  }
+}
 ```
 
-Keep the workspace clean. A clean checkout makes read-only enforcement and recovery easier to reason about.
+Keep the primary workspace clean. Dirty checkouts are rejected unless `policy.allowDirtyWorkspace` is true.
 
 ## 6. Run lifecycle
 
@@ -172,12 +218,22 @@ maswe run <run-id>
 
 Inspect:
 
-- `run.failure` in `run.json`.
+- `run.failure` in `run.json` (includes `resumeState` when recoverable).
 - Last transition details.
 - Runtime stderr captured in the failure or stage output.
 - Cursor authentication and model availability.
 
-A failed run is terminal in v0.1. Copy the approved request/artifacts into a new run after fixing the cause. A formal retry-from-failed command is planned.
+Retry the same run after fixing the cause:
+
+```bash
+maswe retry <run-id>
+```
+
+Or start a linked replacement that cancels the original when it is still active:
+
+```bash
+maswe supersede <run-id>
+```
 
 ### Quality failure loop
 
@@ -189,7 +245,7 @@ A failed verifier returns to `BUILDING`. The next builder prompt includes the la
 
 ### Read-only violation
 
-The run fails if a read-only role changes workspace state. Inspect `git status` and revert only changes attributable to that role. Preserve unrelated user work.
+The run fails if a read-only role changes fingerprinted workspace state. In Git checkouts that includes git status/diffs/untracked content. In both Git and non-Git working directories it also includes authoritative `.maswe` run records, durable artifacts, and project config under the fingerprinted working directory (Git excludes do not hide that state from the fingerprint). Inspect `git status` (when applicable) and `.maswe/runs/<id>/`, and revert only changes attributable to that role. Preserve unrelated user work. Ephemeral `.lock` / `.admin.lock` / `.admin.lock.recovering` / `*.tmp` churn under `.maswe` is excluded from the fingerprint by design. The fingerprint is a before/after mutation detector, not an OS sandbox.
 
 ## 8. File-store backup and privacy
 

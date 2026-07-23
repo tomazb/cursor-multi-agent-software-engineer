@@ -1,11 +1,31 @@
 import type { QualityReport } from "./domain.ts";
 import { spawnCaptured } from "./process.ts";
+import { redactSecrets } from "./redaction.ts";
 
-export async function runQualityChecks(cwd: string, commands: string[]): Promise<QualityReport> {
+export async function runQualityChecks(
+  cwd: string,
+  commands: string[],
+  options: { timeoutMs?: number } = {},
+): Promise<QualityReport> {
   const results = [];
   for (const command of commands) {
-    const result = await spawnCaptured(command, [], { cwd, shell: true });
-    results.push({ command, ...result });
+    const spawnOptions: {
+      cwd: string;
+      shell: boolean;
+      timeoutMs?: number;
+    } = {
+      cwd,
+      shell: true,
+    };
+    if (options.timeoutMs !== undefined) spawnOptions.timeoutMs = options.timeoutMs;
+    const result = await spawnCaptured(command, [], spawnOptions);
+    results.push({
+      command,
+      exitCode: result.exitCode,
+      stdout: redactSecrets(result.stdout),
+      stderr: redactSecrets(result.stderr),
+      durationMs: result.durationMs,
+    });
     if (result.exitCode !== 0) break;
   }
   return {

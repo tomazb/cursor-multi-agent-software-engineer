@@ -44,8 +44,11 @@ Return a Markdown report with:
 - Non-blocking warnings.
 - Final decision.
 
-The final line must be exactly one of:
+## Terminal marker (mandatory)
 
-`VERDICT: PASS`
+The **very last line** of your response must be exactly one of these bare markers:
 
-`VERDICT: FAIL`
+VERDICT: PASS
+VERDICT: FAIL
+
+Do not wrap the marker in backticks, quotes, bold, or code fences. Do not mention those marker strings anywhere else in the response.

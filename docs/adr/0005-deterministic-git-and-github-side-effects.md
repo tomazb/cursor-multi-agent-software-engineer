@@ -1,6 +1,6 @@
 # ADR-0005: Keep git publishing and GitHub side effects deterministic
 
-- Status: Accepted
+- Status: Accepted (local subset implemented in v0.2)
 - Date: 2026-07-22
 
 ## Context
@@ -22,6 +22,10 @@ Models may edit an isolated workspace and propose messages. Deterministic integr
 
 ### Negative
 
-- Requires a GitHub App and control-plane work beyond the local MVP.
+- Requires a GitHub App and control-plane work beyond the local MVP for remote GitHub side effects.
 - Some convenient agent-native PR features are intentionally not used as authoritative operations.
 - Deterministic publishing code must handle conflicts and rate limits.
+
+## Local progress (v0.2)
+
+`src/git-workspace.ts` owns local branch/worktree creation, deterministic commits, and change-scope checks. Push, PR creation, check runs, and webhook ingestion remain v0.3+.

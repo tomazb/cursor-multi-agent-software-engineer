@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tomazb/cursor-multi-agent-software-engineer/schemas/run-record.schema.json",
+  "title": "RunRecord",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "version",
+    "id",
+    "title",
+    "request",
+    "repositoryPath",
+    "state",
+    "createdAt",
+    "updatedAt",
+    "approvals",
+    "counters",
+    "config",
+    "artifacts",
+    "events"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "version": { "type": "integer", "minimum": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "title": { "type": "string" },
+    "request": { "type": "string" },
+    "repositoryPath": { "type": "string" },
+    "state": { "type": "string" },
+    "createdAt": { "type": "string" },
+    "updatedAt": { "type": "string" },
+    "approvals": {
+      "type": "object",
+      "required": ["brainstorm", "design"],
+      "properties": {
+        "brainstorm": { "type": "boolean" },
+        "design": { "type": "boolean" }
+      }
+    },
+    "counters": {
+      "type": "object",
+      "required": ["buildVerifyCycles", "commentResolutionCycles"],
+      "properties": {
+        "buildVerifyCycles": { "type": "integer", "minimum": 0 },
+        "commentResolutionCycles": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "config": { "type": "object" },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "logicalName", "attempt", "path", "sha256", "createdAt"],
+        "properties": {
+          "name": { "type": "string" },
+          "logicalName": { "type": "string" },
+          "attempt": { "type": "integer", "minimum": 1 },
+          "path": { "type": "string" },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "createdAt": { "type": "string" }
+        }
+      }
+    },
+    "events": { "type": "array" },
+    "workspace": {
+      "type": "object",
+      "required": ["baseSha", "headSha", "branch", "fingerprint"],
+      "properties": {
+        "remote": { "type": "string" },
+        "baseSha": { "type": "string" },
+        "headSha": { "type": "string" },
+        "branch": { "type": "string" },
+        "fingerprint": { "type": "string" },
+        "worktreePath": { "type": "string" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "quality": { "$ref": "#/$defs/evidenceBinding" },
+        "verification": { "$ref": "#/$defs/evidenceBinding" },
+        "mergeReady": { "$ref": "#/$defs/evidenceBinding" }
+      }
+    },
+    "supersedes": { "type": "string" },
+    "supersededBy": { "type": "string" },
+    "failure": {
+      "type": "object",
+      "required": ["message", "at"],
+      "properties": {
+        "message": { "type": "string" },
+        "at": { "type": "string" },
+        "resumeState": { "type": "string" }
+      }
+    }
+  },
+  "$defs": {
+    "evidenceBinding": {
+      "type": "object",
+      "required": ["headSha", "passed", "at"],
+      "properties": {
+        "headSha": { "type": "string" },
+        "passed": { "type": "boolean" },
+        "at": { "type": "string" }
+      }
+    }
+  }
+}

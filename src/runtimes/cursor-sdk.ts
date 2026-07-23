@@ -6,6 +6,11 @@ const importOptional = new Function("specifier", "return import(specifier)") as 
 ) => Promise<Record<string, any>>;
 
 export class CursorSdkRuntime implements AgentRuntime {
+  async listModels(): Promise<string[]> {
+    // SDK catalogue discovery is not available here; require exact IDs in config.
+    return [];
+  }
+
   async execute(request: RuntimeRequest): Promise<RuntimeResult> {
     const apiKey = process.env.CURSOR_API_KEY;
     if (!apiKey) throw new Error("CURSOR_API_KEY is required for the cursor-sdk runtime.");

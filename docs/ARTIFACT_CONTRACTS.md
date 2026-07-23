@@ -4,12 +4,15 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
 
 ## General rules
 
-- Every artifact is UTF-8 Markdown in v0.1.
-- The store records file name, repository-relative path, creation timestamp, and SHA-256 digest.
-- An artifact is replaced by name when a stage is retried; event history retains the transition attempts.
+- Every artifact is UTF-8 Markdown in v0.1+.
+- The store records logical name, attempt number, repository-relative path, creation timestamp, and SHA-256 digest.
+- Retries write attempt-scoped immutable files (`*.attempt-<n>.md`) and keep a latest logical pointer by name.
+- Digests are recomputed and compared on every read; mismatches fail closed.
 - Agents must not rely on prior chat messages that are absent from the supplied prompt.
-- Model output cannot authorize a transition unless the orchestrator recognizes the required terminal marker.
-- Future versions will include prompt version, model identity, git SHA, attempt number, and immutable artifact version in metadata.
+- Model output cannot authorize a transition unless the orchestrator recognizes the required terminal marker: exactly one bare marker token on the final line (no backticks, quotes, or earlier mentions of the token).
+- Common secrets are redacted before persistence.
+- JSON schemas live under `schemas/` for configuration and run records.
+- Persisted `run.config.roles.*.model` values are exact executable catalogue IDs after `start`. Loading a run migrates defaults then runs the same config assertions as project load (without applying process environment overrides).
 
 ## Run record
 
@@ -18,6 +21,7 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
 ```json
 {
   "schemaVersion": 1,
+  "version": 3,
   "id": "20260722120000-1a2b3c4d",
   "title": "Add organization audit trail",
   "request": "...",
@@ -33,11 +37,25 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
     "buildVerifyCycles": 0,
     "commentResolutionCycles": 0
   },
+  "workspace": {
+    "remote": "https://github.com/example/repo.git",
+    "baseSha": "abc...",
+    "headSha": "abc...",
+    "branch": "maswe/20260722120000-1a2b3c4d",
+    "fingerprint": "...",
+    "worktreePath": "/tmp/maswe-worktrees/<repoKey>/20260722120000-1a2b3c4d"
+  },
+  "evidence": {
+    "quality": { "headSha": "abc...", "passed": true, "at": "..." },
+    "verification": { "headSha": "abc...", "passed": true, "at": "..." }
+  },
   "config": {},
   "artifacts": [],
   "events": []
 }
 ```
+
+Build, quality, and verification events include the evaluated `headSha`. When `headSha` changes, prior quality/verification evidence is invalidated and merge-ready fails closed until CI and verification are re-run.
 
 The run's configuration is a snapshot. Changing `.maswe/config.json` affects only later runs unless a future migration command explicitly updates a run.
 
@@ -59,7 +77,7 @@ Required terminal marker:
 READY_FOR_BRAINSTORM_APPROVAL
 ```
 
-v0.1 records the artifact even if the marker is absent; strict marker validation is a planned hardening item.
+Strict marker validation rejects missing, quoted, embedded, or non-final-line markers.
 
 ## `03-specification-and-design.md`
 

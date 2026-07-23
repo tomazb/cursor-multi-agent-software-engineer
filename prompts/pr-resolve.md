@@ -31,4 +31,12 @@ Use Superpowers receiving-code-review, test-driven-development, and verification
 - Do not resolve the GitHub thread yourself; a fresh verifier and CI must pass first.
 - Report ambiguity or scope expansion instead of guessing.
 
-Return a Markdown resolution report with changes, tests, evidence, and any unresolved concern. End with `RESOLUTION_COMPLETE`.
+Return a Markdown resolution report with changes, tests, evidence, and any unresolved concern.
+
+## Terminal marker (mandatory)
+
+The **very last line** of your response must be exactly this bare marker:
+
+RESOLUTION_COMPLETE
+
+Do not wrap it in backticks, quotes, bold, or code fences. Do not mention that marker text anywhere else in the response.

@@ -29,15 +29,43 @@ const TRANSITIONS: Partial<Record<WorkflowState, Partial<Record<WorkflowEventTyp
 
 const TERMINAL_STATES: WorkflowState[] = ["COMPLETED", "FAILED", "CANCELLED"];
 
-export function transition(state: WorkflowState, event: WorkflowEventType): WorkflowState {
+const RESUMABLE_STATES: WorkflowState[] = [
+  "BRAINSTORMING",
+  "WAITING_FOR_BRAINSTORM_APPROVAL",
+  "DESIGNING",
+  "WAITING_FOR_DESIGN_APPROVAL",
+  "BUILDING",
+  "CI_RUNNING",
+  "VERIFYING",
+  "PR_READY",
+  "PR_REVIEW",
+  "CLASSIFYING_COMMENT",
+  "RESOLVING",
+  "WAITING_FOR_HUMAN",
+  "MERGE_READY",
+];
+
+export function transition(
+  state: WorkflowState,
+  event: WorkflowEventType,
+  resumeState?: WorkflowState,
+): WorkflowState {
   if (event === "CANCEL" && !TERMINAL_STATES.includes(state)) return "CANCELLED";
   if (event === "FAIL" && !TERMINAL_STATES.includes(state)) return "FAILED";
+  if (event === "RETRY_FROM_FAILED") {
+    if (state !== "FAILED") throw new Error(`Event RETRY_FROM_FAILED is not allowed from state ${state}`);
+    if (!resumeState || !RESUMABLE_STATES.includes(resumeState)) {
+      throw new Error("RETRY_FROM_FAILED requires a resumable resumeState");
+    }
+    return resumeState;
+  }
   const next = TRANSITIONS[state]?.[event];
   if (!next) throw new Error(`Event ${event} is not allowed from state ${state}`);
   return next;
 }
 
 export function allowedEvents(state: WorkflowState): WorkflowEventType[] {
+  if (state === "FAILED") return ["RETRY_FROM_FAILED"];
   if (TERMINAL_STATES.includes(state)) return [];
   const events = Object.keys(TRANSITIONS[state] ?? {}) as WorkflowEventType[];
   return [...events, "FAIL", "CANCEL"];

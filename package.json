@@ -1,6 +1,6 @@
 {
   "name": "cursor-multi-agent-software-engineer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A durable, model-configurable software delivery orchestrator for Cursor and Superpowers.",
   "type": "module",
   "private": true,
@@ -11,6 +11,7 @@
     "dist",
     "prompts",
     "skills",
+    "schemas",
     ".cursor-plugin",
     "README.md",
     "LICENSE"
@@ -23,6 +24,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "check": "npm run typecheck && npm test && npm run build",
+    "pack:dry": "npm pack --dry-run",
     "dev": "node --experimental-strip-types src/cli.ts",
     "start": "node dist/cli.js"
   },

@@ -39,15 +39,17 @@ MASWE must prevent untrusted requests, model output, repository content, and PR 
 
 ### T2 — Read-only role modifies code
 
-**Threat:** Brainstormer, designer, verifier, or classifier writes files or stages changes.
+**Threat:** Brainstormer, designer, verifier, or classifier writes files or stages changes, including authoritative `.maswe` run state or artifacts hidden by Git excludes.
 
 **Controls:**
 
 - Cursor CLI omits `--force` for read-only roles.
-- All read-only adapters compare a git workspace fingerprint before and after execution.
+- All read-only adapters compare a workspace fingerprint before and after execution.
+- In Git checkouts the fingerprint covers git status, unstaged/staged diffs, and untracked content, with `.maswe/` excluded from those Git-plane probes via explicit pathspecs (independent of `.git/info/exclude`).
+- In both Git and non-Git working directories the fingerprint also covers authoritative `.maswe` state under `cwd` (project config, `runs/*/run.json`, durable artifacts) via the MASWE-plane hashing contract.
 - A mismatch fails the run.
 
-**Gap:** Detection occurs after the process runs; it is not a preventive OS sandbox. External side effects outside the repository are not fingerprinted.
+**Gap:** Detection occurs after the process runs; it is a mutation detector, not a preventive OS-level sandbox. External side effects outside the fingerprinted working directory are not covered. Ephemeral `.maswe` locks (`.lock`, `.admin.lock`, `.admin.lock.recovering`) and `*.tmp` staging files are intentionally excluded from the fingerprint. Non-Git directories do not fingerprint ordinary files outside `.maswe` (there is no Git status/diff plane); workspace identity fields still use the `not-a-git-repository` sentinel separately from the digest fingerprint.
 
 ### T3 — Builder or resolver exceeds scope
 
@@ -60,7 +62,7 @@ MASWE must prevent untrusted requests, model output, repository content, and PR 
 - Out-of-scope comments stop for a human.
 - Deterministic quality and fresh independent verification follow edits.
 
-**Gap:** v0.1 does not mechanically restrict write paths. Future policy will calculate allowed file scopes and run in an isolated worktree.
+**Gap:** v0.2 isolates builders in a dedicated worktree and rejects commits outside `policy.allowedPathGlobs`. Fine-grained path policy derived from design artifacts remains future work.
 
 ### T4 — Self-verification
 
@@ -82,7 +84,7 @@ MASWE must prevent untrusted requests, model output, repository content, and PR 
 - Requested model is stored in configuration and event details.
 - Default policy does not attempt configured fallbacks.
 - Reported actual-model mismatch fails the run.
-- Doctor checks available model catalogue on a best-effort basis.
+- Doctor checks available model catalogue with fail-closed structured row parsing. Empty or unparseable catalogues are failures. Logical names resolve only for new runs; existing runs validate persisted exact IDs without substitution.
 
 **Gap:** Not every runtime reports actual model identity. Provider-side substitution may remain opaque.
 
@@ -107,13 +109,14 @@ MASWE must prevent untrusted requests, model output, repository content, and PR 
 - Credentials come from environment variables.
 - `.env*` is ignored except the example file.
 - SDK API key is passed through process environment/options, not persisted in run config.
+- Persisted workspace `remote` provenance is sanitized at capture time: HTTP(S)/`ssh://` userinfo is stripped; malformed credential-like remotes are omitted rather than stored raw.
 - Documentation instructs teams not to commit run artifacts by default.
 
 **Gaps and future work:**
 
-- No automatic secret redaction.
-- CLI prompt is currently passed as a process argument and may be visible in local process listings.
-- No data-loss prevention policy or provider-specific privacy controls.
+- Automatic secret redaction covers common token/PEM/Authorization patterns; it is best-effort, not a DLP product.
+- Default Cursor CLI prompt transport is stdin; argv remains available via `policy.promptTransport`.
+- No provider-specific privacy controls beyond local redaction.
 
 A near-term change should pass large prompts through stdin or SDK calls rather than command-line arguments where supported.
 
@@ -125,7 +128,7 @@ A near-term change should pass large prompts through stdin or SDK calls rather t
 
 - Artifacts have SHA-256 digests in the run record.
 
-**Gap:** Digests are not revalidated on read in v0.1 and are not signed. Future versions should verify hashes before every stage and bind approvals to artifact digests.
+**Gap:** Digests are revalidated on every read in v0.2 but are not cryptographically signed. Future versions should bind approvals to artifact digests with signatures where needed.
 
 ### T9 — Verification on stale code
 
@@ -134,8 +137,10 @@ A near-term change should pass large prompts through stdin or SDK calls rather t
 **Controls:**
 
 - Local read-only checks cover the workspace during the verifier execution.
+- Quality, verification, and merge-ready evidence records bind to the evaluated git **head SHA**.
+- Head-SHA movement after a successful stage invalidates stale evidence before merge-ready.
 
-**Gap:** v0.1 lacks exact git-SHA binding and GitHub check runs. Production GitHub integration must invalidate verification on every head-SHA change.
+**Gap:** Digests and evidence are not yet cryptographically signed, and remote GitHub check-run automation remains a later milestone. Production GitHub integration must continue to invalidate verification on every head-SHA change.
 
 ### T10 — Webhook replay or forged GitHub event
 

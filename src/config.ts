@@ -51,6 +51,12 @@ export const DEFAULT_CONFIG: MasweConfig = {
     maxBuildVerifyCycles: 3,
     maxCommentResolutionCycles: 2,
     allowDirtyWorkspace: false,
+    useIsolatedWorktree: true,
+    trustManagedWorktrees: true,
+    promptTransport: "stdin",
+    commandTimeoutMs: 600_000,
+    roleTimeoutMs: 1_800_000,
+    allowedPathGlobs: ["**"],
   },
 };
 
@@ -77,12 +83,13 @@ function mergeRole(base: RoleConfig, incoming: unknown): RoleConfig {
   };
 }
 
-function mergeConfig(raw: unknown): MasweConfig {
+/** Pure default migration without applying process environment overrides. */
+export function migrateConfig(raw: unknown): MasweConfig {
   const base = cloneDefaults();
-  if (!raw || typeof raw !== "object") return applyEnvironment(base);
+  if (!raw || typeof raw !== "object") return base;
   const value = raw as Partial<MasweConfig>;
 
-  const merged: MasweConfig = {
+  return {
     ...base,
     ...value,
     version: 1,
@@ -98,8 +105,18 @@ function mergeConfig(raw: unknown): MasweConfig {
     quality: { ...base.quality, ...(value.quality ?? {}) },
     policy: { ...base.policy, ...(value.policy ?? {}) },
   };
+}
 
-  return applyEnvironment(merged);
+/** Project config load path: migrate defaults then apply environment overrides. */
+export function mergeConfig(raw: unknown): MasweConfig {
+  return applyEnvironment(migrateConfig(raw));
+}
+
+/** Test/helper alias: deep-migrate partial or v0.1 config snapshots onto current defaults. */
+export function mergeConfigForTest(raw: unknown): MasweConfig {
+  const config = migrateConfig(raw);
+  assertConfig(config);
+  return config;
 }
 
 function applyEnvironment(config: MasweConfig): MasweConfig {
@@ -114,23 +131,94 @@ function applyEnvironment(config: MasweConfig): MasweConfig {
   return result;
 }
 
-function assertConfig(config: MasweConfig): void {
+/** Fail-closed validation shared by project config load and persisted run migration. */
+export function assertConfig(config: MasweConfig): void {
   const runtimes: RuntimeKind[] = ["mock", "cursor-cli", "cursor-sdk"];
   if (!runtimes.includes(config.runtime.kind)) {
     throw new Error(`Unsupported runtime.kind: ${config.runtime.kind}`);
   }
-  if (!config.runtime.command.trim()) throw new Error("runtime.command must not be empty");
+  if (typeof config.runtime.command !== "string" || !config.runtime.command.trim()) {
+    throw new Error("runtime.command must not be empty");
+  }
+  if (!["text", "json", "stream-json"].includes(config.runtime.outputFormat)) {
+    throw new Error("runtime.outputFormat must be text, json, or stream-json");
+  }
   for (const [role, roleConfig] of Object.entries(config.roles)) {
-    if (!roleConfig.model.trim()) throw new Error(`roles.${role}.model must not be empty`);
+    if (typeof roleConfig.model !== "string" || !roleConfig.model.trim()) {
+      throw new Error(`roles.${role}.model must not be empty`);
+    }
+    if (!["read-only", "workspace-write"].includes(roleConfig.permissions)) {
+      throw new Error(`roles.${role}.permissions must be read-only or workspace-write`);
+    }
+    if (!["low", "medium", "high"].includes(roleConfig.reasoning)) {
+      throw new Error(`roles.${role}.reasoning must be low, medium, or high`);
+    }
+    if (
+      roleConfig.fallbackModels !== undefined &&
+      (!Array.isArray(roleConfig.fallbackModels) ||
+        !roleConfig.fallbackModels.every((model) => typeof model === "string" && model.trim().length > 0))
+    ) {
+      throw new Error(`roles.${role}.fallbackModels must be an array of non-empty strings when set`);
+    }
+  }
+  for (const [gate, value] of Object.entries(config.gates)) {
+    if (typeof value !== "boolean") {
+      throw new Error(`gates.${gate} must be a boolean`);
+    }
   }
   if (!Array.isArray(config.quality.commands)) {
     throw new Error("quality.commands must be an array");
   }
-  if (config.policy.maxBuildVerifyCycles < 1) {
+  if (!config.quality.commands.every((command) => typeof command === "string")) {
+    throw new Error("quality.commands must contain only strings");
+  }
+  if (
+    typeof config.policy.maxBuildVerifyCycles !== "number" ||
+    !Number.isFinite(config.policy.maxBuildVerifyCycles) ||
+    config.policy.maxBuildVerifyCycles < 1
+  ) {
     throw new Error("policy.maxBuildVerifyCycles must be at least 1");
   }
-  if (config.policy.maxCommentResolutionCycles < 1) {
+  if (
+    typeof config.policy.maxCommentResolutionCycles !== "number" ||
+    !Number.isFinite(config.policy.maxCommentResolutionCycles) ||
+    config.policy.maxCommentResolutionCycles < 1
+  ) {
     throw new Error("policy.maxCommentResolutionCycles must be at least 1");
+  }
+  if (!["stdin", "argv"].includes(config.policy.promptTransport)) {
+    throw new Error("policy.promptTransport must be stdin or argv");
+  }
+  if (typeof config.policy.trustManagedWorktrees !== "boolean") {
+    throw new Error("policy.trustManagedWorktrees must be a boolean");
+  }
+  if (typeof config.policy.useIsolatedWorktree !== "boolean") {
+    throw new Error("policy.useIsolatedWorktree must be a boolean");
+  }
+  if (typeof config.policy.allowDirtyWorkspace !== "boolean") {
+    throw new Error("policy.allowDirtyWorkspace must be a boolean");
+  }
+  if (typeof config.policy.rejectModelFallback !== "boolean") {
+    throw new Error("policy.rejectModelFallback must be a boolean");
+  }
+  if (!Number.isFinite(config.policy.commandTimeoutMs) || config.policy.commandTimeoutMs < 1) {
+    throw new Error("policy.commandTimeoutMs must be at least 1");
+  }
+  if (!Number.isFinite(config.policy.roleTimeoutMs) || config.policy.roleTimeoutMs < 1) {
+    throw new Error("policy.roleTimeoutMs must be at least 1");
+  }
+  if (
+    config.policy.maxRunDurationMs !== undefined &&
+    (!Number.isFinite(config.policy.maxRunDurationMs) || config.policy.maxRunDurationMs < 1)
+  ) {
+    throw new Error("policy.maxRunDurationMs must be at least 1 when set");
+  }
+  if (
+    !Array.isArray(config.policy.allowedPathGlobs) ||
+    config.policy.allowedPathGlobs.length < 1 ||
+    !config.policy.allowedPathGlobs.every((glob) => typeof glob === "string" && glob.trim().length > 0)
+  ) {
+    throw new Error("policy.allowedPathGlobs must contain at least one glob");
   }
 }
 

@@ -1,6 +1,6 @@
 # ADR-0002: Use artifact-based handoffs and a file store for v0.1
 
-- Status: Accepted
+- Status: Accepted (amended by v0.2 hardening)
 - Date: 2026-07-22
 
 ## Context
@@ -22,11 +22,9 @@ Every stage produces a named Markdown artifact. Persist run state, configuration
 
 ### Negative
 
-- No atomic multi-process concurrency.
-- Artifact replacement loses prior file contents unless backed up.
 - Local paths and data retention need care.
-- Hashes are recorded but not yet validated or signed.
+- Digests are validated but not cryptographically signed.
 
 ## Follow-up
 
-Extract a store interface, add version checks and atomic writes, then implement SQLite and PostgreSQL stores before distributed workers.
+v0.2 extracted the `RunStore` interface, added optimistic `version` checks, atomic writes, digest revalidation on read, and attempt-scoped immutable artifact history. Implement SQLite and PostgreSQL stores before distributed workers.

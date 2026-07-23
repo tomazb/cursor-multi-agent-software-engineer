@@ -10,6 +10,7 @@ export type RoleId = (typeof ROLE_IDS)[number];
 export type PermissionMode = "read-only" | "workspace-write";
 export type RuntimeKind = "mock" | "cursor-cli" | "cursor-sdk";
 export type ReasoningEffort = "low" | "medium" | "high";
+export type PromptTransport = "stdin" | "argv";
 
 export interface RoleConfig {
   model: string;
@@ -23,7 +24,7 @@ export interface MasweConfig {
   runtime: {
     kind: RuntimeKind;
     command: string;
-    outputFormat: "json" | "text";
+    outputFormat: "json" | "text" | "stream-json";
   };
   roles: Record<RoleId, RoleConfig>;
   gates: {
@@ -40,6 +41,14 @@ export interface MasweConfig {
     maxBuildVerifyCycles: number;
     maxCommentResolutionCycles: number;
     allowDirtyWorkspace: boolean;
+    useIsolatedWorktree: boolean;
+    /** Pass Cursor CLI `--trust` for MASWE-managed worktrees. */
+    trustManagedWorktrees: boolean;
+    promptTransport: PromptTransport;
+    commandTimeoutMs: number;
+    roleTimeoutMs: number;
+    maxRunDurationMs?: number;
+    allowedPathGlobs: string[];
   };
 }
 
@@ -87,6 +96,7 @@ export const WORKFLOW_EVENTS = [
   "COMPLETE",
   "FAIL",
   "CANCEL",
+  "RETRY_FROM_FAILED",
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENTS)[number];
@@ -103,13 +113,37 @@ export interface WorkflowEvent {
 
 export interface ArtifactReference {
   name: string;
+  logicalName: string;
+  attempt: number;
   path: string;
   sha256: string;
   createdAt: string;
 }
 
+export interface RunWorkspace {
+  remote?: string;
+  baseSha: string;
+  headSha: string;
+  branch: string;
+  fingerprint: string;
+  worktreePath?: string;
+}
+
+export interface EvidenceBinding {
+  headSha: string;
+  passed: boolean;
+  at: string;
+}
+
+export interface RunEvidence {
+  quality?: EvidenceBinding;
+  verification?: EvidenceBinding;
+  mergeReady?: EvidenceBinding;
+}
+
 export interface RunRecord {
   schemaVersion: 1;
+  version: number;
   id: string;
   title: string;
   request: string;
@@ -128,9 +162,14 @@ export interface RunRecord {
   config: MasweConfig;
   artifacts: ArtifactReference[];
   events: WorkflowEvent[];
+  workspace?: RunWorkspace;
+  evidence?: RunEvidence;
+  supersedes?: string;
+  supersededBy?: string;
   failure?: {
     message: string;
     at: string;
+    resumeState?: WorkflowState;
   };
 }
 
@@ -140,6 +179,9 @@ export interface RuntimeRequest {
   prompt: string;
   cwd: string;
   roleConfig: RoleConfig;
+  timeoutMs?: number;
+  /** True when cwd is a MASWE-created isolated worktree. */
+  managedWorktree?: boolean;
 }
 
 export interface RuntimeResult {
@@ -164,6 +206,8 @@ export interface RuntimeDoctorResult {
 export interface AgentRuntime {
   execute(request: RuntimeRequest): Promise<RuntimeResult>;
   doctor(): Promise<RuntimeDoctorResult>;
+  /** Local provider model catalogue IDs for logical→exact resolution. */
+  listModels(): Promise<string[]>;
 }
 
 export interface QualityCommandResult {

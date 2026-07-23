@@ -30,14 +30,19 @@ npm run dev -- status --cwd /path/to/target
 ```text
 src/domain.ts             stable contracts and data types
 src/state-machine.ts      all legal state transitions
-src/store.ts              local persistence and artifact hashing
+src/store.ts              RunStore interface and atomic file persistence
 src/orchestrator.ts       workflow policy and stage execution
 src/prompt-builder.ts     prompt-template assembly
 src/quality.ts            deterministic project command runner
-src/git-snapshot.ts       read-only enforcement support
+src/git-snapshot.ts       fingerprint and git identity helpers
+src/git-workspace.ts      worktree/branch/commit/scope management
+src/markers.ts            terminal marker validation
+src/redaction.ts          secret masking for artifacts and logs
+src/process.ts            process capture with timeouts
 src/runtime.ts            adapter factory
 src/runtimes/*            provider/runtime-specific implementation
 src/cli.ts                user interface only
+schemas/*                 JSON schemas for config and run records
 ```
 
 Do not import Cursor SDK from the core. Do not move transition decisions into prompts or runtime adapters.

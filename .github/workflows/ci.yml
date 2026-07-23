@@ -29,7 +29,19 @@ jobs:
           node-version: ${{ matrix.node-version }}
 
       - name: Install dependencies
-        run: npm install --include=dev --ignore-scripts --no-audit --no-fund
+        run: npm ci --include=dev --ignore-scripts --no-audit --no-fund
 
-      - name: Type check, test, and build
-        run: npm run check
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Ready-review regression tests
+        run: node --experimental-strip-types --test test/ready-review-corrections.test.ts
+
+      - name: Full test suite
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify package contents
+        run: npm run pack:dry

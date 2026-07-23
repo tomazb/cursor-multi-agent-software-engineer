@@ -25,4 +25,12 @@ Produce a self-contained Markdown artifact with:
 7. Draft measurable acceptance criteria.
 8. A decision checklist for the human approval gate.
 
-Never claim facts about the repository without inspecting it. Never modify files. End with `READY_FOR_BRAINSTORM_APPROVAL`.
+Never claim facts about the repository without inspecting it. Never modify files.
+
+## Terminal marker (mandatory)
+
+The **very last line** of your response must be exactly this bare marker and nothing else on that line:
+
+READY_FOR_BRAINSTORM_APPROVAL
+
+Do not wrap it in backticks, quotes, bold, or code fences. Do not mention that marker text anywhere else in the response.

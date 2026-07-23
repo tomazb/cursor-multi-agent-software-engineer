@@ -6,7 +6,7 @@
 
 ## Status
 
-- Version: 0.1 foundation
+- Version: 0.2 local hardening
 - Date: 2026-07-22
 - Owner: repository maintainer
 - Intended first users: individual software engineers and small teams using Cursor and GitHub
@@ -88,7 +88,9 @@ Classify review comments before editing, escalate scope changes, re-run CI after
 
 Support Cursor CLI immediately, Cursor SDK through an adapter, Superpowers practices in stage prompts, and a Cursor plugin skill as the editor entry point.
 
-## Non-goals for v0.1
+## Non-goals (historical v0.1) and remaining out of scope
+
+The following were non-goals for the original v0.1 CLI and remain out of scope for local v0.2 except where noted:
 
 - Fully autonomous requirement approval.
 - Automatic merging.
@@ -97,7 +99,7 @@ Support Cursor CLI immediately, Cursor SDK through an adapter, Superpowers pract
 - General-purpose swarm or arbitrary recursive subagent framework.
 - Guaranteeing provider model availability or pricing.
 - Sandboxing untrusted repositories beyond the permissions supplied by Cursor and the local operating system.
-- Creating branches, worktrees, commits, or PRs automatically.
+- Creating pull requests or merging automatically. **v0.2 does provide local branch/worktree/commit isolation**; remote PR/merge automation remains a later milestone.
 
 ## Core principles
 
@@ -177,7 +179,7 @@ Each role shall have a configurable model. When fail-closed model fallback is en
 
 ### FR-16 — Read-only enforcement
 
-The system shall fingerprint git-tracked, staged, and untracked workspace state before and after read-only roles. A difference shall fail the run.
+The system shall fingerprint workspace state before and after read-only roles. In Git checkouts that includes git-tracked, staged, and untracked content. In both Git and non-Git working directories the system shall also fingerprint authoritative `.maswe` run state, durable artifacts, and project config under the fingerprinted working directory (independent of Git excludes). A difference shall fail the run. Ephemeral lock and `*.tmp` files under `.maswe` are excluded from that fingerprint so normal orchestration churn does not false-fail.
 
 ### FR-17 — Run inspection
 
@@ -193,7 +195,7 @@ The core shall support a mock runtime, Cursor CLI runtime, and optional Cursor S
 
 ### FR-20 — Environment diagnostics
 
-The system shall provide a doctor command that checks runtime availability, credentials where applicable, and configured model slugs on a best-effort basis.
+The system shall provide a doctor command that checks runtime availability, credentials where applicable, and configured model slugs. For runtimes that implement catalogue discovery (currently Cursor CLI), doctor shall perform fail-closed catalogue discovery and project-style logical→exact resolution before the probe, and shall not report transport success when model resolution failed. Doctor does not create a run or persist a `run.config` snapshot. Runtimes without catalogue capability (currently Cursor SDK) are diagnosed without `agent models` resolution.
 
 ## Non-functional requirements
 

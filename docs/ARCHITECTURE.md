@@ -118,7 +118,7 @@ It does not contain Cursor SDK implementation details, shell output parsing, or 
     └── 09-resolution-report.md
 ```
 
-`run.json` is an event-bearing snapshot, not an event-sourced database. It stores enough history for audit and recovery in a single-process local deployment.
+`run.json` is an event-bearing snapshot, not an event-sourced database. It stores enough history for audit and recovery in a single-process local deployment. Mutating operations take an exclusive data lock (temp+`link` complete `{pid,owner,at}` record) coordinated with explicit `unlock` through a dedicated `.admin.lock`. Automatic stale reclaim is not used for data locks **or** admin locks; operators use `maswe unlock` / `maswe unlock-admin`. `writeArtifact` rejects stale caller versions and only mutates authoritative on-disk state so concurrent cancellation or state transitions cannot lose events, approvals, counters, evidence, or failure records.
 
 Artifacts are SHA-256 hashed when written. A future store can place content in object storage and keep the same reference contract.
 
@@ -140,25 +140,26 @@ doctor(): Promise<RuntimeDoctorResult>
 Implemented adapters:
 
 - `MockRuntime`: deterministic outputs for tests and workflow development.
-- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode; adds `--force` only for write roles.
-- `CursorSdkRuntime`: dynamically imports `@cursor/sdk` and runs a local one-shot `Agent.prompt` call.
+- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode. **New runs** resolve logical model names via `resolveProjectModels` against a fail-closed structured catalogue parse; **existing-run stages** call `validatePersistedExactModel` and never substitute. Unwraps JSON/`stream-json` stdout using only terminal `type: "result"` events (text mode keeps raw stdout); never treats stderr as successful assistant content. Adds `--mode ask` for read-only roles and `--force` only for write roles; adds `--trust` when `policy.trustManagedWorktrees` is set for MASWE-managed worktrees. Doctor discovers the catalogue before the stdin probe and cleans probe branch/worktree by recorded probe identity in `finally`.
+- `CursorSdkRuntime`: dynamically imports `@cursor/sdk` and runs a local one-shot `Agent.prompt` call (no catalogue capability; empty-catalogue pass-through stays SDK-only).
 
 The optional SDK import means the CLI can build and run without installing the beta SDK.
 
 ### 3.9 Read-only enforcement
 
-`src/git-snapshot.ts` computes a workspace fingerprint using:
+`src/git-snapshot.ts` computes a SHA-256 workspace fingerprint for both Git and non-Git working directories:
 
-- Git porcelain status including untracked files.
-- Unstaged binary diff.
-- Staged binary diff.
-- Paths and contents of untracked files.
+- **Git mode:** porcelain status including untracked files; unstaged binary diff; staged binary diff; paths and contents of untracked files. Git-plane probes always pathspec-exclude `.maswe/` (they do not rely on `.git/info/exclude`). Other paths still honor ordinary `--exclude-standard` policy.
+- **Non-Git mode:** a stable namespace sentinel (not the invariant identity string) so the digest remains deterministic when nothing authoritative changes.
+- **Both modes:** authoritative `.maswe` state under the fingerprinted `cwd`, hashed only through the MASWE-plane hasher: project config, `runs/*/run.json`, and durable artifact files.
 
-Read-only runtimes compare the fingerprint before and after execution. Any difference fails the run. This is a detection boundary, not an operating-system sandbox. A future sandbox can prevent writes rather than merely detecting them.
+Intentionally excluded from the MASWE portion (expected orchestration churn): `.lock`, `.admin.lock`, `.admin.lock.recovering`, and `*.tmp` staging files. Isolated worktrees fingerprint their own `cwd` (typically without a local `.maswe` store); non-isolated checkouts include the operator-tree `.maswe` so read-only roles cannot mutate handoffs undetected. Workspace identity fields (`baseSha` / `headSha` / `branch`) may still record `not-a-git-repository` for non-Git trees; that sentinel is separate from the fingerprint digest.
+
+Read-only runtimes compare the fingerprint before and after execution. Any difference fails the run. This is a mutation detector, not an operating-system sandbox. A future sandbox can prevent writes rather than merely detecting them.
 
 ### 3.10 Quality runner
 
-`src/quality.ts` runs trusted project commands sequentially with the system shell. It records exit code, stdout, stderr, and duration. It stops after the first failure.
+`src/quality.ts` runs trusted project commands sequentially with the system shell. It records exit code, stdout, stderr, and duration. It stops after the first failure. Timeouts use `src/process.ts`, which terminates the shell process tree (POSIX process group / Windows `taskkill /T`) and bounds Promise settlement even if a descendant held pipes open.
 
 Quality commands never come from model output, issue text, or PR comments.
 
@@ -204,7 +205,13 @@ With `rejectModelFallback: true`, only the primary candidate is attempted. If a 
 
 With `rejectModelFallback: false`, runtime or startup failure may advance through configured candidates. Every attempt remains visible in the failure message and successful event metadata.
 
-Model aliases are project configuration. Exact provider slugs must be validated against the user's current Cursor catalogue.
+Model aliases are project configuration for **new runs only**. For runtimes that implement catalogue discovery (`CursorCliRuntime` via `agent models`):
+
+- **`start`:** discovers the catalogue, resolves logical role models to exact executable IDs (effort-aware: an explicit `-high`/`-medium`/`-low` suffix requires the same effort; otherwise fail closed), and **persists** those exact IDs in the new `run.config` snapshot.
+- **`doctor`:** discovers the catalogue and resolves an exact ID for its stdin probe only. Doctor does **not** create a run and does **not** persist a `run.config` snapshot.
+- **Existing-run stages:** validate the persisted exact ID against the live catalogue and never substitute same-core, same-family, provider, or effort variants when the catalogue drifts.
+
+`CursorSdkRuntime` has no catalogue capability; doctor/start do not call `agent models`, and empty-catalogue pass-through keeps configured IDs as-is for SDK-only paths.
 
 ## 6. Superpowers integration
 
@@ -249,7 +256,7 @@ See `docs/GITHUB_APP.md`.
 
 ## 9. Consistency and concurrency
 
-v0.1 assumes a single writer per run. Concurrent commands against the same `run.json` can lose updates.
+v0.2 uses optimistic `version` checks and atomic writes per run. Concurrent writers against the same run still fail closed rather than merge updates.
 
 The hosted design adds:
 
@@ -295,20 +302,17 @@ GitHub input (future)
 
 ## 12. Known architecture gaps
 
-- No branch/worktree manager.
-- No exact git SHA persisted in the run record.
-- No atomic file-store writes or locking.
-- No redaction pipeline for artifacts.
 - No structured telemetry exporter.
 - SDK adapter uses a one-shot local prompt and does not yet exploit durable SDK agents.
 - Reasoning effort is stored but not translated into provider-specific SDK parameters.
+- GitHub App check runs and authenticated PR automation remain v0.3+.
 
-These gaps are tracked in the roadmap rather than hidden behind implied guarantees.
+Closed in v0.2: branch/worktree manager, git SHA persistence on the run record, atomic file-store writes with optimistic versioning, artifact digest revalidation, attempt history, secret redaction, stdin prompt transport, budgets/timeouts, and retry/supersede recovery.
 
 ## 13. Extension points
 
 - Add a runtime by implementing `AgentRuntime` and extending `RuntimeKind` plus the factory.
-- Add a store by extracting a `RunStore` interface from `FileRunStore` before the first database implementation.
+- Add a store by implementing `RunStore` (see `FileRunStore`) before the first database implementation.
 - Add a stage by changing domain constants, transition table, orchestrator behavior, prompts, artifact contracts, tests, and docs together.
 - Add GitHub through an event adapter that calls public orchestrator operations; do not put webhook logic in the core.
 - Add policy through deterministic functions that take configuration and run state; avoid prompt-only policy.

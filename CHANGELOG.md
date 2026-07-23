@@ -9,9 +9,42 @@ The project follows semantic versioning once a public release process is establi
 ### Planned
 
 - GitHub App webhooks, check runs, and review-thread automation.
-- SHA-bound verification and branch/worktree management.
 - SQLite and PostgreSQL stores.
 - Remote control-plane API and MCP server.
+
+## [0.2.0] - 2026-07-22
+
+### Added
+
+- `RunStore` interface with atomic file writes, exclusive data locks (temp+`link` complete `{pid,owner,at}` records), a dedicated `.admin.lock` serializing acquire/unlock, **no automatic stale reclaim** for data or admin locks (use `maswe unlock` / `maswe unlock-admin`), and optimistic `version` checks.
+- Artifact digest revalidation on every read and attempt-scoped immutable artifact history.
+- Persisted workspace provenance: remote, base SHA, head SHA, branch, fingerprint, optional external worktree path.
+- Git worktree/branch manager with deterministic commits (input/output SHA provenance), change-scope checks (NUL-delimited path parsing), unexpected branch-movement rejection, and worktree cleanup on terminal runs.
+- Strict final-line terminal marker parsing with typed results; conflicting/duplicate/embedded markers fail closed.
+- SHA-bound quality/verification evidence; new commits invalidate prior verification before merge-ready.
+- Explicit verifier defect artifacts passed back into builder prompts.
+- Secret redaction for artifacts and quality command output.
+- Cursor CLI stdin prompt transport with doctor probe (argv fallback retained).
+- Command/role/run timeout budgets.
+- `maswe retry` and `maswe supersede` recovery commands.
+- v0.1 run-record migration (synthesize `version` / attempt metadata) with full config assertion after migration, or fail-closed on invalid records.
+- JSON schemas for configuration and run records under `schemas/`.
+- Packaged CLI dry-run verification in CI via `npm ci` and `npm pack --dry-run`.
+- Strict separation of project model resolution (`resolveProjectModels`) vs existing-run exact validation (`validatePersistedExactModel`); structured fail-closed Cursor catalogue row parsing; approved-family smoke model selection.
+
+### Changed
+
+- Default policy enables isolated worktrees and stdin prompt transport.
+- Builder prompt includes `{{VERIFIER_DEFECTS}}` on verification retries.
+- Cursor `stream-json` extraction accepts only terminal `type: "result"` events; stderr is never successful assistant content.
+- Doctor probe cleanup is identity-based (branch + worktree) and runs in `finally` after partial creation failures.
+- Logical model resolution requires matching effort suffixes (`-high`/`-medium`/`-low`); missing effort fails closed.
+- Read-only workspace fingerprints include authoritative `.maswe` run/artifact state (locks/`*.tmp` excluded) for both Git and non-Git working directories; non-Git no longer returns the invariant `not-a-git-repository` fingerprint sentinel.
+- Project-level model resolution errors identify the failing role.
+- `runtime.outputFormat` contracts accept `stream-json` in TypeScript types and `schemas/config.schema.json`.
+- Shell command timeouts terminate the process tree (POSIX process group / Windows `taskkill /T`) and bound Promise settlement when descendants hold pipes.
+- Workspace remote provenance strips URL userinfo before persistence; SCP-style `git@host:path` remotes remain intact.
+- Git-plane fingerprint probes pathspec-exclude `.maswe/` explicitly and no longer rely on `.git/info/exclude` for that isolation.
 
 ## [0.1.0] - 2026-07-22
 
