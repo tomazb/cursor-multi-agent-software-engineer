@@ -85,11 +85,13 @@ maswe unlock-admin <run-id> --force
 Data, admin, and administrative-recovery locks are never auto-reclaimed. `--force` asserts that
 the apparently live or incomplete initializer is quiescent; it is not process fencing.
 
-Version-2 locks are directories containing exactly one UUID-named record. Empty, temporary,
-corrupt, multiple-entry, link, junction/reparse, ownership-loss, deletion-pending, and cleanup
-failure states fail closed. `unlock-admin` must first own `.admin.lock.recovering`; even force
-cannot revoke a live recovery marker. MASWE removes only exact observed tokens/singletons and
-empty directories—never a public lock directory recursively.
+Version-2 locks are directories containing exactly one UUID-named record. Without the documented
+recovery command and quiescence assertion, empty, temporary, corrupt, ownership-loss,
+deletion-pending, and cleanup-failure states fail closed. Force may perform only the documented
+exact-token, exact regular-singleton, or empty-only cleanup. It cannot revoke a live recovery
+marker or mutate links, junctions/reparse points, multiple entries, unexpected types, or
+unsupported filesystems. `unlock-admin` must first own `.admin.lock.recovering`. MASWE never
+removes a public lock directory recursively.
 
 Legacy PR #10 regular-file locks remain readable. Mixed-version active locking is unsupported;
 upgrade/rollback requires quiescence, and rollback requires the new binary to remove all

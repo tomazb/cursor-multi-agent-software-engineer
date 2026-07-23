@@ -33,7 +33,8 @@ Options:
   --config <path>  Use a specific config file.
   --cwd <path>     Run against a different repository directory.
   --json           Print machine-readable output.
-  --force          Assert lock/recovery quiescence; never revokes a live recovery marker.
+  --force          unlock: assert quiescence and remove an explicitly selected live lock.
+                   unlock-admin: never revokes a live recovery marker.
 `;
 }
 

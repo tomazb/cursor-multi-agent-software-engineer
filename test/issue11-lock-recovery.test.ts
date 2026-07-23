@@ -203,6 +203,25 @@ test("acquisition never overwrites an existing empty directory", async () => {
   assert.deepEqual(await import("node:fs/promises").then((fs) => fs.readdir(lockPath)), []);
 });
 
+test("internal publication never replaces an existing owner-token entry", async () => {
+  const { lockPath } = await fixture();
+  const sentinel = "existing-owner-token-entry";
+  await assert.rejects(
+    acquireDirectoryLock(lockPath, "data", {
+      transition: async (transition, owner) => {
+        if (transition === "RECORD_SYNCED") {
+          await writeFile(path.join(lockPath, owner), sentinel, "utf8");
+        }
+      },
+    }),
+    (error: unknown) =>
+      error instanceof LockProtocolError && error.code === "LOCK_OWNERSHIP_LOST",
+  );
+  const entries = await import("node:fs/promises").then((fs) => fs.readdir(lockPath));
+  assert.equal(entries.length, 1);
+  assert.equal(await readFile(path.join(lockPath, entries[0]!), "utf8"), sentinel);
+});
+
 test("old owner release cannot remove a fully published replacement directory", async () => {
   const { lockPath } = await fixture();
   const oldOwner = await acquireDirectoryLock(lockPath, "data");

@@ -591,6 +591,34 @@ async function requireDirectoryIdentity(
   }
 }
 
+async function requireSoleEntryIdentity(
+  lockPath: string,
+  directoryIdentity: LockIdentity,
+  basename: string,
+  entryIdentity: LockIdentity,
+): Promise<void> {
+  await requireDirectoryIdentity(lockPath, directoryIdentity);
+  const entries = await readdir(lockPath);
+  if (entries.length !== 1 || entries[0] !== basename) {
+    throw new LockProtocolError(
+      "LOCK_OWNERSHIP_LOST",
+      `Lock publication namespace changed before token publication at ${lockPath}`,
+    );
+  }
+  const entryPath = path.join(lockPath, basename);
+  const stat = await lstatBigInt(entryPath);
+  if (
+    stat.isSymbolicLink() ||
+    !stat.isFile() ||
+    !sameIdentity(identityFromStat(stat, entryPath), entryIdentity)
+  ) {
+    throw new LockProtocolError(
+      "LOCK_OWNERSHIP_LOST",
+      `Temporary lock entry changed before token publication at ${entryPath}`,
+    );
+  }
+}
+
 async function cleanupOwnTemporary(
   lockPath: string,
   tempBasename: string,
@@ -650,7 +678,10 @@ export async function acquireDirectoryLock(
   }
   await options.transition?.("DIRECTORY_CLAIMED", owner);
 
-  const tempBasename = `.record-${owner}-${randomUUID()}`;
+  // Keep the unpublished owner UUID out of the temporary basename. Combined with a sole-entry
+  // check immediately before rename, this preserves the approved collision-resistance invariant
+  // without relying on a platform-specific no-replace rename primitive.
+  const tempBasename = `.record-${randomUUID()}`;
   const tempPath = path.join(lockPath, tempBasename);
   let handle;
   let tempIdentity: LockIdentity | undefined;
@@ -693,7 +724,12 @@ export async function acquireDirectoryLock(
     handleClosed = true;
     await options.transition?.("RECORD_SYNCED", owner);
 
-    await requireDirectoryIdentity(lockPath, directoryIdentity);
+    await requireSoleEntryIdentity(
+      lockPath,
+      directoryIdentity,
+      tempBasename,
+      tempIdentity,
+    );
     await rename(tempPath, path.join(lockPath, owner));
     await options.transition?.("TOKEN_PUBLISHED", owner);
 
