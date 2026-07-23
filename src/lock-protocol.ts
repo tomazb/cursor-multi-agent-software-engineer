@@ -340,7 +340,13 @@ export async function classifyLockPath(
   }
 
   const directoryIdentity = identityFromStat(canonicalStat, lockPath);
-  const entries = await readdir(lockPath);
+  let entries: string[];
+  try {
+    entries = await readdir(lockPath);
+  } catch (error) {
+    if (errno(error) === "ENOENT") return { state: "absent", lockPath, kind };
+    throw error;
+  }
   if (entries.length === 0) {
     return { state: "incomplete-empty", lockPath, kind, directoryIdentity };
   }
@@ -362,11 +368,10 @@ export async function classifyLockPath(
   } catch (error) {
     if (errno(error) === "ENOENT") {
       return {
-        state: "corrupt",
+        state: "incomplete-empty",
         lockPath,
         kind,
         directoryIdentity,
-        reason: "Lock entry disappeared during classification",
       };
     }
     throw error;
@@ -588,12 +593,11 @@ async function requireDirectoryIdentity(
 
 async function cleanupOwnTemporary(
   lockPath: string,
-  directoryIdentity: LockIdentity,
   tempBasename: string,
   tempIdentity: LockIdentity | undefined,
 ): Promise<void> {
   if (!tempIdentity) return;
-  await requireDirectoryIdentity(lockPath, directoryIdentity);
+  await currentDirectoryIdentity(lockPath);
   const tempPath = path.join(lockPath, tempBasename);
   let stat: BigIntStats;
   try {
@@ -716,14 +720,18 @@ export async function acquireDirectoryLock(
       }
     }
     try {
-      await requireDirectoryIdentity(lockPath, directoryIdentity);
       await cleanupOwnTemporary(
         lockPath,
-        directoryIdentity,
         tempBasename,
         tempIdentity,
       );
-      await requireDirectoryIdentity(lockPath, directoryIdentity);
+      const cleanupIdentity = await currentDirectoryIdentity(lockPath);
+      if (!sameIdentity(cleanupIdentity, directoryIdentity)) {
+        throw new LockProtocolError(
+          "LOCK_OWNERSHIP_LOST",
+          `Claimed lock directory was replaced before temporary cleanup at ${lockPath}`,
+        );
+      }
       try {
         await rmdir(lockPath);
       } catch (cleanupDirectoryError) {
@@ -760,6 +768,8 @@ export async function acquireDirectoryLock(
 
 export interface ReleaseOwnedDirectoryOptions {
   transition?: (transition: LockTransition, owner: string) => Promise<void>;
+  /** Platform-semantic test seam; production callers use non-recursive fs.rmdir. */
+  removeEmptyDirectory?: (lockPath: string) => Promise<void>;
 }
 
 export async function removeOwnedDirectory(
@@ -801,7 +811,7 @@ export async function removeOwnedDirectory(
   await options.transition?.("TOKEN_REMOVED", ownership.owner);
 
   try {
-    await rmdir(ownership.lockPath);
+    await (options.removeEmptyDirectory ?? rmdir)(ownership.lockPath);
     await options.transition?.("DIRECTORY_EMPTY", ownership.owner);
   } catch (error) {
     const code = errno(error);
@@ -905,7 +915,9 @@ async function removeObservedEmptyDirectory(
     await rmdir(classified.lockPath);
   } catch (error) {
     throw new LockProtocolError(
-      errno(error) === "ENOTEMPTY" || errno(error) === "EEXIST"
+      errno(error) === "ENOENT" ||
+        errno(error) === "ENOTEMPTY" ||
+        errno(error) === "EEXIST"
         ? "LOCK_OWNERSHIP_LOST"
         : "LOCK_CLEANUP_FAILED",
       `Empty-only recovery failed at ${classified.lockPath}`,

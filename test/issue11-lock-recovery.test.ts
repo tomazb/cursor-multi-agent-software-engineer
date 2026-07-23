@@ -11,11 +11,13 @@ import {
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import {
   acquireDirectoryLock,
   classifyLockPath,
   LockProtocolError,
+  recoverClassifiedLock,
   removeOwnedDirectory,
   type LockRecordV2,
 } from "../src/lock-protocol.ts";
@@ -141,6 +143,28 @@ test("reads PR #10 legacy regular-file locks without writing legacy format", asy
   assert.equal(classified.state, "legacy-dead");
 });
 
+test("incomplete and corrupt singleton recovery is force-only and exact", async () => {
+  for (const content of ['{"format":2', "{not-json"]) {
+    const { lockPath } = await fixture();
+    await mkdir(lockPath);
+    const basename = `.record-${randomUUID()}`;
+    await writeFile(path.join(lockPath, basename), content, "utf8");
+    const classified = await classifyLockPath(lockPath, "data");
+    await assert.rejects(
+      recoverClassifiedLock(classified, { force: false }),
+      (error: unknown) =>
+        error instanceof LockProtocolError &&
+        (error.code === "LOCK_INCOMPLETE" || error.code === "LOCK_CORRUPT"),
+    );
+    assert.equal(await readFile(path.join(lockPath, basename), "utf8"), content);
+    await recoverClassifiedLock(
+      await classifyLockPath(lockPath, "data"),
+      { force: true },
+    );
+    assert.equal((await classifyLockPath(lockPath, "data")).state, "absent");
+  }
+});
+
 test("acquisition claims with mkdir and returns ownership only after token validation", async () => {
   const { lockPath } = await fixture();
   const transitions: string[] = [];
@@ -212,6 +236,76 @@ test("release surfaces cleanup failure and never recursively deletes a second en
       error instanceof LockProtocolError && error.code === "LOCK_OWNERSHIP_LOST",
   );
   assert.equal(await readFile(path.join(lockPath, second), "utf8"), "sentinel");
+});
+
+test("token filename mismatch and marker ownership loss remove nothing else", async () => {
+  const mismatch = await fixture();
+  const filename = randomUUID();
+  const jsonOwner = randomUUID();
+  await mkdir(mismatch.lockPath);
+  await writeFile(
+    path.join(mismatch.lockPath, filename),
+    JSON.stringify(record(jsonOwner)),
+    "utf8",
+  );
+  const mismatchState = await classifyLockPath(mismatch.lockPath, "data");
+  assert.equal(mismatchState.state, "corrupt");
+  if (!("directoryIdentity" in mismatchState)) assert.fail("directory identity required");
+  await assert.rejects(
+    removeOwnedDirectory({
+      lockPath: mismatch.lockPath,
+      kind: "data",
+      owner: filename,
+      directoryIdentity: mismatchState.directoryIdentity,
+    }),
+    (error: unknown) =>
+      error instanceof LockProtocolError && error.code === "LOCK_OWNERSHIP_LOST",
+  );
+  assert.equal(
+    JSON.parse(await readFile(path.join(mismatch.lockPath, filename), "utf8")).owner,
+    jsonOwner,
+  );
+
+  const marker = await fixture();
+  const markerPath = path.join(marker.root, ".admin.lock.recovering");
+  const oldMarker = await acquireDirectoryLock(markerPath, "admin-recovery", {
+    recovery: { mode: "admin-unlock", force: true },
+  });
+  await recoverClassifiedLock(
+    await classifyLockPath(markerPath, "admin-recovery"),
+    { force: true },
+  );
+  const replacement = await acquireDirectoryLock(markerPath, "admin-recovery", {
+    recovery: { mode: "admin-unlock", force: true },
+  });
+  await assert.rejects(
+    removeOwnedDirectory(oldMarker),
+    (error: unknown) =>
+      error instanceof LockProtocolError && error.code === "LOCK_OWNERSHIP_LOST",
+  );
+  const surviving = await classifyLockPath(markerPath, "admin-recovery");
+  assert.equal(surviving.state, "valid-live");
+  if (surviving.state === "valid-live") {
+    assert.equal(surviving.record.owner, replacement.owner);
+  }
+  await removeOwnedDirectory(replacement);
+});
+
+test("injected Windows deletion-pending semantic is bounded and never reported as success", async () => {
+  const { lockPath } = await fixture();
+  const handle = await acquireDirectoryLock(lockPath, "data");
+  const busy = Object.assign(new Error("injected sharing violation"), { code: "EBUSY" });
+  await assert.rejects(
+    removeOwnedDirectory(handle, {
+      removeEmptyDirectory: async () => {
+        throw busy;
+      },
+    }),
+    (error: unknown) =>
+      error instanceof LockProtocolError && error.code === "LOCK_DELETION_PENDING",
+  );
+  assert.equal((await classifyLockPath(lockPath, "data")).state, "incomplete-empty");
+  await import("node:fs/promises").then((fs) => fs.rmdir(lockPath));
 });
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -309,4 +403,30 @@ test("two forced actors recovering a dead marker produce one recovery owner", as
   assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
   assert.equal(results.filter((result) => result.status === "rejected").length, 1);
   assert.equal((await classifyLockPath(markerPath, "admin-recovery")).state, "absent");
+});
+
+test(
+  "Windows junction lock paths are rejected without following when natively testable",
+  { skip: process.platform !== "win32" },
+  async () => {
+    const { root, lockPath } = await fixture();
+    const target = path.join(root, "junction-target");
+    await mkdir(target);
+    await symlink(target, lockPath, "junction");
+    assert.equal((await classifyLockPath(lockPath, "data")).state, "unsafe");
+  },
+);
+
+test("lock release and recovery implementation contains no recursive deletion fallback", async () => {
+  const protocolSource = await readFile(
+    fileURLToPath(new URL("../src/lock-protocol.ts", import.meta.url)),
+    "utf8",
+  );
+  const storeSource = await readFile(
+    fileURLToPath(new URL("../src/store.ts", import.meta.url)),
+    "utf8",
+  );
+  assert.doesNotMatch(protocolSource, /\brm\s*\(/);
+  assert.doesNotMatch(protocolSource, /recursive\s*:\s*true/);
+  assert.doesNotMatch(storeSource, /\brm\s*\(/);
 });
