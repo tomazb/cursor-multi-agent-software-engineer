@@ -129,7 +129,7 @@ test("resolveProjectModels succeeds with matching high effort and leaves input i
   assert.equal(resolved.roles.verifier.model, "cursor-gpt-5.6-sol-high");
   assert.equal(resolved.roles.brainstormer.model, "cursor-grok-4.5-high");
   assert.equal(resolved.roles.designer.model, "cursor-claude-fable-5-high");
-  assert.equal(resolved.roles.designer.fallbackModels?.[0], "cursor-claude-opus-4.8-high");
+  assert.equal(resolved.roles.designer.fallbackModels?.[0], "claude-opus-4.8");
   assert.equal(resolved.roles.builder.model, "cursor-grok-4.5-high");
   assert.equal(resolved.roles.prResolver.model, "cursor-gpt-5.6-sol-high");
   assert.notEqual(resolved, config);
@@ -162,8 +162,10 @@ test("doctor probe and start share effort-aware project resolution", () => {
   );
 });
 
-test("resolveConfigModels rewrites all role models to exact IDs", () => {
-  const resolved = resolveConfigModels(DEFAULT_CONFIG, CATALOGUE);
+test("resolveConfigModels rewrites enabled fallback models to exact IDs", () => {
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.policy.rejectModelFallback = false;
+  const resolved = resolveConfigModels(config, CATALOGUE);
   assert.equal(resolved.roles.brainstormer.model, "cursor-grok-4.5-high");
   assert.equal(resolved.roles.designer.model, "cursor-claude-fable-5-high");
   assert.equal(resolved.roles.designer.fallbackModels?.[0], "cursor-claude-opus-4.8-high");
