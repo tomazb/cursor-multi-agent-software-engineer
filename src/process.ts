@@ -31,6 +31,7 @@ export function spawnCaptured(
     let stderr = "";
     let timedOut = false;
     let settled = false;
+    let stdinError: Error | undefined;
     const timeout =
       options.timeoutMs && options.timeoutMs > 0
         ? setTimeout(() => {
@@ -43,6 +44,9 @@ export function spawnCaptured(
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => (stdout += chunk));
     child.stderr.on("data", (chunk: string) => (stderr += chunk));
+    child.stdin.on("error", (error) => {
+      stdinError = error;
+    });
     child.on("error", (error) => {
       if (timeout) clearTimeout(timeout);
       if (!settled) {
@@ -54,17 +58,25 @@ export function spawnCaptured(
       if (timeout) clearTimeout(timeout);
       if (settled) return;
       settled = true;
+      const stdinFailure = stdinError
+        ? `stdin write failed: ${stdinError.message}`
+        : "";
       resolve({
-        exitCode: timedOut ? 124 : (code ?? 1),
+        exitCode: timedOut ? 124 : stdinError ? 1 : (code ?? 1),
         stdout,
         stderr: timedOut
           ? `${stderr}\nProcess timed out after ${options.timeoutMs}ms`.trim()
-          : stderr,
+          : `${stderr}${stderr && stdinFailure ? "\n" : ""}${stdinFailure}`,
         durationMs: Date.now() - startedAt,
         timedOut,
       });
     });
-    if (options.input) child.stdin.write(options.input);
-    child.stdin.end();
+    try {
+      if (options.input !== undefined) child.stdin.end(options.input);
+      else child.stdin.end();
+    } catch (error) {
+      stdinError = error instanceof Error ? error : new Error(String(error));
+      child.stdin.destroy();
+    }
   });
 }
