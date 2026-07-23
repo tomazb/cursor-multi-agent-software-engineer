@@ -125,7 +125,7 @@ export function resolveConfigModels(config: MasweConfig, catalogue: Iterable<str
     const roleConfig = resolved.roles[role as RoleId];
     try {
       roleConfig.model = resolveLogicalModelId(roleConfig.model, catalogue);
-      if (roleConfig.fallbackModels?.length) {
+      if (!resolved.policy.rejectModelFallback && roleConfig.fallbackModels?.length) {
         roleConfig.fallbackModels = roleConfig.fallbackModels.map((model) =>
           resolveLogicalModelId(model, catalogue),
         );
