@@ -27,6 +27,7 @@ function nextChildMessage(child: ChildProcess): Promise<Record<string, unknown>>
     }
     const timer = setTimeout(() => {
       cleanup();
+      child.kill();
       reject(new Error("timed out waiting for store writer IPC message"));
     }, CHILD_WATCHDOG_MS);
     const cleanup = () => {
@@ -65,6 +66,7 @@ function waitForChildExit(child: ChildProcess): Promise<void> {
     }
     const timer = setTimeout(() => {
       cleanup();
+      child.kill();
       reject(new Error("timed out waiting for store writer exit"));
     }, CHILD_WATCHDOG_MS);
     const cleanup = () => {
@@ -194,8 +196,7 @@ test("exclusive lock blocks simultaneous multi-process writers", async () => {
   assert.equal((await nextChildMessage(child)).type, "READY");
   const resultPromise = nextChildMessage(child);
   child.send({ type: "CONTINUE" });
-  const result = await resultPromise;
-  await exitPromise;
+  const [result] = await Promise.all([resultPromise, exitPromise]);
 
   await holder.close();
   await import("node:fs/promises").then((fs) => fs.rm(lockPath, { force: true }));
