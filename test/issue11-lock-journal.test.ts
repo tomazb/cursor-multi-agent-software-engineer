@@ -361,6 +361,30 @@ test("scan reconciles a claim and release published after claims observation", a
   assert.equal(scan.releases.has("00000000000000000001"), true);
 });
 
+test("scan reconciles the contiguous lower range for a later released ticket", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-scan-late-range-");
+  await initializeLockJournal(runDirectory);
+
+  const scan = await scanLockJournal(runDirectory, "data", {
+    afterClaimsObserved: async () => {
+      await publishLockClaim(runDirectory, "data", "store-write");
+      const queued = await publishLockClaim(
+        runDirectory,
+        "data",
+        "store-write",
+      );
+      await publishClaimRelease(queued);
+    },
+  });
+
+  assert.deepEqual(scan.claims.map((claim) => claim.ticket), [
+    "00000000000000000001",
+    "00000000000000000002",
+  ]);
+  assert.equal(scan.releases.has("00000000000000000001"), false);
+  assert.equal(scan.releases.has("00000000000000000002"), true);
+});
+
 test("scan reconciles a raw claim and release published after claims observation", async () => {
   const runDirectory = await freshRunDirectory("maswe-journal-raw-observation-");
   await initializeLockJournal(runDirectory);
@@ -384,6 +408,50 @@ test("scan reconciles a raw claim and release published after claims observation
     scan.rawReleases.has("00000000000000000001"),
     true,
   );
+});
+
+test("scan reconciles the contiguous lower range for a later raw release", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-raw-late-range-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "data");
+
+  const scan = await scanLockJournal(runDirectory, "data", {
+    afterClaimsObserved: async () => {
+      await publishLockClaim(runDirectory, "data", "store-write");
+      const ticket = "00000000000000000002";
+      const rawBytes = Buffer.from("{stable-corrupt-claim");
+      const rawDigest = `sha256:${createHash("sha256").update(rawBytes).digest("hex")}`;
+      const withoutDigest = {
+        format: 3,
+        record: "release",
+        kind: "data",
+        ticket,
+        targetMode: "raw-claim",
+        claimPath: `${ticket}.json`,
+        rawDigest,
+      };
+      const releaseDigest = `sha256:${
+        createHash("sha256")
+          .update(`${JSON.stringify(withoutDigest)}\n`)
+          .digest("hex")
+      }`;
+      await writeFile(path.join(paths.claims, `${ticket}.json`), rawBytes);
+      await writeFile(
+        path.join(
+          paths.releases,
+          `data.${ticket}.raw.${rawDigest.slice("sha256:".length)}.json`,
+        ),
+        `${JSON.stringify({ ...withoutDigest, releaseDigest })}\n`,
+      );
+    },
+  });
+
+  assert.deepEqual(scan.claims.map((claim) => claim.ticket), [
+    "00000000000000000001",
+  ]);
+  assert.equal(scan.rawClaims.has("00000000000000000002"), true);
+  assert.equal(scan.rawReleases.has("00000000000000000002"), true);
+  assert.equal(scan.highestTicket, 2n);
 });
 
 test("exact-path reconciliation preserves missing-target corruption for canonical and raw releases", async () => {

@@ -1274,6 +1274,33 @@ function addClaimInterpretation(
   }
 }
 
+async function mergeClaimEntries(
+  paths: LockJournalPaths,
+  kind: LockKind,
+  entries: string[],
+  claimsByTicket: Map<bigint, ClaimRecordV3>,
+  rawClaimsByTicket: Map<bigint, RawClaimOverlay>,
+  afterFirstRead?: (claimPath: string) => Promise<void>,
+): Promise<void> {
+  for (const basename of entries) {
+    const match = CLAIM_BASENAME_PATTERN.exec(basename);
+    if (!match) throw corrupt(`Published claim filename is malformed: ${basename}`);
+    const ticket = parseLockTicket(match[1]);
+    if (claimsByTicket.has(ticket) || rawClaimsByTicket.has(ticket)) continue;
+    const claimPath = path.join(paths.claims, basename);
+    const rawBytes = await readStableOrdinaryBytes(claimPath, afterFirstRead);
+    addClaimInterpretation(
+      rawBytes,
+      claimPath,
+      basename,
+      ticket,
+      kind,
+      claimsByTicket,
+      rawClaimsByTicket,
+    );
+  }
+}
+
 async function reconcileExactClaimPath(
   paths: LockJournalPaths,
   kind: LockKind,
@@ -1349,27 +1376,20 @@ export async function scanLockJournal(
   await options.afterClaimsObserved?.();
   const claimsByTicket = new Map<bigint, ClaimRecordV3>();
   const rawClaimsByTicket = new Map<bigint, RawClaimOverlay>();
-  for (const basename of claimEntries) {
-    const match = CLAIM_BASENAME_PATTERN.exec(basename);
-    if (!match) throw corrupt(`Published claim filename is malformed: ${basename}`);
-    const ticket = parseLockTicket(match[1]);
-    const claimPath = path.join(paths.claims, basename);
-    const rawBytes = await readStableOrdinaryBytes(claimPath);
-    addClaimInterpretation(
-      rawBytes,
-      claimPath,
-      basename,
-      ticket,
-      kind,
-      claimsByTicket,
-      rawClaimsByTicket,
-    );
-  }
+  await mergeClaimEntries(
+    paths,
+    kind,
+    claimEntries,
+    claimsByTicket,
+    rawClaimsByTicket,
+  );
 
   const releases = new Map<string, ReleaseRecordV3>();
   const rawReleases = new Map<string, RawClaimReleaseRecordV3>();
   let legacyRelease: LegacyReleaseRecordV3 | undefined;
-  for (const basename of await readdir(paths.releases)) {
+  const releaseEntries = await readdir(paths.releases);
+  let reconciledClaimsAfterReleaseObservation = false;
+  for (const basename of releaseEntries) {
     const releasePath = path.join(paths.releases, basename);
     const bytes = await readOrdinaryRecord(releasePath);
     let preliminary: unknown;
@@ -1397,6 +1417,21 @@ export async function scanLockJournal(
       }
       legacyRelease = parseLegacyReleaseBytes(bytes, legacy, kind);
       continue;
+    }
+    if (
+      !claimsByTicket.has(ticket) &&
+      !rawClaimsByTicket.has(ticket) &&
+      !reconciledClaimsAfterReleaseObservation
+    ) {
+      await mergeClaimEntries(
+        paths,
+        kind,
+        await readdir(paths.claims),
+        claimsByTicket,
+        rawClaimsByTicket,
+        options.afterExactClaimFirstRead,
+      );
+      reconciledClaimsAfterReleaseObservation = true;
     }
     if (candidate.targetMode === "raw-claim") {
       if (!rawClaimsByTicket.has(ticket) && !claimsByTicket.has(ticket)) {
