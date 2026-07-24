@@ -1,7 +1,7 @@
 # Issue #11 Immutable Ticket-Journal Implementation Plan
 
-> **For the implementation agent:** Do not execute this plan until the repository owner explicitly
-> approves the revised design. After approval, use the Superpowers test-driven-development,
+> **For the implementation agent:** The repository owner approved Phase B v3 with mandatory
+> invariants on 2026-07-24. Use the Superpowers test-driven-development,
 > systematic-debugging, verification-before-completion, requesting-code-review, and
 > finishing-a-development-branch workflows. Do not merge.
 
@@ -15,7 +15,7 @@
 
 **Blocked prototype:** `a1ad79bedc8ca2a6a51d3af7597f5eb25c4faa23`
 
-**Status:** `WAITING_FOR_DESIGN_REAPPROVAL`
+**Status:** `APPROVED_FOR_PHASE_B_V3_IMPLEMENTATION`
 
 **Goal:** Replace reusable-path lock ownership with a version-3 append-only ticket journal whose
 immutable no-clobber claims, exact-target releases, monotonic ordering, and self-serializing
@@ -33,18 +33,31 @@ native dependency.
 **Scope exclusions:** Issues #12, #13, #3, and #5; distributed stores; cross-host locks; automatic
 age reclaim; automatic compaction; native addons; automatic merge; unrelated cleanup.
 
-## Reapproval prerequisites
+## Phase B authorization and baseline
 
-Before Phase B:
-
-- [ ] Repository owner approves the revised append-only architecture.
-- [ ] Approval explicitly accepts the hard-link filesystem boundary, including local NTFS as the
+- [x] Repository owner approved the revised append-only architecture through
+      `APPROVED_FOR_PHASE_B_V3_WITH_MANDATORY_INVARIANTS`.
+- [x] Approval explicitly accepts the hard-link filesystem boundary, including local NTFS as the
       intended Windows filesystem and fail-closed behavior on unsupported filesystems.
-- [ ] Record the exact redesign commit SHA in this plan or the Phase-B baseline report.
-- [ ] Confirm `origin/main` has not materially changed locking, process, filesystem, fingerprint,
+- [x] Redesign commit before finalization:
+      `f70ee4de702afc49200c6ba7257b0a0eb6b99455`.
+- [x] `origin/main` remains
+      `dab10487baf7f05867b54895ec5db109ad3a3e65`; no rebase delta exists.
+- [x] Confirm `origin/main` has not materially changed locking, process, filesystem, fingerprint,
       CLI recovery, test, package, or CI behavior.
-- [ ] If `origin/main` changed materially, stop with `BLOCKED_BASELINE_CHANGED`; do not resolve a
-      design conflict implicitly.
+- [x] Preserved prototype branch remains
+      `archive/issue-11-mkdir-prototype-a1ad79b` at
+      `a1ad79bedc8ca2a6a51d3af7597f5eb25c4faa23`; no prototype production lifecycle commit will be
+      cherry-picked.
+
+The pre-production baseline used Fedora Linux 44, kernel 7.1.3, x86_64, Btrfs for the worktree,
+tmpfs for `/tmp`, Node 22.22.2, npm 10.9.7, and Git 2.55.0. Hard links, symlinks, child IPC, and
+nested Git refs were available. `npm ci`, typecheck, build, package dry-run, and `git diff --check`
+passed. The unchanged baseline full suite reproduced five unrelated failures in
+`compat-doctor`, `linked-worktree-compat`, `merge-blockers-round3`,
+`ready-review-corrections`, and `store-locking`; these predate v3 production changes and must not
+be hidden or attributed to Issue #11. Final verification must report their disposition without
+weakening unrelated behavior.
 
 ## Expected files
 
@@ -89,16 +102,23 @@ stop for design review rather than silently changing the portability or read-onl
 4. Claims and releases are never deleted, replaced, renamed aside, or modified.
 5. Tickets are fixed-width decimal strings parsed with `BigInt`, contiguous from one, and never
    reused.
-6. Only the smallest valid unreleased claim may enter protected work.
-7. A release targets one exact ticket, UUID, kind, and claim digest.
-8. Forced recovery appends an exact release; it never removes or mutates the target claim.
-9. A live `admin-recovery` claim is never force-released.
-10. Resolving a predecessor never grants recovery ownership; every actor rescans ticket order.
-11. No release/recovery path recursively deletes any lock-related path.
-12. Unsupported or ambiguous filesystem/path/record behavior fails closed.
-13. The v3 fingerprint exclusion is exact and does not hide `run.json`, artifacts, config, or
+6. Enumeration may discover state but never proves a lower ticket absent; ownership validates the
+   deterministic exact paths for ticket zero when present and every ticket `1..T`.
+7. Only the smallest valid unreleased claim may enter protected work, and the actor rechecks its
+   own computed release path immediately before protected entry.
+8. Each exact valid claim has one canonical release pathname and canonical byte sequence derived
+   from kind, ticket, UUID, and claim digest. Actor/reason/time are non-authoritative evidence.
+9. A release targets one exact ticket, UUID, kind, and claim digest.
+10. Forced recovery appends the same canonical exact release; it never removes or mutates the
+    target claim. Force is operator quiescence, not process fencing.
+11. A live `admin-recovery` claim is never force-released.
+12. Resolving a predecessor never grants recovery ownership; every actor rescans ticket order.
+13. No release/recovery path recursively deletes any lock-related path.
+14. Unsupported or ambiguous filesystem/path/record behavior fails closed.
+15. The v3 fingerprint exclusion is exact and does not hide `run.json`, artifacts, config, or
     other `.maswe` state.
-14. No caller enters protected work before a positive journal ownership proof.
+16. No caller enters protected work before a positive journal ownership proof and immediate own
+    release-state revalidation.
 
 ## Deterministic worker protocol
 
@@ -220,8 +240,8 @@ git commit -m "feat: initialize immutable lock journals"
 ### RED
 
 - [ ] Add failing cases for valid claim/release records and every malformed field: version,
-      record type, kind, ticket, UUID, PID, process identity, timestamp, operation, reason, target
-      mode, digest, unknown keys, and newline/canonical encoding.
+      record type, kind, ticket, UUID, PID, process identity, timestamp, operation, target mode,
+      digest, unknown keys, and newline/canonical encoding.
 - [ ] Add malformed fixed-width ticket, duplicate numeric interpretation, ticket gap, wrong JSON
       ticket, overflow, truncated file, digest mutation, wrong release target/digest, missing-claim
       release, alternate release basename, symbolic-link record, directory/device entry, and
@@ -349,9 +369,9 @@ git commit -m "feat: acquire locks by immutable ticket order"
 ### RED
 
 - [ ] Test exact kind/ticket/UUID/digest targeting.
-- [ ] Test missing/mismatched claim, existing identical release, existing exact-target release by a
-      different actor/reason, wrong-digest release, publication failure, validation failure, and
-      temp-cleanup failure.
+- [ ] Test missing/mismatched claim, existing identical canonical release, concurrent publication
+      by actors with different audit reasons, wrong-digest release, publication failure,
+      validation failure, and temp-cleanup failure.
 - [ ] Reproduce:
   1. `O` owns;
   2. forced actor publishes exact release for `O`;
@@ -364,10 +384,11 @@ git commit -m "feat: acquire locks by immutable ticket order"
 
 ### GREEN
 
-- [ ] Implement deterministic exact release publication.
-- [ ] Treat exact same target+reason as idempotent.
-- [ ] Treat another valid exact-target release as already/lost ownership without claiming this
-      actor's cleanup succeeded.
+- [ ] Implement the one deterministic exact release pathname and canonical byte sequence derived
+      from kind, ticket, UUID, and claim digest.
+- [ ] Keep actor, reason, command, PID, and timestamp out of ownership-affecting bytes and paths.
+- [ ] Treat the same valid exact-target marker as idempotently released regardless of the
+      competing actor's non-authoritative audit reason.
 - [ ] Never unlink/rename/modify a claim or permanent structure.
 - [ ] Retain exact handle fields through every `FileRunStore` release call.
 - [ ] Preserve primary and release errors using `AggregateError`.
@@ -405,7 +426,8 @@ git commit -m "fix: release only exact immutable lock claims"
 ### GREEN
 
 - [ ] Implement fresh serialized recovery classification.
-- [ ] Publish `dead-recovery` or `forced-quiescent-recovery` exact releases.
+- [ ] Publish the one canonical exact release marker; record dead/forced reason only in
+      non-authoritative evidence.
 - [ ] Implement raw-digest target mode only for eligible data/admin regular records.
 - [ ] Require operator quiescence for live force and raw corrupt recovery.
 - [ ] Add precise CLI messages without changing command names or force semantics.
@@ -782,9 +804,8 @@ No prototype production commit is cherry-picked.
 Every behavior follows RED → focused expected failure → minimum GREEN → focused pass → adjacent
 regressions → cohesive commit. Do not implement the entire protocol before tests.
 
-## Stop condition
+## Execution gate
 
-Do not execute Task 1 or modify production/tests until the repository owner explicitly reapproves
-the redesigned specification.
-
-`WAITING_FOR_DESIGN_REAPPROVAL`
+Phase B v3 is authorized only after the design and plan finalization commit is created with no
+production or test changes. The implementation must then follow each RED/GREEN boundary above.
+No merge is authorized.

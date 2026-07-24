@@ -4,7 +4,7 @@
 
 **Date:** 2026-07-24
 
-**Status:** Revised after BLOCKED_DESIGN_DEFECT; awaiting repository-owner reapproval
+**Status:** Approved for Phase B v3 implementation
 
 **Redesign branch:** `issue/11-lock-recovery-redesign`
 
@@ -227,12 +227,13 @@ lowercase hexadecimal prefixed with `sha256:` and cover the canonical encoding w
 own digest field omitted.
 
 Ticket strings are exactly 20 decimal digits and are parsed and compared with `BigInt`, never
-JavaScript `number` and never locale or ordinary lexical ordering. Valid claim and release names
-are:
+JavaScript `number` and never locale or ordinary lexical ordering. Valid claim names and
+exact-claim release names are:
 
 ```text
 claims/<20-digit-ticket>.json
-releases/<20-digit-ticket>.json
+releases/<kind>.<20-digit-ticket>.<owner-uuid>.<claim-digest-hex>.json
+releases/<kind>.<20-digit-ticket>.raw.<raw-content-digest-hex>.json
 ```
 
 Tickets start at `00000000000000000001`. Ticket
@@ -285,19 +286,17 @@ A normal release record contains:
   "owner": "550e8400-e29b-41d4-a716-446655440000",
   "claimDigest": "sha256:<target-claim-digest>",
   "targetMode": "claim",
-  "releasedBy": {
-    "actor": "2d624e44-156d-4b52-9365-bf42f6072753",
-    "pid": 12345
-  },
-  "reason": "normal",
-  "at": "2026-07-24T10:05:00.000Z",
   "releaseDigest": "sha256:<digest>"
 }
 ```
 
-Valid reasons are closed and include `normal`, `cancelled-before-owner`, `dead-recovery`, and
-`forced-quiescent-recovery`. A release targets the exact ticket, UUID, kind, and claim digest.
-There is one deterministic release pathname per ticket.
+The ownership-affecting bytes contain only deterministic target semantics. The kind, ticket,
+owner UUID, and claim digest determine both the canonical bytes and the single final pathname.
+`releaseDigest` is itself deterministically derived from those fields. Normal owner release,
+queued cancellation, dead recovery, and forced quiescent recovery therefore converge on the same
+marker for one exact claim. Actor, reason, command, PID, and timestamp differences are recorded
+only in existing run events or other non-authoritative audit evidence; they never create a second
+ownership interpretation.
 
 For a well-named but corrupt regular claim, forced data/admin recovery may publish a
 `targetMode: "raw-claim"` release containing the exact claim basename and SHA-256 digest of the
@@ -307,11 +306,10 @@ revalidation. A changed digest invalidates the release. A malformed ticket filen
 ticket, link, unexpected type, or corrupt `admin-recovery` claim cannot be force-resolved
 automatically.
 
-Publishing the same release again is idempotent only when the existing record matches the same
-exact target and semantic reason. If a competing actor already published a different valid
-release for the same exact target, the later actor observes that the claim is resolved but does
-not claim its own release succeeded. An existing wrong-target or wrong-digest release corrupts the
-journal and blocks later ownership.
+Publishing a release again is idempotent only when the existing canonical bytes validly target the
+same exact claim. A concurrent normal owner and forced recoverer therefore either publishes that
+one marker or observes it already published. Any existing wrong-target, wrong-digest,
+wrong-pathname, or noncanonical release corrupts the journal and blocks later ownership.
 
 ## Atomic publication primitive
 
@@ -397,10 +395,20 @@ after proving:
 5. its ticket is therefore the smallest unreleased claim;
 6. under the allocation invariant, no smaller claim can appear later.
 
-The positive ownership check reads deterministic claim and release pathnames for tickets
-`1..ownTicket`; it does not trust one arbitrary `readdir` ordering. A release that appears while
-checking an earlier ticket can cause only a conservative false wait when it is missed; it cannot
-create a second owner. Later claims have larger tickets and cannot preempt the current owner.
+Directory enumeration is never proof that a lower ticket is absent. After publishing ticket `T`,
+the positive ownership check validates deterministic exact paths for legacy ticket zero when
+present and for every ticket `1..T`. Each lower position must contain one valid exact claim and
+its one computed canonical release marker; the actor's own exact claim must exist and its computed
+release marker must be absent. Missing positions, unexpected release names, corrupt records, or
+ambiguous path types fail closed. Enumeration may discover the maximum and unexpected entries,
+but exact-range path checks establish eligibility.
+
+A release that appears while checking an earlier ticket can cause only a conservative false wait
+when it is missed; it cannot create a second owner. Later claims have larger tickets and cannot
+preempt the current owner. Immediately before invoking protected work, the process repeats the
+exact check for its own computed release path. If its claim was released, it reports
+`LOCK_OWNERSHIP_LOST` and does not enter. This check narrows operator-misuse exposure but does not
+turn force into process fencing.
 
 Queued claims are not owners. A contender that stops waiting publishes an exact release for its
 own queued claim before reporting cancellation. Cancellation-publication failure is surfaced as
@@ -416,8 +424,7 @@ An ownership handle retains the exact kind, ticket, UUID, and claim digest. Norm
 2. prepares a release targeting exactly those retained values;
 3. hard-links the release to that ticket's deterministic release pathname;
 4. validates the published or existing release;
-5. reports success only for its own matching semantic release, or reports already/lost ownership
-   when another valid release already resolved the claim.
+5. reports success when the one canonical marker is published or already validly present.
 
 Release never unlinks a claim or any canonical owner pathname. A former owner releasing after
 forced recovery can only attempt the release slot of its own immutable ticket. It cannot address,
@@ -446,12 +453,17 @@ the ownership rule above.
 ### Valid claims
 
 - Valid live data/admin claim without force: `LOCK_LIVE_OWNER`.
-- Valid dead data/admin claim: after owning the required serializer, publish an exact
-  `dead-recovery` release.
+- Valid dead data/admin claim: after owning the required serializer, publish the claim's exact
+  canonical release marker.
 - Valid live data/admin claim with force: require the existing explicit operator-quiescence
-  assertion and publish an exact `forced-quiescent-recovery` release.
+  assertion and publish the same exact canonical release marker.
 - A valid live `admin-recovery` claim is never force-released.
 - PID age is not ownership and no record expires automatically.
+
+Force is an operator assertion, not fencing. An incorrectly forced live data/admin process can
+continue executing. Every claimant therefore rechecks its own release marker immediately before
+protected entry, but the protocol does not claim it can stop a process after entry. The stronger
+administrative-recovery rule remains: a valid live recovery claim is never released under force.
 
 After entering the serializer, recovery discards pre-lock observations, revalidates the complete
 journal, and targets the current smallest unreleased claim. Publication success never grants the
@@ -849,7 +861,7 @@ No blocked production lifecycle commit is cherry-picked. The archive is evidence
 
 ## Required implementation documentation
 
-After reapproval, Phase B updates:
+During Phase B, implementation updates:
 
 - `docs/ARCHITECTURE.md`: permanent v3 journal, ticket ownership, exact release, serializer flow,
   and fingerprint boundary;
@@ -900,10 +912,10 @@ After reapproval, Phase B updates:
 The absence conclusion is about the documented Node.js 22 core API surface, not about what POSIX
 or Windows kernels can do through native code.
 
-## Approval gate
+## Approval
 
-The previous Phase B authorization is suspended. No production code, tests, push, or pull request
-may proceed until the repository owner explicitly approves this v3 ticket-journal redesign and its
-filesystem support boundary.
-
-`WAITING_FOR_DESIGN_REAPPROVAL`
+The repository owner recorded `APPROVED_FOR_PHASE_B_V3_WITH_MANDATORY_INVARIANTS` on Issue #11 on
+2026-07-24. This revision incorporates the mandatory exact-range, immutable-publication,
+single-release-identity, permanent-infrastructure, force-boundary, contiguous-ticket, temporary
+record, and legacy-ticket-zero invariants. Phase B may proceed from this tracked revision without
+resuming any blocked v2 lifecycle code.
