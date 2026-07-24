@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -21,9 +22,12 @@ import {
   journalPaths,
   parseClaimBytes,
   parseReleaseBytes,
+  publishClaimRelease,
   publishLockClaim,
+  recoverCurrentLock,
   releaseBasename,
   scanLockJournal,
+  validateClaimOwnership,
   type LockJournalErrorCode,
 } from "../src/lock-journal.ts";
 
@@ -305,4 +309,188 @@ test("three concurrent claimants allocate a gap-free numeric sequence", async ()
     [1n, 2n, 3n],
   );
   assert.equal((await scanLockJournal(runDirectory, "admin")).highestTicket, 3n);
+});
+
+test("exact-range ownership keeps higher claims queued until every predecessor is released", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-owner-");
+  const first = await publishLockClaim(runDirectory, "data", "store-write");
+  const second = await publishLockClaim(runDirectory, "data", "store-write");
+  const third = await publishLockClaim(runDirectory, "data", "store-write");
+
+  await validateClaimOwnership(first);
+  await assert.rejects(
+    validateClaimOwnership(second),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_QUEUED",
+  );
+  await publishClaimRelease(first);
+  await validateClaimOwnership(second);
+  await assert.rejects(
+    validateClaimOwnership(third),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_QUEUED",
+  );
+  await publishClaimRelease(second);
+  await validateClaimOwnership(third);
+});
+
+test("concurrent owner and recoverer releases converge on one canonical marker", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-release-");
+  const owner = await publishLockClaim(runDirectory, "data", "store-write");
+
+  const releases = await Promise.all([
+    publishClaimRelease(owner),
+    publishClaimRelease(owner),
+  ]);
+  assert.equal(releases[0].bytes, releases[1].bytes);
+  assert.deepEqual(
+    await readdir(journalPaths(runDirectory, "data").releases),
+    [releaseBasename(owner.claim)],
+  );
+  await assert.rejects(
+    validateClaimOwnership(owner),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_OWNERSHIP_LOST",
+  );
+});
+
+test("late former-owner release cannot modify or release a successor claim", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-late-");
+  const former = await publishLockClaim(runDirectory, "data", "store-write");
+  const successor = await publishLockClaim(runDirectory, "data", "store-write");
+  await publishClaimRelease(former);
+  await validateClaimOwnership(successor);
+  const successorBytes = canonicalClaim({
+    kind: successor.claim.kind,
+    ticket: successor.ticket,
+    owner: successor.owner,
+    pid: successor.claim.pid,
+    process: successor.claim.process,
+    at: successor.claim.at,
+    operation: successor.claim.operation,
+  }).bytes;
+
+  await publishClaimRelease(former);
+  await validateClaimOwnership(successor);
+  assert.equal(
+    await readFile(
+      path.join(
+        journalPaths(runDirectory, "data").claims,
+        `${successor.claim.ticket}.json`,
+      ),
+      "utf8",
+    ),
+    successorBytes,
+  );
+  assert.equal(
+    (await readdir(journalPaths(runDirectory, "data").releases)).includes(
+      releaseBasename(successor.claim),
+    ),
+    false,
+  );
+});
+
+test("legacy ticket zero is exact, immutable, and required before v3 ownership", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-legacy-");
+  const legacyPath = path.join(runDirectory, ".lock");
+  const legacyBytes = `${JSON.stringify({
+    pid: process.pid,
+    owner: "legacy-live-owner",
+    at: "2026-07-24T10:00:00.000Z",
+  })}\n`;
+  await writeFile(legacyPath, legacyBytes);
+  const claimant = await publishLockClaim(runDirectory, "data", "store-write");
+
+  await assert.rejects(
+    validateClaimOwnership(claimant),
+    (error: unknown) =>
+      error instanceof LockJournalError &&
+      ["LOCK_QUEUED", "LOCK_LIVE_OWNER"].includes(error.code),
+  );
+  await assert.rejects(
+    recoverCurrentLock(runDirectory, "data", { force: false }),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_LIVE_OWNER",
+  );
+  await recoverCurrentLock(runDirectory, "data", { force: true });
+  assert.equal(await readFile(legacyPath, "utf8"), legacyBytes);
+  await validateClaimOwnership(claimant);
+
+  await writeFile(legacyPath, legacyBytes.replace("legacy-live-owner", "mutated-owner"));
+  await assert.rejects(
+    validateClaimOwnership(claimant),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+});
+
+test("dead legacy ticket zero is explicitly recoverable without force", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-legacy-dead-");
+  const legacyPath = path.join(runDirectory, ".admin.lock");
+  const legacyBytes = `${JSON.stringify({
+    pid: 1_000_000_001,
+    owner: "legacy-dead-owner",
+    at: "2026-07-24T10:00:00.000Z",
+  })}\n`;
+  await writeFile(legacyPath, legacyBytes);
+  await recoverCurrentLock(runDirectory, "admin", { force: false });
+  assert.equal(await readFile(legacyPath, "utf8"), legacyBytes);
+});
+
+test("corrupt legacy ticket zero remains fail closed without force", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-legacy-corrupt-");
+  const legacyPath = path.join(runDirectory, ".lock");
+  await writeFile(legacyPath, "{partial");
+  await assert.rejects(
+    recoverCurrentLock(runDirectory, "data", { force: false }),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+  await recoverCurrentLock(runDirectory, "data", { force: true });
+  assert.equal(await readFile(legacyPath, "utf8"), "{partial");
+});
+
+test("forced corrupt-claim resolution is bound to exact raw bytes and preserves the claim", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-raw-claim-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "data");
+  const claimPath = path.join(paths.claims, "00000000000000000001.json");
+  const corruptBytes = '{"format":3,"record":"claim","ticket":"00000000000000000001"';
+  await writeFile(claimPath, corruptBytes);
+
+  await assert.rejects(
+    recoverCurrentLock(runDirectory, "data", { force: false }),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+  await recoverCurrentLock(runDirectory, "data", { force: true });
+  assert.equal(await readFile(claimPath, "utf8"), corruptBytes);
+
+  const successor = await publishLockClaim(runDirectory, "data", "store-write");
+  assert.equal(successor.ticket, 2n);
+  await validateClaimOwnership(successor);
+
+  await writeFile(claimPath, `${corruptBytes} `);
+  await assert.rejects(
+    validateClaimOwnership(successor),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+});
+
+test("corrupt administrative-recovery claims remain fail closed under force", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-raw-recovery-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "admin-recovery");
+  await writeFile(
+    path.join(paths.claims, "00000000000000000001.json"),
+    "{corrupt-recovery-claim",
+  );
+
+  await assert.rejects(
+    recoverCurrentLock(runDirectory, "admin-recovery", { force: true }),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+  assert.deepEqual(await readdir(paths.releases), []);
 });

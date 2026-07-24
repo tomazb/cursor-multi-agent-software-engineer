@@ -3,8 +3,12 @@ import { link, mkdtemp, writeFile, readFile, open, rm, mkdir } from "node:fs/pro
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { randomUUID } from "node:crypto";
 import { DEFAULT_CONFIG } from "../src/config.ts";
+import {
+  publishClaimRelease,
+  publishLockClaim,
+  validateClaimOwnership,
+} from "../src/lock-journal.ts";
 import { FileRunStore } from "../src/store.ts";
 
 async function installLinkLock(
@@ -27,7 +31,10 @@ test("incomplete lock is never auto-reclaimed while a live owner may still be in
   await holder.writeFile("", "utf8");
 
   run.title = "must-not-steal";
-  await assert.rejects(store.save(run), /lock contention|stale lock|maswe unlock/i);
+  await assert.rejects(
+    store.save(run),
+    /lock contention|stale lock|maswe unlock|corrupt|incomplete/i,
+  );
 
   const raw = await readFile(lockPath, "utf8");
   assert.equal(raw, "");
@@ -53,39 +60,43 @@ test("four-actor race: two unlockers cannot hand the lock to a second acquirer o
   await assert.rejects(store.save(blocked), /stale lock|maswe unlock|lock contention/i);
   assert.equal((await readLockOwner(lockPath)), "dead-owner");
 
-  // Explicit unlock removes the dead lock once.
+  // Explicit unlock releases legacy ticket zero without deleting its pathname.
   await store.unlock(run.id);
+  assert.equal((await readLockOwner(lockPath)), "dead-owner");
 
-  // Replacement owner acquires via normal link-based save.
+  // Replacement writer completes one normal v3 acquisition/release.
   const replacement = structuredClone(await store.load(run.id));
   replacement.title = "replacement-owner";
   await store.save(replacement);
   assert.equal((await store.load(run.id)).title, "replacement-owner");
 
-  // Hold the lock as the replacement owner would during a critical section.
-  const holdOwner = randomUUID();
-  await installLinkLock(lockPath, {
-    pid: process.pid,
-    owner: holdOwner,
-    at: new Date().toISOString(),
-  });
+  // Hold a published v3 claim as the replacement owner during a critical section.
+  const hold = await publishLockClaim(
+    path.dirname(lockPath),
+    "data",
+    "store-write",
+  );
+  await validateClaimOwnership(hold);
 
-  // Two concurrent unlock attempts must not remove a live replacement lock.
+  // Two concurrent non-force unlock attempts must not release the live replacement claim.
   const unlockResults = await Promise.allSettled([
     store.unlock(run.id),
     store.unlock(run.id),
   ]);
   assert.equal(unlockResults.filter((r) => r.status === "rejected").length, 2);
-  assert.equal((await readLockOwner(lockPath)), holdOwner);
+  await validateClaimOwnership(hold);
 
   // Second acquiring owner cannot steal while replacement holds the lock.
   const second = structuredClone(await store.load(run.id));
   second.title = "second-acquirer";
-  await assert.rejects(store.save(second), /lock contention|exclusive lock|live/i);
-  assert.equal((await readLockOwner(lockPath)), holdOwner);
+  await assert.rejects(
+    store.save(second),
+    /lock contention|exclusive lock|live|queued|maswe unlock/i,
+  );
+  await validateClaimOwnership(hold);
   assert.equal((await store.load(run.id)).title, "replacement-owner");
 
-  await store.unlock(run.id, { force: true });
+  await publishClaimRelease(hold);
 });
 
 async function readLockOwner(lockPath: string): Promise<string | undefined> {
@@ -146,34 +157,40 @@ test("admin lock serializes unlockers against replacement acquire (barrier)", as
   await Promise.all([aValidated.promise, bValidated.promise]);
   assert.equal(await readLockOwner(lockPath), "stale-owner");
 
-  // Unlocker A removes the stale lock.
+  // Unlocker A publishes the exact ticket-zero release.
   allowARemove.resolve();
   await unlockA;
-  assert.equal(await readLockOwner(lockPath), undefined);
+  assert.equal(
+    await readLockOwner(lockPath),
+    "stale-owner",
+    "v3 recovery must not delete the legacy pathname",
+  );
 
-  // Writer C acquires the replacement lock and holds it.
-  const replacementOwner = randomUUID();
-  await installLinkLock(lockPath, {
-    pid: process.pid,
-    owner: replacementOwner,
-    at: new Date().toISOString(),
-  });
-  assert.equal(await readLockOwner(lockPath), replacementOwner);
+  // Writer C publishes the replacement v3 claim and holds it.
+  const replacement = await publishLockClaim(
+    path.dirname(lockPath),
+    "data",
+    "store-write",
+  );
+  await validateClaimOwnership(replacement);
 
-  // Unlocker B attempts cleanup — must not delete C's replacement lock.
+  // Unlocker B's stale observation cannot release C's exact live replacement claim.
   allowBCleanup.resolve();
-  await assert.rejects(() => unlockB, /live pid|lock changed|refusing|incomplete|missing/i);
-  assert.equal(await readLockOwner(lockPath), replacementOwner);
+  await assert.rejects(
+    () => unlockB,
+    /live pid|lock changed|refusing|incomplete|missing|live owner/i,
+  );
+  await validateClaimOwnership(replacement);
 
   // Writer D attempts acquisition while C holds the lock.
   const writerD = structuredClone(await store.load(run.id));
   writerD.title = "writer-d";
   await assert.rejects(
     store.save(writerD),
-    /lock contention|exclusive lock|stale lock|maswe unlock/i,
+    /lock contention|exclusive lock|stale lock|maswe unlock|queued/i,
   );
-  assert.equal(await readLockOwner(lockPath), replacementOwner);
+  await validateClaimOwnership(replacement);
   assert.equal((await store.load(run.id)).title, "admin");
 
-  await store.unlock(run.id, { force: true });
+  await publishClaimRelease(replacement);
 });

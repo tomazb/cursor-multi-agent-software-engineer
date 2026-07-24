@@ -1,14 +1,44 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdtemp, writeFile, readFile, mkdir } from "node:fs/promises";
+import { fork } from "node:child_process";
+import { access, mkdtemp, writeFile, readFile, mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { FileRunStore } from "../src/store.ts";
+import { journalPaths, scanLockJournal } from "../src/lock-journal.ts";
 
-const storeModule = fileURLToPath(new URL("../src/store.ts", import.meta.url));
+const storeWriterWorker = fileURLToPath(
+  new URL("./fixtures/store-writer-worker.ts", import.meta.url),
+);
+
+test("normal store acquisition and release use immutable v3 claims and releases", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-v3-store-"));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("v3", "journal", DEFAULT_CONFIG);
+  const runDirectory = path.join(cwd, ".maswe", "runs", run.id);
+
+  await assert.rejects(access(path.join(runDirectory, ".lock")), /ENOENT/);
+  await assert.rejects(access(path.join(runDirectory, ".admin.lock")), /ENOENT/);
+
+  const data = await scanLockJournal(runDirectory, "data");
+  assert.equal(data.claims.length, 1);
+  assert.equal(data.releases.size, 1);
+  const admin = await scanLockJournal(runDirectory, "admin");
+  assert.equal(admin.claims.length, 2);
+  assert.equal(admin.releases.size, 2);
+  assert.equal(
+    (await readFile(
+      path.join(
+        journalPaths(runDirectory, "data").claims,
+        "00000000000000000001.json",
+      ),
+      "utf8",
+    )).includes('"format":3'),
+    true,
+  );
+});
 
 test("exclusive lock blocks simultaneous multi-process writers", async () => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-lock-"));
@@ -28,56 +58,28 @@ test("exclusive lock blocks simultaneous multi-process writers", async () => {
     "utf8",
   );
 
-  const child = spawn(
-    process.execPath,
-    [
-      "--experimental-strip-types",
-      "--input-type=module",
-      "-e",
-      `
-      import { FileRunStore } from ${JSON.stringify(storeModule)};
-      import { DEFAULT_CONFIG } from ${JSON.stringify(fileURLToPath(new URL("../src/config.ts", import.meta.url)))};
-      console.log("CHILD_READY");
-      const store = new FileRunStore(${JSON.stringify(cwd)});
-      const run = await store.load(${JSON.stringify(run.id)});
-      run.title = "child-writer";
-      try {
-        await store.save(run);
-        console.log("SAVED");
-        process.exit(0);
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exit(2);
-      }
-      `,
-    ],
-    { cwd, stdio: ["ignore", "pipe", "pipe"] },
-  );
-
-  const result = await new Promise<{ code: number | null; stderr: string; stdout: string }>(
-    (resolve) => {
-      let stdout = "";
-      let stderr = "";
-      child.stdout?.setEncoding("utf8");
-      child.stderr?.setEncoding("utf8");
-      child.stdout?.on("data", (chunk) => (stdout += chunk));
-      child.stderr?.on("data", (chunk) => (stderr += chunk));
-      child.on("close", (code) => resolve({ code, stdout, stderr }));
+  const child = fork(storeWriterWorker, [], {
+    cwd,
+    execArgv: ["--experimental-strip-types"],
+    env: {
+      ...process.env,
+      MASWE_STORE_CWD: cwd,
+      MASWE_STORE_RUN_ID: run.id,
     },
-  );
+    stdio: ["ignore", "ignore", "ignore", "ipc"],
+  });
+  const nextMessage = () =>
+    new Promise<Record<string, unknown>>((resolve) => child.once("message", resolve));
+  assert.equal((await nextMessage()).type, "READY");
+  child.send({ type: "CONTINUE" });
+  const result = await nextMessage();
+  await new Promise<void>((resolve) => child.once("exit", () => resolve()));
 
   await holder.close();
   await import("node:fs/promises").then((fs) => fs.rm(lockPath, { force: true }));
 
-  const combined = `${result.stderr}${result.stdout}`;
-  assert.match(result.stdout, /CHILD_READY/, "child must load ESM modules and reach readiness");
-  assert.doesNotMatch(
-    combined,
-    /SyntaxError|Cannot use import statement|await is only valid|ERR_MODULE_NOT_FOUND|Cannot find module/i,
-  );
-  assert.notEqual(result.code, 0, "child must not save while lock is held exclusively");
-  assert.doesNotMatch(result.stdout, /\bSAVED\b/);
-  assert.match(combined, /lock|busy|contention|EEXIST/i);
+  assert.equal(result.result, "ERROR", "child must not save while legacy ticket zero is live");
+  assert.match(String(result.message), /lock|queued|contention|maswe unlock/i);
   const loaded = await store.load(run.id);
   assert.notEqual(loaded.title, "child-writer");
 });
@@ -97,7 +99,7 @@ test("stale lock from dead pid requires explicit unlock", async () => {
     "utf8",
   );
   run.title = "blocked";
-  await assert.rejects(store.save(run), /stale lock|maswe unlock|lock contention/i);
+  await assert.rejects(store.save(run), /stale lock|maswe unlock|lock contention|queued/i);
   await store.unlock(run.id);
   run.title = "reclaimed";
   await store.save(run);
@@ -118,7 +120,18 @@ test("concurrent writeArtifact under lock yields unique attempts and valid diges
   );
   const results = await Promise.allSettled(writers);
   const fulfilled = results.filter((r) => r.status === "fulfilled");
-  assert.ok(fulfilled.length >= 1);
+  assert.ok(
+    fulfilled.length >= 1,
+    results
+      .map((result) =>
+        result.status === "rejected"
+          ? result.reason instanceof Error
+            ? `${result.reason.name}: ${result.reason.message}`
+            : String(result.reason)
+          : "fulfilled",
+      )
+      .join("\n"),
+  );
 
   const final = await store.load(run.id);
   const notes = final.artifacts.filter((a) => a.logicalName === "note.md");

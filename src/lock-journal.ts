@@ -93,6 +93,46 @@ export interface ReleaseRecordV3 {
   releaseDigest: string;
 }
 
+export interface LegacyReleaseRecordV3 {
+  format: 3;
+  record: "release";
+  kind: LockKind;
+  ticket: "00000000000000000000";
+  targetMode: "legacy";
+  legacyPath: ".lock" | ".admin.lock" | ".admin.lock.recovering";
+  rawDigest: string;
+  releaseDigest: string;
+}
+
+export interface RawClaimOverlay {
+  ticket: string;
+  basename: string;
+  rawBytes: string;
+  rawDigest: string;
+}
+
+export interface RawClaimReleaseRecordV3 {
+  format: 3;
+  record: "release";
+  kind: LockKind;
+  ticket: string;
+  targetMode: "raw-claim";
+  claimPath: string;
+  rawDigest: string;
+  releaseDigest: string;
+}
+
+export interface LegacyLockOverlay {
+  path: string;
+  basename: LegacyReleaseRecordV3["legacyPath"];
+  rawBytes: string;
+  rawDigest: string;
+  state: "valid-live" | "valid-dead" | "corrupt";
+  pid?: number;
+  owner?: string;
+  at?: string;
+}
+
 export interface CanonicalRecord<T> {
   record: T;
   bytes: string;
@@ -101,7 +141,11 @@ export interface CanonicalRecord<T> {
 export interface JournalScan {
   claims: ClaimRecordV3[];
   releases: Map<string, ReleaseRecordV3>;
+  rawClaims: Map<string, RawClaimOverlay>;
+  rawReleases: Map<string, RawClaimReleaseRecordV3>;
   highestTicket: bigint;
+  legacy?: LegacyLockOverlay;
+  legacyRelease?: LegacyReleaseRecordV3;
 }
 
 export type JournalTransition =
@@ -112,7 +156,12 @@ export type JournalTransition =
   | "CLAIM_PUBLISHED"
   | "CLAIM_VALIDATED"
   | "TICKET_CONFLICT"
-  | "TICKET_RESCAN";
+  | "TICKET_RESCAN"
+  | "OWNERSHIP_CHECK_READY"
+  | "OWNERSHIP_ENTERED"
+  | "RELEASE_PREPARED"
+  | "RELEASE_LINK_ATTEMPT_READY"
+  | "RELEASE_PUBLISHED";
 
 export interface JournalTransitionContext {
   kind: LockKind;
@@ -155,6 +204,15 @@ const TEMP_BASENAME_PATTERN =
 
 function errno(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
+}
+
+function pidAliveConservative(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return errno(error) === "EPERM";
+  }
 }
 
 function digest(bytes: string): string {
@@ -421,6 +479,220 @@ export function parseReleaseBytes(
   return rebuilt.record;
 }
 
+function legacyBasename(kind: LockKind): LegacyReleaseRecordV3["legacyPath"] {
+  if (kind === "data") return ".lock";
+  if (kind === "admin") return ".admin.lock";
+  return ".admin.lock.recovering";
+}
+
+async function inspectLegacyLock(
+  runDirectory: string,
+  kind: LockKind,
+): Promise<LegacyLockOverlay | undefined> {
+  const basename = legacyBasename(kind);
+  const legacyPath = path.join(runDirectory, basename);
+  let stat;
+  try {
+    stat = await lstat(legacyPath);
+  } catch (error) {
+    if (errno(error) === "ENOENT") return undefined;
+    throw error;
+  }
+  if (stat.isSymbolicLink()) {
+    throw new LockJournalError(
+      "LOCK_UNSAFE_PATH_TYPE",
+      `Legacy ticket-zero path is a symbolic link or reparse point`,
+    );
+  }
+  if (kind === "admin-recovery" && stat.isDirectory()) {
+    const entries = await readdir(legacyPath);
+    if (entries.length !== 0) {
+      throw new LockJournalError(
+        "LOCK_UNSAFE_PATH_TYPE",
+        `Legacy administrative-recovery marker is a non-empty directory`,
+      );
+    }
+    const rawBytes = "legacy-empty-directory\n";
+    return {
+      path: legacyPath,
+      basename,
+      rawBytes,
+      rawDigest: digest(rawBytes),
+      state: "corrupt",
+    };
+  }
+  if (!stat.isFile()) {
+    throw new LockJournalError(
+      "LOCK_UNSAFE_PATH_TYPE",
+      `Legacy ticket-zero path has an unsupported object type`,
+    );
+  }
+  const rawBytes = await readFile(legacyPath, "utf8");
+  const rawDigest = digest(rawBytes);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawBytes);
+  } catch {
+    return { path: legacyPath, basename, rawBytes, rawDigest, state: "corrupt" };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { path: legacyPath, basename, rawBytes, rawDigest, state: "corrupt" };
+  }
+  const candidate = parsed as Record<string, unknown>;
+  if (
+    !Number.isInteger(candidate.pid) ||
+    (candidate.pid as number) <= 0 ||
+    typeof candidate.owner !== "string" ||
+    candidate.owner.length === 0 ||
+    !validTimestamp(candidate.at)
+  ) {
+    return { path: legacyPath, basename, rawBytes, rawDigest, state: "corrupt" };
+  }
+  const pid = candidate.pid as number;
+  return {
+    path: legacyPath,
+    basename,
+    rawBytes,
+    rawDigest,
+    state: pidAliveConservative(pid) ? "valid-live" : "valid-dead",
+    pid,
+    owner: candidate.owner,
+    at: candidate.at,
+  };
+}
+
+function canonicalLegacyRelease(
+  legacy: LegacyLockOverlay,
+  kind: LockKind,
+): CanonicalRecord<LegacyReleaseRecordV3> {
+  if (!DIGEST_PATTERN.test(legacy.rawDigest)) {
+    throw corrupt("Legacy ticket-zero digest is invalid");
+  }
+  const withoutDigest = {
+    format: 3 as const,
+    record: "release" as const,
+    kind,
+    ticket: "00000000000000000000" as const,
+    targetMode: "legacy" as const,
+    legacyPath: legacy.basename,
+    rawDigest: legacy.rawDigest,
+  };
+  const releaseDigest = digest(`${JSON.stringify(withoutDigest)}\n`);
+  const record: LegacyReleaseRecordV3 = { ...withoutDigest, releaseDigest };
+  return { record, bytes: `${JSON.stringify(record)}\n` };
+}
+
+function legacyReleaseBasename(
+  legacy: LegacyLockOverlay,
+  kind: LockKind,
+): string {
+  return `${kind}.00000000000000000000.raw.${legacy.rawDigest.slice("sha256:".length)}.json`;
+}
+
+function parseLegacyReleaseBytes(
+  bytes: string,
+  legacy: LegacyLockOverlay,
+  kind: LockKind,
+): LegacyReleaseRecordV3 {
+  let value: unknown;
+  try {
+    value = JSON.parse(bytes);
+  } catch (error) {
+    throw corrupt("Legacy release is not valid JSON", error);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw corrupt("Legacy release is not a JSON object");
+  }
+  const candidate = value as Record<string, unknown>;
+  if (
+    !exactKeys(candidate, [
+      "format",
+      "record",
+      "kind",
+      "ticket",
+      "targetMode",
+      "legacyPath",
+      "rawDigest",
+      "releaseDigest",
+    ])
+  ) {
+    throw corrupt("Legacy release schema is invalid");
+  }
+  const canonical = canonicalLegacyRelease(legacy, kind);
+  if (bytes !== canonical.bytes) {
+    throw corrupt("Legacy release target, digest, or canonical bytes are invalid");
+  }
+  return canonical.record;
+}
+
+function canonicalRawClaimRelease(
+  rawClaim: RawClaimOverlay,
+  kind: LockKind,
+): CanonicalRecord<RawClaimReleaseRecordV3> {
+  parseLockTicket(rawClaim.ticket);
+  if (
+    rawClaim.basename !== `${rawClaim.ticket}.json` ||
+    rawClaim.rawDigest !== digest(rawClaim.rawBytes)
+  ) {
+    throw corrupt("Raw claim recovery target is inconsistent");
+  }
+  const withoutDigest = {
+    format: 3 as const,
+    record: "release" as const,
+    kind,
+    ticket: rawClaim.ticket,
+    targetMode: "raw-claim" as const,
+    claimPath: rawClaim.basename,
+    rawDigest: rawClaim.rawDigest,
+  };
+  const releaseDigest = digest(`${JSON.stringify(withoutDigest)}\n`);
+  const record: RawClaimReleaseRecordV3 = { ...withoutDigest, releaseDigest };
+  return { record, bytes: `${JSON.stringify(record)}\n` };
+}
+
+function rawClaimReleaseBasename(
+  rawClaim: RawClaimOverlay,
+  kind: LockKind,
+): string {
+  return `${kind}.${rawClaim.ticket}.raw.${rawClaim.rawDigest.slice("sha256:".length)}.json`;
+}
+
+function parseRawClaimReleaseBytes(
+  bytes: string,
+  rawClaim: RawClaimOverlay,
+  kind: LockKind,
+): RawClaimReleaseRecordV3 {
+  let value: unknown;
+  try {
+    value = JSON.parse(bytes);
+  } catch (error) {
+    throw corrupt("Raw-claim release is not valid JSON", error);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw corrupt("Raw-claim release is not a JSON object");
+  }
+  const candidate = value as Record<string, unknown>;
+  if (
+    !exactKeys(candidate, [
+      "format",
+      "record",
+      "kind",
+      "ticket",
+      "targetMode",
+      "claimPath",
+      "rawDigest",
+      "releaseDigest",
+    ])
+  ) {
+    throw corrupt("Raw-claim release schema is invalid");
+  }
+  const canonical = canonicalRawClaimRelease(rawClaim, kind);
+  if (bytes !== canonical.bytes) {
+    throw corrupt("Raw-claim release target, digest, or canonical bytes are invalid");
+  }
+  return canonical.record;
+}
+
 export function journalPaths(runDirectory: string, kind: LockKind): LockJournalPaths {
   const root = path.join(runDirectory, LOCK_JOURNAL_DIRECTORY);
   const kindDirectory = path.join(root, kind);
@@ -641,7 +913,13 @@ async function validateTemporaryEntries(tmpDirectory: string): Promise<void> {
   const entries = await readdir(tmpDirectory);
   for (const basename of entries) {
     const temporaryPath = path.join(tmpDirectory, basename);
-    const stat = await lstat(temporaryPath);
+    let stat;
+    try {
+      stat = await lstat(temporaryPath);
+    } catch (error) {
+      if (errno(error) === "ENOENT") continue;
+      throw error;
+    }
     if (stat.isSymbolicLink() || !stat.isFile()) {
       throw new LockJournalError(
         "LOCK_UNSAFE_PATH_TYPE",
@@ -657,25 +935,43 @@ async function validateTemporaryEntries(tmpDirectory: string): Promise<void> {
 export async function scanLockJournal(
   runDirectory: string,
   kind: LockKind,
+  options: { allowUnresolvedRawClaims?: boolean } = {},
 ): Promise<JournalScan> {
   await initializeLockJournal(runDirectory);
   const paths = journalPaths(runDirectory, kind);
   await validateTemporaryEntries(paths.tmp);
+  const legacy = await inspectLegacyLock(runDirectory, kind);
 
   const claimEntries = await readdir(paths.claims);
   const claimsByTicket = new Map<bigint, ClaimRecordV3>();
+  const rawClaimsByTicket = new Map<bigint, RawClaimOverlay>();
   for (const basename of claimEntries) {
     const match = CLAIM_BASENAME_PATTERN.exec(basename);
     if (!match) throw corrupt(`Published claim filename is malformed: ${basename}`);
     const ticket = parseLockTicket(match[1]);
-    if (claimsByTicket.has(ticket)) {
+    if (claimsByTicket.has(ticket) || rawClaimsByTicket.has(ticket)) {
       throw corrupt(`Published claim ticket has a duplicate interpretation: ${ticket}`);
     }
     const bytes = await readOrdinaryRecord(path.join(paths.claims, basename));
-    claimsByTicket.set(ticket, parseClaimBytes(bytes, kind, ticket));
+    try {
+      claimsByTicket.set(ticket, parseClaimBytes(bytes, kind, ticket));
+    } catch (error) {
+      if (!(error instanceof LockJournalError) || error.code !== "LOCK_CORRUPT") {
+        throw error;
+      }
+      rawClaimsByTicket.set(ticket, {
+        ticket: formatLockTicket(ticket),
+        basename,
+        rawBytes: bytes,
+        rawDigest: digest(bytes),
+      });
+    }
   }
 
-  const orderedTickets = [...claimsByTicket.keys()].sort((left, right) =>
+  const orderedTickets = [
+    ...claimsByTicket.keys(),
+    ...rawClaimsByTicket.keys(),
+  ].sort((left, right) =>
     left < right ? -1 : left > right ? 1 : 0
   );
   for (let index = 0; index < orderedTickets.length; index += 1) {
@@ -688,6 +984,8 @@ export async function scanLockJournal(
   }
 
   const releases = new Map<string, ReleaseRecordV3>();
+  const rawReleases = new Map<string, RawClaimReleaseRecordV3>();
+  let legacyRelease: LegacyReleaseRecordV3 | undefined;
   for (const basename of await readdir(paths.releases)) {
     const releasePath = path.join(paths.releases, basename);
     const bytes = await readOrdinaryRecord(releasePath);
@@ -701,7 +999,37 @@ export async function scanLockJournal(
       throw corrupt(`Published release is not a JSON object: ${basename}`);
     }
     const candidate = preliminary as Record<string, unknown>;
-    const ticket = parseLockTicket(candidate.ticket);
+    const ticket = parseLockTicket(candidate.ticket, { allowZero: true });
+    if (ticket === 0n) {
+      if (!legacy) {
+        throw corrupt(`Legacy release exists after the ticket-zero path disappeared`);
+      }
+      const expectedBasename = legacyReleaseBasename(legacy, kind);
+      if (
+        candidate.targetMode !== "legacy" ||
+        basename !== expectedBasename ||
+        legacyRelease
+      ) {
+        throw corrupt(`Legacy release pathname is conflicting or noncanonical: ${basename}`);
+      }
+      legacyRelease = parseLegacyReleaseBytes(bytes, legacy, kind);
+      continue;
+    }
+    if (candidate.targetMode === "raw-claim") {
+      const rawClaim = rawClaimsByTicket.get(ticket);
+      if (!rawClaim) {
+        throw corrupt(`Raw-claim release targets a missing or valid claim: ${basename}`);
+      }
+      const expectedBasename = rawClaimReleaseBasename(rawClaim, kind);
+      if (basename !== expectedBasename || rawReleases.has(rawClaim.ticket)) {
+        throw corrupt(`Raw-claim release pathname is conflicting or noncanonical: ${basename}`);
+      }
+      rawReleases.set(
+        rawClaim.ticket,
+        parseRawClaimReleaseBytes(bytes, rawClaim, kind),
+      );
+      continue;
+    }
     const claim = claimsByTicket.get(ticket);
     if (!claim) {
       throw corrupt(`Published release targets a missing claim: ${basename}`);
@@ -713,10 +1041,33 @@ export async function scanLockJournal(
     releases.set(claim.ticket, parseReleaseBytes(bytes, claim));
   }
 
+  if (!options.allowUnresolvedRawClaims) {
+    const unresolved = [...rawClaimsByTicket.values()].find(
+      (rawClaim) => !rawReleases.has(rawClaim.ticket),
+    );
+    if (unresolved) {
+      throw corrupt(
+        `Published claim ${unresolved.basename} is corrupt and has no exact raw resolution`,
+      );
+    }
+  }
+
   return {
-    claims: orderedTickets.map((ticket) => claimsByTicket.get(ticket)!),
+    claims: orderedTickets.flatMap((ticket) => {
+      const claim = claimsByTicket.get(ticket);
+      return claim ? [claim] : [];
+    }),
     releases,
+    rawClaims: new Map(
+      [...rawClaimsByTicket].map(([ticket, rawClaim]) => [
+        formatLockTicket(ticket),
+        rawClaim,
+      ]),
+    ),
+    rawReleases,
     highestTicket: orderedTickets.at(-1) ?? 0n,
+    ...(legacy ? { legacy } : {}),
+    ...(legacyRelease ? { legacyRelease } : {}),
   };
 }
 
@@ -725,10 +1076,14 @@ const PROCESS_STARTED_AT = new Date(
 ).toISOString();
 
 async function currentPlatformProcessIdentity(): Promise<string | null> {
+  return platformProcessIdentity(process.pid);
+}
+
+async function platformProcessIdentity(pid: number): Promise<string | null> {
   if (process.platform !== "linux") return null;
   try {
     const [stat, bootId] = await Promise.all([
-      readFile("/proc/self/stat", "utf8"),
+      readFile(`/proc/${pid}/stat`, "utf8"),
       readFile("/proc/sys/kernel/random/boot_id", "utf8"),
     ]);
     const closeParen = stat.lastIndexOf(")");
@@ -743,6 +1098,14 @@ async function currentPlatformProcessIdentity(): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+async function claimIsLive(claim: ClaimRecordV3): Promise<boolean> {
+  if (!pidAliveConservative(claim.pid)) return false;
+  if (claim.process.platformIdentity === null) return true;
+  const current = await platformProcessIdentity(claim.pid);
+  if (current === null) return true;
+  return current === claim.process.platformIdentity;
 }
 
 async function cleanupExactTemporary(temporaryPath: string): Promise<void> {
@@ -907,5 +1270,413 @@ export async function publishLockClaim(
       claimDigest: published.claimDigest,
       claim: published,
     };
+  }
+}
+
+async function readExactClaim(
+  runDirectory: string,
+  kind: LockKind,
+  ticket: bigint,
+): Promise<ClaimRecordV3> {
+  const ticketText = formatLockTicket(ticket);
+  const claimPath = path.join(
+    journalPaths(runDirectory, kind).claims,
+    `${ticketText}.json`,
+  );
+  return parseClaimBytes(await readOrdinaryRecord(claimPath), kind, ticket);
+}
+
+async function readExactRelease(
+  runDirectory: string,
+  claim: ClaimRecordV3,
+): Promise<ReleaseRecordV3 | undefined> {
+  const releasePath = path.join(
+    journalPaths(runDirectory, claim.kind).releases,
+    releaseBasename(claim),
+  );
+  try {
+    const stat = await lstat(releasePath);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new LockJournalError(
+        "LOCK_UNSAFE_PATH_TYPE",
+        `Canonical release path is not an ordinary regular file`,
+      );
+    }
+  } catch (error) {
+    if (error instanceof LockJournalError) throw error;
+    if (errno(error) === "ENOENT") return undefined;
+    throw error;
+  }
+  return parseReleaseBytes(await readFile(releasePath, "utf8"), claim);
+}
+
+function requireHandleMatchesClaim(
+  handle: PublishedClaimHandle,
+  claim: ClaimRecordV3,
+): void {
+  if (
+    handle.kind !== claim.kind ||
+    handle.claim.ticket !== claim.ticket ||
+    handle.ticket !== parseLockTicket(claim.ticket) ||
+    handle.owner !== claim.owner ||
+    handle.claimDigest !== claim.claimDigest
+  ) {
+    throw new LockJournalError(
+      "LOCK_OWNERSHIP_LOST",
+      `Retained lock claim identity no longer matches its exact published record`,
+    );
+  }
+}
+
+export async function validateClaimOwnership(
+  handle: PublishedClaimHandle,
+  options: PublishClaimOptions = {},
+): Promise<void> {
+  const fullScan = await scanLockJournal(handle.runDirectory, handle.kind);
+  if (handle.ticket > fullScan.highestTicket) {
+    throw new LockJournalError(
+      "LOCK_OWNERSHIP_LOST",
+      `Retained ${handle.kind} ticket is outside the published contiguous range`,
+    );
+  }
+  const context: JournalTransitionContext = {
+    kind: handle.kind,
+    ticket: handle.claim.ticket,
+    owner: handle.owner,
+  };
+  await options.transition?.("OWNERSHIP_CHECK_READY", context);
+
+  if (fullScan.legacy && !fullScan.legacyRelease) {
+    if (fullScan.legacy.state === "corrupt") {
+      throw new LockJournalError(
+        "LOCK_CORRUPT",
+        `Legacy ticket zero is corrupt and blocks ${handle.kind} ownership`,
+      );
+    }
+    throw new LockJournalError(
+      "LOCK_QUEUED",
+      `${handle.kind} ticket ${handle.claim.ticket} is queued behind legacy ticket zero`,
+    );
+  }
+
+  for (let ticket = 1n; ticket < handle.ticket; ticket += 1n) {
+    const ticketText = formatLockTicket(ticket);
+    const rawClaim = fullScan.rawClaims.get(ticketText);
+    if (rawClaim) {
+      if (!fullScan.rawReleases.has(ticketText)) {
+        throw new LockJournalError(
+          "LOCK_CORRUPT",
+          `Corrupt lower ${handle.kind} ticket ${ticketText} has no exact resolution`,
+        );
+      }
+      continue;
+    }
+    const lowerClaim = await readExactClaim(handle.runDirectory, handle.kind, ticket);
+    if (!(await readExactRelease(handle.runDirectory, lowerClaim))) {
+      throw new LockJournalError(
+        "LOCK_QUEUED",
+        `${handle.kind} ticket ${handle.claim.ticket} is queued behind ${lowerClaim.ticket}`,
+      );
+    }
+  }
+
+  const ownClaim = await readExactClaim(
+    handle.runDirectory,
+    handle.kind,
+    handle.ticket,
+  );
+  requireHandleMatchesClaim(handle, ownClaim);
+  if (await readExactRelease(handle.runDirectory, ownClaim)) {
+    throw new LockJournalError(
+      "LOCK_OWNERSHIP_LOST",
+      `${handle.kind} ticket ${ownClaim.ticket} was released before protected entry`,
+    );
+  }
+
+  // Immediate final exact-path recheck. No enumeration or unrelated await occurs between this
+  // check and returning ownership to the caller.
+  if (await readExactRelease(handle.runDirectory, ownClaim)) {
+    throw new LockJournalError(
+      "LOCK_OWNERSHIP_LOST",
+      `${handle.kind} ticket ${ownClaim.ticket} lost ownership at protected entry`,
+    );
+  }
+  await options.transition?.("OWNERSHIP_ENTERED", context);
+}
+
+export async function publishClaimRelease(
+  handle: PublishedClaimHandle,
+  options: PublishClaimOptions = {},
+): Promise<CanonicalRecord<ReleaseRecordV3>> {
+  await scanLockJournal(handle.runDirectory, handle.kind);
+  const exactClaim = await readExactClaim(
+    handle.runDirectory,
+    handle.kind,
+    handle.ticket,
+  );
+  requireHandleMatchesClaim(handle, exactClaim);
+  const canonical = canonicalRelease(exactClaim);
+  const paths = journalPaths(handle.runDirectory, handle.kind);
+  const temporaryPath = path.join(paths.tmp, `.release.${randomUUID()}.tmp`);
+  const finalPath = path.join(paths.releases, releaseBasename(exactClaim));
+  const context: JournalTransitionContext = {
+    kind: handle.kind,
+    ticket: exactClaim.ticket,
+    owner: exactClaim.owner,
+  };
+  let fileHandle;
+  let prepared = false;
+  try {
+    fileHandle = await open(temporaryPath, "wx", 0o600);
+    await fileHandle.writeFile(canonical.bytes, "utf8");
+    await fileHandle.sync();
+    await fileHandle.close();
+    fileHandle = undefined;
+    prepared = true;
+    try {
+      await chmod(temporaryPath, 0o400);
+    } catch {
+      // Permission modes are advisory on some supported platforms.
+    }
+    await options.transition?.("RELEASE_PREPARED", context);
+    await options.transition?.("RELEASE_LINK_ATTEMPT_READY", context);
+    try {
+      await link(temporaryPath, finalPath);
+    } catch (error) {
+      if (errno(error) !== "EEXIST") {
+        try {
+          const existing = await readOrdinaryRecord(finalPath);
+          if (existing === canonical.bytes) {
+            await options.transition?.("RELEASE_PUBLISHED", context);
+            return canonical;
+          }
+        } catch {
+          // The original publication failure remains authoritative.
+        }
+        throw new LockJournalError(
+          "LOCK_UNSUPPORTED_FILESYSTEM",
+          `Atomic no-clobber release publication failed`,
+          { cause: error },
+        );
+      }
+    }
+    const finalBytes = await readOrdinaryRecord(finalPath);
+    const validated = parseReleaseBytes(finalBytes, exactClaim);
+    if (
+      finalBytes !== canonical.bytes ||
+      validated.releaseDigest !== canonical.record.releaseDigest
+    ) {
+      throw corrupt(`Existing canonical release path has conflicting bytes`);
+    }
+    await options.transition?.("RELEASE_PUBLISHED", context);
+    return canonical;
+  } finally {
+    if (fileHandle) await fileHandle.close();
+    if (prepared) await cleanupExactTemporary(temporaryPath);
+  }
+}
+
+async function publishLegacyRelease(
+  runDirectory: string,
+  kind: LockKind,
+  observed: LegacyLockOverlay,
+): Promise<CanonicalRecord<LegacyReleaseRecordV3>> {
+  const current = await inspectLegacyLock(runDirectory, kind);
+  if (
+    !current ||
+    current.basename !== observed.basename ||
+    current.rawBytes !== observed.rawBytes ||
+    current.rawDigest !== observed.rawDigest
+  ) {
+    throw new LockJournalError(
+      "LOCK_OWNERSHIP_LOST",
+      `Legacy ticket-zero bytes changed before exact release publication`,
+    );
+  }
+  const canonical = canonicalLegacyRelease(current, kind);
+  const paths = journalPaths(runDirectory, kind);
+  const temporaryPath = path.join(paths.tmp, `.release.${randomUUID()}.tmp`);
+  const finalPath = path.join(paths.releases, legacyReleaseBasename(current, kind));
+  let fileHandle;
+  let prepared = false;
+  try {
+    fileHandle = await open(temporaryPath, "wx", 0o600);
+    await fileHandle.writeFile(canonical.bytes, "utf8");
+    await fileHandle.sync();
+    await fileHandle.close();
+    fileHandle = undefined;
+    prepared = true;
+    try {
+      await chmod(temporaryPath, 0o400);
+    } catch {
+      // Permission modes are advisory on some supported platforms.
+    }
+    try {
+      await link(temporaryPath, finalPath);
+    } catch (error) {
+      if (errno(error) !== "EEXIST") {
+        throw new LockJournalError(
+          "LOCK_UNSUPPORTED_FILESYSTEM",
+          `Atomic legacy release publication failed`,
+          { cause: error },
+        );
+      }
+    }
+    const finalBytes = await readOrdinaryRecord(finalPath);
+    if (
+      finalBytes !== canonical.bytes ||
+      parseLegacyReleaseBytes(finalBytes, current, kind).releaseDigest !==
+        canonical.record.releaseDigest
+    ) {
+      throw corrupt(`Existing legacy release path has conflicting bytes`);
+    }
+    return canonical;
+  } finally {
+    if (fileHandle) await fileHandle.close();
+    if (prepared) await cleanupExactTemporary(temporaryPath);
+  }
+}
+
+async function publishRawClaimRelease(
+  runDirectory: string,
+  kind: LockKind,
+  observed: RawClaimOverlay,
+): Promise<CanonicalRecord<RawClaimReleaseRecordV3>> {
+  const claimPath = path.join(
+    journalPaths(runDirectory, kind).claims,
+    observed.basename,
+  );
+  const currentBytes = await readOrdinaryRecord(claimPath);
+  if (currentBytes !== observed.rawBytes || digest(currentBytes) !== observed.rawDigest) {
+    throw new LockJournalError(
+      "LOCK_OWNERSHIP_LOST",
+      `Corrupt ${kind} claim bytes changed before exact raw resolution`,
+    );
+  }
+  const canonical = canonicalRawClaimRelease(observed, kind);
+  const paths = journalPaths(runDirectory, kind);
+  const temporaryPath = path.join(paths.tmp, `.release.${randomUUID()}.tmp`);
+  const finalPath = path.join(paths.releases, rawClaimReleaseBasename(observed, kind));
+  let fileHandle;
+  let prepared = false;
+  try {
+    fileHandle = await open(temporaryPath, "wx", 0o600);
+    await fileHandle.writeFile(canonical.bytes, "utf8");
+    await fileHandle.sync();
+    await fileHandle.close();
+    fileHandle = undefined;
+    prepared = true;
+    try {
+      await chmod(temporaryPath, 0o400);
+    } catch {
+      // Permission modes are advisory on some supported platforms.
+    }
+    try {
+      await link(temporaryPath, finalPath);
+    } catch (error) {
+      if (errno(error) !== "EEXIST") {
+        throw new LockJournalError(
+          "LOCK_UNSUPPORTED_FILESYSTEM",
+          `Atomic corrupt-claim resolution publication failed`,
+          { cause: error },
+        );
+      }
+    }
+    const finalBytes = await readOrdinaryRecord(finalPath);
+    if (
+      finalBytes !== canonical.bytes ||
+      parseRawClaimReleaseBytes(finalBytes, observed, kind).releaseDigest !==
+        canonical.record.releaseDigest
+    ) {
+      throw corrupt(`Existing corrupt-claim resolution path has conflicting bytes`);
+    }
+    return canonical;
+  } finally {
+    if (fileHandle) await fileHandle.close();
+    if (prepared) await cleanupExactTemporary(temporaryPath);
+  }
+}
+
+export async function recoverCurrentLock(
+  runDirectory: string,
+  kind: LockKind,
+  options: { force: boolean },
+): Promise<void> {
+  const scan = await scanLockJournal(runDirectory, kind, {
+    allowUnresolvedRawClaims: true,
+  });
+  if (scan.legacy && !scan.legacyRelease) {
+    if (scan.legacy.state === "corrupt") {
+      if (!options.force) {
+        throw new LockJournalError(
+          "LOCK_CORRUPT",
+          `Legacy ${kind} ticket zero is corrupt; force requires operator quiescence`,
+        );
+      }
+    } else if (scan.legacy.state === "valid-live") {
+      if (kind === "admin-recovery") {
+        throw new LockJournalError(
+          "ADMIN_RECOVERY_CONCURRENT",
+          `A live legacy administrative-recovery marker cannot be force-released`,
+        );
+      }
+      if (!options.force) {
+        throw new LockJournalError(
+          "LOCK_LIVE_OWNER",
+          `Legacy ${kind} ticket zero is held by live pid ${scan.legacy.pid}`,
+        );
+      }
+    }
+    await publishLegacyRelease(runDirectory, kind, scan.legacy);
+    return;
+  }
+
+  for (let ticket = 1n; ticket <= scan.highestTicket; ticket += 1n) {
+    const ticketText = formatLockTicket(ticket);
+    const rawClaim = scan.rawClaims.get(ticketText);
+    if (!rawClaim || scan.rawReleases.has(ticketText)) continue;
+    if (kind === "admin-recovery" || !options.force) {
+      throw new LockJournalError(
+        "LOCK_CORRUPT",
+        `Corrupt ${kind} ticket ${ticketText} cannot be resolved under the current policy`,
+      );
+    }
+    await publishRawClaimRelease(runDirectory, kind, rawClaim);
+    return;
+  }
+
+  for (const claim of scan.claims) {
+    if (scan.releases.has(claim.ticket)) continue;
+    const live = await claimIsLive(claim);
+    if (live) {
+      if (kind === "admin-recovery") {
+        throw new LockJournalError(
+          "ADMIN_RECOVERY_CONCURRENT",
+          `Live administrative-recovery ticket ${claim.ticket} cannot be force-released`,
+        );
+      }
+      if (!options.force) {
+        throw new LockJournalError(
+          "LOCK_LIVE_OWNER",
+          `${kind} ticket ${claim.ticket} is held by live pid ${claim.pid}`,
+        );
+      }
+    }
+    if (!live && kind === "admin-recovery" && !options.force) {
+      throw new LockJournalError(
+        "LOCK_DEAD_OWNER",
+        `Dead administrative-recovery ticket ${claim.ticket} requires force`,
+      );
+    }
+    const ticket = parseLockTicket(claim.ticket);
+    await publishClaimRelease({
+      runDirectory,
+      kind,
+      ticket,
+      owner: claim.owner,
+      claimDigest: claim.claimDigest,
+      claim,
+    });
+    return;
   }
 }
