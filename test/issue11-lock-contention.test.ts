@@ -147,7 +147,7 @@ async function runExclusiveMkdirRace(iteration: number): Promise<void> {
     { worker: b, message: { action: "acquire", actor: "B", lockPath, kind: "data" } },
   ]);
 
-  const ownerMessage = await Promise.race([
+  const ownerMessage = await Promise.any([
     a.waitFor((message) => message.type === "owned"),
     b.waitFor((message) => message.type === "owned"),
   ]);
@@ -394,7 +394,7 @@ async function runRecoveryMarkerRace(initial: "dead" | "empty"): Promise<void> {
   ]);
   a.send({ action: "continue", transition: "RECOVERY_MARKER_OBSERVED" });
   b.send({ action: "continue", transition: "RECOVERY_MARKER_OBSERVED" });
-  const entered = await Promise.race([
+  const entered = await Promise.any([
     a.waitFor(
       (message) =>
         message.type === "transition" && message.transition === "RECOVERY_ENTERED",
