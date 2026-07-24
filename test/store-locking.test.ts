@@ -7,7 +7,12 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { FileRunStore } from "../src/store.ts";
-import { journalPaths, scanLockJournal } from "../src/lock-journal.ts";
+import {
+  LockJournalError,
+  journalPaths,
+  publishLockClaim,
+  scanLockJournal,
+} from "../src/lock-journal.ts";
 
 const storeWriterWorker = fileURLToPath(
   new URL("./fixtures/store-writer-worker.ts", import.meta.url),
@@ -70,6 +75,24 @@ test("protected-work and exact-release failures are both preserved", async () =>
       return true;
     },
   );
+});
+
+test("zero configured retries still requires one positive ownership validation", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-v3-zero-retry-"));
+  const setupStore = new FileRunStore(cwd);
+  const run = await setupStore.create("before", "zero retry", DEFAULT_CONFIG);
+  const runDirectory = path.join(cwd, ".maswe", "runs", run.id);
+  await publishLockClaim(runDirectory, "data", "store-write");
+
+  const zeroRetryStore = new FileRunStore(cwd, { lockRetries: 0 });
+  const changed = structuredClone(run);
+  changed.title = "must-not-enter";
+  await assert.rejects(
+    zeroRetryStore.save(changed),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_QUEUED",
+  );
+  assert.equal((await zeroRetryStore.load(run.id)).title, "before");
 });
 
 test("exclusive lock blocks simultaneous multi-process writers", async () => {

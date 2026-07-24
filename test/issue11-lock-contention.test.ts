@@ -5,15 +5,21 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_CONFIG } from "../src/config.ts";
 import {
   canonicalClaim,
+  initializeLockJournal,
   journalPaths,
   recoverCurrentLock,
   scanLockJournal,
 } from "../src/lock-journal.ts";
+import { FileRunStore } from "../src/store.ts";
 
 const workerPath = fileURLToPath(
   new URL("./fixtures/lock-journal-worker.ts", import.meta.url),
+);
+const unlockAdminWorkerPath = fileURLToPath(
+  new URL("./fixtures/unlock-admin-worker.ts", import.meta.url),
 );
 const WATCHDOG_MS = 10_000;
 
@@ -135,11 +141,14 @@ function spawnWorker(
   };
 }
 
-async function event(worker: Worker, name: string): Promise<WorkerMessage> {
+async function event(
+  worker: Pick<Worker, "next">,
+  name: string,
+): Promise<WorkerMessage> {
   return worker.next((message) => message.type === "EVENT" && message.event === name);
 }
 
-async function result(worker: Worker): Promise<WorkerMessage> {
+async function result(worker: Pick<Worker, "next">): Promise<WorkerMessage> {
   return worker.next((message) => message.type === "RESULT");
 }
 
@@ -147,6 +156,88 @@ async function stopWorker(worker: Worker): Promise<void> {
   if (worker.child.exitCode !== null || worker.child.signalCode !== null) return;
   const response = await worker.command("EXIT");
   assert.equal(response.result, "OK");
+}
+
+function spawnUnlockAdminWorker(
+  cwd: string,
+  runId: string,
+  actor: string,
+  pauseEvents: string[],
+  force: boolean,
+): Pick<Worker, "child" | "next" | "continue"> {
+  const child = fork(unlockAdminWorkerPath, [], {
+    execArgv: ["--experimental-strip-types"],
+    env: {
+      ...process.env,
+      MASWE_STORE_CWD: cwd,
+      MASWE_STORE_RUN_ID: runId,
+      MASWE_LOCK_ACTOR: actor,
+      MASWE_LOCK_PAUSE_EVENTS: pauseEvents.join(","),
+      MASWE_UNLOCK_FORCE: force ? "1" : "0",
+    },
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  const messages: WorkerMessage[] = [];
+  const waiters: Array<{
+    predicate: (message: WorkerMessage) => boolean;
+    resolve: (message: WorkerMessage) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }> = [];
+  child.on("message", (message: WorkerMessage) => {
+    const index = waiters.findIndex((waiter) => waiter.predicate(message));
+    if (index >= 0) {
+      const [waiter] = waiters.splice(index, 1);
+      clearTimeout(waiter!.timer);
+      waiter!.resolve(message);
+    } else {
+      messages.push(message);
+    }
+  });
+  child.on("exit", (code, signal) => {
+    if (code === 0) return;
+    const error = new Error(`unlock worker ${actor} exited ${code ?? signal}`);
+    for (const waiter of waiters.splice(0)) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+  });
+  return {
+    child,
+    next(predicate) {
+      const index = messages.findIndex(predicate);
+      if (index >= 0) return Promise.resolve(messages.splice(index, 1)[0]!);
+      return new Promise<WorkerMessage>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const waiterIndex = waiters.findIndex((waiter) => waiter.resolve === resolve);
+          if (waiterIndex >= 0) waiters.splice(waiterIndex, 1);
+          reject(new Error(`unlock worker ${actor} watchdog expired`));
+        }, WATCHDOG_MS);
+        waiters.push({ predicate, resolve, reject, timer });
+      });
+    },
+    continue(event) {
+      child.send({ type: "CONTINUE", event });
+    },
+  };
+}
+
+async function createStoreRun(prefix: string): Promise<{
+  cwd: string;
+  runId: string;
+  runDirectory: string;
+}> {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), prefix));
+  const run = await new FileRunStore(cwd, { lockRetries: 5 }).create(
+    "recovery",
+    "issue-11",
+    DEFAULT_CONFIG,
+  );
+  return {
+    cwd,
+    runId: run.id,
+    runDirectory: path.join(cwd, ".maswe", "runs", run.id),
+  };
 }
 
 test("real processes conflict on one proposed ticket and publish contiguous successors", async () => {
@@ -301,7 +392,7 @@ test("three real-process claimants enter strictly in ticket order", async () => 
 test("two real recoverers converge on one exact dead-claim release", async () => {
   const runDirectory = await freshRunDirectory("maswe-recover-process-");
   const paths = journalPaths(runDirectory, "data");
-  await mkdir(paths.claims, { recursive: true });
+  await initializeLockJournal(runDirectory);
   const dead = canonicalClaim({
     kind: "data",
     ticket: 1n,
@@ -373,10 +464,69 @@ test("two real administrative-recovery claimants admit exactly one owner", async
   await Promise.all([stopWorker(first), stopWorker(second)]);
 });
 
+test("two real unlockAdmin calls admit one recovery owner and reject the live contender", async () => {
+  const { cwd, runId, runDirectory } = await createStoreRun(
+    "maswe-unlock-admin-race-",
+  );
+  const first = spawnUnlockAdminWorker(
+    cwd,
+    runId,
+    "unlock-first",
+    ["OWNERSHIP_ENTERED"],
+    true,
+  );
+  const entered = await event(first, "OWNERSHIP_ENTERED");
+  assert.equal(entered.kind, "admin-recovery");
+
+  const second = spawnUnlockAdminWorker(cwd, runId, "unlock-second", [], true);
+  const rejected = await result(second);
+  assert.equal(rejected.result, "ERROR");
+  assert.equal(rejected.code, "ADMIN_RECOVERY_CONCURRENT");
+
+  let recovery = await scanLockJournal(runDirectory, "admin-recovery");
+  assert.equal(recovery.claims.length, 2);
+  assert.equal(recovery.releases.has(recovery.claims[0]!.ticket), false);
+  assert.equal(recovery.releases.has(recovery.claims[1]!.ticket), true);
+
+  first.continue("OWNERSHIP_ENTERED");
+  assert.equal((await result(first)).result, "OK");
+  recovery = await scanLockJournal(runDirectory, "admin-recovery");
+  assert.equal(recovery.releases.size, 2);
+});
+
+test("a crashed real unlockAdmin recovery owner is exact-recovered by its successor", async () => {
+  const { cwd, runId, runDirectory } = await createStoreRun(
+    "maswe-unlock-admin-crash-",
+  );
+  const crashed = spawnUnlockAdminWorker(
+    cwd,
+    runId,
+    "unlock-crashed",
+    ["OWNERSHIP_ENTERED"],
+    true,
+  );
+  const entered = await event(crashed, "OWNERSHIP_ENTERED");
+  assert.equal(entered.kind, "admin-recovery");
+  crashed.child.kill("SIGKILL");
+  await new Promise<void>((resolve) => crashed.child.once("exit", () => resolve()));
+
+  const successor = spawnUnlockAdminWorker(
+    cwd,
+    runId,
+    "unlock-successor",
+    [],
+    true,
+  );
+  assert.equal((await result(successor)).result, "OK");
+  const recovery = await scanLockJournal(runDirectory, "admin-recovery");
+  assert.equal(recovery.claims.length, 2);
+  assert.equal(recovery.releases.size, 2);
+});
+
 test("two administrative recoverers converge on one dead recovery-claim release", async () => {
   const runDirectory = await freshRunDirectory("maswe-dead-recovery-process-");
   const paths = journalPaths(runDirectory, "admin-recovery");
-  await mkdir(paths.claims, { recursive: true });
+  await initializeLockJournal(runDirectory);
   const dead = canonicalClaim({
     kind: "admin-recovery",
     ticket: 1n,

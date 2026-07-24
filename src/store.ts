@@ -17,6 +17,7 @@ import {
   recoverCurrentLock,
   validateClaimOwnership,
   type ClaimOperation,
+  type PublishClaimOptions,
   type PublishedClaimHandle,
 } from "./lock-journal.ts";
 import { redactSecrets } from "./redaction.ts";
@@ -212,6 +213,8 @@ export class FileRunStore implements RunStore {
       force?: boolean;
       /** Test hook after observing the current admin lock, before recovery proceeds. */
       afterObserve?: (meta: LockMeta | undefined) => Promise<void>;
+      /** Test hook for deterministic child-process journal barriers. */
+      transition?: PublishClaimOptions["transition"];
     } = {},
   ): Promise<void> {
     assertSafeRunId(runId);
@@ -219,17 +222,21 @@ export class FileRunStore implements RunStore {
     await mkdir(directory, { recursive: true });
     const observed = await readLockMeta(this.adminLockFile(runId));
     await options.afterObserve?.(observed);
+    const transitionOptions: PublishClaimOptions = options.transition
+      ? { transition: options.transition }
+      : {};
 
     const recovery = await publishLockClaim(
       directory,
       "admin-recovery",
       "admin-recovery",
+      transitionOptions,
     );
     let primaryError: unknown;
     try {
       for (;;) {
         try {
-          await validateClaimOwnership(recovery);
+          await validateClaimOwnership(recovery, transitionOptions);
           break;
         } catch (error) {
           if (
@@ -240,12 +247,14 @@ export class FileRunStore implements RunStore {
           }
           await recoverCurrentLock(directory, "admin-recovery", {
             force: options.force ?? false,
+            ...transitionOptions,
           });
         }
       }
       // Recovery-stream ownership is freshly validated before inspecting admin state.
       await recoverCurrentLock(directory, "admin", {
         force: options.force ?? false,
+        ...transitionOptions,
       });
     } catch (error) {
       primaryError = error;
@@ -253,7 +262,7 @@ export class FileRunStore implements RunStore {
 
     let releaseError: unknown;
     try {
-      await publishClaimRelease(recovery);
+      await publishClaimRelease(recovery, transitionOptions);
     } catch (error) {
       releaseError = error;
     }
@@ -272,7 +281,8 @@ export class FileRunStore implements RunStore {
     handle: PublishedClaimHandle,
     retries: number,
   ): Promise<void> {
-    for (let attempt = 0; attempt < retries; attempt += 1) {
+    const effectiveRetries = Math.max(retries, 1);
+    for (let attempt = 0; attempt < effectiveRetries; attempt += 1) {
       try {
         await validateClaimOwnership(handle);
         return;
@@ -280,7 +290,7 @@ export class FileRunStore implements RunStore {
         if (!(error instanceof LockJournalError) || error.code !== "LOCK_QUEUED") {
           throw error;
         }
-        if (attempt === retries - 1) {
+        if (attempt === effectiveRetries - 1) {
           throw new LockJournalError(
             "LOCK_QUEUED",
             `Run ${runId} ${handle.kind} ticket ${handle.claim.ticket} remained queued. ` +

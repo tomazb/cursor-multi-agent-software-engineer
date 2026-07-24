@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
 import {
   chmod,
   link,
@@ -107,7 +108,7 @@ export interface LegacyReleaseRecordV3 {
 export interface RawClaimOverlay {
   ticket: string;
   basename: string;
-  rawBytes: string;
+  rawBytes: Buffer;
   rawDigest: string;
 }
 
@@ -125,7 +126,7 @@ export interface RawClaimReleaseRecordV3 {
 export interface LegacyLockOverlay {
   path: string;
   basename: LegacyReleaseRecordV3["legacyPath"];
-  rawBytes: string;
+  rawBytes: Buffer;
   rawDigest: string;
   state: "valid-live" | "valid-dead" | "corrupt";
   pid?: number;
@@ -216,8 +217,155 @@ function pidAliveConservative(pid: number): boolean {
   }
 }
 
-function digest(bytes: string): string {
+function digest(bytes: string | Uint8Array): string {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+const MAX_AUTHORITATIVE_RECORD_BYTES = 1024 * 1024;
+const STRICT_UTF8 = new TextDecoder("utf-8", { fatal: true });
+
+function decodeCanonicalText(bytes: Uint8Array, recordPath: string): string {
+  try {
+    return STRICT_UTF8.decode(bytes);
+  } catch (error) {
+    throw corrupt(`Published journal record is not valid UTF-8: ${recordPath}`, error);
+  }
+}
+
+async function readHandleExactly(
+  handle: Awaited<ReturnType<typeof open>>,
+  size: number,
+): Promise<Buffer> {
+  const bytes = Buffer.alloc(size);
+  let offset = 0;
+  while (offset < size) {
+    const result = await handle.read(bytes, offset, size - offset, offset);
+    if (result.bytesRead === 0) {
+      throw corrupt("Published journal record was truncated during stable read");
+    }
+    offset += result.bytesRead;
+  }
+  return bytes;
+}
+
+async function readStableOrdinaryBytes(recordPath: string): Promise<Buffer> {
+  const noFollow = constants.O_NOFOLLOW;
+  const nonBlock = constants.O_NONBLOCK;
+  if (
+    typeof noFollow !== "number" ||
+    noFollow === 0 ||
+    typeof nonBlock !== "number"
+  ) {
+    throw new LockJournalError(
+      "LOCK_UNSUPPORTED_FILESYSTEM",
+      `Non-following authoritative record reads are unavailable on this platform`,
+    );
+  }
+
+  let beforeOpen;
+  try {
+    beforeOpen = await lstat(recordPath);
+  } catch (error) {
+    if (errno(error) === "ENOENT") {
+      throw corrupt(`Published journal record disappeared during validation: ${recordPath}`);
+    }
+    throw error;
+  }
+  if (beforeOpen.isSymbolicLink() || !beforeOpen.isFile()) {
+    throw new LockJournalError(
+      "LOCK_UNSAFE_PATH_TYPE",
+      `Published journal entry is not an ordinary regular file: ${recordPath}`,
+    );
+  }
+
+  let handle;
+  let primaryError: unknown;
+  try {
+    try {
+      handle = await open(recordPath, constants.O_RDONLY | noFollow | nonBlock);
+    } catch (error) {
+      if (errno(error) === "ELOOP") {
+        throw new LockJournalError(
+          "LOCK_UNSAFE_PATH_TYPE",
+          `Published journal entry became a symbolic link during validation: ${recordPath}`,
+          { cause: error },
+        );
+      }
+      if (["EINVAL", "ENOTSUP", "EOPNOTSUPP", "ENOSYS"].includes(errno(error) ?? "")) {
+        throw new LockJournalError(
+          "LOCK_UNSUPPORTED_FILESYSTEM",
+          `Non-following authoritative record open is unsupported: ${recordPath}`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+    const firstStat = await handle.stat();
+    if (!firstStat.isFile()) {
+      throw new LockJournalError(
+        "LOCK_UNSAFE_PATH_TYPE",
+        `Opened journal entry is not an ordinary regular file: ${recordPath}`,
+      );
+    }
+    if (
+      !Number.isSafeInteger(firstStat.size) ||
+      firstStat.size < 0 ||
+      firstStat.size > MAX_AUTHORITATIVE_RECORD_BYTES
+    ) {
+      throw corrupt(`Published journal record size is outside the supported bound`);
+    }
+    const first = await readHandleExactly(handle, firstStat.size);
+    const second = await readHandleExactly(handle, firstStat.size);
+    const secondStat = await handle.stat();
+    if (
+      secondStat.size !== firstStat.size ||
+      secondStat.dev !== firstStat.dev ||
+      secondStat.ino !== firstStat.ino ||
+      !first.equals(second)
+    ) {
+      throw new LockJournalError(
+        "LOCK_OWNERSHIP_LOST",
+        `Published journal record changed during stable read: ${recordPath}`,
+      );
+    }
+    return first;
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    if (handle) {
+      try {
+        await handle.close();
+      } catch (cleanupError) {
+        const cleanup = new LockJournalError(
+          "LOCK_CLEANUP_FAILED",
+          `Could not close authoritative journal record handle`,
+          { cause: cleanupError },
+        );
+        if (primaryError !== undefined) {
+          throw new AggregateError(
+            [primaryError, cleanup],
+            `Journal record validation and handle cleanup both failed`,
+          );
+        }
+        throw cleanup;
+      }
+    }
+  }
+}
+
+async function readOrdinaryRecord(recordPath: string): Promise<string> {
+  return decodeCanonicalText(await readStableOrdinaryBytes(recordPath), recordPath);
+}
+
+async function requirePreparedBytes(
+  temporaryPath: string,
+  expected: string,
+): Promise<void> {
+  const actual = await readStableOrdinaryBytes(temporaryPath);
+  if (!actual.equals(Buffer.from(expected, "utf8"))) {
+    throw corrupt(`Prepared journal temporary bytes changed before publication`);
+  }
 }
 
 function validTimestamp(value: unknown): value is string {
@@ -331,10 +479,10 @@ export function parseClaimBytes(
   try {
     value = JSON.parse(bytes);
   } catch (error) {
-    throw corrupt("Claim is not valid JSON", error);
+    throw corrupt("Corrupt claim is not valid JSON", error);
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw corrupt("Claim is not a JSON object");
+    throw corrupt("Corrupt claim is not a JSON object");
   }
   const candidate = value as Record<string, unknown>;
   if (
@@ -513,7 +661,7 @@ async function inspectLegacyLock(
         `Legacy administrative-recovery marker is a non-empty directory`,
       );
     }
-    const rawBytes = "legacy-empty-directory\n";
+    const rawBytes = Buffer.from("legacy-empty-directory\n", "utf8");
     return {
       path: legacyPath,
       basename,
@@ -528,11 +676,11 @@ async function inspectLegacyLock(
       `Legacy ticket-zero path has an unsupported object type`,
     );
   }
-  const rawBytes = await readFile(legacyPath, "utf8");
+  const rawBytes = await readStableOrdinaryBytes(legacyPath);
   const rawDigest = digest(rawBytes);
   let parsed: unknown;
   try {
-    parsed = JSON.parse(rawBytes);
+    parsed = JSON.parse(decodeCanonicalText(rawBytes, legacyPath));
   } catch {
     return { path: legacyPath, basename, rawBytes, rawDigest, state: "corrupt" };
   }
@@ -752,7 +900,7 @@ async function readManifest(manifestPath: string): Promise<"missing" | "valid"> 
       `Lock journal manifest is not an ordinary regular file: ${manifestPath}`,
     );
   }
-  const bytes = await readFile(manifestPath, "utf8");
+  const bytes = await readOrdinaryRecord(manifestPath);
   if (bytes !== MANIFEST_BYTES) {
     throw new LockJournalError(
       "LOCK_CORRUPT",
@@ -773,8 +921,11 @@ async function publishManifest(
     `.format.${randomUUID()}.tmp`,
   );
   let handle;
+  let created = false;
+  let primaryError: unknown;
   try {
     handle = await open(temporary, "wx", 0o600);
+    created = true;
     await handle.writeFile(MANIFEST_BYTES, "utf8");
     await handle.sync();
     await handle.close();
@@ -784,6 +935,7 @@ async function publishManifest(
     } catch {
       // Permission modes are advisory on some supported platforms.
     }
+    await requirePreparedBytes(temporary, MANIFEST_BYTES);
     try {
       await linkFile(temporary, manifestPath);
     } catch (error) {
@@ -796,19 +948,16 @@ async function publishManifest(
       }
     }
     await readManifest(manifestPath);
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    if (handle) await handle.close();
-    try {
-      await unlink(temporary);
-    } catch (error) {
-      if (errno(error) !== "ENOENT") {
-        throw new LockJournalError(
-          "LOCK_CLEANUP_FAILED",
-          `Failed to remove exact journal manifest temporary path`,
-          { cause: error },
-        );
-      }
-    }
+    await finishTemporaryCleanup(
+      handle,
+      created ? [temporary] : [],
+      primaryError,
+      "Journal manifest publication",
+    );
   }
 }
 
@@ -820,14 +969,20 @@ async function probeHardLink(
   const source = path.join(tmpDirectory, `.link-probe.${id}.tmp`);
   const published = path.join(tmpDirectory, `.link-probe.${id}.published.tmp`);
   let handle;
+  let sourceCreated = false;
+  let publishedCreated = false;
+  let primaryError: unknown;
   try {
     handle = await open(source, "wx", 0o600);
+    sourceCreated = true;
     await handle.writeFile("maswe-lock-journal-link-probe\n", "utf8");
     await handle.sync();
     await handle.close();
     handle = undefined;
+    await requirePreparedBytes(source, "maswe-lock-journal-link-probe\n");
     await linkFile(source, published);
-    const bytes = await readFile(published, "utf8");
+    publishedCreated = true;
+    const bytes = await readOrdinaryRecord(published);
     if (bytes !== "maswe-lock-journal-link-probe\n") {
       throw new LockJournalError(
         "LOCK_UNSUPPORTED_FILESYSTEM",
@@ -835,27 +990,25 @@ async function probeHardLink(
       );
     }
   } catch (error) {
-    if (error instanceof LockJournalError) throw error;
-    throw new LockJournalError(
-      "LOCK_UNSUPPORTED_FILESYSTEM",
-      `Hard-link publication is unavailable in ${tmpDirectory}`,
-      { cause: error },
-    );
-  } finally {
-    if (handle) await handle.close();
-    for (const exactPath of [published, source]) {
-      try {
-        await unlink(exactPath);
-      } catch (error) {
-        if (errno(error) !== "ENOENT") {
-          throw new LockJournalError(
-            "LOCK_CLEANUP_FAILED",
-            `Failed to remove exact hard-link probe path`,
+    primaryError =
+      error instanceof LockJournalError
+        ? error
+        : new LockJournalError(
+            "LOCK_UNSUPPORTED_FILESYSTEM",
+            `Hard-link publication is unavailable in ${tmpDirectory}`,
             { cause: error },
           );
-        }
-      }
-    }
+    throw primaryError;
+  } finally {
+    await finishTemporaryCleanup(
+      handle,
+      [
+        ...(publishedCreated ? [published] : []),
+        ...(sourceCreated ? [source] : []),
+      ],
+      primaryError,
+      "Hard-link capability probe",
+    );
   }
 }
 
@@ -867,6 +1020,21 @@ function allFixedDirectories(runDirectory: string): string[] {
     directories.push(paths.kind, paths.claims, paths.releases, paths.tmp);
   }
   return directories;
+}
+
+async function hasPreManifestPublishedRecords(
+  runDirectory: string,
+): Promise<boolean> {
+  for (const kind of LOCK_KINDS) {
+    const paths = journalPaths(runDirectory, kind);
+    if (
+      (await readdir(paths.claims)).length > 0 ||
+      (await readdir(paths.releases)).length > 0
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export async function initializeLockJournal(
@@ -897,29 +1065,24 @@ export async function initializeLockJournal(
   for (const directory of fixedDirectories) {
     await createOrValidateDirectory(directory);
   }
+  if (await hasPreManifestPublishedRecords(runDirectory)) {
+    // Another initializer may have completed the manifest and a claimant may then have
+    // published while this actor was creating components. That is a valid completed journal,
+    // not pre-manifest state.
+    if ((await readManifest(manifestPath)) === "valid") {
+      for (const directory of fixedDirectories) {
+        await inspectOrdinaryDirectory(directory, { allowMissing: false });
+      }
+      return;
+    }
+    throw corrupt(
+      "Lock journal contains published records before initialization manifest publication",
+    );
+  }
   for (const kind of LOCK_KINDS) {
     await probeHardLink(journalPaths(runDirectory, kind).tmp, linkFile);
   }
   await publishManifest(manifestPath, linkFile);
-}
-
-async function readOrdinaryRecord(recordPath: string): Promise<string> {
-  let stat;
-  try {
-    stat = await lstat(recordPath);
-  } catch (error) {
-    if (errno(error) === "ENOENT") {
-      throw corrupt(`Published journal record disappeared during validation: ${recordPath}`);
-    }
-    throw error;
-  }
-  if (stat.isSymbolicLink() || !stat.isFile()) {
-    throw new LockJournalError(
-      "LOCK_UNSAFE_PATH_TYPE",
-      `Published journal entry is not an ordinary regular file: ${recordPath}`,
-    );
-  }
-  return readFile(recordPath, "utf8");
 }
 
 async function validateTemporaryEntries(tmpDirectory: string): Promise<void> {
@@ -965,8 +1128,10 @@ export async function scanLockJournal(
     if (claimsByTicket.has(ticket) || rawClaimsByTicket.has(ticket)) {
       throw corrupt(`Published claim ticket has a duplicate interpretation: ${ticket}`);
     }
-    const bytes = await readOrdinaryRecord(path.join(paths.claims, basename));
+    const claimPath = path.join(paths.claims, basename);
+    const rawBytes = await readStableOrdinaryBytes(claimPath);
     try {
+      const bytes = decodeCanonicalText(rawBytes, claimPath);
       claimsByTicket.set(ticket, parseClaimBytes(bytes, kind, ticket));
     } catch (error) {
       if (!(error instanceof LockJournalError) || error.code !== "LOCK_CORRUPT") {
@@ -975,8 +1140,8 @@ export async function scanLockJournal(
       rawClaimsByTicket.set(ticket, {
         ticket: formatLockTicket(ticket),
         basename,
-        rawBytes: bytes,
-        rawDigest: digest(bytes),
+        rawBytes,
+        rawDigest: digest(rawBytes),
       });
     }
   }
@@ -1150,6 +1315,46 @@ async function cleanupExactTemporary(temporaryPath: string): Promise<void> {
   }
 }
 
+type OpenFileHandle = Awaited<ReturnType<typeof open>>;
+
+async function finishTemporaryCleanup(
+  handle: OpenFileHandle | undefined,
+  exactPaths: string[],
+  primaryError: unknown,
+  context: string,
+): Promise<void> {
+  const cleanupErrors: unknown[] = [];
+  if (handle) {
+    try {
+      await handle.close();
+    } catch (error) {
+      cleanupErrors.push(
+        new LockJournalError(
+          "LOCK_CLEANUP_FAILED",
+          `Could not close ${context} temporary handle`,
+          { cause: error },
+        ),
+      );
+    }
+  }
+  for (const exactPath of exactPaths) {
+    try {
+      await cleanupExactTemporary(exactPath);
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (cleanupErrors.length === 0) return;
+  if (primaryError !== undefined) {
+    throw new AggregateError(
+      [primaryError, ...cleanupErrors],
+      `${context} failed and its exact temporary cleanup also failed`,
+    );
+  }
+  if (cleanupErrors.length === 1) throw cleanupErrors[0];
+  throw new AggregateError(cleanupErrors, `${context} temporary cleanup failed`);
+}
+
 async function prepareAndPublishClaim(
   paths: LockJournalPaths,
   canonical: CanonicalRecord<ClaimRecordV3>,
@@ -1163,9 +1368,11 @@ async function prepareAndPublishClaim(
     owner: canonical.record.owner,
   };
   let handle;
-  let prepared = false;
+  let created = false;
+  let primaryError: unknown;
   try {
     handle = await open(temporaryPath, "wx", 0o600);
+    created = true;
     await options.transition?.("TEMP_READY", context);
     const midpoint = Math.max(1, Math.floor(canonical.bytes.length / 2));
     await handle.writeFile(canonical.bytes.slice(0, midpoint), "utf8");
@@ -1174,13 +1381,13 @@ async function prepareAndPublishClaim(
     await handle.sync();
     await handle.close();
     handle = undefined;
-    prepared = true;
     try {
       await chmod(temporaryPath, 0o400);
     } catch {
       // Permission modes are advisory on some supported platforms.
     }
     await options.transition?.("CLAIM_PREPARED", context);
+    await requirePreparedBytes(temporaryPath, canonical.bytes);
     await options.transition?.("CLAIM_LINK_ATTEMPT_READY", context);
     try {
       await link(temporaryPath, finalPath);
@@ -1216,9 +1423,16 @@ async function prepareAndPublishClaim(
     }
     await options.transition?.("CLAIM_VALIDATED", context);
     return "published";
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    if (handle) await handle.close();
-    if (prepared) await cleanupExactTemporary(temporaryPath);
+    await finishTemporaryCleanup(
+      handle,
+      created ? [temporaryPath] : [],
+      primaryError,
+      "Claim publication",
+    );
   }
 }
 
@@ -1323,7 +1537,7 @@ async function readExactRelease(
     if (errno(error) === "ENOENT") return undefined;
     throw error;
   }
-  return parseReleaseBytes(await readFile(releasePath, "utf8"), claim);
+  return parseReleaseBytes(await readOrdinaryRecord(releasePath), claim);
 }
 
 function requireHandleMatchesClaim(
@@ -1424,7 +1638,7 @@ export async function publishClaimRelease(
   handle: PublishedClaimHandle,
   options: PublishClaimOptions = {},
 ): Promise<CanonicalRecord<ReleaseRecordV3>> {
-  await scanLockJournal(handle.runDirectory, handle.kind);
+  await initializeLockJournal(handle.runDirectory);
   const exactClaim = await readExactClaim(
     handle.runDirectory,
     handle.kind,
@@ -1441,20 +1655,22 @@ export async function publishClaimRelease(
     owner: exactClaim.owner,
   };
   let fileHandle;
-  let prepared = false;
+  let created = false;
+  let primaryError: unknown;
   try {
     fileHandle = await open(temporaryPath, "wx", 0o600);
+    created = true;
     await fileHandle.writeFile(canonical.bytes, "utf8");
     await fileHandle.sync();
     await fileHandle.close();
     fileHandle = undefined;
-    prepared = true;
     try {
       await chmod(temporaryPath, 0o400);
     } catch {
       // Permission modes are advisory on some supported platforms.
     }
     await options.transition?.("RELEASE_PREPARED", context);
+    await requirePreparedBytes(temporaryPath, canonical.bytes);
     await options.transition?.("RELEASE_LINK_ATTEMPT_READY", context);
     try {
       await link(temporaryPath, finalPath);
@@ -1486,9 +1702,16 @@ export async function publishClaimRelease(
     }
     await options.transition?.("RELEASE_PUBLISHED", context);
     return canonical;
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    if (fileHandle) await fileHandle.close();
-    if (prepared) await cleanupExactTemporary(temporaryPath);
+    await finishTemporaryCleanup(
+      fileHandle,
+      created ? [temporaryPath] : [],
+      primaryError,
+      "Claim release publication",
+    );
   }
 }
 
@@ -1501,7 +1724,7 @@ async function publishLegacyRelease(
   if (
     !current ||
     current.basename !== observed.basename ||
-    current.rawBytes !== observed.rawBytes ||
+    !current.rawBytes.equals(observed.rawBytes) ||
     current.rawDigest !== observed.rawDigest
   ) {
     throw new LockJournalError(
@@ -1514,19 +1737,21 @@ async function publishLegacyRelease(
   const temporaryPath = path.join(paths.tmp, `.release.${randomUUID()}.tmp`);
   const finalPath = path.join(paths.releases, legacyReleaseBasename(current, kind));
   let fileHandle;
-  let prepared = false;
+  let created = false;
+  let primaryError: unknown;
   try {
     fileHandle = await open(temporaryPath, "wx", 0o600);
+    created = true;
     await fileHandle.writeFile(canonical.bytes, "utf8");
     await fileHandle.sync();
     await fileHandle.close();
     fileHandle = undefined;
-    prepared = true;
     try {
       await chmod(temporaryPath, 0o400);
     } catch {
       // Permission modes are advisory on some supported platforms.
     }
+    await requirePreparedBytes(temporaryPath, canonical.bytes);
     try {
       await link(temporaryPath, finalPath);
     } catch (error) {
@@ -1547,9 +1772,16 @@ async function publishLegacyRelease(
       throw corrupt(`Existing legacy release path has conflicting bytes`);
     }
     return canonical;
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    if (fileHandle) await fileHandle.close();
-    if (prepared) await cleanupExactTemporary(temporaryPath);
+    await finishTemporaryCleanup(
+      fileHandle,
+      created ? [temporaryPath] : [],
+      primaryError,
+      "Legacy release publication",
+    );
   }
 }
 
@@ -1562,8 +1794,8 @@ async function publishRawClaimRelease(
     journalPaths(runDirectory, kind).claims,
     observed.basename,
   );
-  const currentBytes = await readOrdinaryRecord(claimPath);
-  if (currentBytes !== observed.rawBytes || digest(currentBytes) !== observed.rawDigest) {
+  const currentBytes = await readStableOrdinaryBytes(claimPath);
+  if (!currentBytes.equals(observed.rawBytes) || digest(currentBytes) !== observed.rawDigest) {
     throw new LockJournalError(
       "LOCK_OWNERSHIP_LOST",
       `Corrupt ${kind} claim bytes changed before exact raw resolution`,
@@ -1574,19 +1806,21 @@ async function publishRawClaimRelease(
   const temporaryPath = path.join(paths.tmp, `.release.${randomUUID()}.tmp`);
   const finalPath = path.join(paths.releases, rawClaimReleaseBasename(observed, kind));
   let fileHandle;
-  let prepared = false;
+  let created = false;
+  let primaryError: unknown;
   try {
     fileHandle = await open(temporaryPath, "wx", 0o600);
+    created = true;
     await fileHandle.writeFile(canonical.bytes, "utf8");
     await fileHandle.sync();
     await fileHandle.close();
     fileHandle = undefined;
-    prepared = true;
     try {
       await chmod(temporaryPath, 0o400);
     } catch {
       // Permission modes are advisory on some supported platforms.
     }
+    await requirePreparedBytes(temporaryPath, canonical.bytes);
     try {
       await link(temporaryPath, finalPath);
     } catch (error) {
@@ -1607,9 +1841,16 @@ async function publishRawClaimRelease(
       throw corrupt(`Existing corrupt-claim resolution path has conflicting bytes`);
     }
     return canonical;
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    if (fileHandle) await fileHandle.close();
-    if (prepared) await cleanupExactTemporary(temporaryPath);
+    await finishTemporaryCleanup(
+      fileHandle,
+      created ? [temporaryPath] : [],
+      primaryError,
+      "Corrupt-claim resolution publication",
+    );
   }
 }
 
@@ -1647,22 +1888,27 @@ export async function recoverCurrentLock(
     return;
   }
 
+  const validClaims = new Map(scan.claims.map((claim) => [claim.ticket, claim]));
   for (let ticket = 1n; ticket <= scan.highestTicket; ticket += 1n) {
     const ticketText = formatLockTicket(ticket);
     const rawClaim = scan.rawClaims.get(ticketText);
-    if (!rawClaim || scan.rawReleases.has(ticketText)) continue;
-    if (kind === "admin-recovery" || !options.force) {
-      throw new LockJournalError(
-        "LOCK_CORRUPT",
-        `Corrupt ${kind} ticket ${ticketText} cannot be resolved under the current policy`,
-      );
+    if (rawClaim) {
+      if (scan.rawReleases.has(ticketText)) continue;
+      if (kind === "admin-recovery" || !options.force) {
+        throw new LockJournalError(
+          "LOCK_CORRUPT",
+          `Corrupt ${kind} ticket ${ticketText} cannot be resolved under the current policy`,
+        );
+      }
+      await publishRawClaimRelease(runDirectory, kind, rawClaim);
+      return;
     }
-    await publishRawClaimRelease(runDirectory, kind, rawClaim);
-    return;
-  }
 
-  for (const claim of scan.claims) {
-    if (scan.releases.has(claim.ticket)) continue;
+    const claim = validClaims.get(ticketText);
+    if (!claim) {
+      throw corrupt(`Contiguous ${kind} ticket ${ticketText} has no stable interpretation`);
+    }
+    if (scan.releases.has(ticketText)) continue;
     const live = await claimIsLive(claim);
     if (live) {
       if (kind === "admin-recovery") {
@@ -1684,12 +1930,11 @@ export async function recoverCurrentLock(
         `Dead administrative-recovery ticket ${claim.ticket} requires force`,
       );
     }
-    const ticket = parseLockTicket(claim.ticket);
     await publishClaimRelease(
       {
         runDirectory,
         kind,
-        ticket,
+        ticket: parseLockTicket(claim.ticket),
         owner: claim.owner,
         claimDigest: claim.claimDigest,
         claim,
