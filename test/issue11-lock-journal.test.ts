@@ -21,6 +21,7 @@ import {
   journalPaths,
   parseClaimBytes,
   parseReleaseBytes,
+  publishLockClaim,
   releaseBasename,
   scanLockJournal,
   type LockJournalErrorCode,
@@ -240,4 +241,68 @@ test("journal scan rejects malformed names, links, and conflicting release inter
     (error: unknown) =>
       error instanceof LockJournalError && error.code === "LOCK_UNSAFE_PATH_TYPE",
   );
+});
+
+function barrier(parties: number): () => Promise<void> {
+  let arrived = 0;
+  let release!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return async () => {
+    arrived += 1;
+    if (arrived === parties) release();
+    await waiting;
+  };
+}
+
+test("two claimants may propose one ticket but publish contiguous unique claims", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-allocate-");
+  const proposed = barrier(2);
+  const proposals: string[] = [];
+  const publish = (actor: string) =>
+    publishLockClaim(runDirectory, "data", "store-write", {
+      transition: async (event, context) => {
+        if (event === "CLAIM_TICKET_PROPOSED") {
+          proposals.push(`${actor}:${context.ticket}`);
+          await proposed();
+        }
+      },
+    });
+
+  const [left, right] = await Promise.all([publish("left"), publish("right")]);
+  assert.deepEqual(new Set([left.ticket, right.ticket]), new Set([1n, 2n]));
+  assert.deepEqual(
+    proposals.slice(0, 2).map((entry) => entry.split(":")[1]),
+    ["00000000000000000001", "00000000000000000001"],
+  );
+  assert.equal(
+    proposals.at(-1)?.split(":")[1],
+    "00000000000000000002",
+    "the conflict loser must rescan and propose the contiguous successor",
+  );
+  const scan = await scanLockJournal(runDirectory, "data");
+  assert.deepEqual(scan.claims.map((claim) => claim.ticket), [
+    "00000000000000000001",
+    "00000000000000000002",
+  ]);
+});
+
+test("three concurrent claimants allocate a gap-free numeric sequence", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-three-");
+  const proposed = barrier(3);
+  const handles = await Promise.all(
+    Array.from({ length: 3 }, () =>
+      publishLockClaim(runDirectory, "admin", "admin-serialize", {
+        transition: async (event) => {
+          if (event === "CLAIM_TICKET_PROPOSED") await proposed();
+        },
+      }),
+    ),
+  );
+  assert.deepEqual(
+    handles.map((handle) => handle.ticket).sort((a, b) => (a < b ? -1 : 1)),
+    [1n, 2n, 3n],
+  );
+  assert.equal((await scanLockJournal(runDirectory, "admin")).highestTicket, 3n);
 });

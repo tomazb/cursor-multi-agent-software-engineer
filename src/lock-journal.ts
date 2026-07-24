@@ -104,6 +104,38 @@ export interface JournalScan {
   highestTicket: bigint;
 }
 
+export type JournalTransition =
+  | "TEMP_READY"
+  | "CLAIM_TICKET_PROPOSED"
+  | "CLAIM_PREPARED"
+  | "CLAIM_LINK_ATTEMPT_READY"
+  | "CLAIM_PUBLISHED"
+  | "CLAIM_VALIDATED"
+  | "TICKET_CONFLICT"
+  | "TICKET_RESCAN";
+
+export interface JournalTransitionContext {
+  kind: LockKind;
+  ticket: string;
+  owner: string;
+}
+
+export interface PublishedClaimHandle {
+  runDirectory: string;
+  kind: LockKind;
+  ticket: bigint;
+  owner: string;
+  claimDigest: string;
+  claim: ClaimRecordV3;
+}
+
+export interface PublishClaimOptions {
+  transition?: (
+    event: JournalTransition,
+    context: JournalTransitionContext,
+  ) => Promise<void>;
+}
+
 const LOCK_KINDS: LockKind[] = ["data", "admin", "admin-recovery"];
 const CLAIM_OPERATIONS: ClaimOperation[] = [
   "store-write",
@@ -686,4 +718,194 @@ export async function scanLockJournal(
     releases,
     highestTicket: orderedTickets.at(-1) ?? 0n,
   };
+}
+
+const PROCESS_STARTED_AT = new Date(
+  Date.now() - Math.max(0, process.uptime()) * 1_000,
+).toISOString();
+
+async function currentPlatformProcessIdentity(): Promise<string | null> {
+  if (process.platform !== "linux") return null;
+  try {
+    const [stat, bootId] = await Promise.all([
+      readFile("/proc/self/stat", "utf8"),
+      readFile("/proc/sys/kernel/random/boot_id", "utf8"),
+    ]);
+    const closeParen = stat.lastIndexOf(")");
+    if (closeParen < 0) return null;
+    const fields = stat.slice(closeParen + 2).trim().split(/\s+/);
+    const startTicks = fields[19];
+    const boot = bootId.trim().toLowerCase();
+    if (!startTicks || !/^[0-9]+$/.test(startTicks) || !UUID_PATTERN.test(boot)) {
+      return null;
+    }
+    return `linux:${boot}:${startTicks}`;
+  } catch {
+    return null;
+  }
+}
+
+async function cleanupExactTemporary(temporaryPath: string): Promise<void> {
+  let stat;
+  try {
+    stat = await lstat(temporaryPath);
+  } catch (error) {
+    if (errno(error) === "ENOENT") return;
+    throw new LockJournalError(
+      "LOCK_CLEANUP_FAILED",
+      `Could not inspect exact journal temporary path`,
+      { cause: error },
+    );
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new LockJournalError(
+      "LOCK_UNSAFE_PATH_TYPE",
+      `Exact journal temporary path changed to an unsafe type`,
+    );
+  }
+  try {
+    await unlink(temporaryPath);
+  } catch (error) {
+    throw new LockJournalError(
+      "LOCK_CLEANUP_FAILED",
+      `Could not unlink exact journal temporary path`,
+      { cause: error },
+    );
+  }
+}
+
+async function prepareAndPublishClaim(
+  paths: LockJournalPaths,
+  canonical: CanonicalRecord<ClaimRecordV3>,
+  options: PublishClaimOptions,
+): Promise<"published" | "conflict"> {
+  const temporaryPath = path.join(paths.tmp, `.claim.${randomUUID()}.tmp`);
+  const finalPath = path.join(paths.claims, `${canonical.record.ticket}.json`);
+  const context: JournalTransitionContext = {
+    kind: canonical.record.kind,
+    ticket: canonical.record.ticket,
+    owner: canonical.record.owner,
+  };
+  let handle;
+  let prepared = false;
+  try {
+    handle = await open(temporaryPath, "wx", 0o600);
+    await options.transition?.("TEMP_READY", context);
+    await handle.writeFile(canonical.bytes, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    prepared = true;
+    try {
+      await chmod(temporaryPath, 0o400);
+    } catch {
+      // Permission modes are advisory on some supported platforms.
+    }
+    await options.transition?.("CLAIM_PREPARED", context);
+    await options.transition?.("CLAIM_LINK_ATTEMPT_READY", context);
+    try {
+      await link(temporaryPath, finalPath);
+    } catch (error) {
+      if (errno(error) === "EEXIST") return "conflict";
+      try {
+        const existing = await readOrdinaryRecord(finalPath);
+        if (existing === canonical.bytes) {
+          await options.transition?.("CLAIM_PUBLISHED", context);
+          return "published";
+        }
+      } catch {
+        // The original link failure is authoritative when exact reconciliation fails.
+      }
+      throw new LockJournalError(
+        "LOCK_UNSUPPORTED_FILESYSTEM",
+        `Atomic no-clobber claim publication failed`,
+        { cause: error },
+      );
+    }
+    await options.transition?.("CLAIM_PUBLISHED", context);
+    const finalBytes = await readOrdinaryRecord(finalPath);
+    const validated = parseClaimBytes(
+      finalBytes,
+      canonical.record.kind,
+      parseLockTicket(canonical.record.ticket),
+    );
+    if (
+      finalBytes !== canonical.bytes ||
+      validated.claimDigest !== canonical.record.claimDigest
+    ) {
+      throw corrupt(`Published claim differs from the prepared claim`);
+    }
+    await options.transition?.("CLAIM_VALIDATED", context);
+    return "published";
+  } finally {
+    if (handle) await handle.close();
+    if (prepared) await cleanupExactTemporary(temporaryPath);
+  }
+}
+
+export async function publishLockClaim(
+  runDirectory: string,
+  kind: LockKind,
+  operation: ClaimOperation,
+  options: PublishClaimOptions = {},
+): Promise<PublishedClaimHandle> {
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, kind);
+  const owner = randomUUID();
+  const processIdentity: ClaimProcessIdentity = {
+    startedAt: PROCESS_STARTED_AT,
+    platformIdentity: await currentPlatformProcessIdentity(),
+  };
+
+  for (;;) {
+    const scan = await scanLockJournal(runDirectory, kind);
+    if (scan.highestTicket >= MAX_LOCK_TICKET) {
+      throw new LockJournalError(
+        "LOCK_TICKET_OVERFLOW",
+        `No further ${kind} lock ticket can be allocated`,
+      );
+    }
+    const ticket = scan.highestTicket + 1n;
+    const context: JournalTransitionContext = {
+      kind,
+      ticket: formatLockTicket(ticket),
+      owner,
+    };
+    await options.transition?.("CLAIM_TICKET_PROPOSED", context);
+    const canonical = canonicalClaim({
+      kind,
+      ticket,
+      owner,
+      pid: process.pid,
+      process: processIdentity,
+      at: new Date().toISOString(),
+      operation,
+    });
+    const result = await prepareAndPublishClaim(paths, canonical, options);
+    if (result === "conflict") {
+      await options.transition?.("TICKET_CONFLICT", context);
+      await options.transition?.("TICKET_RESCAN", context);
+      continue;
+    }
+    const finalScan = await scanLockJournal(runDirectory, kind);
+    const published = finalScan.claims.find((claim) => claim.ticket === canonical.record.ticket);
+    if (
+      !published ||
+      published.owner !== owner ||
+      published.claimDigest !== canonical.record.claimDigest
+    ) {
+      throw new LockJournalError(
+        "LOCK_OWNERSHIP_LOST",
+        `Published ${kind} claim failed final journal validation`,
+      );
+    }
+    return {
+      runDirectory,
+      kind,
+      ticket,
+      owner,
+      claimDigest: published.claimDigest,
+      claim: published,
+    };
+  }
 }
