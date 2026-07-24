@@ -796,7 +796,7 @@ Useful worker events include `TEMP_READY`, `CLAIM_PARTIALLY_WRITTEN`,
 | 11 | Forced recovery and old release race | Both target one release pathname; one publishes, the other observes exact resolution. |
 | 12 | Two actors recover one dead claim | Shared release barrier proves one immutable release and safe loser rescan. |
 | 13 | Two actors queue for administrative recovery | Both publish ordered recovery claims from explicit barriers. |
-| 14 | Exactly one recovery claimant enters | Only smallest unreleased recovery ticket reaches `RECOVERY_ENTERED`. |
+| 14 | Exactly one recovery claimant enters | Only smallest unreleased recovery ticket reaches `OWNERSHIP_ENTERED`. |
 | 15 | Live recovery owner survives force | Forced contender cancels its own claim and receives `ADMIN_RECOVERY_CONCURRENT`; live claim unchanged. |
 | 16 | Corrupt earlier claim blocks later ownership | Later valid child remains queued/fails closed; corrupt record is not skipped. |
 | 17 | Mismatched release digest does not release | Wrong digest makes journal corrupt and no later owner enters. |

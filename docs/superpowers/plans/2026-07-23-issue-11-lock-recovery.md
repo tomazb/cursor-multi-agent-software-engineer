@@ -481,7 +481,7 @@ git commit -m "feat: recover exact data lock tickets"
 - [ ] Create one dead earliest recovery claim; race two forced contenders publishing its exact
       release; one release wins, all rescan, and exactly the next eligible ticket enters.
 - [ ] Crash a queued/owning recovery child and recover it through exact release.
-- [ ] Prove cleanup/release success alone never emits `RECOVERY_ENTERED`.
+- [ ] Prove cleanup/release success alone never emits `OWNERSHIP_ENTERED`.
 - [ ] Prove late previous recoverer release cannot affect a successor.
 - [ ] Prove corrupt recovery claim remains fail closed even with force.
 - [ ] Prove absent admin state still requires validated recovery ownership before success.
