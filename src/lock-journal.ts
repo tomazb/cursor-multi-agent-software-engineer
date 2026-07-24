@@ -321,6 +321,15 @@ async function readStableOrdinaryBytes(
       );
     }
     if (
+      firstStat.dev !== beforeOpen.dev ||
+      firstStat.ino !== beforeOpen.ino
+    ) {
+      throw new LockJournalError(
+        "LOCK_OWNERSHIP_LOST",
+        `Published journal pathname changed before stable read: ${recordPath}`,
+      );
+    }
+    if (
       !Number.isSafeInteger(firstStat.size) ||
       firstStat.size < 0 ||
       firstStat.size > MAX_AUTHORITATIVE_RECORD_BYTES
@@ -340,6 +349,34 @@ async function readStableOrdinaryBytes(
       throw new LockJournalError(
         "LOCK_OWNERSHIP_LOST",
         `Published journal record changed during stable read: ${recordPath}`,
+      );
+    }
+    let afterRead;
+    try {
+      afterRead = await lstat(recordPath);
+    } catch (error) {
+      if (errno(error) === "ENOENT") {
+        throw new LockJournalError(
+          "LOCK_OWNERSHIP_LOST",
+          `Published journal pathname disappeared during stable read: ${recordPath}`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+    if (afterRead.isSymbolicLink() || !afterRead.isFile()) {
+      throw new LockJournalError(
+        "LOCK_UNSAFE_PATH_TYPE",
+        `Published journal pathname became unsafe during stable read: ${recordPath}`,
+      );
+    }
+    if (
+      afterRead.dev !== firstStat.dev ||
+      afterRead.ino !== firstStat.ino
+    ) {
+      throw new LockJournalError(
+        "LOCK_OWNERSHIP_LOST",
+        `Published journal pathname was replaced during stable read: ${recordPath}`,
       );
     }
     return first;

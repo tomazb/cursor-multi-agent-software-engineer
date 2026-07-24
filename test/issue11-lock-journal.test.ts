@@ -8,6 +8,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  rename,
   symlink,
   unlink,
   writeFile,
@@ -548,6 +549,41 @@ test("exact-path reconciliation fails closed when the claim changes during stabl
       },
       afterExactClaimFirstRead: async (claimPath) => {
         await writeFile(claimPath, `${claim.bytes} `);
+      },
+    }),
+    (error: unknown) =>
+      error instanceof LockJournalError &&
+      error.code === "LOCK_OWNERSHIP_LOST",
+  );
+});
+
+test("exact-path reconciliation fails closed when the claim pathname is replaced during stable read", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-exact-replace-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "data");
+  const claim = canonicalClaim(CLAIM_INPUT);
+  const replacement = canonicalClaim({
+    ...CLAIM_INPUT,
+    owner: "8d196f64-9811-4f6c-9234-a43f12847e93",
+  });
+  const release = canonicalRelease(claim.record);
+  const claimPath = path.join(
+    paths.claims,
+    "00000000000000000001.json",
+  );
+
+  await assert.rejects(
+    scanLockJournal(runDirectory, "data", {
+      afterClaimsObserved: async () => {
+        await writeFile(claimPath, claim.bytes);
+        await writeFile(
+          path.join(paths.releases, releaseBasename(claim.record)),
+          release.bytes,
+        );
+      },
+      afterExactClaimFirstRead: async () => {
+        await rename(claimPath, path.join(paths.tmp, ".displaced-claim"));
+        await writeFile(claimPath, replacement.bytes);
       },
     }),
     (error: unknown) =>
