@@ -22,6 +22,7 @@ import {
 import { FileRunStore, migrateRunRecord } from "../src/store.ts";
 import { Orchestrator } from "../src/orchestrator.ts";
 import { gitChangedFiles } from "../src/git-snapshot.ts";
+import { scanLockJournal } from "../src/lock-journal.ts";
 import {
   cleanupDoctorProbeResources,
   ensureRunWorkspace,
@@ -394,7 +395,11 @@ test("stale admin lock is not auto-reclaimed; explicit recovery is owner-safe (b
 
   allowARecover.resolve();
   await recoverA;
-  assert.equal(await readLockOwner(adminPath), undefined);
+  assert.equal(await readLockOwner(adminPath), staleOwner);
+  assert.ok(
+    (await scanLockJournal(path.dirname(adminPath), "admin")).legacyRelease,
+    "v3 must exact-release legacy ticket zero without deleting its pathname",
+  );
 
   // C acquires live admin N and pauses inside the critical section.
   const holdN = deferred();
@@ -404,7 +409,11 @@ test("stale admin lock is not auto-reclaimed; explicit recovery is owner-safe (b
     return "c-done";
   });
   await cEntered.promise;
-  const liveOwner = await readLockOwner(adminPath);
+  const liveScan = await scanLockJournal(path.dirname(adminPath), "admin");
+  const liveClaim = liveScan.claims.find(
+    (claim) => !liveScan.releases.has(claim.ticket),
+  );
+  const liveOwner = liveClaim?.owner;
   assert.ok(liveOwner);
   assert.notEqual(liveOwner, staleOwner);
   holdN.resolve();
@@ -412,18 +421,34 @@ test("stale admin lock is not auto-reclaimed; explicit recovery is owner-safe (b
   // B resumes — must not delete N.
   allowBResume.resolve();
   await assert.rejects(() => recoverB, /changed|live|refusing|recovery/i);
-  assert.equal(await readLockOwner(adminPath), liveOwner);
+  assert.equal(
+    (await scanLockJournal(path.dirname(adminPath), "admin")).releases.has(
+      liveClaim!.ticket,
+    ),
+    false,
+  );
 
   // D cannot enter while C holds N.
   await assert.rejects(
     store.withAdminLockForTest(run.id, async () => "d-entered"),
     /admin lock|contention|recovery/i,
   );
-  assert.equal(await readLockOwner(adminPath), liveOwner);
+  assert.equal(
+    (await scanLockJournal(path.dirname(adminPath), "admin")).releases.has(
+      liveClaim!.ticket,
+    ),
+    false,
+  );
 
   allowCExit.resolve();
   assert.equal(await cPromise, "c-done");
-  assert.equal(await readLockOwner(adminPath), undefined);
+  assert.equal(
+    (await scanLockJournal(path.dirname(adminPath), "admin")).releases.has(
+      liveClaim!.ticket,
+    ),
+    true,
+  );
+  assert.equal(await readLockOwner(adminPath), staleOwner);
 
   // Normal save works after cleanup.
   const ok = structuredClone(await store.load(run.id));
@@ -433,29 +458,68 @@ test("stale admin lock is not auto-reclaimed; explicit recovery is owner-safe (b
 });
 
 test("unlockAdmin rejects live owner, corrupt lock, and incomplete lock without force", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-admin-reject-"));
-  const store = new FileRunStore(cwd, { lockRetries: 4 });
-  const run = await store.create("admin-reject", "cases", DEFAULT_CONFIG);
-  const adminPath = path.join(cwd, ".maswe", "runs", run.id, ".admin.lock");
-
-  await installLinkLock(adminPath, {
+  const liveCwd = await mkdtemp(path.join(os.tmpdir(), "maswe-admin-live-"));
+  const liveStore = new FileRunStore(liveCwd, { lockRetries: 4 });
+  const liveRun = await liveStore.create("admin-live", "case", DEFAULT_CONFIG);
+  const livePath = path.join(
+    liveCwd,
+    ".maswe",
+    "runs",
+    liveRun.id,
+    ".admin.lock",
+  );
+  await installLinkLock(livePath, {
     pid: process.pid,
     owner: "live-admin",
     at: new Date().toISOString(),
   });
-  await assert.rejects(store.unlockAdmin(run.id), /live pid|refusing/i);
-  await store.unlockAdmin(run.id, { force: true });
-  assert.equal(await readLockOwner(adminPath), undefined);
+  await assert.rejects(liveStore.unlockAdmin(liveRun.id), /live pid|refusing/i);
+  await liveStore.unlockAdmin(liveRun.id, { force: true });
+  assert.equal(await readLockOwner(livePath), "live-admin");
 
-  await writeFile(adminPath, "{not-json\n", "utf8");
-  await assert.rejects(store.unlockAdmin(run.id), /corrupt|incomplete|force/i);
-  await store.unlockAdmin(run.id, { force: true });
+  const corruptCwd = await mkdtemp(path.join(os.tmpdir(), "maswe-admin-corrupt-"));
+  const corruptStore = new FileRunStore(corruptCwd, { lockRetries: 4 });
+  const corruptRun = await corruptStore.create("admin-corrupt", "case", DEFAULT_CONFIG);
+  const corruptPath = path.join(
+    corruptCwd,
+    ".maswe",
+    "runs",
+    corruptRun.id,
+    ".admin.lock",
+  );
+  await writeFile(corruptPath, "{not-json\n", "utf8");
+  await assert.rejects(
+    corruptStore.unlockAdmin(corruptRun.id),
+    /corrupt|incomplete|force/i,
+  );
+  await corruptStore.unlockAdmin(corruptRun.id, { force: true });
+  assert.equal(await readFile(corruptPath, "utf8"), "{not-json\n");
 
-  const holder = await open(adminPath, "wx");
+  const incompleteCwd = await mkdtemp(
+    path.join(os.tmpdir(), "maswe-admin-incomplete-"),
+  );
+  const incompleteStore = new FileRunStore(incompleteCwd, { lockRetries: 4 });
+  const incompleteRun = await incompleteStore.create(
+    "admin-incomplete",
+    "case",
+    DEFAULT_CONFIG,
+  );
+  const incompletePath = path.join(
+    incompleteCwd,
+    ".maswe",
+    "runs",
+    incompleteRun.id,
+    ".admin.lock",
+  );
+  const holder = await open(incompletePath, "wx");
   await holder.writeFile("", "utf8");
-  await assert.rejects(store.unlockAdmin(run.id), /incomplete|corrupt|force/i);
-  await store.unlockAdmin(run.id, { force: true });
   await holder.close();
+  await assert.rejects(
+    incompleteStore.unlockAdmin(incompleteRun.id),
+    /incomplete|corrupt|force/i,
+  );
+  await incompleteStore.unlockAdmin(incompleteRun.id, { force: true });
+  assert.equal(await readFile(incompletePath, "utf8"), "");
 });
 
 // ---------------------------------------------------------------------------
