@@ -223,6 +223,25 @@ test("manifest publication reconciles an exact final record after any link error
   );
 });
 
+test("manifest publication reports unsupported when a link error leaves no final record", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-manifest-absent-");
+  await assert.rejects(
+    initializeLockJournal(runDirectory, {
+      linkFile: async (existingPath, newPath) => {
+        if (path.basename(newPath.toString()) === "format.json") {
+          const error = new Error("injected manifest link failure") as NodeJS.ErrnoException;
+          error.code = "EIO";
+          throw error;
+        }
+        await hardLink(existingPath, newPath);
+      },
+    }),
+    (error: unknown) =>
+      error instanceof LockJournalError &&
+      error.code === "LOCK_UNSUPPORTED_FILESYSTEM",
+  );
+});
+
 const CLAIM_INPUT = {
   kind: "data" as const,
   ticket: 1n,
@@ -647,6 +666,24 @@ test("concurrent owner and recoverer releases converge on one canonical marker",
     (error: unknown) =>
       error instanceof LockJournalError && error.code === "LOCK_OWNERSHIP_LOST",
   );
+});
+
+test("release publication reports unsupported when a link error leaves no final record", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-release-absent-");
+  const claim = await publishLockClaim(runDirectory, "data", "store-write");
+  await assert.rejects(
+    publishClaimRelease(claim, {
+      linkFile: async () => {
+        const error = new Error("injected release link failure") as NodeJS.ErrnoException;
+        error.code = "EIO";
+        throw error;
+      },
+    }),
+    (error: unknown) =>
+      error instanceof LockJournalError &&
+      error.code === "LOCK_UNSUPPORTED_FILESYSTEM",
+  );
+  assert.deepEqual(await readdir(journalPaths(runDirectory, "data").releases), []);
 });
 
 test("late former-owner release cannot modify or release a successor claim", async () => {

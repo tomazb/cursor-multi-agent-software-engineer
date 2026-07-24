@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { fork } from "node:child_process";
+import { fork, type ChildProcess } from "node:child_process";
 import { access, chmod, mkdtemp, writeFile, readFile, mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -17,6 +17,73 @@ import {
 const storeWriterWorker = fileURLToPath(
   new URL("./fixtures/store-writer-worker.ts", import.meta.url),
 );
+const CHILD_WATCHDOG_MS = 10_000;
+
+function nextChildMessage(child: ChildProcess): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      reject(new Error("store writer exited before its next IPC message"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("timed out waiting for store writer IPC message"));
+    }, CHILD_WATCHDOG_MS);
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.off("message", onMessage);
+      child.off("error", onError);
+      child.off("exit", onExit);
+    };
+    const onMessage = (message: unknown) => {
+      cleanup();
+      resolve(message as Record<string, unknown>);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      reject(
+        new Error(
+          `store writer exited before IPC message (code=${code}, signal=${signal})`,
+        ),
+      );
+    };
+    child.once("message", onMessage);
+    child.once("error", onError);
+    child.once("exit", onExit);
+  });
+}
+
+function waitForChildExit(child: ChildProcess): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("timed out waiting for store writer exit"));
+    }, CHILD_WATCHDOG_MS);
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.off("error", onError);
+      child.off("exit", onExit);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onExit = () => {
+      cleanup();
+      resolve();
+    };
+    child.once("error", onError);
+    child.once("exit", onExit);
+  });
+}
 
 test("normal store acquisition and release use immutable v3 claims and releases", async () => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-v3-store-"));
@@ -123,12 +190,12 @@ test("exclusive lock blocks simultaneous multi-process writers", async () => {
     },
     stdio: ["ignore", "ignore", "ignore", "ipc"],
   });
-  const nextMessage = () =>
-    new Promise<Record<string, unknown>>((resolve) => child.once("message", resolve));
-  assert.equal((await nextMessage()).type, "READY");
+  const exitPromise = waitForChildExit(child);
+  assert.equal((await nextChildMessage(child)).type, "READY");
+  const resultPromise = nextChildMessage(child);
   child.send({ type: "CONTINUE" });
-  const result = await nextMessage();
-  await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  const result = await resultPromise;
+  await exitPromise;
 
   await holder.close();
   await import("node:fs/promises").then((fs) => fs.rm(lockPath, { force: true }));

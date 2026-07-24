@@ -775,10 +775,11 @@ Correctness tests use real Node child processes and explicit IPC or filesystem b
 by the parent. A bounded watchdog may fail a hung test but never advances an actor. Arbitrary
 sleeps are not a correctness mechanism.
 
-Useful worker events include `TEMP_PREPARED`, `CLAIM_TICKET_PROPOSED`, `CLAIM_PUBLISH_READY`,
-`CLAIM_PUBLISHED`, `CLAIM_VALIDATED`, `QUEUED`, `OWNERSHIP_VALIDATED`,
-`RELEASE_PUBLISH_READY`, `RELEASE_PUBLISHED`, `DEAD_CLAIM_OBSERVED`,
-`RECOVERY_RELEASE_PUBLISHED`, and `RECOVERY_ENTERED`.
+Useful worker events include `TEMP_READY`, `CLAIM_PARTIALLY_WRITTEN`,
+`CLAIM_TICKET_PROPOSED`, `CLAIM_PREPARED`, `CLAIM_LINK_ATTEMPT_READY`,
+`CLAIM_PUBLISHED`, `CLAIM_VALIDATED`, `TICKET_CONFLICT`, `TICKET_RESCAN`,
+`OWNERSHIP_CHECK_READY`, `OWNERSHIP_ENTERED`, `RELEASE_PREPARED`,
+`RELEASE_LINK_ATTEMPT_READY`, and `RELEASE_PUBLISHED`.
 
 | # | Required case | Deterministic evidence |
 |---:|---|---|

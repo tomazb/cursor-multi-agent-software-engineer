@@ -79,6 +79,7 @@ async function hashMasweAuthoritativeState(cwd: string, hash: Hash): Promise<voi
       continue;
     }
     if (
+      !journalEntry &&
       fileStat.isFile() &&
       (MASWE_EPHEMERAL_BASENAMES.has(base) || base.endsWith(".tmp"))
     ) {

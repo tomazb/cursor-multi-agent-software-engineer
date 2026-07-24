@@ -236,7 +236,11 @@ test("canonical-looking malformed and unsafe journal claims remain fingerprint-v
     path.join(cwd, "outside"),
     path.join(claims, "00000000000000000098.json"),
   );
-  assert.notEqual(await gitWorkspaceFingerprint(cwd), afterMalformed);
+  const afterUnsafe = await gitWorkspaceFingerprint(cwd);
+  assert.notEqual(afterUnsafe, afterMalformed);
+
+  await writeFile(path.join(claims, "poison.tmp"), "not a journal temporary\n");
+  assert.notEqual(await gitWorkspaceFingerprint(cwd), afterUnsafe);
 });
 
 test("canonical journal kind path is excluded only when it is an ordinary directory", async () => {

@@ -156,22 +156,20 @@ The fixture is a real Node child process connected through IPC. The parent sends
 
 Planned events:
 
-- `JOURNAL_VALIDATED`;
-- `TEMP_PREPARED`;
+- `TEMP_READY`;
+- `CLAIM_PARTIALLY_WRITTEN`;
 - `CLAIM_TICKET_PROPOSED`;
-- `CLAIM_PUBLISH_READY`;
+- `CLAIM_PREPARED`;
+- `CLAIM_LINK_ATTEMPT_READY`;
 - `CLAIM_PUBLISHED`;
 - `CLAIM_VALIDATED`;
-- `QUEUED`;
-- `OWNERSHIP_VALIDATED`;
-- `PROTECTED_ENTERED`;
-- `RELEASE_PUBLISH_READY`;
+- `TICKET_CONFLICT`;
+- `TICKET_RESCAN`;
+- `OWNERSHIP_CHECK_READY`;
+- `OWNERSHIP_ENTERED`;
+- `RELEASE_PREPARED`;
+- `RELEASE_LINK_ATTEMPT_READY`;
 - `RELEASE_PUBLISHED`;
-- `DEAD_CLAIM_OBSERVED`;
-- `RECOVERY_RELEASE_READY`;
-- `RECOVERY_RELEASE_PUBLISHED`;
-- `RECOVERY_RESCAN_COMPLETE`;
-- `RECOVERY_ENTERED`.
 
 The parent alone releases barriers. A bounded watchdog only fails a hung test. Timeouts and sleeps
 never establish actor order or advance a race.
@@ -349,7 +347,7 @@ git commit -m "feat: publish monotonic lock tickets"
 - [ ] Queue three children and prove protected entry order is numeric.
 - [ ] Prove a valid queued claim is not ownership.
 - [ ] Crash a queued child and prove it blocks when it becomes earliest.
-- [ ] Assert no protected callback/event occurs before `OWNERSHIP_VALIDATED`.
+- [ ] Assert no protected callback/event occurs before `OWNERSHIP_ENTERED`.
 - [ ] Add store regressions for normal data/admin acquisition and contention.
 
 ### GREEN
@@ -677,8 +675,14 @@ git commit -m "docs: document immutable ticket lock journals"
   npm ci
   node --experimental-strip-types --test test/issue11-lock-journal.test.ts
   node --experimental-strip-types --test test/issue11-lock-contention.test.ts
-  # exact 25-iteration command
-  # exact 100-iteration command
+  MASWE_ISSUE11_ALLOCATION_ITERATIONS=25 \
+    node --experimental-strip-types --test \
+      --test-name-pattern="allocation contention repetition" \
+      test/issue11-lock-contention.test.ts
+  MASWE_ISSUE11_RELEASE_ITERATIONS=100 \
+    node --experimental-strip-types --test \
+      --test-name-pattern="owner recovery successor repetition" \
+      test/issue11-lock-contention.test.ts
   npm run typecheck
   npm test
   npm run build

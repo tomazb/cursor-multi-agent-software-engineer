@@ -920,6 +920,25 @@ async function reconcileExactPublication(
   publicationError: unknown,
   context: string,
 ): Promise<void> {
+  let finalStat;
+  try {
+    finalStat = await lstat(finalPath);
+  } catch (error) {
+    if (errno(error) === "ENOENT") {
+      throw new LockJournalError(
+        "LOCK_UNSUPPORTED_FILESYSTEM",
+        `${context} was not published by the failed hard-link operation`,
+        { cause: publicationError },
+      );
+    }
+    throw error;
+  }
+  if (finalStat.isSymbolicLink() || !finalStat.isFile()) {
+    throw new LockJournalError(
+      "LOCK_UNSAFE_PATH_TYPE",
+      `${context} final path is not an ordinary regular file`,
+    );
+  }
   try {
     const existing = await readOrdinaryRecord(finalPath);
     if (existing !== expectedBytes) {
