@@ -72,6 +72,10 @@ The implementation followed the approved design without using the blocked v2 lif
   call sites.
 - `366261f` added real-process crash/race barriers and opt-in 25/100 repetition selection.
 - `bb2a7b8` implemented and tested the exact fingerprint exclusion.
+- `da396d8` corrected the second-order split-observation case by merging one bounded post-release
+  claims observation before exact-target and contiguity validation. Deterministic canonical and
+  raw tests cover an unreleased ticket one plus a later released ticket two; the existing real-gap,
+  unsafe-path, content-mutation, and pathname-replacement negatives remain fail closed.
 
 The implementation uses `src/lock-journal.ts`; it did not cherry-pick the blocked v2 production
 lifecycle. `src/cli.ts` changes only user-facing recovery wording. Existing Issue #2 lock tests

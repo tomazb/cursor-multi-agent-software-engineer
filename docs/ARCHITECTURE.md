@@ -293,7 +293,11 @@ canonical JSON to an exclusive temporary regular file, closes it, and hard-links
 deterministic claim path without clobbering. The owner is the smallest valid unreleased ticket.
 Before protected work, the claimant validates every exact lower ticket/release path and rechecks
 that its own canonical release is absent. Enumeration discovers state but is not proof that a
-lower ticket is absent.
+lower ticket is absent. Claims and releases are not treated as one cross-directory snapshot: when
+a release names a ticket absent from the first claims observation, the scanner performs one
+bounded second claims enumeration, stable-validates all newly observed entries, and then
+revalidates the exact target and contiguous numeric range. It never loops through an
+attacker-selected ticket range.
 
 For valid claims, release, queued cancellation, and forced recovery all publish the same
 deterministic immutable release marker for one exact kind, ticket, UUID, and claim digest. Forced
