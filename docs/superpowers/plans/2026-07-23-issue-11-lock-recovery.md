@@ -76,6 +76,10 @@ The implementation followed the approved design without using the blocked v2 lif
   claims observation before exact-target and contiguity validation. Deterministic canonical and
   raw tests cover an unreleased ticket one plus a later released ticket two; the existing real-gap,
   unsafe-path, content-mutation, and pathname-replacement negatives remain fail closed.
+- `1cb7e34` extends that bounded merge to every non-empty release observation, including the
+  non-snapshot schedule where the first claims observation includes released ticket two but omits
+  concurrently published lower ticket one. Canonical and raw known-target regressions cover the
+  schedule without an attacker-controlled numeric loop.
 
 The implementation uses `src/lock-journal.ts`; it did not cherry-pick the blocked v2 production
 lifecycle. `src/cli.ts` changes only user-facing recovery wording. Existing Issue #2 lock tests
