@@ -283,7 +283,7 @@ test(
     const { ROLE_IDS } = await import("../src/domain.ts");
     const model = pickCatalogueModel(
       await runtime.listModels(),
-      process.env.MASWE_MODEL_BRAINSTORMER ?? "grok-4.5",
+      process.env.MASWE_MODEL_BRAINSTORMER,
     );
     for (const role of ROLE_IDS) {
       config.roles[role].model = model;

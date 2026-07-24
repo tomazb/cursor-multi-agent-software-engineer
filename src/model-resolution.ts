@@ -171,10 +171,39 @@ export const SMOKE_MODEL_FAMILY_ALLOWLIST = [
   "claude-fable-5",
 ] as const;
 
+function isApprovedSmokeModelId(modelId: string): boolean {
+  const id = modelId.trim().toLowerCase();
+  return SMOKE_MODEL_FAMILY_ALLOWLIST.some((family) => {
+    if (logicalModelCore(id) !== logicalModelCore(family)) return false;
+    const requiredEffort = modelEffortTier(family);
+    return requiredEffort === undefined || modelEffortTier(id) === requiredEffort;
+  });
+}
+
+function isApprovedSmokeFamilyHint(value: string): boolean {
+  return (SMOKE_MODEL_FAMILY_ALLOWLIST as readonly string[]).includes(value);
+}
+
+function throwPreferredAmbiguity(preferred: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/Ambiguous model/i.test(message)) {
+    throw new Error(`Ambiguous preferred smoke-model selection '${preferred}': ${message}`);
+  }
+}
+
+function throwAutomaticAmbiguity(family: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/Ambiguous model/i.test(message)) {
+    throw new Error(`Ambiguous smoke-model selection for approved family '${family}': ${message}`);
+  }
+}
+
 /**
  * Pick a concrete catalogue model for smoke helpers.
- * Resolves only within the ordered allowlist of approved logical families.
- * Never falls back to an unrelated provider/family via global sort.
+ * Automatic selection resolves only within the ordered allowlist. A preferred
+ * exact ID must be present and satisfy the same family/effort policy. For safe
+ * compatibility, a preferred value equal to one literal allowlist family may
+ * act as a family hint; no other absent or logical preferred value is eligible.
  */
 export function pickCatalogueModel(catalogue: Iterable<string>, preferred?: string): string {
   const ids = [...new Set([...catalogue].map((id) => id.trim().toLowerCase()).filter(Boolean))];
@@ -182,23 +211,37 @@ export function pickCatalogueModel(catalogue: Iterable<string>, preferred?: stri
     throw new Error("Model catalogue is empty. Run 'agent models' and confirm Cursor CLI auth.");
   }
 
-  const errors: string[] = [];
-  if (preferred?.trim()) {
-    try {
-      return resolveLogicalModelId(preferred.trim().toLowerCase(), ids);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      // Ambiguous preferred family must fail closed (no cross-family fallback).
-      if (/Ambiguous/i.test(message)) throw error;
-      errors.push(message);
+  const normalizedPreferred = preferred?.trim().toLowerCase();
+  if (normalizedPreferred) {
+    if (ids.includes(normalizedPreferred)) {
+      if (!isApprovedSmokeModelId(normalizedPreferred)) {
+        throw new Error(
+          `Preferred exact smoke model '${preferred}' is present but belongs to a disallowed family (approved families: ${SMOKE_MODEL_FAMILY_ALLOWLIST.join(", ")}).`,
+        );
+      }
+      return normalizedPreferred;
     }
+
+    try {
+      const resolvedHint = resolveLogicalModelId(normalizedPreferred, ids);
+      if (isApprovedSmokeFamilyHint(normalizedPreferred)) {
+        return resolvedHint;
+      }
+    } catch (error) {
+      throwPreferredAmbiguity(normalizedPreferred, error);
+    }
+
+    throw new Error(
+      `Preferred smoke model '${preferred}' is neither an exact ID present in the discovered catalogue nor a literal approved-family hint (allowlist: ${SMOKE_MODEL_FAMILY_ALLOWLIST.join(", ")}). Exact IDs never fall back.`,
+    );
   }
 
+  const errors: string[] = [];
   for (const family of SMOKE_MODEL_FAMILY_ALLOWLIST) {
-    if (preferred?.trim() && family === preferred.trim().toLowerCase()) continue;
     try {
       return resolveLogicalModelId(family, ids);
     } catch (error) {
+      throwAutomaticAmbiguity(family, error);
       errors.push(error instanceof Error ? error.message : String(error));
     }
   }

@@ -11,9 +11,12 @@ import {
   resolveProjectModels,
   validatePersistedExactModel,
 } from "../model-resolution.ts";
+import { parseModelCatalogue, parseModelCatalogueIds } from "./cursor-model-catalogue.ts";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { RunRecord } from "../domain.ts";
+
+export { parseModelCatalogueIds };
 
 /**
  * Extract assistant text from Cursor CLI `-p` stdout.
@@ -81,56 +84,6 @@ function extractOutput(
 function looksLikeNode(command: string): boolean {
   const base = path.basename(command);
   return base === "node" || base === "nodejs" || command === process.execPath;
-}
-
-const MODEL_ID_PATTERN = /^[a-zA-Z][a-zA-Z0-9._+-]{2,80}$/;
-const METADATA_ID_PATTERN =
-  /^(?:alias|metadata|context|build|status|provider|timeout|tokens?|default|recommended)(?:[-_].*)?$/i;
-
-/**
- * Parse exact executable model IDs from Cursor `agent models` text output.
- *
- * Fail-closed: only recognized catalogue row shapes contribute an ID. Headings,
- * aliases, metadata, prose, and annotation tokens are ignored. The first
- * model-ID field on each row is preferred; later slug-like tokens on the same
- * line are not collected.
- */
-export function parseModelCatalogueIds(catalogueText: string): Set<string> {
-  const ids = new Set<string>();
-  const stripped = catalogueText.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
-  for (const line of stripped.split(/\r?\n/)) {
-    const id = parseCatalogueRow(line);
-    if (id) ids.add(id);
-  }
-  return ids;
-}
-
-function parseCatalogueRow(line: string): string | undefined {
-  let trimmed = line.trim();
-  if (!trimmed) return undefined;
-
-  // Headings and key/value metadata (alias:, metadata:, Available models:, …).
-  if (/^[A-Za-z][\w ./-]*:\s*$/.test(trimmed)) return undefined;
-  if (/^[A-Za-z][\w-]*\s*:/.test(trimmed)) return undefined;
-
-  // Pure annotation / bullet noise.
-  if (/^\(.*\)$/.test(trimmed)) return undefined;
-  if (/^#+/.test(trimmed)) return undefined;
-
-  // Common row prefixes: bullets and selection indicators.
-  trimmed = trimmed.replace(/^(?:[>*•·▪▸❯✔✓☑]|[-+])\s+/, "");
-  if (!trimmed) return undefined;
-
-  // Prose lines do not start with an executable model ID.
-  const match = trimmed.match(/^([a-zA-Z][a-zA-Z0-9._+-]{2,80})(?=\s|$|\(|-|–|—)/);
-  if (!match) return undefined;
-  const id = match[1]!.toLowerCase();
-  if (!MODEL_ID_PATTERN.test(id)) return undefined;
-  if (!/[0-9]/.test(id)) return undefined;
-  if (METADATA_ID_PATTERN.test(id)) return undefined;
-
-  // Remainder may be a description (" - Name") or "(default)" — never scanned for IDs.
-  return id;
 }
 
 export function shouldPassTrustFlag(
@@ -276,8 +229,18 @@ export class CursorCliRuntime implements AgentRuntime {
       );
     }
     // Stdout only — never treat stderr prose as a valid catalogue.
-    const parsed = [...parseModelCatalogueIds(models.stdout)];
+    const catalogue = parseModelCatalogue(models.stdout);
+    const parsed = [...catalogue.ids];
     if (parsed.length === 0) {
+      if (catalogue.malformedRows.length > 0) {
+        const sample = catalogue.malformedRows
+          .slice(0, 3)
+          .map((row) => `line ${row.lineNumber} ('${row.candidate}')`)
+          .join(", ");
+        throw new Error(
+          `Model catalogue discovery failed: '${this.config.runtime.command} models' returned malformed catalogue row candidates (${sample}) but no valid executable model IDs. Recognized rows require an ID alone or a known selection/decorated/column structure.`,
+        );
+      }
       throw new Error(
         `Model catalogue discovery failed: '${this.config.runtime.command} models' exited successfully but no executable model IDs could be parsed from stdout. Confirm Cursor CLI auth and catalogue format.`,
       );
