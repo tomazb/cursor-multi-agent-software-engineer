@@ -111,8 +111,36 @@ test("lock and temp churn under .maswe does not change fingerprint", async () =>
     "temp\n",
     "utf8",
   );
+  const journalClaims = path.join(
+    cwd,
+    ".maswe",
+    "runs",
+    run.id,
+    ".lock-journal-v3",
+    "data",
+    "claims",
+  );
+  await mkdir(journalClaims, { recursive: true });
+  await writeFile(
+    path.join(journalClaims, "00000000000000000099.json"),
+    "published synchronization record\n",
+    "utf8",
+  );
   const after = await gitWorkspaceFingerprint(cwd);
   assert.equal(before, after, "ephemeral lock/temp files must not affect fingerprint");
+});
+
+test("journal exclusion is limited to a run's exact synchronization namespace", async () => {
+  const cwd = await initRepo();
+  await ensureMasweGitExclude(cwd);
+  await mkdir(path.join(cwd, ".maswe", ".lock-journal-v3"), { recursive: true });
+  const before = await gitWorkspaceFingerprint(cwd);
+  await writeFile(
+    path.join(cwd, ".maswe", ".lock-journal-v3", "not-a-run-journal"),
+    "must remain authoritative\n",
+    "utf8",
+  );
+  assert.notEqual(await gitWorkspaceFingerprint(cwd), before);
 });
 
 test("isolated worktree fingerprint still detects worktree repository mutations", async () => {

@@ -95,6 +95,18 @@ test("non-Git lock-file and temporary-file churn does not change fingerprint", a
   );
   await writeFile(path.join(runDir, ".admin.lock.recovering"), "recovering\n", "utf8");
   await writeFile(path.join(runDir, "artifacts", "note.attempt-1.md.tmp"), "temp\n", "utf8");
+  const journalReleases = path.join(
+    runDir,
+    ".lock-journal-v3",
+    "data",
+    "releases",
+  );
+  await mkdir(journalReleases, { recursive: true });
+  await writeFile(
+    path.join(journalReleases, "data.00000000000000000001.example.json"),
+    "published synchronization record\n",
+    "utf8",
+  );
   const after = await gitWorkspaceFingerprint(cwd);
   assert.equal(before, after);
 });

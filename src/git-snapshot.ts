@@ -26,6 +26,7 @@ const MASWE_EPHEMERAL_BASENAMES = new Set([
  *
  * Intentionally excluded (ephemeral / self-churn):
  * - `.lock`, `.admin.lock`, `.admin.lock.recovering`
+ * - exact `runs/<run-id>/.lock-journal-v3/**` synchronization journals
  * - `*.tmp` write staging files
  *
  * The Git-plane fingerprint pathspec-excludes `.maswe/` entirely; this hasher is
@@ -48,6 +49,15 @@ async function hashMasweAuthoritativeState(cwd: string, hash: Hash): Promise<voi
       const base = path.posix.basename(relative);
       if (MASWE_EPHEMERAL_BASENAMES.has(base)) return false;
       if (base.endsWith(".tmp")) return false;
+      const segments = relative.split("/");
+      if (
+        segments.length >= 3 &&
+        segments[0] === "runs" &&
+        segments[1] !== "" &&
+        segments[2] === ".lock-journal-v3"
+      ) {
+        return false;
+      }
       return true;
     })
     .sort();
