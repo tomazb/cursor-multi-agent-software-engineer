@@ -22,6 +22,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Verify checked-out revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "Expected SHA: ${EXPECTED_SHA}"
+          echo "Actual SHA:   ${actual}"
+          test "${actual}" = "${EXPECTED_SHA}"
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -36,6 +49,16 @@ jobs:
 
       - name: Ready-review regression tests
         run: node --experimental-strip-types --test test/ready-review-corrections.test.ts
+
+      - name: Issue 11 allocation contention (25 iterations)
+        env:
+          MASWE_ISSUE11_ALLOCATION_ITERATIONS: "25"
+        run: node --experimental-strip-types --test-name-pattern='allocation contention repetition' test/issue11-lock-contention.test.ts
+
+      - name: Issue 11 owner/recovery/successor contention (100 iterations)
+        env:
+          MASWE_ISSUE11_RELEASE_ITERATIONS: "100"
+        run: node --experimental-strip-types --test-name-pattern='owner recovery successor repetition' test/issue11-lock-contention.test.ts
 
       - name: Full test suite
         run: npm test

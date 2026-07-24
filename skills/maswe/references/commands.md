@@ -82,7 +82,16 @@ maswe unlock-admin <run-id>
 maswe unlock-admin <run-id> --force
 ```
 
-Data locks and admin locks are never auto-reclaimed. Use `unlock-admin` only when `.admin.lock` is stale/corrupt after confirming no writer is active.
+Data, admin, and admin-recovery locks are immutable ticket journals and are never auto-reclaimed
+by age. Non-force recovery accepts a valid dead data/admin owner and rejects live, corrupt, or
+ambiguous state. `--force` is an explicit assertion that affected data/admin processes are
+quiescent; it is not process fencing. A live administrative-recovery owner is never revoked,
+including with force.
+
+Recovery publishes one deterministic release for the exact ticket and digest. It does not delete
+claims, successor records, or `.lock-journal-v3` infrastructure. Do not manually remove journal
+files. NFS, SMB, distributed FUSE, object-store mounts, and other filesystems without coherent
+atomic hard-link publication are unsupported. Mixed old/new binaries and rollback after the first
+v3 claim are unsupported without a fully quiescent separately designed migration.
 
 Logical role models resolve only on `doctor`/`start`. Existing-run commands use the exact IDs persisted in `run.config` and fail closed if those IDs leave the catalogue.
-

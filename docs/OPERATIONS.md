@@ -53,21 +53,56 @@ maswe doctor --cwd /path/to/repo
 
 `doctor` probes the Cursor CLI from a MASWE-managed worktree when `trustManagedWorktrees` is enabled (passing `--trust`), then removes that ephemeral worktree **and** its `maswe/doctor-*` branch. Cleanup outcome is reported as a doctor check.
 
-If a run **data** lock is abandoned (dead process), use explicit unlock — MASWE never auto-reclaims data locks. Acquire and unlock are serialized through a short-lived `.admin.lock` so a concurrent unlock cannot delete a replacement owner's lock:
+MASWE stores local lock history under
+`.maswe/runs/<run-id>/.lock-journal-v3/`. The `data`, `admin`, and
+`admin-recovery` streams contain immutable ticket claims and exact release markers. A queued claim
+is not an owner; only the smallest valid unreleased ticket may enter. The journal infrastructure,
+published claims, and published releases are permanent and must not be manually pruned.
+
+If the smallest data claim belongs to a dead process, use explicit recovery. MASWE never
+auto-reclaims by age:
 
 ```bash
 maswe unlock <run-id>
-maswe unlock <run-id> --force   # only when you are sure no writer is alive
+maswe unlock <run-id> --force   # explicit assertion that every affected writer is quiescent
 ```
 
-If `.admin.lock` itself is stale, corrupt, or incomplete, MASWE **fails closed** and does **not** automatically reclaim it (automatic reclaim previously raced with replacement owners). Clear it explicitly:
+Without force, a live owner and corrupt/incomplete state are rejected; a valid dead owner is
+recoverable. Force can publish an exact release for a live data/admin claim or one stable eligible
+corrupt claim only after the operator confirms quiescence. Force is not fencing: it cannot stop a
+live process after operator error. Every release targets one exact ticket/digest and leaves later
+claims untouched.
+
+If the admin stream is blocked, use:
 
 ```bash
 maswe unlock-admin <run-id>
-maswe unlock-admin <run-id> --force   # corrupt/incomplete/live only after confirming no writer
+maswe unlock-admin <run-id> --force   # only after confirming data/admin actors are quiescent
 ```
 
-Admin recovery is serialized through an exclusive `.admin.lock.recovering` marker and re-checks the observed owner token before deletion, so a stale observer cannot delete a live replacement admin lock.
+Administrative recovery first publishes a ticket in the separate `admin-recovery` stream. During
+forced bootstrap, a contender may exactly release one eligible dead predecessor, but that
+publication does not grant recovery ownership. Every contender rescans; only the smallest
+unreleased recovery ticket may enter the recovery critical section. A live recovery owner is never
+force-released. Corrupt/ambiguous recovery claims remain fail-closed.
+
+Useful semantic failures include `LOCK_LIVE_OWNER`, `LOCK_DEAD_OWNER`, `LOCK_QUEUED`,
+`LOCK_CORRUPT`, `LOCK_UNSAFE_PATH_TYPE`, `LOCK_OWNERSHIP_LOST`,
+`ADMIN_RECOVERY_CONCURRENT`, `LOCK_CLEANUP_FAILED`, `LOCK_UNSUPPORTED_FILESYSTEM`, and
+`LOCK_TICKET_OVERFLOW`. Do not work around them by deleting journal files. Preserve the run
+directory and investigate the reported exact path/state.
+
+The journal requires coherent same-host local filesystem semantics, exclusive temporary creation,
+and atomic no-clobber hard links. NFS, SMB, distributed FUSE, object-store mounts, cross-host use,
+and filesystems without hard links are unsupported. Windows support requires exact-head native
+testing on local NTFS; Linux-injected Windows/error cases are not Windows-native coverage. ReFS,
+FAT, unsupported reparse layouts, and network shares fail closed.
+
+Each successful lock cycle appends a claim and usually a release. Records are roughly 0.5–1 KiB
+but commonly consume a filesystem block each. Ten thousand mutations can consume tens to a few
+hundred MiB because data operations also use admin serialization. Issue #11 provides no
+compaction. Monitor `.lock-journal-v3` size, but do not archive, compact, or delete it while using
+this version.
 
 ### Model resolution invariants
 
@@ -275,4 +310,18 @@ Before pulling a new version:
 4. Rebuild and re-link the CLI.
 5. Run `maswe doctor` in target repositories.
 
-There is no run-schema migration tool in v0.1. Avoid upgrading the code that operates an active run across breaking changes.
+For the v3 lock-journal upgrade:
+
+1. Stop every MASWE process using the target `.maswe/runs/` tree.
+2. Back up the tree and inspect legacy `.lock`, `.admin.lock`, and
+   `.admin.lock.recovering` objects.
+3. Start only the new binary. It represents an existing PR #10 lock as virtual ticket zero and
+   publishes a digest-bound compatibility release only through `maswe unlock <run-id> --force`
+   or `maswe unlock-admin <run-id> --force`; it never deletes the legacy path. An empty legacy
+   `.admin.lock.recovering` directory is bound to stable filesystem identity and fails closed if
+   replaced or if that identity is unavailable.
+4. Do not run old and new binaries concurrently. Old binaries cannot see v3 claims.
+
+After the first v3 claim, rollback to an old binary is unsupported without a separately designed
+quiescent migration/archival operation. Stop and restore the backup rather than deleting claims or
+journal directories. There is no general run-schema migration tool in v0.1.

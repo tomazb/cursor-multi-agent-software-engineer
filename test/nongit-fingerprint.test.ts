@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { gitWorkspaceFingerprint } from "../src/git-snapshot.ts";
+import { publishLockClaim } from "../src/lock-journal.ts";
 
 async function nonGitDir(prefix = "maswe-nongit-fp-"): Promise<string> {
   return mkdtemp(path.join(os.tmpdir(), prefix));
@@ -95,6 +96,7 @@ test("non-Git lock-file and temporary-file churn does not change fingerprint", a
   );
   await writeFile(path.join(runDir, ".admin.lock.recovering"), "recovering\n", "utf8");
   await writeFile(path.join(runDir, "artifacts", "note.attempt-1.md.tmp"), "temp\n", "utf8");
+  await publishLockClaim(runDir, "data", "store-write");
   const after = await gitWorkspaceFingerprint(cwd);
   assert.equal(before, after);
 });

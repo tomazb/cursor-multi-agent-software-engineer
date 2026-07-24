@@ -6,6 +6,23 @@ The project follows semantic versioning once a public release process is establi
 
 ## [Unreleased]
 
+### Added
+
+- Version-3 per-run immutable ticket journals for data, administrative, and administrative-recovery
+  locking. Claims and exact-target releases use canonical digest-bound records and atomic
+  no-clobber hard-link publication.
+- Deterministic real-process barrier tests for ticket contention, crash boundaries, exact release
+  convergence, recovery ordering, and late-owner/successor safety.
+
+### Changed
+
+- `maswe unlock` and `maswe unlock-admin` now publish an exact immutable release rather than
+  deleting a reusable owner pathname. Force remains an explicit operator-quiescence assertion,
+  not process fencing.
+- PR #10 regular-file locks are read as virtual ticket zero during a quiescent upgrade. New code
+  never writes or deletes the legacy path; mixed old/new execution and rollback after v3
+  publication are unsupported.
+
 ### Planned
 
 - GitHub App webhooks, check runs, and review-thread automation.

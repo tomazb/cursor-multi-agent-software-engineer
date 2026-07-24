@@ -1,6 +1,7 @@
 import { createHash, type Hash } from "node:crypto";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { lstat, readdir, readFile, readlink } from "node:fs/promises";
 import path from "node:path";
+import { isCanonicalJournalFingerprintEntry } from "./lock-journal.ts";
 import { spawnCaptured } from "./process.ts";
 
 interface ProcessResult {
@@ -17,6 +18,14 @@ const MASWE_EPHEMERAL_BASENAMES = new Set([
   ".admin.lock",
   ".admin.lock.recovering",
 ]);
+function isRunJournalPath(segments: string[]): boolean {
+  return (
+    segments.length >= 3 &&
+    segments[0] === "runs" &&
+    segments[1] !== "" &&
+    segments[2] === ".lock-journal-v3"
+  );
+}
 
 /**
  * Authoritative MASWE paths included in the read-only fingerprint (under `cwd/.maswe`):
@@ -26,6 +35,8 @@ const MASWE_EPHEMERAL_BASENAMES = new Set([
  *
  * Intentionally excluded (ephemeral / self-churn):
  * - `.lock`, `.admin.lock`, `.admin.lock.recovering`
+ * - canonical entries in exact `runs/<run-id>/.lock-journal-v3/` journals
+ *   (unexpected or malformed entries remain fingerprint-visible)
  * - `*.tmp` write staging files
  *
  * The Git-plane fingerprint pathspec-excludes `.maswe/` entirely; this hasher is
@@ -43,29 +54,55 @@ async function hashMasweAuthoritativeState(cwd: string, hash: Hash): Promise<voi
   }
 
   const relativePaths = entries
-    .map((entry) => entry.replace(/\\/g, "/"))
-    .filter((relative) => {
-      const base = path.posix.basename(relative);
-      if (MASWE_EPHEMERAL_BASENAMES.has(base)) return false;
-      if (base.endsWith(".tmp")) return false;
-      return true;
-    })
+    .map((entry) => (path.sep === "\\" ? entry.replace(/\\/g, "/") : entry))
     .sort();
 
   for (const relative of relativePaths) {
     const absolute = path.join(masweRoot, relative);
     let fileStat;
     try {
-      fileStat = await stat(absolute);
+      fileStat = await lstat(absolute);
     } catch {
       continue;
     }
-    if (!fileStat.isFile()) continue;
-    hash.update(`.maswe/${relative}`);
-    try {
-      hash.update(await readFile(absolute));
-    } catch {
-      hash.update("unreadable");
+    const identity = `.maswe/${relative}`;
+    const segments = relative.split("/");
+    const base = path.posix.basename(relative);
+    const journalEntry = isRunJournalPath(segments);
+    if (
+      journalEntry &&
+      await isCanonicalJournalFingerprintEntry(
+        path.join(masweRoot, "runs", segments[1]!),
+        segments.slice(3),
+      )
+    ) {
+      continue;
+    }
+    if (
+      !journalEntry &&
+      fileStat.isFile() &&
+      (MASWE_EPHEMERAL_BASENAMES.has(base) || base.endsWith(".tmp"))
+    ) {
+      continue;
+    }
+    if (fileStat.isSymbolicLink()) {
+      hash.update(`${identity}\0symlink\0`);
+      try {
+        hash.update(await readlink(absolute));
+      } catch {
+        hash.update("unreadable");
+      }
+    } else if (fileStat.isFile()) {
+      hash.update(`${identity}\0file\0`);
+      try {
+        hash.update(await readFile(absolute));
+      } catch {
+        hash.update("unreadable");
+      }
+    } else if (fileStat.isDirectory()) {
+      hash.update(`${identity}\0directory\0`);
+    } else {
+      hash.update(`${identity}\0other\0`);
     }
   }
 }

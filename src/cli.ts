@@ -33,7 +33,7 @@ Options:
   --config <path>  Use a specific config file.
   --cwd <path>     Run against a different repository directory.
   --json           Print machine-readable output.
-  --force          Force unlock even if the lock pid appears live.
+  --force          init: replace config; unlock*: assert quiescence and release exactly.
 `;
 }
 
@@ -241,14 +241,14 @@ async function main(): Promise<void> {
       const runId = values[0];
       if (!runId) throw new Error("unlock requires <run-id>");
       await store.unlock(runId, { force: has(args, "--force") });
-      console.log(`Unlocked run ${runId}`);
+      console.log(`Published an exact data-lock release for run ${runId}`);
       return;
     }
     case "unlock-admin": {
       const runId = values[0];
       if (!runId) throw new Error("unlock-admin requires <run-id>");
       await store.unlockAdmin(runId, { force: has(args, "--force") });
-      console.log(`Cleared admin lock for run ${runId}`);
+      console.log(`Published an exact admin-lock release for run ${runId}`);
       return;
     }
     default:

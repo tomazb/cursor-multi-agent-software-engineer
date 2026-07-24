@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { link, mkdir, readFile, readdir, rename, rm, writeFile, access } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type {
   ArtifactReference,
@@ -10,6 +10,16 @@ import type {
 } from "./domain.ts";
 import { assertConfig, migrateConfig } from "./config.ts";
 import { assertSafeRunId } from "./git-workspace.ts";
+import {
+  LockJournalError,
+  publishClaimRelease,
+  publishLockClaim,
+  recoverCurrentLock,
+  validateClaimOwnership,
+  type ClaimOperation,
+  type PublishClaimOptions,
+  type PublishedClaimHandle,
+} from "./lock-journal.ts";
 import { redactSecrets } from "./redaction.ts";
 import { transition } from "./state-machine.ts";
 
@@ -28,16 +38,6 @@ function sha256(content: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function pidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 async function writeAtomic(filePath: string, content: string): Promise<void> {
@@ -71,19 +71,6 @@ async function readLockMeta(lockPath: string): Promise<LockMeta | undefined> {
   } catch {
     return undefined;
   }
-}
-
-async function releaseOwnedLock(lockPath: string, owner: string): Promise<void> {
-  const meta = await readLockMeta(lockPath);
-  if (!meta || meta.owner !== owner) return;
-  // Owner-verified release: delete only if the token still matches (no rename-aside window).
-  const again = await readLockMeta(lockPath);
-  if (!again || again.owner !== owner) return;
-  await rm(lockPath, { force: true });
-}
-
-async function accessRecoveryMarker(markerPath: string): Promise<void> {
-  await access(markerPath);
 }
 
 export interface RunStore {
@@ -190,77 +177,25 @@ export class FileRunStore implements RunStore {
     return path.join(this.runDirectory(runId), ".admin.lock");
   }
 
-  private adminRecoveryMarker(runId: string): string {
-    return path.join(this.runDirectory(runId), ".admin.lock.recovering");
-  }
-
   private async readRunFile(runId: string): Promise<RunRecord> {
     const raw = await readFile(this.runFile(runId), "utf8");
     return migrateRunRecord(JSON.parse(raw));
   }
 
   /**
-   * Short-lived administrative mutex shared by data-lock acquisition and unlock.
-   *
-   * Stale/corrupt/incomplete admin locks are NEVER auto-reclaimed (that raced with
-   * replacement owners). Operators must run `maswe unlock-admin <run-id>`.
+   * Ordered administrative journal shared by data-claim publication/release and unlock.
+   * Dead or corrupt predecessors are never auto-released.
    */
   private async withAdminLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
     const directory = this.runDirectory(runId);
     await mkdir(directory, { recursive: true });
-    const adminPath = this.adminLockFile(runId);
-    const recoveryMarker = this.adminRecoveryMarker(runId);
-    const adminRetries = Math.max(this.lockRetries * 4, 8);
-    let owner: string | undefined;
-
-    for (let attempt = 0; attempt < adminRetries; attempt += 1) {
-      try {
-        await accessRecoveryMarker(recoveryMarker);
-        owner = undefined;
-        await sleep(5 + attempt * 2);
-        continue;
-      } catch {
-        // No recovery in progress.
-      }
-
-      owner = randomUUID();
-      const meta: LockMeta = { pid: process.pid, owner, at: new Date().toISOString() };
-      const tmpPath = `${adminPath}.${owner}.tmp`;
-      await writeFile(tmpPath, `${JSON.stringify(meta)}\n`, "utf8");
-      try {
-        await link(tmpPath, adminPath);
-        await rm(tmpPath, { force: true });
-        break;
-      } catch (error) {
-        await rm(tmpPath, { force: true });
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== "EEXIST") throw error;
-        const existing = await readLockMeta(adminPath);
-        if (existing && pidAlive(existing.pid)) {
-          owner = undefined;
-          await sleep(5 + attempt * 2);
-          continue;
-        }
-        // Dead, corrupt, or incomplete admin lock: fail closed — never delete by path
-        // based on a previously observed owner token.
-        throw new Error(
-          `Run ${runId} admin lock is stale, corrupt, or incomplete at ${adminPath}. ` +
-            `Refusing automatic reclaim. After confirming no maswe writer is active, run: maswe unlock-admin ${runId}`,
-        );
-      }
-    }
-    if (!owner) {
-      throw new Error(
-        `Run ${runId} admin lock contention: could not serialize unlock/acquire. ` +
-          `If a stale admin lock or recovery marker remains, run: maswe unlock-admin ${runId}`,
-      );
-    }
-
-    try {
-      return await fn();
-    } finally {
-      await releaseOwnedLock(adminPath, owner);
-    }
+    return this.withJournalClaim(
+      runId,
+      "admin",
+      "admin-serialize",
+      fn,
+      Math.max(this.lockRetries * 4, 8),
+    );
   }
 
   /** Test hook exposing the admin critical section with barrier-friendly acquisition. */
@@ -269,11 +204,8 @@ export class FileRunStore implements RunStore {
   }
 
   /**
-   * Explicit administrative recovery for `.admin.lock`.
-   *
-   * Serialized through an exclusive recovery marker directory so two reclaimers
-   * cannot both proceed, and a stale observer cannot delete a replacement owner.
-   * Never deletes `.admin.lock` based only on a previously observed owner token.
+   * Explicit administrative recovery serialized by the immutable admin-recovery journal.
+   * Recovery publishes exact releases and never deletes a claim or replacement owner.
    */
   async unlockAdmin(
     runId: string,
@@ -281,141 +213,161 @@ export class FileRunStore implements RunStore {
       force?: boolean;
       /** Test hook after observing the current admin lock, before recovery proceeds. */
       afterObserve?: (meta: LockMeta | undefined) => Promise<void>;
+      /** Test hook for deterministic child-process journal barriers. */
+      transition?: PublishClaimOptions["transition"];
     } = {},
   ): Promise<void> {
     assertSafeRunId(runId);
     const directory = this.runDirectory(runId);
     await mkdir(directory, { recursive: true });
-    const adminPath = this.adminLockFile(runId);
-    const recoveryMarker = this.adminRecoveryMarker(runId);
+    const observed = await readLockMeta(this.adminLockFile(runId));
+    await options.afterObserve?.(observed);
+    const transitionOptions: PublishClaimOptions = options.transition
+      ? { transition: options.transition }
+      : {};
 
-    const observed = await readLockMeta(adminPath);
-    let adminExists = true;
+    const recovery = await publishLockClaim(
+      directory,
+      "admin-recovery",
+      "admin-recovery",
+      transitionOptions,
+    );
+    let primaryError: unknown;
     try {
-      await readFile(adminPath);
-    } catch {
-      adminExists = false;
+      for (;;) {
+        try {
+          await validateClaimOwnership(recovery, transitionOptions);
+          break;
+        } catch (error) {
+          if (
+            !(error instanceof LockJournalError) ||
+            !["LOCK_QUEUED", "LOCK_CORRUPT"].includes(error.code)
+          ) {
+            throw error;
+          }
+          await recoverCurrentLock(directory, "admin-recovery", {
+            force: options.force ?? false,
+            ...transitionOptions,
+          });
+        }
+      }
+      // Recovery-stream ownership is freshly validated before inspecting admin state.
+      await recoverCurrentLock(directory, "admin", {
+        force: options.force ?? false,
+        ...transitionOptions,
+      });
+    } catch (error) {
+      primaryError = error;
     }
 
-    if (!adminExists) {
-      // Clear a leftover recovery marker with force.
-      if (options.force) {
-        await rm(recoveryMarker, { recursive: true, force: true });
-      }
-      return;
+    let releaseError: unknown;
+    try {
+      await publishClaimRelease(recovery, transitionOptions);
+    } catch (error) {
+      releaseError = error;
     }
-
-    if (!observed) {
-      if (!options.force) {
-        throw new Error(
-          `Run ${runId} admin lock is corrupt or incomplete. Re-run with --force only after confirming no writer is active: maswe unlock-admin ${runId} --force`,
-        );
-      }
-    } else if (pidAlive(observed.pid) && !options.force) {
-      throw new Error(
-        `Run ${runId} admin lock is held by live pid ${observed.pid}. Refusing unlock-admin without --force.`,
+    if (primaryError !== undefined && releaseError !== undefined) {
+      throw new AggregateError(
+        [primaryError, releaseError],
+        `Run ${runId} admin recovery and exact recovery-claim release both failed`,
       );
     }
+    if (primaryError !== undefined) throw primaryError;
+    if (releaseError !== undefined) throw releaseError;
+  }
 
-    if (options.afterObserve) {
-      await options.afterObserve(observed);
-    }
-
-    // Exclusive recovery marker — only one recoverer proceeds.
-    try {
-      await mkdir(recoveryMarker);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "EEXIST") {
-        if (!options.force) {
-          throw new Error(
-            `Run ${runId} admin recovery already in progress (${recoveryMarker}). ` +
-              `If recovery is abandoned, re-run with --force after confirming no writer is active.`,
+  private async waitForJournalOwnership(
+    runId: string,
+    handle: PublishedClaimHandle,
+    retries: number,
+  ): Promise<void> {
+    const effectiveRetries = Math.max(retries, 1);
+    for (let attempt = 0; attempt < effectiveRetries; attempt += 1) {
+      try {
+        await validateClaimOwnership(handle);
+        return;
+      } catch (error) {
+        if (!(error instanceof LockJournalError) || error.code !== "LOCK_QUEUED") {
+          throw error;
+        }
+        if (attempt === effectiveRetries - 1) {
+          throw new LockJournalError(
+            "LOCK_QUEUED",
+            `Run ${runId} ${handle.kind} ticket ${handle.claim.ticket} remained queued. ` +
+              `Use explicit recovery if a lower owner is dead: ` +
+              `${handle.kind === "data" ? `maswe unlock ${runId}` : `maswe unlock-admin ${runId}`}.`,
+            { cause: error },
           );
         }
-        // Force: remove abandoned recovery marker and retry once.
-        await rm(recoveryMarker, { recursive: true, force: true });
-        await mkdir(recoveryMarker);
-      } else {
-        throw error;
+        await sleep(5 + attempt * 2);
       }
-    }
-
-    try {
-      const again = await readLockMeta(adminPath);
-      if (!observed) {
-        // Forced incomplete/corrupt cleanup: remove only if still incomplete.
-        if (!again) {
-          await rm(adminPath, { force: true });
-          return;
-        }
-        throw new Error(`Run ${runId} admin lock changed during recovery; refusing to delete.`);
-      }
-      if (!again || again.owner !== observed.owner) {
-        throw new Error(`Run ${runId} admin lock changed during recovery; refusing to delete.`);
-      }
-      if (pidAlive(again.pid) && !options.force) {
-        throw new Error(
-          `Run ${runId} admin lock is held by live pid ${again.pid}. Refusing unlock-admin without --force.`,
-        );
-      }
-      await rm(adminPath, { force: true });
-      const leftover = await readLockMeta(adminPath);
-      if (leftover) {
-        throw new Error(`Run ${runId} unlock-admin failed: admin lock still present`);
-      }
-    } finally {
-      await rm(recoveryMarker, { recursive: true, force: true });
     }
   }
 
-  private async acquireLock(runId: string): Promise<{ owner: string }> {
+  private async withJournalClaim<T>(
+    runId: string,
+    kind: "admin" | "admin-recovery",
+    operation: ClaimOperation,
+    fn: () => Promise<T>,
+    retries: number,
+  ): Promise<T> {
+    const handle = await publishLockClaim(
+      this.runDirectory(runId),
+      kind,
+      operation,
+    );
+    let result: T | undefined;
+    let primaryError: unknown;
+    try {
+      await this.waitForJournalOwnership(runId, handle, retries);
+      // validateClaimOwnership's final exact release check is the last await before entry.
+      result = await fn();
+    } catch (error) {
+      primaryError = error;
+    }
+
+    let releaseError: unknown;
+    try {
+      await publishClaimRelease(handle);
+    } catch (error) {
+      releaseError = error;
+    }
+    if (primaryError !== undefined && releaseError !== undefined) {
+      throw new AggregateError(
+        [primaryError, releaseError],
+        `Run ${runId} ${kind} protected work and exact release both failed`,
+      );
+    }
+    if (primaryError !== undefined) throw primaryError;
+    if (releaseError !== undefined) throw releaseError;
+    return result as T;
+  }
+
+  private async acquireLock(runId: string): Promise<PublishedClaimHandle> {
     const directory = this.runDirectory(runId);
     await mkdir(directory, { recursive: true });
-    const lockPath = this.lockFile(runId);
-
-    for (let attempt = 0; attempt < this.lockRetries; attempt += 1) {
-      const outcome = await this.withAdminLock(runId, async () => {
-        const owner = randomUUID();
-        const meta: LockMeta = { pid: process.pid, owner, at: new Date().toISOString() };
-        const tmpPath = `${lockPath}.${owner}.tmp`;
-        await writeFile(tmpPath, `${JSON.stringify(meta)}\n`, "utf8");
-        try {
-          // Atomic exclusive create of a complete lock record (no empty/partial window).
-          await link(tmpPath, lockPath);
-          await rm(tmpPath, { force: true });
-          return { kind: "acquired" as const, owner };
-        } catch (error) {
-          await rm(tmpPath, { force: true });
-          const code = (error as NodeJS.ErrnoException).code;
-          if (code !== "EEXIST") throw error;
-          const existing = await readLockMeta(lockPath);
-          if (existing && pidAlive(existing.pid)) {
-            return { kind: "live" as const };
-          }
-          // Never auto-reclaim stale/incomplete data locks — that races with new owners.
-          return { kind: "stale" as const };
-        }
-      });
-
-      if (outcome.kind === "acquired") return { owner: outcome.owner };
-      if (outcome.kind === "stale" && attempt === this.lockRetries - 1) {
-        throw new Error(
-          `Run ${runId} lock contention: stale or incomplete lock at ${lockPath}. If the holder is dead, run: maswe unlock ${runId}`,
+    const handle = await this.withAdminLock(runId, () =>
+      publishLockClaim(directory, "data", "store-write")
+    );
+    try {
+      await this.waitForJournalOwnership(runId, handle, this.lockRetries);
+      return handle;
+    } catch (primaryError) {
+      try {
+        await this.withAdminLock(runId, () => publishClaimRelease(handle));
+      } catch (releaseError) {
+        throw new AggregateError(
+          [primaryError, releaseError],
+          `Run ${runId} data acquisition and queued-claim cancellation both failed`,
         );
       }
-      // Sleep outside the admin lock so unlock can proceed.
-      await sleep(20 + attempt * 10);
+      throw primaryError;
     }
-    throw new Error(
-      `Run ${runId} lock contention: could not acquire exclusive lock. If the holder is dead, run: maswe unlock ${runId}`,
-    );
   }
 
   /**
-   * Explicit unlock for abandoned locks. Refuses to remove a live holder's lock
-   * unless `force` is set. Coordinates with acquisition through `.admin.lock` so
-   * a concurrent unlock can never delete a replacement owner's data lock.
+   * Explicit recovery for abandoned data claims. Force is an operator quiescence
+   * assertion; every path publishes an exact release under admin serialization.
    */
   async unlock(
     runId: string,
@@ -425,63 +377,50 @@ export class FileRunStore implements RunStore {
       afterValidate?: (meta: LockMeta | undefined) => Promise<void>;
     } = {},
   ): Promise<void> {
-    const lockPath = this.lockFile(runId);
-    const meta = await readLockMeta(lockPath);
-    if (!meta) {
-      // Incomplete/corrupt: only removable with force.
-      if (!options.force) {
-        throw new Error(
-          `Run ${runId} lock is incomplete or missing owner metadata. Re-run with --force only after confirming no writer is active.`,
-        );
-      }
-    } else if (pidAlive(meta.pid) && !options.force) {
-      throw new Error(
-        `Run ${runId} lock is held by live pid ${meta.pid}. Refusing unlock without --force.`,
-      );
-    }
-
-    if (options.afterValidate) {
-      await options.afterValidate(meta);
-    }
-
+    const directory = this.runDirectory(runId);
+    await mkdir(directory, { recursive: true });
+    const meta = await readLockMeta(this.lockFile(runId));
+    await options.afterValidate?.(meta);
     await this.withAdminLock(runId, async () => {
-      const again = await readLockMeta(lockPath);
-      if (!meta) {
-        // Forced incomplete cleanup: remove whatever is present only if still incomplete
-        // or gone; never delete a complete replacement owner without matching the observe.
-        if (!again) {
-          await rm(lockPath, { force: true });
-          return;
-        }
-        throw new Error(`Run ${runId} lock changed during unlock; refusing to delete.`);
-      }
-      if (!again || again.owner !== meta.owner) {
-        throw new Error(`Run ${runId} lock changed during unlock; refusing to delete.`);
-      }
-      if (pidAlive(again.pid) && !options.force) {
-        throw new Error(
-          `Run ${runId} lock is held by live pid ${again.pid}. Refusing unlock without --force.`,
-        );
-      }
-      await rm(lockPath, { force: true });
-      const leftover = await readLockMeta(lockPath);
-      if (leftover) {
-        throw new Error(`Run ${runId} unlock failed: lock still present`);
-      }
+      // Discard the pre-admin observation and classify the current exact journal state.
+      await recoverCurrentLock(directory, "data", {
+        force: options.force ?? false,
+      });
     });
   }
 
-  private async releaseLock(runId: string, owner: string): Promise<void> {
-    await releaseOwnedLock(this.lockFile(runId), owner);
+  private async releaseLock(
+    runId: string,
+    handle: PublishedClaimHandle,
+  ): Promise<void> {
+    await this.withAdminLock(runId, () => publishClaimRelease(handle));
   }
 
   private async withLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
-    const { owner } = await this.acquireLock(runId);
+    const handle = await this.acquireLock(runId);
+    let result: T | undefined;
+    let primaryError: unknown;
     try {
-      return await fn();
-    } finally {
-      await this.releaseLock(runId, owner);
+      // acquireLock returned only after exact-range and immediate own-release validation.
+      result = await fn();
+    } catch (error) {
+      primaryError = error;
     }
+    let releaseError: unknown;
+    try {
+      await this.releaseLock(runId, handle);
+    } catch (error) {
+      releaseError = error;
+    }
+    if (primaryError !== undefined && releaseError !== undefined) {
+      throw new AggregateError(
+        [primaryError, releaseError],
+        `Run ${runId} protected work and exact data release both failed`,
+      );
+    }
+    if (primaryError !== undefined) throw primaryError;
+    if (releaseError !== undefined) throw releaseError;
+    return result as T;
   }
 
   async create(title: string, request: string, config: MasweConfig): Promise<RunRecord> {

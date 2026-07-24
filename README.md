@@ -161,6 +161,8 @@ The current implementation provides:
 - Deterministic project quality commands outside the model.
 - Independent verifier context and an exact `VERDICT: PASS|FAIL` contract.
 - Read-only workspace fingerprinting around brainstorm, design, classification, and verification stages.
+- Immutable per-run ticket journals with exact-target release and explicitly serialized recovery;
+  no automatic age reclaim or recursive lock deletion.
 - Configurable retry ceilings for build/verify and review-resolution loops.
 - Scope classification before any PR comment is automatically resolved.
 - Re-running quality checks and a fresh verifier after every resolver edit.
@@ -173,6 +175,9 @@ The v0.2 verifier and quality gates bind evidence to the current git **head SHA*
 - GitHub webhooks and check runs are not yet wired to the CLI.
 - Human approvals are local commands rather than signed GitHub actions.
 - File-based state is suitable for one operator or CI job, not concurrent distributed workers.
+- Lock journals require a coherent same-host local filesystem with atomic no-clobber hard links;
+  they are not distributed locks or process fencing, and Windows support requires native NTFS
+  qualification.
 - Model catalogue output differs across Cursor versions; for Cursor CLI, `maswe doctor` resolves logical names against exact catalogue IDs for its probe (without persisting a run snapshot) and fails closed on missing or ambiguous matches. `maswe start` persists resolved exact IDs into the new run config.
 - The Cursor SDK is a public beta and is kept behind an adapter boundary.
 
