@@ -10,6 +10,8 @@
 
 **Implementation base:** `dab10487baf7f05867b54895ec5db109ad3a3e65`
 
+**Implementation status:** `BLOCKED_DESIGN_DEFECT`
+
 **Goal:** Replace pathname-wide regular-file lock cleanup with version-2 lock directories whose
 exclusive `mkdir` namespace claim, UUID token publication, final namespace-identity validation,
 exact-token unlink, and empty-only `rmdir` prevent an old owner from deleting a replacement and
@@ -26,6 +28,45 @@ explicit IPC barriers; injected filesystem behavior is limited to platform-seman
 
 **Toolchain:** TypeScript ESM, Node.js 22.22.2 built-in test runner, Node `fs/promises`, no new
 dependencies.
+
+## Blocking design contradiction discovered during implementation review
+
+Implementation stopped after exact-head review identified that the approved portable Node
+protocol cannot prove the mandatory acquisition identity invariant.
+
+The approved sequence is:
+
+1. `mkdir(lockPath)` succeeds;
+2. capture the stable identity of the directory created by this actor;
+3. create/publish the record;
+4. require final identity equality before ownership.
+
+Node's supported filesystem API does not return an identity-bearing directory handle from
+`mkdir`. The implementation must perform a separate `lstat(lockPath)` pathname lookup. A forced
+actor can execute `rmdir(lockPath)`, and a replacement actor can execute `mkdir(lockPath)`, after
+the first actor's `mkdir` returns but before its first `lstat`. That `lstat` then captures the
+replacement directory identity as though it were the original claim. Internal temp creation and
+final validation can all remain self-consistent against that replacement, allowing the first
+actor to return ownership without proving that the canonical directory is the object it created.
+
+This contradicts both binding requirements:
+
+- “the canonical directory identity is still the identity originally claimed”; and
+- a claimant whose empty directory was removed “must detect that the canonical path no longer
+  represents its claimed directory” and “must not publish into a replacement directory.”
+
+Opening the directory after `mkdir` has the same pathname race. Portable Node also exposes no
+handle-relative `openat`/`mkdirat` child-creation API, no `mkdir` that returns the created object,
+and no portable native compare-and-publish primitive. A native/platform helper or a changed
+ownership invariant/protocol would require repository-owner design revision. Ordinary rename,
+recursive cleanup, age reclaim, and approximate identity checks remain prohibited.
+
+The current deterministic claimant-replacement test pauses only after the first `lstat` has
+captured identity, so it proves the later interference case but cannot prove the gap between
+successful `mkdir` and initial identity capture.
+
+No workaround is approved. Do not push the implementation commits or open a pull request until
+the repository owner revises and reapproves the design.
 
 ## Baseline record
 
