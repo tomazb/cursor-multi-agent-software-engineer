@@ -182,10 +182,8 @@ export class FileRunStore implements RunStore {
   }
 
   /**
-   * Short-lived administrative mutex shared by data-lock acquisition and unlock.
-   *
-   * Stale/corrupt/incomplete admin locks are NEVER auto-reclaimed (that raced with
-   * replacement owners). Operators must run `maswe unlock-admin <run-id>`.
+   * Ordered administrative journal shared by data-claim publication/release and unlock.
+   * Dead or corrupt predecessors are never auto-released.
    */
   private async withAdminLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
     const directory = this.runDirectory(runId);
@@ -205,11 +203,8 @@ export class FileRunStore implements RunStore {
   }
 
   /**
-   * Explicit administrative recovery for `.admin.lock`.
-   *
-   * Serialized through an exclusive recovery marker directory so two reclaimers
-   * cannot both proceed, and a stale observer cannot delete a replacement owner.
-   * Never deletes `.admin.lock` based only on a previously observed owner token.
+   * Explicit administrative recovery serialized by the immutable admin-recovery journal.
+   * Recovery publishes exact releases and never deletes a claim or replacement owner.
    */
   async unlockAdmin(
     runId: string,
@@ -361,9 +356,8 @@ export class FileRunStore implements RunStore {
   }
 
   /**
-   * Explicit unlock for abandoned locks. Refuses to remove a live holder's lock
-   * unless `force` is set. Coordinates with acquisition through `.admin.lock` so
-   * a concurrent unlock can never delete a replacement owner's data lock.
+   * Explicit recovery for abandoned data claims. Force is an operator quiescence
+   * assertion; every path publishes an exact release under admin serialization.
    */
   async unlock(
     runId: string,

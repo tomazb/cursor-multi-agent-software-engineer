@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
-import { access, mkdtemp, writeFile, readFile, mkdir } from "node:fs/promises";
+import { access, chmod, mkdtemp, writeFile, readFile, mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -37,6 +37,38 @@ test("normal store acquisition and release use immutable v3 claims and releases"
       "utf8",
     )).includes('"format":3'),
     true,
+  );
+});
+
+test("protected-work and exact-release failures are both preserved", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-v3-dual-failure-"));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("dual", "failure", DEFAULT_CONFIG);
+  const runDirectory = path.join(cwd, ".maswe", "runs", run.id);
+  const primary = new Error("protected work failed");
+
+  await assert.rejects(
+    store.withAdminLockForTest(run.id, async () => {
+      const scan = await scanLockJournal(runDirectory, "admin");
+      const owned = scan.claims.at(-1)!;
+      const claimPath = path.join(
+        journalPaths(runDirectory, "admin").claims,
+        `${owned.ticket}.json`,
+      );
+      await chmod(claimPath, 0o600);
+      await writeFile(
+        claimPath,
+        "{corrupted-before-release",
+      );
+      throw primary;
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors.length, 2);
+      assert.equal(error.errors[0], primary);
+      assert.match(String(error.errors[1]), /corrupt/i);
+      return true;
+    },
   );
 });
 
