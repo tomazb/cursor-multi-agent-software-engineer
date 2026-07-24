@@ -1,13 +1,28 @@
 import assert from "node:assert/strict";
-import { lstat, mkdir, mkdtemp, readFile, symlink } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
   LOCK_JOURNAL_DIRECTORY,
+  MAX_LOCK_TICKET,
   LockJournalError,
+  canonicalClaim,
+  canonicalRelease,
+  formatLockTicket,
   initializeLockJournal,
   journalPaths,
+  parseClaimBytes,
+  parseReleaseBytes,
+  releaseBasename,
+  scanLockJournal,
   type LockJournalErrorCode,
 } from "../src/lock-journal.ts";
 
@@ -113,4 +128,116 @@ test("unsafe journal root symlink is rejected without following or replacing it"
       error instanceof LockJournalError && error.code === "LOCK_UNSAFE_PATH_TYPE",
   );
   assert.equal((await lstat(root)).isSymbolicLink(), true);
+});
+
+const CLAIM_INPUT = {
+  kind: "data" as const,
+  ticket: 1n,
+  owner: "550e8400-e29b-41d4-a716-446655440000",
+  pid: 12345,
+  process: {
+    startedAt: "2026-07-24T10:00:00.000Z",
+    platformIdentity: null,
+  },
+  at: "2026-07-24T10:00:01.000Z",
+  operation: "store-write" as const,
+};
+
+test("tickets use canonical fixed-width BigInt encoding and fail closed on overflow", () => {
+  assert.equal(formatLockTicket(1n), "00000000000000000001");
+  assert.equal(formatLockTicket(MAX_LOCK_TICKET), "99999999999999999999");
+  assert.throws(
+    () => formatLockTicket(0n),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+  assert.throws(
+    () => formatLockTicket(MAX_LOCK_TICKET + 1n),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_TICKET_OVERFLOW",
+  );
+});
+
+test("claim encoding is canonical, digest-bound, and rejects mutation", () => {
+  const claim = canonicalClaim(CLAIM_INPUT);
+  assert.equal(claim.record.ticket, "00000000000000000001");
+  assert.match(claim.record.claimDigest, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(parseClaimBytes(claim.bytes, "data", 1n).claimDigest, claim.record.claimDigest);
+
+  const unknownField = claim.bytes.replace(
+    ',"claimDigest"',
+    ',"unexpected":true,"claimDigest"',
+  );
+  assert.throws(
+    () => parseClaimBytes(unknownField, "data", 1n),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+  assert.throws(
+    () => parseClaimBytes(claim.bytes.replace('"pid":12345', '"pid":12346'), "data", 1n),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+});
+
+test("one deterministic release identity is derived only from the exact claim", () => {
+  const claim = canonicalClaim(CLAIM_INPUT).record;
+  const first = canonicalRelease(claim);
+  const second = canonicalRelease(claim);
+  assert.equal(first.bytes, second.bytes);
+  assert.deepEqual(first.record, second.record);
+  assert.equal(
+    releaseBasename(claim),
+    `data.00000000000000000001.${claim.owner}.${claim.claimDigest.slice("sha256:".length)}.json`,
+  );
+  assert.equal(
+    parseReleaseBytes(first.bytes, claim).releaseDigest,
+    first.record.releaseDigest,
+  );
+  assert.equal(first.bytes.includes("reason"), false);
+  assert.equal(first.bytes.includes("releasedBy"), false);
+  assert.equal(first.bytes.includes('"at"'), false);
+});
+
+test("journal scan validates a contiguous range and ignores only ordinary temp records", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-scan-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "data");
+  const claim1 = canonicalClaim(CLAIM_INPUT);
+  const claim2 = canonicalClaim({
+    ...CLAIM_INPUT,
+    ticket: 2n,
+    owner: "8d196f64-9811-4f6c-9234-a43f12847e93",
+  });
+  await writeFile(path.join(paths.claims, "00000000000000000001.json"), claim1.bytes);
+  await writeFile(path.join(paths.tmp, `.claim.${CLAIM_INPUT.owner}.tmp`), "partial");
+
+  const one = await scanLockJournal(runDirectory, "data");
+  assert.equal(one.claims.length, 1);
+  assert.equal(one.highestTicket, 1n);
+
+  await writeFile(path.join(paths.claims, "00000000000000000003.json"), claim2.bytes);
+  await assert.rejects(
+    scanLockJournal(runDirectory, "data"),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+});
+
+test("journal scan rejects malformed names, links, and conflicting release interpretation", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-corrupt-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "data");
+  const claim = canonicalClaim(CLAIM_INPUT);
+  await writeFile(path.join(paths.claims, "00000000000000000001.json"), claim.bytes);
+  await symlink(
+    path.join(paths.claims, "00000000000000000001.json"),
+    path.join(paths.releases, releaseBasename(claim.record)),
+  );
+
+  await assert.rejects(
+    scanLockJournal(runDirectory, "data"),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_UNSAFE_PATH_TYPE",
+  );
 });
