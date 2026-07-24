@@ -41,7 +41,22 @@ test("present exact smoke override outside approved families is rejected", () =>
 test("absent exact smoke override is rejected without automatic fallback", () => {
   assert.throws(
     () => pickCatalogueModel(CATALOGUE, "cursor-grok-4.5-medium"),
-    /absent from the discovered catalogue.*never fall back/i,
+    /neither an exact ID present.*Exact IDs never fall back/i,
+  );
+});
+
+test("unrelated logical preference reports the two allowed shapes without calling it exact", () => {
+  assert.throws(
+    () => pickCatalogueModel(CATALOGUE, "unrelated-family"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(
+        error.message,
+        /neither an exact ID present.*literal approved-family hint/i,
+      );
+      assert.doesNotMatch(error.message, /Preferred exact smoke model/i);
+      return true;
+    },
   );
 });
 

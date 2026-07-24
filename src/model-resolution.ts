@@ -232,7 +232,7 @@ export function pickCatalogueModel(catalogue: Iterable<string>, preferred?: stri
     }
 
     throw new Error(
-      `Preferred exact smoke model '${preferred}' is absent from the discovered catalogue. Only literal approved-family hints may resolve logically; explicit exact overrides never fall back.`,
+      `Preferred smoke model '${preferred}' is neither an exact ID present in the discovered catalogue nor a literal approved-family hint (allowlist: ${SMOKE_MODEL_FAMILY_ALLOWLIST.join(", ")}). Exact IDs never fall back.`,
     );
   }
 
