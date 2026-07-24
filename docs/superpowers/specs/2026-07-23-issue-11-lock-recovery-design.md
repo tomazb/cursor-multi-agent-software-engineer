@@ -413,13 +413,15 @@ ambiguous path types fail closed. Enumeration may discover the maximum and unexp
 but exact-range path checks establish eligibility.
 
 Claims and releases are separate directories, so a scanner must not treat their enumerations as
-one atomic snapshot. After any non-empty release observation, the scanner performs one bounded
-second claims enumeration, stable-validates and merges every newly observed entry, then
-classifies exact release targets and revalidates numeric contiguity. This is required even when a
-release target was already present in the first claims observation, because that observation may
-have omitted a lower concurrently published ticket. The bound is the finite directory entry set,
-never an attacker-selected `1..T` loop. A target still absent after this reconciliation, a real
-gap, or any malformed or unsafe newly observed entry remains fail-closed corruption.
+one atomic snapshot. After any non-empty release observation, or when the first claims observation
+itself contains a numeric gap, the scanner performs one bounded second claims enumeration,
+stable-validates and merges every newly observed entry, then classifies exact release targets and
+revalidates numeric contiguity. This is required even when a release target was already present in
+the first claims observation, because that observation may have omitted a lower concurrently
+published ticket; the gap condition also covers a claims-only observation that sees a higher
+published ticket before an already-linked lower ticket. The bound is the finite directory entry
+set, never an attacker-selected `1..T` loop. A target still absent after this reconciliation, a
+real gap, or any malformed or unsafe newly observed entry remains fail-closed corruption.
 
 A release that appears while checking an earlier ticket can cause only a conservative false wait
 when it is missed; it cannot create a second owner. Later claims have larger tickets and cannot

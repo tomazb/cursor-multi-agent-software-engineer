@@ -294,11 +294,12 @@ deterministic claim path without clobbering. The owner is the smallest valid unr
 Before protected work, the claimant validates every exact lower ticket/release path and rechecks
 that its own canonical release is absent. Enumeration discovers state but is not proof that a
 lower ticket is absent. Claims and releases are not treated as one cross-directory snapshot:
-after any non-empty release observation, the scanner performs one bounded second claims
-enumeration, stable-validates all newly observed entries, and then revalidates exact targets and
-the contiguous numeric range. This also covers a first observation that included the released
-target but omitted a lower concurrent ticket. The scanner never loops through an attacker-selected
-ticket range.
+after any non-empty release observation, or when the first claims observation itself contains a
+numeric gap, the scanner performs one bounded second claims enumeration, stable-validates all
+newly observed entries, and then revalidates exact targets and the contiguous numeric range. This
+covers both a first observation that included the released target but omitted a lower concurrent
+ticket and a claims-only observation that saw a higher ticket before an already-linked lower
+ticket. The scanner never loops through an attacker-selected ticket range.
 
 For valid claims, release, queued cancellation, and forced recovery all publish the same
 deterministic immutable release marker for one exact kind, ticket, UUID, and claim digest. Forced

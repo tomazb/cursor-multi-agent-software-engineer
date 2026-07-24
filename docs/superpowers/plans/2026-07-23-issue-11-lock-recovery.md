@@ -80,6 +80,10 @@ The implementation followed the approved design without using the blocked v2 lif
   non-snapshot schedule where the first claims observation includes released ticket two but omits
   concurrently published lower ticket one. Canonical and raw known-target regressions cover the
   schedule without an attacker-controlled numeric loop.
+- `05d39c8` uses the same single bounded merge when the first claims observation itself contains a
+  numeric gap, covering the claims-only schedule where ticket three is observed before an
+  already-linked ticket two. The focused regression proves the merged range is contiguous while a
+  persistent gap still fails closed.
 
 The implementation uses `src/lock-journal.ts`; it did not cherry-pick the blocked v2 production
 lifecycle. `src/cli.ts` changes only user-facing recovery wording. Existing Issue #2 lock tests
