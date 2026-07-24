@@ -299,6 +299,8 @@ export class FileRunStore implements RunStore {
       force?: boolean;
       /** Test hook after observing the current admin lock, before recovery proceeds. */
       afterObserve?: (meta: LockMeta | undefined) => Promise<void>;
+      /** Test hook after classifying an existing marker, before conditional cleanup. */
+      afterMarkerObserve?: (state: ClassifiedLock["state"]) => Promise<void>;
     } = {},
   ): Promise<void> {
     assertSafeRunId(runId);
@@ -309,6 +311,13 @@ export class FileRunStore implements RunStore {
     const markerRetries = Math.max(this.lockRetries, 8);
     let markerOwnership: LockOwnershipHandle | undefined;
     let joinedBootstrapRace = false;
+    if (options.afterMarkerObserve) {
+      const initiallyObserved = await classifyLockPath(
+        recoveryMarker,
+        "admin-recovery",
+      );
+      await options.afterMarkerObserve(initiallyObserved.state);
+    }
     for (let attempt = 0; attempt < markerRetries; attempt += 1) {
       try {
         markerOwnership = await acquireDirectoryLock(

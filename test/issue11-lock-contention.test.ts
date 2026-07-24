@@ -20,7 +20,7 @@ const workerPath = fileURLToPath(new URL("./fixtures/lock-worker.ts", import.met
 const DEAD_PID = 1_000_000_313;
 
 interface WorkerMessage {
-  type: "ready" | "transition" | "owned" | "result";
+  type: "ready" | "prepared" | "transition" | "owned" | "result";
   actor: string;
   transition?: string;
   token?: string;
@@ -46,6 +46,7 @@ function spawnWorker(): Worker {
   const pending = new Set<{
     predicate: (message: WorkerMessage) => boolean;
     resolve: (message: WorkerMessage) => void;
+    reject: (error: Error) => void;
     timer: NodeJS.Timeout;
   }>();
   let stderr = "";
@@ -65,7 +66,14 @@ function spawnWorker(): Worker {
   const close = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
     (resolve) => {
       child.on("close", (code, signal) => {
-        for (const waiter of pending) clearTimeout(waiter.timer);
+        for (const waiter of pending) {
+          clearTimeout(waiter.timer);
+          waiter.reject(
+            new Error(
+              `Worker exited before barrier: code=${String(code)} signal=${String(signal)} stderr=${stderr}`,
+            ),
+          );
+        }
         pending.clear();
         resolve({ code, signal });
       });
@@ -81,6 +89,7 @@ function spawnWorker(): Worker {
         const waiter = {
           predicate,
           resolve,
+          reject,
           timer: setTimeout(() => {
             pending.delete(waiter);
             reject(new Error(`Worker barrier timed out; stderr=${stderr}`));
@@ -102,6 +111,20 @@ async function readyWorker(): Promise<Worker> {
   return worker;
 }
 
+async function startTogether(
+  actors: Array<{ worker: Worker; message: Record<string, unknown> }>,
+): Promise<void> {
+  for (const actor of actors) actor.worker.send(actor.message);
+  await Promise.all(
+    actors.map(({ worker }) =>
+      worker.waitFor((message) => message.type === "prepared"),
+    ),
+  );
+  for (const actor of actors) {
+    actor.worker.send({ action: "continue", transition: "START" });
+  }
+}
+
 function serializeOwnership(ownership: LockOwnershipHandle) {
   return {
     lockPath: ownership.lockPath,
@@ -119,8 +142,10 @@ async function runExclusiveMkdirRace(iteration: number): Promise<void> {
   const lockPath = path.join(root, ".lock");
   const a = await readyWorker();
   const b = await readyWorker();
-  a.send({ action: "acquire", actor: "A", lockPath, kind: "data" });
-  b.send({ action: "acquire", actor: "B", lockPath, kind: "data" });
+  await startTogether([
+    { worker: a, message: { action: "acquire", actor: "A", lockPath, kind: "data" } },
+    { worker: b, message: { action: "acquire", actor: "B", lockPath, kind: "data" } },
+  ]);
 
   const ownerMessage = await Promise.race([
     a.waitFor((message) => message.type === "owned"),
@@ -162,13 +187,18 @@ for (const transition of [
     const root = await mkdtemp(path.join(os.tmpdir(), "maswe-issue11-crash-"));
     const lockPath = path.join(root, ".lock");
     const worker = await readyWorker();
-    worker.send({
-      action: "acquire",
-      actor: "crasher",
-      lockPath,
-      kind: "data",
-      pauseAt: [transition],
-    });
+    await startTogether([
+      {
+        worker,
+        message: {
+          action: "acquire",
+          actor: "crasher",
+          lockPath,
+          kind: "data",
+          pauseAt: [transition],
+        },
+      },
+    ]);
     await worker.waitFor(
       (message) => message.type === "transition" && message.transition === transition,
     );
@@ -189,12 +219,17 @@ async function runReleaseReplacementRace(iteration: number): Promise<void> {
   const lockPath = path.join(root, ".lock");
   const oldOwner = await acquireDirectoryLock(lockPath, "data");
   const oldRelease = await readyWorker();
-  oldRelease.send({
-    action: "release",
-    actor: "old-owner",
-    ownership: serializeOwnership(oldOwner),
-    pauseAt: ["OWNER_VALIDATED"],
-  });
+  await startTogether([
+    {
+      worker: oldRelease,
+      message: {
+        action: "release",
+        actor: "old-owner",
+        ownership: serializeOwnership(oldOwner),
+        pauseAt: ["OWNER_VALIDATED"],
+      },
+    },
+  ]);
   await oldRelease.waitFor(
     (message) =>
       message.type === "transition" && message.transition === "OWNER_VALIDATED",
@@ -228,12 +263,17 @@ test("acquisition does not overwrite the old-owner empty-directory release windo
   const lockPath = path.join(root, ".lock");
   const owner = await acquireDirectoryLock(lockPath, "data");
   const release = await readyWorker();
-  release.send({
-    action: "release",
-    actor: "old-owner",
-    ownership: serializeOwnership(owner),
-    pauseAt: ["TOKEN_REMOVED"],
-  });
+  await startTogether([
+    {
+      worker: release,
+      message: {
+        action: "release",
+        actor: "old-owner",
+        ownership: serializeOwnership(owner),
+        pauseAt: ["TOKEN_REMOVED"],
+      },
+    },
+  ]);
   await release.waitFor(
     (message) =>
       message.type === "transition" && message.transition === "TOKEN_REMOVED",
@@ -254,13 +294,18 @@ test("claimant losing its empty directory cannot publish into a replacement", as
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-issue11-claim-loss-"));
   const lockPath = path.join(root, ".lock");
   const claimant = await readyWorker();
-  claimant.send({
-    action: "acquire",
-    actor: "claimant",
-    lockPath,
-    kind: "data",
-    pauseAt: ["DIRECTORY_CLAIMED"],
-  });
+  await startTogether([
+    {
+      worker: claimant,
+      message: {
+        action: "acquire",
+        actor: "claimant",
+        lockPath,
+        kind: "data",
+        pauseAt: ["DIRECTORY_CLAIMED"],
+      },
+    },
+  ]);
   await claimant.waitFor(
     (message) =>
       message.type === "transition" && message.transition === "DIRECTORY_CLAIMED",
@@ -309,22 +354,46 @@ async function runRecoveryMarkerRace(initial: "dead" | "empty"): Promise<void> {
 
   const a = await readyWorker();
   const b = await readyWorker();
-  a.send({
-    action: "recover-admin",
-    actor: "A",
-    cwd: root,
-    runId: run.id,
-    force: true,
-    pauseOnEntry: true,
-  });
-  b.send({
-    action: "recover-admin",
-    actor: "B",
-    cwd: root,
-    runId: run.id,
-    force: true,
-    pauseOnEntry: true,
-  });
+  await startTogether([
+    {
+      worker: a,
+      message: {
+        action: "recover-admin",
+        actor: "A",
+        cwd: root,
+        runId: run.id,
+        force: true,
+        pauseOnEntry: true,
+        pauseOnMarkerObserve: true,
+      },
+    },
+    {
+      worker: b,
+      message: {
+        action: "recover-admin",
+        actor: "B",
+        cwd: root,
+        runId: run.id,
+        force: true,
+        pauseOnEntry: true,
+        pauseOnMarkerObserve: true,
+      },
+    },
+  ]);
+  await Promise.all([
+    a.waitFor(
+      (message) =>
+        message.type === "transition" &&
+        message.transition === "RECOVERY_MARKER_OBSERVED",
+    ),
+    b.waitFor(
+      (message) =>
+        message.type === "transition" &&
+        message.transition === "RECOVERY_MARKER_OBSERVED",
+    ),
+  ]);
+  a.send({ action: "continue", transition: "RECOVERY_MARKER_OBSERVED" });
+  b.send({ action: "continue", transition: "RECOVERY_MARKER_OBSERVED" });
   const entered = await Promise.race([
     a.waitFor(
       (message) =>

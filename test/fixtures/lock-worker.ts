@@ -36,6 +36,7 @@ interface StartRecoverAdmin {
   runId: string;
   force: boolean;
   pauseOnEntry?: boolean;
+  pauseOnMarkerObserve?: boolean;
 }
 
 type StartMessage = StartAcquire | StartRelease | StartRecoverAdmin;
@@ -132,6 +133,17 @@ async function run(config: StartMessage): Promise<void> {
   const store = new FileRunStore(config.cwd, { lockRetries: 20 });
   await store.unlockAdmin(config.runId, {
     force: config.force,
+    afterMarkerObserve: async () => {
+      send({
+        type: "transition",
+        actor: config.actor,
+        kind: "admin-recovery",
+        transition: "RECOVERY_MARKER_OBSERVED",
+      });
+      if (config.pauseOnMarkerObserve) {
+        await waitFor("RECOVERY_MARKER_OBSERVED");
+      }
+    },
     afterObserve: async () => {
       send({
         type: "transition",
@@ -153,7 +165,8 @@ process.on("message", (message: StartMessage | ContinueMessage) => {
     }
     return;
   }
-  void run(message).then(
+  send({ type: "prepared", actor: message.actor });
+  void waitFor("START").then(() => run(message)).then(
     () => {
       send({ type: "result", actor: message.actor, result: "ok" });
       process.exit(0);
