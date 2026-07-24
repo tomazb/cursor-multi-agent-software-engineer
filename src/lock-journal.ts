@@ -150,6 +150,7 @@ export interface JournalScan {
 
 export type JournalTransition =
   | "TEMP_READY"
+  | "CLAIM_PARTIALLY_WRITTEN"
   | "CLAIM_TICKET_PROPOSED"
   | "CLAIM_PREPARED"
   | "CLAIM_LINK_ATTEMPT_READY"
@@ -761,7 +762,12 @@ async function readManifest(manifestPath: string): Promise<"missing" | "valid"> 
   return "valid";
 }
 
-async function publishManifest(manifestPath: string): Promise<void> {
+type LinkFile = typeof link;
+
+async function publishManifest(
+  manifestPath: string,
+  linkFile: LinkFile,
+): Promise<void> {
   const temporary = path.join(
     path.dirname(manifestPath),
     `.format.${randomUUID()}.tmp`,
@@ -779,7 +785,7 @@ async function publishManifest(manifestPath: string): Promise<void> {
       // Permission modes are advisory on some supported platforms.
     }
     try {
-      await link(temporary, manifestPath);
+      await linkFile(temporary, manifestPath);
     } catch (error) {
       if (errno(error) !== "EEXIST") {
         throw new LockJournalError(
@@ -806,7 +812,10 @@ async function publishManifest(manifestPath: string): Promise<void> {
   }
 }
 
-async function probeHardLink(tmpDirectory: string): Promise<void> {
+async function probeHardLink(
+  tmpDirectory: string,
+  linkFile: LinkFile,
+): Promise<void> {
   const id = randomUUID();
   const source = path.join(tmpDirectory, `.link-probe.${id}.tmp`);
   const published = path.join(tmpDirectory, `.link-probe.${id}.published.tmp`);
@@ -817,7 +826,7 @@ async function probeHardLink(tmpDirectory: string): Promise<void> {
     await handle.sync();
     await handle.close();
     handle = undefined;
-    await link(source, published);
+    await linkFile(source, published);
     const bytes = await readFile(published, "utf8");
     if (bytes !== "maswe-lock-journal-link-probe\n") {
       throw new LockJournalError(
@@ -860,7 +869,11 @@ function allFixedDirectories(runDirectory: string): string[] {
   return directories;
 }
 
-export async function initializeLockJournal(runDirectory: string): Promise<void> {
+export async function initializeLockJournal(
+  runDirectory: string,
+  options: { linkFile?: LinkFile } = {},
+): Promise<void> {
+  const linkFile = options.linkFile ?? link;
   const root = path.join(runDirectory, LOCK_JOURNAL_DIRECTORY);
   const manifestPath = path.join(root, "format.json");
   const rootState = await inspectOrdinaryDirectory(root, { allowMissing: true });
@@ -885,9 +898,9 @@ export async function initializeLockJournal(runDirectory: string): Promise<void>
     await createOrValidateDirectory(directory);
   }
   for (const kind of LOCK_KINDS) {
-    await probeHardLink(journalPaths(runDirectory, kind).tmp);
+    await probeHardLink(journalPaths(runDirectory, kind).tmp, linkFile);
   }
-  await publishManifest(manifestPath);
+  await publishManifest(manifestPath, linkFile);
 }
 
 async function readOrdinaryRecord(recordPath: string): Promise<string> {
@@ -1154,7 +1167,10 @@ async function prepareAndPublishClaim(
   try {
     handle = await open(temporaryPath, "wx", 0o600);
     await options.transition?.("TEMP_READY", context);
-    await handle.writeFile(canonical.bytes, "utf8");
+    const midpoint = Math.max(1, Math.floor(canonical.bytes.length / 2));
+    await handle.writeFile(canonical.bytes.slice(0, midpoint), "utf8");
+    await options.transition?.("CLAIM_PARTIALLY_WRITTEN", context);
+    await handle.writeFile(canonical.bytes.slice(midpoint), "utf8");
     await handle.sync();
     await handle.close();
     handle = undefined;
@@ -1600,7 +1616,7 @@ async function publishRawClaimRelease(
 export async function recoverCurrentLock(
   runDirectory: string,
   kind: LockKind,
-  options: { force: boolean },
+  options: { force: boolean; transition?: PublishClaimOptions["transition"] },
 ): Promise<void> {
   const scan = await scanLockJournal(runDirectory, kind, {
     allowUnresolvedRawClaims: true,
@@ -1669,14 +1685,17 @@ export async function recoverCurrentLock(
       );
     }
     const ticket = parseLockTicket(claim.ticket);
-    await publishClaimRelease({
-      runDirectory,
-      kind,
-      ticket,
-      owner: claim.owner,
-      claimDigest: claim.claimDigest,
-      claim,
-    });
+    await publishClaimRelease(
+      {
+        runDirectory,
+        kind,
+        ticket,
+        owner: claim.owner,
+        claimDigest: claim.claimDigest,
+        claim,
+      },
+      options.transition ? { transition: options.transition } : {},
+    );
     return;
   }
 }

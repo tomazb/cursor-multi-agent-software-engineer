@@ -135,6 +135,22 @@ test("unsafe journal root symlink is rejected without following or replacing it"
   assert.equal((await lstat(root)).isSymbolicLink(), true);
 });
 
+test("unsupported hard-link publication fails closed under injected filesystem semantics", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-no-link-");
+  await assert.rejects(
+    initializeLockJournal(runDirectory, {
+      linkFile: async () => {
+        const error = new Error("hard links unavailable") as NodeJS.ErrnoException;
+        error.code = "ENOTSUP";
+        throw error;
+      },
+    }),
+    (error: unknown) =>
+      error instanceof LockJournalError &&
+      error.code === "LOCK_UNSUPPORTED_FILESYSTEM",
+  );
+});
+
 const CLAIM_INPUT = {
   kind: "data" as const,
   ticket: 1n,
@@ -244,6 +260,125 @@ test("journal scan rejects malformed names, links, and conflicting release inter
     scanLockJournal(runDirectory, "data"),
     (error: unknown) =>
       error instanceof LockJournalError && error.code === "LOCK_UNSAFE_PATH_TYPE",
+  );
+});
+
+test("claim and temporary symlinks are rejected without being followed", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-entry-link-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "data");
+  const outside = path.join(path.dirname(runDirectory), "outside");
+  await writeFile(outside, canonicalClaim(CLAIM_INPUT).bytes);
+  await symlink(outside, path.join(paths.claims, "00000000000000000001.json"));
+  await assert.rejects(
+    scanLockJournal(runDirectory, "data"),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_UNSAFE_PATH_TYPE",
+  );
+
+  const secondRun = await freshRunDirectory("maswe-journal-temp-link-");
+  await initializeLockJournal(secondRun);
+  const secondPaths = journalPaths(secondRun, "data");
+  await symlink(outside, path.join(secondPaths.tmp, `.claim.${CLAIM_INPUT.owner}.tmp`));
+  await assert.rejects(
+    scanLockJournal(secondRun, "data"),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_UNSAFE_PATH_TYPE",
+  );
+});
+
+test("malformed filenames and unsupported record versions fail closed", async () => {
+  const malformedRun = await freshRunDirectory("maswe-journal-name-");
+  await initializeLockJournal(malformedRun);
+  await writeFile(
+    path.join(journalPaths(malformedRun, "data").claims, "1.json"),
+    canonicalClaim(CLAIM_INPUT).bytes,
+  );
+  await assert.rejects(
+    scanLockJournal(malformedRun, "data"),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+
+  const versionRun = await freshRunDirectory("maswe-journal-version-");
+  await initializeLockJournal(versionRun);
+  await writeFile(
+    path.join(
+      journalPaths(versionRun, "data").claims,
+      "00000000000000000001.json",
+    ),
+    canonicalClaim(CLAIM_INPUT).bytes.replace('"format":3', '"format":4'),
+  );
+  await assert.rejects(
+    scanLockJournal(versionRun, "data"),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+});
+
+test("wrong-digest, duplicate, and missing-target releases fail closed", async () => {
+  const wrongDigestRun = await freshRunDirectory("maswe-journal-release-wrong-");
+  const claim = await publishLockClaim(wrongDigestRun, "data", "store-write");
+  const paths = journalPaths(wrongDigestRun, "data");
+  const canonical = canonicalRelease(claim.claim);
+  await writeFile(
+    path.join(paths.releases, releaseBasename(claim.claim)),
+    canonical.bytes.replace(claim.claimDigest.slice(-1), "0"),
+  );
+  await assert.rejects(
+    scanLockJournal(wrongDigestRun, "data"),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+
+  const duplicateRun = await freshRunDirectory("maswe-journal-release-duplicate-");
+  const duplicateClaim = await publishLockClaim(duplicateRun, "data", "store-write");
+  const duplicatePaths = journalPaths(duplicateRun, "data");
+  const release = canonicalRelease(duplicateClaim.claim);
+  await writeFile(
+    path.join(duplicatePaths.releases, releaseBasename(duplicateClaim.claim)),
+    release.bytes,
+  );
+  await writeFile(
+    path.join(duplicatePaths.releases, `duplicate-${releaseBasename(duplicateClaim.claim)}`),
+    release.bytes,
+  );
+  await assert.rejects(
+    scanLockJournal(duplicateRun, "data"),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+
+  const missingRun = await freshRunDirectory("maswe-journal-release-missing-");
+  await initializeLockJournal(missingRun);
+  await writeFile(
+    path.join(journalPaths(missingRun, "data").releases, releaseBasename(claim.claim)),
+    canonical.bytes,
+  );
+  await assert.rejects(
+    scanLockJournal(missingRun, "data"),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+});
+
+test("enumeration order cannot change numeric claim order", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-listing-order-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "data");
+  const second = canonicalClaim({
+    ...CLAIM_INPUT,
+    ticket: 2n,
+    owner: "8d196f64-9811-4f6c-9234-a43f12847e93",
+  });
+  await writeFile(path.join(paths.claims, "00000000000000000002.json"), second.bytes);
+  await writeFile(
+    path.join(paths.claims, "00000000000000000001.json"),
+    canonicalClaim(CLAIM_INPUT).bytes,
+  );
+  assert.deepEqual(
+    (await scanLockJournal(runDirectory, "data")).claims.map((claim) => claim.ticket),
+    ["00000000000000000001", "00000000000000000002"],
   );
 });
 
@@ -493,4 +628,49 @@ test("corrupt administrative-recovery claims remain fail closed under force", as
       error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
   );
   assert.deepEqual(await readdir(paths.releases), []);
+});
+
+test(
+  "Linux process-start identity prevents PID reuse from preserving a dead claim",
+  { skip: process.platform !== "linux" },
+  async () => {
+    const runDirectory = await freshRunDirectory("maswe-journal-pid-reuse-");
+    await initializeLockJournal(runDirectory);
+    const paths = journalPaths(runDirectory, "data");
+    const reusedPid = canonicalClaim({
+      ...CLAIM_INPUT,
+      pid: process.pid,
+      process: {
+        startedAt: "2026-07-24T10:00:00.000Z",
+        platformIdentity:
+          "linux:550e8400-e29b-41d4-a716-446655440000:0",
+      },
+    });
+    await writeFile(
+      path.join(paths.claims, "00000000000000000001.json"),
+      reusedPid.bytes,
+    );
+    await recoverCurrentLock(runDirectory, "data", { force: false });
+    assert.equal(
+      (await scanLockJournal(runDirectory, "data")).releases.has(
+        reusedPid.record.ticket,
+      ),
+      true,
+    );
+  },
+);
+
+test("production lock lifecycle never deletes published journals or canonical records", async () => {
+  const [journalSource, storeSource] = await Promise.all([
+    readFile(new URL("../src/lock-journal.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/store.ts", import.meta.url), "utf8"),
+  ]);
+  const production = `${journalSource}\n${storeSource}`;
+  assert.doesNotMatch(production, /\brm(?:Sync)?\s*\(/);
+  assert.doesNotMatch(production, /\brmdir(?:Sync)?\s*\(/);
+  assert.doesNotMatch(journalSource, /unlink\s*\(\s*(?:finalPath|claimPath|releasePath)/);
+  assert.doesNotMatch(journalSource, /rename\s*\(/);
+  assert.doesNotMatch(journalSource, /recursive\s*:/);
+  assert.doesNotMatch(storeSource, /\bunlink\s*\(/);
+  assert.doesNotMatch(storeSource, /\.lock-journal-v3[\s\S]*\brename\s*\(/);
 });
