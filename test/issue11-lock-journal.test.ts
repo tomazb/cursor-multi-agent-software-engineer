@@ -1228,6 +1228,34 @@ test("dead legacy administrative-recovery ticket zero requires force", async () 
   await recoverCurrentLock(runDirectory, "admin-recovery", { force: true });
 });
 
+test("recreated legacy recovery directory cannot inherit ticket-zero release", async () => {
+  const runDirectory = await freshRunDirectory(
+    "maswe-journal-legacy-recovery-replaced-",
+  );
+  const legacyPath = path.join(runDirectory, ".admin.lock.recovering");
+  await mkdir(legacyPath);
+
+  await assert.rejects(
+    recoverCurrentLock(runDirectory, "admin-recovery", {
+      force: true,
+      linkFile: async (existingPath, newPath) => {
+        await rename(legacyPath, `${legacyPath}.replaced`);
+        await mkdir(legacyPath);
+        await hardLink(existingPath, newPath);
+      },
+    }),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_OWNERSHIP_LOST",
+  );
+
+  assert.equal((await lstat(legacyPath)).isDirectory(), true);
+  await assert.rejects(
+    scanLockJournal(runDirectory, "admin-recovery"),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+});
+
 test("legacy release reconciles an exact final record after any link error", async () => {
   const runDirectory = await freshRunDirectory("maswe-journal-legacy-ambiguous-");
   await writeFile(

@@ -310,8 +310,10 @@ has no recursively higher lock; a live recovery owner is never force-released.
 
 Ticket zero is a read-only compatibility overlay for a PR #10 `.lock`, `.admin.lock`, or
 `.admin.lock.recovering` object. A v3 resolution binds its exact raw digest and leaves the legacy
-path untouched. New code never writes the legacy format, and mixed old/new active binaries are
-unsupported.
+path untouched. For the empty legacy recovery directory, the digest instead covers canonical
+stable filesystem identity and that identity is rechecked after release publication; replacement
+or unavailable identity fails closed. New code never writes the legacy format, and mixed old/new
+active binaries are unsupported.
 
 The hosted design adds:
 

@@ -628,7 +628,11 @@ Leaving the legacy object in place prevents the original compare-and-delete race
 digest has a valid ticket-zero release, the v3 binary treats that historical object as resolved.
 If the legacy bytes or path type later change, the digest no longer matches and v3 fails closed.
 An empty PR #10 `.admin.lock.recovering` marker may be resolved only with force and an explicit
-upgrade-quiescence assertion; it is never removed by v3.
+upgrade-quiescence assertion; it is never removed by v3. Because that legacy marker has no record
+bytes, its compatibility digest covers canonical bytes derived from stable non-following
+filesystem identity (`dev`, `ino`, `ctimeNs`, and `birthtimeNs`). The identity is checked before
+and after release publication. Replacement, unavailable identity, or an identity change fails
+closed, so a recreated directory cannot inherit an earlier ticket-zero release.
 
 Upgrade requires all MASWE processes to stop. The new binary validates legacy state, initializes
 v3, and records exact legacy resolutions when authorized. Mixed PR #10 and v3 processes are

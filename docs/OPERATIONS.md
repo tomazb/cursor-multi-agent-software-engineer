@@ -317,7 +317,9 @@ For the v3 lock-journal upgrade:
    `.admin.lock.recovering` objects.
 3. Start only the new binary. It represents an existing PR #10 lock as virtual ticket zero and
    publishes a digest-bound compatibility release only through `maswe unlock <run-id> --force`
-   or `maswe unlock-admin <run-id> --force`; it never deletes the legacy path.
+   or `maswe unlock-admin <run-id> --force`; it never deletes the legacy path. An empty legacy
+   `.admin.lock.recovering` directory is bound to stable filesystem identity and fails closed if
+   replaced or if that identity is unavailable.
 4. Do not run old and new binaries concurrently. Old binaries cannot see v3 claims.
 
 After the first v3 claim, rollback to an old binary is unsupported without a separately designed

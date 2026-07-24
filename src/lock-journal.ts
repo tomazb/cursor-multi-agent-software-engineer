@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, type BigIntStats } from "node:fs";
 import {
   chmod,
   link,
@@ -685,6 +685,31 @@ function legacyBasename(kind: LockKind): LegacyReleaseRecordV3["legacyPath"] {
   return ".admin.lock.recovering";
 }
 
+function legacyDirectoryIdentityBytes(stat: BigIntStats): Buffer {
+  if (
+    stat.dev < 0n ||
+    stat.ino <= 0n ||
+    stat.ctimeNs <= 0n ||
+    stat.birthtimeNs < 0n
+  ) {
+    throw new LockJournalError(
+      "LOCK_UNSUPPORTED_FILESYSTEM",
+      `Stable identity is unavailable for the legacy administrative-recovery directory`,
+    );
+  }
+  return Buffer.from(
+    `${JSON.stringify({
+      format: 3,
+      record: "legacy-directory-identity",
+      dev: stat.dev.toString(10),
+      ino: stat.ino.toString(10),
+      ctimeNs: stat.ctimeNs.toString(10),
+      birthtimeNs: stat.birthtimeNs.toString(10),
+    })}\n`,
+    "utf8",
+  );
+}
+
 async function inspectLegacyLock(
   runDirectory: string,
   kind: LockKind,
@@ -693,7 +718,7 @@ async function inspectLegacyLock(
   const legacyPath = path.join(runDirectory, basename);
   let stat;
   try {
-    stat = await lstat(legacyPath);
+    stat = await lstat(legacyPath, { bigint: true });
   } catch (error) {
     if (errno(error) === "ENOENT") return undefined;
     throw error;
@@ -712,7 +737,32 @@ async function inspectLegacyLock(
         `Legacy administrative-recovery marker is a non-empty directory`,
       );
     }
-    const rawBytes = Buffer.from("legacy-empty-directory\n", "utf8");
+    const rawBytes = legacyDirectoryIdentityBytes(stat);
+    let afterRead;
+    try {
+      afterRead = await lstat(legacyPath, { bigint: true });
+    } catch (error) {
+      if (errno(error) === "ENOENT") {
+        throw new LockJournalError(
+          "LOCK_OWNERSHIP_LOST",
+          `Legacy administrative-recovery directory disappeared during inspection`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+    if (afterRead.isSymbolicLink() || !afterRead.isDirectory()) {
+      throw new LockJournalError(
+        "LOCK_UNSAFE_PATH_TYPE",
+        `Legacy administrative-recovery marker became an unsafe path type`,
+      );
+    }
+    if (!rawBytes.equals(legacyDirectoryIdentityBytes(afterRead))) {
+      throw new LockJournalError(
+        "LOCK_OWNERSHIP_LOST",
+        `Legacy administrative-recovery directory changed during inspection`,
+      );
+    }
     return {
       path: legacyPath,
       basename,
@@ -2183,6 +2233,18 @@ async function publishLegacyRelease(
         canonical.record.releaseDigest
     ) {
       throw corrupt(`Existing legacy release path has conflicting bytes`);
+    }
+    const publishedTarget = await inspectLegacyLock(runDirectory, kind);
+    if (
+      !publishedTarget ||
+      publishedTarget.basename !== current.basename ||
+      !publishedTarget.rawBytes.equals(current.rawBytes) ||
+      publishedTarget.rawDigest !== current.rawDigest
+    ) {
+      throw new LockJournalError(
+        "LOCK_OWNERSHIP_LOST",
+        `Legacy ticket-zero identity changed during exact release publication`,
+      );
     }
     return canonical;
   } catch (error) {

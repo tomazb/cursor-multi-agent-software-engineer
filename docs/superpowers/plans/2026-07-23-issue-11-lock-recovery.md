@@ -540,12 +540,16 @@ git commit -m "feat: serialize recovery with immutable tickets"
       the legacy path.
 - [ ] Change legacy bytes after resolution and prove v3 fails closed.
 - [ ] Test the empty legacy recovery marker only under explicit forced upgrade quiescence.
+- [ ] Replace that empty marker during release publication and prove the recreated directory
+      cannot inherit the old ticket-zero release.
 - [ ] Test mixed-version sentinel detection/guidance and unsupported rollback.
 - [ ] Prove blocked format-2 prototype directories are not treated as v3.
 
 ### GREEN
 
 - [ ] Implement virtual ticket-zero classification and release validation.
+- [ ] Bind an empty legacy recovery marker to stable filesystem identity, recheck after
+      publication, and fail closed where that identity is unavailable.
 - [ ] Never unlink or replace legacy canonical paths in v3 ordinary/recovery code.
 - [ ] Preserve live/dead/corrupt non-force policies.
 - [ ] Require quiescent upgrade and reject mixed activity.
