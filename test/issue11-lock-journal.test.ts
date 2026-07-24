@@ -336,6 +336,226 @@ test("journal scan validates a contiguous range and ignores only ordinary temp r
   );
 });
 
+test("scan reconciles a claim and release published after claims observation", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-scan-observation-");
+  await initializeLockJournal(runDirectory);
+  let publishedTicket: bigint | undefined;
+
+  const scan = await scanLockJournal(runDirectory, "data", {
+    afterClaimsObserved: async () => {
+      const claim = await publishLockClaim(
+        runDirectory,
+        "data",
+        "store-write",
+      );
+      publishedTicket = claim.ticket;
+      await publishClaimRelease(claim);
+    },
+  });
+
+  assert.equal(publishedTicket, 1n);
+  assert.deepEqual(scan.claims.map((claim) => claim.ticket), [
+    "00000000000000000001",
+  ]);
+  assert.equal(scan.releases.has("00000000000000000001"), true);
+});
+
+test("scan reconciles a raw claim and release published after claims observation", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-raw-observation-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "data");
+
+  const scan = await scanLockJournal(runDirectory, "data", {
+    afterClaimsObserved: async () => {
+      await writeFile(
+        path.join(paths.claims, "00000000000000000001.json"),
+        "{stable-corrupt-claim",
+      );
+      await recoverCurrentLock(runDirectory, "data", { force: true });
+    },
+  });
+
+  assert.equal(
+    scan.rawClaims.has("00000000000000000001"),
+    true,
+  );
+  assert.equal(
+    scan.rawReleases.has("00000000000000000001"),
+    true,
+  );
+});
+
+test("exact-path reconciliation preserves missing-target corruption for canonical and raw releases", async () => {
+  const canonicalRun = await freshRunDirectory("maswe-journal-exact-missing-");
+  await initializeLockJournal(canonicalRun);
+  const canonicalPaths = journalPaths(canonicalRun, "data");
+  const claim = canonicalClaim(CLAIM_INPUT);
+  const release = canonicalRelease(claim.record);
+  await writeFile(
+    path.join(canonicalPaths.releases, releaseBasename(claim.record)),
+    release.bytes,
+  );
+  await assert.rejects(
+    scanLockJournal(canonicalRun, "data"),
+    (error: unknown) =>
+      error instanceof LockJournalError &&
+      error.code === "LOCK_CORRUPT" &&
+      /missing claim/.test(error.message),
+  );
+
+  const rawRun = await freshRunDirectory("maswe-journal-exact-raw-missing-");
+  await initializeLockJournal(rawRun);
+  const rawPaths = journalPaths(rawRun, "data");
+  const rawClaimPath = path.join(
+    rawPaths.claims,
+    "00000000000000000001.json",
+  );
+  await writeFile(rawClaimPath, "{stable-corrupt-claim");
+  await recoverCurrentLock(rawRun, "data", { force: true });
+  await unlink(rawClaimPath);
+  await assert.rejects(
+    scanLockJournal(rawRun, "data"),
+    (error: unknown) =>
+      error instanceof LockJournalError &&
+      error.code === "LOCK_CORRUPT" &&
+      /missing or valid claim/.test(error.message),
+  );
+});
+
+test("exact-path reconciliation rejects unsafe, malformed, and conflicting claims", async () => {
+  const unsafeRun = await freshRunDirectory("maswe-journal-exact-unsafe-");
+  await initializeLockJournal(unsafeRun);
+  const unsafePaths = journalPaths(unsafeRun, "data");
+  const claim = canonicalClaim(CLAIM_INPUT);
+  const release = canonicalRelease(claim.record);
+  const outside = path.join(path.dirname(unsafeRun), "outside-claim");
+  await writeFile(outside, claim.bytes);
+  await assert.rejects(
+    scanLockJournal(unsafeRun, "data", {
+      afterClaimsObserved: async () => {
+        await symlink(
+          outside,
+          path.join(unsafePaths.claims, "00000000000000000001.json"),
+        );
+        await writeFile(
+          path.join(unsafePaths.releases, releaseBasename(claim.record)),
+          release.bytes,
+        );
+      },
+    }),
+    (error: unknown) =>
+      error instanceof LockJournalError &&
+      error.code === "LOCK_UNSAFE_PATH_TYPE",
+  );
+
+  const malformedRun = await freshRunDirectory("maswe-journal-exact-malformed-");
+  await initializeLockJournal(malformedRun);
+  const malformedPaths = journalPaths(malformedRun, "data");
+  await assert.rejects(
+    scanLockJournal(malformedRun, "data", {
+      afterClaimsObserved: async () => {
+        await writeFile(
+          path.join(malformedPaths.claims, "00000000000000000001.json"),
+          "{malformed-claim",
+        );
+        await writeFile(
+          path.join(malformedPaths.releases, releaseBasename(claim.record)),
+          release.bytes,
+        );
+      },
+    }),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+
+  const conflictingRun = await freshRunDirectory("maswe-journal-exact-conflict-");
+  await initializeLockJournal(conflictingRun);
+  const conflictingPaths = journalPaths(conflictingRun, "data");
+  const otherClaim = canonicalClaim({
+    ...CLAIM_INPUT,
+    owner: "8d196f64-9811-4f6c-9234-a43f12847e93",
+  });
+  const conflictingRelease = canonicalRelease(otherClaim.record);
+  await assert.rejects(
+    scanLockJournal(conflictingRun, "data", {
+      afterClaimsObserved: async () => {
+        await writeFile(
+          path.join(conflictingPaths.claims, "00000000000000000001.json"),
+          claim.bytes,
+        );
+        await writeFile(
+          path.join(
+            conflictingPaths.releases,
+            releaseBasename(otherClaim.record),
+          ),
+          conflictingRelease.bytes,
+        );
+      },
+    }),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+});
+
+test("exact-path reconciliation revalidates contiguity", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-exact-gap-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "data");
+  const claim = canonicalClaim({
+    ...CLAIM_INPUT,
+    ticket: 2n,
+  });
+  const release = canonicalRelease(claim.record);
+
+  await assert.rejects(
+    scanLockJournal(runDirectory, "data", {
+      afterClaimsObserved: async () => {
+        await writeFile(
+          path.join(paths.claims, "00000000000000000002.json"),
+          claim.bytes,
+        );
+        await writeFile(
+          path.join(paths.releases, releaseBasename(claim.record)),
+          release.bytes,
+        );
+      },
+    }),
+    (error: unknown) =>
+      error instanceof LockJournalError &&
+      error.code === "LOCK_CORRUPT" &&
+      /not contiguous/.test(error.message),
+  );
+});
+
+test("exact-path reconciliation fails closed when the claim changes during stable read", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-exact-change-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "data");
+  const claim = canonicalClaim(CLAIM_INPUT);
+  const release = canonicalRelease(claim.record);
+
+  await assert.rejects(
+    scanLockJournal(runDirectory, "data", {
+      afterClaimsObserved: async () => {
+        await writeFile(
+          path.join(paths.claims, "00000000000000000001.json"),
+          claim.bytes,
+        );
+        await writeFile(
+          path.join(paths.releases, releaseBasename(claim.record)),
+          release.bytes,
+        );
+      },
+      afterExactClaimFirstRead: async (claimPath) => {
+        await writeFile(claimPath, `${claim.bytes} `);
+      },
+    }),
+    (error: unknown) =>
+      error instanceof LockJournalError &&
+      error.code === "LOCK_OWNERSHIP_LOST",
+  );
+});
+
 test("journal scan rejects malformed names, links, and conflicting release interpretation", async () => {
   const runDirectory = await freshRunDirectory("maswe-journal-corrupt-");
   await initializeLockJournal(runDirectory);

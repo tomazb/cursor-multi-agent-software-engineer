@@ -149,6 +149,14 @@ export interface JournalScan {
   legacyRelease?: LegacyReleaseRecordV3;
 }
 
+export interface ScanLockJournalOptions {
+  allowUnresolvedRawClaims?: boolean;
+  /** Deterministic test seam after the claims namespace observation. */
+  afterClaimsObserved?: () => Promise<void>;
+  /** Deterministic test seam during exact-path reconciliation. */
+  afterExactClaimFirstRead?: (claimPath: string) => Promise<void>;
+}
+
 export type JournalTransition =
   | "TEMP_READY"
   | "CLAIM_PARTIALLY_WRITTEN"
@@ -250,7 +258,10 @@ async function readHandleExactly(
   return bytes;
 }
 
-async function readStableOrdinaryBytes(recordPath: string): Promise<Buffer> {
+async function readStableOrdinaryBytes(
+  recordPath: string,
+  afterFirstRead?: (recordPath: string) => Promise<void>,
+): Promise<Buffer> {
   const noFollow = constants.O_NOFOLLOW;
   const nonBlock = constants.O_NONBLOCK;
   if (
@@ -317,6 +328,7 @@ async function readStableOrdinaryBytes(recordPath: string): Promise<Buffer> {
       throw corrupt(`Published journal record size is outside the supported bound`);
     }
     const first = await readHandleExactly(handle, firstStat.size);
+    await afterFirstRead?.(recordPath);
     const second = await readHandleExactly(handle, firstStat.size);
     const secondStat = await handle.stat();
     if (
@@ -1197,44 +1209,78 @@ async function validateTemporaryEntries(tmpDirectory: string): Promise<void> {
   }
 }
 
-export async function scanLockJournal(
-  runDirectory: string,
+function addClaimInterpretation(
+  rawBytes: Buffer,
+  claimPath: string,
+  basename: string,
+  ticket: bigint,
   kind: LockKind,
-  options: { allowUnresolvedRawClaims?: boolean } = {},
-): Promise<JournalScan> {
-  await initializeLockJournal(runDirectory);
-  const paths = journalPaths(runDirectory, kind);
-  await validateTemporaryEntries(paths.tmp);
-  const legacy = await inspectLegacyLock(runDirectory, kind);
-
-  const claimEntries = await readdir(paths.claims);
-  const claimsByTicket = new Map<bigint, ClaimRecordV3>();
-  const rawClaimsByTicket = new Map<bigint, RawClaimOverlay>();
-  for (const basename of claimEntries) {
-    const match = CLAIM_BASENAME_PATTERN.exec(basename);
-    if (!match) throw corrupt(`Published claim filename is malformed: ${basename}`);
-    const ticket = parseLockTicket(match[1]);
-    if (claimsByTicket.has(ticket) || rawClaimsByTicket.has(ticket)) {
-      throw corrupt(`Published claim ticket has a duplicate interpretation: ${ticket}`);
-    }
-    const claimPath = path.join(paths.claims, basename);
-    const rawBytes = await readStableOrdinaryBytes(claimPath);
-    try {
-      const bytes = decodeCanonicalText(rawBytes, claimPath);
-      claimsByTicket.set(ticket, parseClaimBytes(bytes, kind, ticket));
-    } catch (error) {
-      if (!(error instanceof LockJournalError) || error.code !== "LOCK_CORRUPT") {
-        throw error;
-      }
-      rawClaimsByTicket.set(ticket, {
-        ticket: formatLockTicket(ticket),
-        basename,
-        rawBytes,
-        rawDigest: digest(rawBytes),
-      });
-    }
+  claimsByTicket: Map<bigint, ClaimRecordV3>,
+  rawClaimsByTicket: Map<bigint, RawClaimOverlay>,
+): void {
+  if (claimsByTicket.has(ticket) || rawClaimsByTicket.has(ticket)) {
+    throw corrupt(`Published claim ticket has a duplicate interpretation: ${ticket}`);
   }
+  try {
+    const bytes = decodeCanonicalText(rawBytes, claimPath);
+    claimsByTicket.set(ticket, parseClaimBytes(bytes, kind, ticket));
+  } catch (error) {
+    if (!(error instanceof LockJournalError) || error.code !== "LOCK_CORRUPT") {
+      throw error;
+    }
+    rawClaimsByTicket.set(ticket, {
+      ticket: formatLockTicket(ticket),
+      basename,
+      rawBytes,
+      rawDigest: digest(rawBytes),
+    });
+  }
+}
 
+async function reconcileExactClaimPath(
+  paths: LockJournalPaths,
+  kind: LockKind,
+  ticket: bigint,
+  claimsByTicket: Map<bigint, ClaimRecordV3>,
+  rawClaimsByTicket: Map<bigint, RawClaimOverlay>,
+  options: ScanLockJournalOptions,
+): Promise<void> {
+  if (claimsByTicket.has(ticket) || rawClaimsByTicket.has(ticket)) return;
+  const ticketText = formatLockTicket(ticket);
+  const basename = `${ticketText}.json`;
+  const claimPath = path.join(paths.claims, basename);
+  let stat;
+  try {
+    stat = await lstat(claimPath);
+  } catch (error) {
+    if (errno(error) === "ENOENT") return;
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new LockJournalError(
+      "LOCK_UNSAFE_PATH_TYPE",
+      `Release target claim is not an ordinary regular file: ${claimPath}`,
+    );
+  }
+  const rawBytes = await readStableOrdinaryBytes(
+    claimPath,
+    options.afterExactClaimFirstRead,
+  );
+  addClaimInterpretation(
+    rawBytes,
+    claimPath,
+    basename,
+    ticket,
+    kind,
+    claimsByTicket,
+    rawClaimsByTicket,
+  );
+}
+
+function validateContiguousClaimRange(
+  claimsByTicket: Map<bigint, ClaimRecordV3>,
+  rawClaimsByTicket: Map<bigint, RawClaimOverlay>,
+): bigint[] {
   const orderedTickets = [
     ...claimsByTicket.keys(),
     ...rawClaimsByTicket.keys(),
@@ -1248,6 +1294,39 @@ export async function scanLockJournal(
         `Published claim range is not contiguous: expected ${formatLockTicket(expected)}`,
       );
     }
+  }
+  return orderedTickets;
+}
+
+export async function scanLockJournal(
+  runDirectory: string,
+  kind: LockKind,
+  options: ScanLockJournalOptions = {},
+): Promise<JournalScan> {
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, kind);
+  await validateTemporaryEntries(paths.tmp);
+  const legacy = await inspectLegacyLock(runDirectory, kind);
+
+  const claimEntries = await readdir(paths.claims);
+  await options.afterClaimsObserved?.();
+  const claimsByTicket = new Map<bigint, ClaimRecordV3>();
+  const rawClaimsByTicket = new Map<bigint, RawClaimOverlay>();
+  for (const basename of claimEntries) {
+    const match = CLAIM_BASENAME_PATTERN.exec(basename);
+    if (!match) throw corrupt(`Published claim filename is malformed: ${basename}`);
+    const ticket = parseLockTicket(match[1]);
+    const claimPath = path.join(paths.claims, basename);
+    const rawBytes = await readStableOrdinaryBytes(claimPath);
+    addClaimInterpretation(
+      rawBytes,
+      claimPath,
+      basename,
+      ticket,
+      kind,
+      claimsByTicket,
+      rawClaimsByTicket,
+    );
   }
 
   const releases = new Map<string, ReleaseRecordV3>();
@@ -1283,6 +1362,16 @@ export async function scanLockJournal(
       continue;
     }
     if (candidate.targetMode === "raw-claim") {
+      if (!rawClaimsByTicket.has(ticket) && !claimsByTicket.has(ticket)) {
+        await reconcileExactClaimPath(
+          paths,
+          kind,
+          ticket,
+          claimsByTicket,
+          rawClaimsByTicket,
+          options,
+        );
+      }
       const rawClaim = rawClaimsByTicket.get(ticket);
       if (!rawClaim) {
         throw corrupt(`Raw-claim release targets a missing or valid claim: ${basename}`);
@@ -1297,6 +1386,16 @@ export async function scanLockJournal(
       );
       continue;
     }
+    if (!claimsByTicket.has(ticket) && !rawClaimsByTicket.has(ticket)) {
+      await reconcileExactClaimPath(
+        paths,
+        kind,
+        ticket,
+        claimsByTicket,
+        rawClaimsByTicket,
+        options,
+      );
+    }
     const claim = claimsByTicket.get(ticket);
     if (!claim) {
       throw corrupt(`Published release targets a missing claim: ${basename}`);
@@ -1307,6 +1406,11 @@ export async function scanLockJournal(
     }
     releases.set(claim.ticket, parseReleaseBytes(bytes, claim));
   }
+
+  const orderedTickets = validateContiguousClaimRange(
+    claimsByTicket,
+    rawClaimsByTicket,
+  );
 
   if (!options.allowUnresolvedRawClaims) {
     const unresolved = [...rawClaimsByTicket.values()].find(
