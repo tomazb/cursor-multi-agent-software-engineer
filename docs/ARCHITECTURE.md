@@ -158,13 +158,15 @@ The optional SDK import means the CLI can build and run without installing the b
 - **Both modes:** authoritative `.maswe` state under the fingerprinted `cwd`, hashed only through the MASWE-plane hasher: project config, `runs/*/run.json`, and durable artifact files.
 
 Intentionally excluded from the MASWE portion (expected orchestration churn): `.lock`,
-`.admin.lock`, `.admin.lock.recovering`, exact
-`runs/<run-id>/.lock-journal-v3/**` journal paths, and `*.tmp` staging files. The journal exclusion
-is deliberately path-specific; a `.lock-journal-v3` name elsewhere under `.maswe` remains
-fingerprinted. Isolated worktrees fingerprint their own `cwd` (typically without a local `.maswe`
-store); non-isolated checkouts include the operator-tree `.maswe` so read-only roles cannot mutate
-handoffs undetected. Workspace identity fields (`baseSha` / `headSha` / `branch`) may still record
-`not-a-git-repository` for non-Git trees; that sentinel is separate from the fingerprint digest.
+`.admin.lock`, `.admin.lock.recovering`, canonical protocol entries beneath exact
+`runs/<run-id>/.lock-journal-v3/` paths, and ordinary `*.tmp` staging files. Unexpected or
+malformed journal entries remain fingerprint-visible and also fail journal validation. The
+journal exclusion is deliberately path-specific; a `.lock-journal-v3` name elsewhere under
+`.maswe` remains fingerprinted. Isolated worktrees fingerprint their own `cwd` (typically without
+a local `.maswe` store); non-isolated checkouts include the operator-tree `.maswe` so read-only
+roles cannot mutate handoffs undetected. Workspace identity fields (`baseSha` / `headSha` /
+`branch`) may still record `not-a-git-repository` for non-Git trees; that sentinel is separate
+from the fingerprint digest.
 
 Read-only runtimes compare the fingerprint before and after execution. Any difference fails the run. This is a mutation detector, not an operating-system sandbox. A future sandbox can prevent writes rather than merely detecting them.
 

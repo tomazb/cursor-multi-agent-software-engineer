@@ -668,26 +668,32 @@ test(
         event(left, "CLAIM_LINK_ATTEMPT_READY"),
         event(right, "CLAIM_LINK_ATTEMPT_READY"),
       ]);
+      const leftReady = event(left, "WORKER_READY");
+      const rightReady = event(right, "WORKER_READY");
       left.continue("CLAIM_LINK_ATTEMPT_READY");
-      const firstReady = await event(left, "WORKER_READY");
       right.continue("CLAIM_LINK_ATTEMPT_READY");
-
-      const secondProposal = await event(right, "CLAIM_TICKET_PROPOSED");
+      const first = await Promise.race([
+        leftReady.then((message) => ({ worker: left, message, actor: "left" })),
+        rightReady.then((message) => ({ worker: right, message, actor: "right" })),
+      ]);
+      const loser = first.actor === "left" ? right : left;
+      const loserReady = first.actor === "left" ? rightReady : leftReady;
+      const secondProposal = await event(loser, "CLAIM_TICKET_PROPOSED");
       assert.equal(secondProposal.ticket, "00000000000000000002");
-      right.continue("CLAIM_TICKET_PROPOSED");
-      await event(right, "CLAIM_LINK_ATTEMPT_READY");
-      right.continue("CLAIM_LINK_ATTEMPT_READY");
-      const secondReady = await event(right, "WORKER_READY");
+      loser.continue("CLAIM_TICKET_PROPOSED");
+      await event(loser, "CLAIM_LINK_ATTEMPT_READY");
+      loser.continue("CLAIM_LINK_ATTEMPT_READY");
+      const secondReady = await loserReady;
 
       const scan = await scanLockJournal(runDirectory, "data");
       assert.deepEqual(
         scan.claims.map((claim) => claim.ticket),
         ["00000000000000000001", "00000000000000000002"],
       );
-      assert.equal(firstReady.ticket, "00000000000000000001");
+      assert.equal(first.message.ticket, "00000000000000000001");
       assert.equal(secondReady.ticket, "00000000000000000002");
-      assert.equal((await left.command("VALIDATE")).result, "OK");
-      const queued = await right.command("VALIDATE");
+      assert.equal((await first.worker.command("VALIDATE")).result, "OK");
+      const queued = await loser.command("VALIDATE");
       assert.equal(queued.result, "ERROR");
       assert.equal(queued.code, "LOCK_QUEUED");
       await Promise.all([stopWorker(left), stopWorker(right)]);
@@ -732,10 +738,11 @@ test(
         event(owner, "RELEASE_LINK_ATTEMPT_READY"),
         event(recoverer, "RELEASE_LINK_ATTEMPT_READY"),
       ]);
-      owner.continue("RELEASE_LINK_ATTEMPT_READY");
       recoverer.continue("RELEASE_LINK_ATTEMPT_READY");
-      assert.equal((await ownerRelease).result, "OK");
       assert.equal((await forcedRelease).result, "OK");
+      assert.equal((await successor.command("VALIDATE")).result, "OK");
+      owner.continue("RELEASE_LINK_ATTEMPT_READY");
+      assert.equal((await ownerRelease).result, "OK");
       assert.equal((await successor.command("VALIDATE")).result, "OK");
 
       const scan = await scanLockJournal(runDirectory, "data");

@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, writeFile, appendFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdtemp,
+  mkdir,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -141,6 +147,31 @@ test("journal exclusion is limited to a run's exact synchronization namespace", 
     "utf8",
   );
   assert.notEqual(await gitWorkspaceFingerprint(cwd), before);
+});
+
+test("unexpected journal root and kind entries remain fingerprint-visible", async () => {
+  const cwd = await initRepo();
+  await ensureMasweGitExclude(cwd);
+  const store = new FileRunStore(cwd);
+  const run = await store.create("fp-journal-unsafe", "request", DEFAULT_CONFIG);
+  const journalRoot = path.join(
+    cwd,
+    ".maswe",
+    "runs",
+    run.id,
+    ".lock-journal-v3",
+  );
+  const before = await gitWorkspaceFingerprint(cwd);
+
+  await writeFile(path.join(journalRoot, "unexpected"), "unexpected\n");
+  const afterRoot = await gitWorkspaceFingerprint(cwd);
+  assert.notEqual(afterRoot, before);
+
+  await symlink(
+    path.join(cwd, "outside"),
+    path.join(journalRoot, "data", "unexpected-link"),
+  );
+  assert.notEqual(await gitWorkspaceFingerprint(cwd), afterRoot);
 });
 
 test("isolated worktree fingerprint still detects worktree repository mutations", async () => {

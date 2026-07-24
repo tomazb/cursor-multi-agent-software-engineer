@@ -440,6 +440,8 @@ git commit -m "fix: release only exact immutable lock claims"
 - [ ] Test force resolving one well-named stable non-link corrupt data claim by raw digest.
 - [ ] Test content change, type change, malformed filename, ambiguity, or multiple interpretations
       prevents raw recovery.
+- [ ] Pause after raw-release preparation, mutate the exact corrupt target, and prove the
+      immediate pre-link stable-handle revalidation prevents release publication.
 - [ ] Prove pre-admin observations are discarded and a fresh smallest-unreleased claim is targeted.
 - [ ] Prove age never authorizes release.
 
@@ -449,6 +451,8 @@ git commit -m "fix: release only exact immutable lock claims"
 - [ ] Publish the one canonical exact release marker; record dead/forced reason only in
       non-authoritative evidence.
 - [ ] Implement raw-digest target mode only for eligible data/admin regular records.
+- [ ] Repeat exact raw bytes/digest validation after release preparation and immediately before
+      the hard link, with no intervening await or ownership inference.
 - [ ] Require operator quiescence for live force and raw corrupt recovery.
 - [ ] Add precise CLI messages without changing command names or force semantics.
 - [ ] Re-run focused, CLI, CAS, atomic-write, and artifact tests.
@@ -568,6 +572,8 @@ git commit -m "feat: overlay legacy locks on ticket zero"
 - [ ] If Node cannot detect the native junction/reparse fixtures required by the design, fail the
       Windows support gate with `LOCK_UNSUPPORTED_FILESYSTEM`; do not waive the test.
 - [ ] Assert lock-journal churn leaves read-only fingerprint unchanged.
+- [ ] Assert unexpected or malformed root/kind/record/temp journal entries remain
+      fingerprint-visible and fail closed during journal validation.
 - [ ] Assert `run.json`, artifact, config, and non-journal `.maswe` mutation still changes the
       fingerprint.
 - [ ] Source-audit no deletion of claims/releases/permanent paths and no recursive lock deletion.
@@ -576,7 +582,9 @@ git commit -m "feat: overlay legacy locks on ticket zero"
 
 - [ ] Implement conservative non-following classification and semantic mapping.
 - [ ] Return `LOCK_UNSUPPORTED_FILESYSTEM` rather than rename/copy/direct-write fallback.
-- [ ] Add the exact `runs/<run-id>/.lock-journal-v3/**` MASWE-plane exclusion; do not broaden it.
+- [ ] Exclude only canonical protocol entries beneath exact
+      `runs/<run-id>/.lock-journal-v3/` paths; unexpected or malformed journal entries must remain
+      fingerprint-visible.
 - [ ] Re-run focused fingerprint, read-only, non-Git, and path tests.
 
 ### Commit
@@ -599,8 +607,10 @@ git commit -m "test: enforce journal path and fingerprint boundaries"
 - [ ] Complete all 25 approved deterministic cases listed below.
 - [ ] Each iteration uses a fresh run/journal path.
 - [ ] Add a selection/count environment variable or test option for reproducible repetition.
-- [ ] Run focused allocation contention 25 times.
-- [ ] Run exact old-owner/recovery/successor race 100 times.
+- [ ] Run focused allocation contention 25 times, releasing both same-ticket hard-link barriers
+      before awaiting either actor's publication result.
+- [ ] Run exact old-owner/recovery/successor race 100 times: prepare both exact releases, publish
+      recovery first, admit the successor, then resume the delayed old-owner release.
 - [ ] Characterize a representative large immutable history and record cold allocation/ownership
       scan duration, filesystem-operation count, and orphan-temp count. Any in-process prefix cache
       is optimization only and must fall back safely to full digest validation.

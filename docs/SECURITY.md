@@ -51,9 +51,10 @@ MASWE must prevent untrusted requests, model output, repository content, and PR 
 
 **Gap:** Detection occurs after the process runs; it is a mutation detector, not a preventive
 OS-level sandbox. External side effects outside the fingerprinted working directory are not
-covered. Ephemeral legacy locks, `*.tmp` staging files, and exact
-`runs/<run-id>/.lock-journal-v3/**` synchronization paths are intentionally excluded from the
-fingerprint; the exclusion does not apply to similarly named paths elsewhere under `.maswe`.
+covered. Ephemeral legacy locks, ordinary `*.tmp` staging files, and canonical synchronization
+entries beneath exact `runs/<run-id>/.lock-journal-v3/` paths are intentionally excluded from the
+fingerprint. Unexpected or malformed journal entries remain fingerprint-visible and fail journal
+validation; the exclusion does not apply to similarly named paths elsewhere under `.maswe`.
 Non-Git directories do not fingerprint ordinary files outside `.maswe` (there is no Git status/diff
 plane); workspace identity fields still use the `not-a-git-repository` sentinel separately from
 the digest fingerprint.

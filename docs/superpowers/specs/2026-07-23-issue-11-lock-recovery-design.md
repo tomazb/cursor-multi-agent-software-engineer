@@ -208,17 +208,22 @@ ownership: no authorized ordinary release or recovery operation removes or repla
 
 ### Path and fingerprint policy
 
-Every scan uses `lstat`-style non-following inspection. A canonical journal component or entry that
-is a symlink, detectable junction/reparse point, or unexpected object type fails closed.
-Final claims and releases must be non-link regular files. Well-formed regular orphan files are
-allowed only in `tmp/` and never affect ticket order.
+Every initialization and scan enumerates the journal root and kind-directory levels as well as
+`claims/`, `releases/`, and `tmp/`. Only the exact manifest, kind directories, fixed child
+directories, canonical records, and well-formed temporary basenames are allowed. A canonical or
+unexpected entry that is a symlink, detectable junction/reparse point, or unexpected object type
+fails closed; an unexpected ordinary entry is corruption. Final claims and releases must be
+non-link regular files. Well-formed regular orphan files are allowed only in `tmp/` and never
+affect ticket order.
 
-The MASWE-plane read-only fingerprint must exclude exactly
-`runs/<run-id>/.lock-journal-v3/**` as synchronization churn. It must continue hashing
-`run.json`, artifacts, config, and every other `.maswe` path. Tests must prove that the narrow
-exclusion prevents lock activity from false-failing a read-only role while mutations to
-authoritative files still change the fingerprint. This is the journal equivalent of the existing
-exact lock-file exclusions, not a general `.maswe` weakening.
+The MASWE-plane read-only fingerprint excludes only canonical protocol entries under exact
+`runs/<run-id>/.lock-journal-v3/` paths as synchronization churn. Unexpected or malformed journal
+entries remain fingerprint-visible, including unsafe links and unexpected root/kind entries. It
+must continue hashing `run.json`, artifacts, config, and every other `.maswe` path. Tests must
+prove that the narrow exclusion prevents valid lock activity from false-failing a read-only role
+while mutations to authoritative or unexpected journal paths still change the fingerprint. This
+is the journal equivalent of the existing exact lock-file exclusions, not a general `.maswe`
+weakening.
 
 ## Record encoding
 
@@ -475,7 +480,9 @@ recoverer ownership of a different stream.
 A corrupt earlier record blocks later ownership. Non-force recovery always refuses. Force may
 resolve only a data/admin claim whose fixed-width ticket filename is valid and whose entry is one
 stable non-link regular file. The raw release targets that exact filename and raw content digest.
-If bytes or type change, recovery fails closed.
+After preparing the raw release, recovery repeats the same non-following stable-handle byte and
+digest validation immediately before the hard link. No other awaited operation occurs between
+that final validation and the publication attempt. If bytes or type change, recovery fails closed.
 
 Corrupt `admin-recovery` claims, malformed ticket names, multiple interpretations, links,
 unexpected types, and ambiguous records are not automatically force-released. Because liveness

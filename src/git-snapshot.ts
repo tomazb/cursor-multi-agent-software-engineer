@@ -1,5 +1,5 @@
 import { createHash, type Hash } from "node:crypto";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { lstat, readdir, readFile, readlink } from "node:fs/promises";
 import path from "node:path";
 import { spawnCaptured } from "./process.ts";
 
@@ -17,6 +17,58 @@ const MASWE_EPHEMERAL_BASENAMES = new Set([
   ".admin.lock",
   ".admin.lock.recovering",
 ]);
+const JOURNAL_KINDS = new Set(["data", "admin", "admin-recovery"]);
+const JOURNAL_CLAIM_BASENAME = /^([0-9]{20})\.json$/;
+const JOURNAL_EXACT_RELEASE_BASENAME =
+  /^(data|admin|admin-recovery)\.([0-9]{20})\.[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[0-9a-f]{64}\.json$/;
+const JOURNAL_RAW_RELEASE_BASENAME =
+  /^(data|admin|admin-recovery)\.([0-9]{20})\.raw\.[0-9a-f]{64}\.json$/;
+const JOURNAL_TEMP_BASENAME =
+  /^\.(?:claim|release|link-probe|format)\.[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?:\.published)?\.tmp$/;
+
+function isKnownJournalSynchronizationPath(segments: string[]): boolean {
+  if (
+    segments.length < 3 ||
+    segments[0] !== "runs" ||
+    segments[1] === "" ||
+    segments[2] !== ".lock-journal-v3"
+  ) {
+    return false;
+  }
+  const journal = segments.slice(3);
+  if (journal.length === 0) return true;
+  if (journal.length === 1) {
+    return journal[0] === "format.json" || JOURNAL_KINDS.has(journal[0]!);
+  }
+  if (!JOURNAL_KINDS.has(journal[0]!)) return false;
+  if (journal.length === 2) {
+    return ["claims", "releases", "tmp"].includes(journal[1]!);
+  }
+  if (journal.length !== 3) return false;
+  if (journal[1] === "claims") {
+    const claim = JOURNAL_CLAIM_BASENAME.exec(journal[2]!);
+    return Boolean(claim && claim[1] !== "00000000000000000000");
+  }
+  if (journal[1] === "releases") {
+    const exact = JOURNAL_EXACT_RELEASE_BASENAME.exec(journal[2]!);
+    if (exact) {
+      return exact[1] === journal[0] && exact[2] !== "00000000000000000000";
+    }
+    const raw = JOURNAL_RAW_RELEASE_BASENAME.exec(journal[2]!);
+    return Boolean(raw && raw[1] === journal[0]);
+  }
+  if (journal[1] === "tmp") return JOURNAL_TEMP_BASENAME.test(journal[2]!);
+  return false;
+}
+
+function isRunJournalPath(segments: string[]): boolean {
+  return (
+    segments.length >= 3 &&
+    segments[0] === "runs" &&
+    segments[1] !== "" &&
+    segments[2] === ".lock-journal-v3"
+  );
+}
 
 /**
  * Authoritative MASWE paths included in the read-only fingerprint (under `cwd/.maswe`):
@@ -26,7 +78,8 @@ const MASWE_EPHEMERAL_BASENAMES = new Set([
  *
  * Intentionally excluded (ephemeral / self-churn):
  * - `.lock`, `.admin.lock`, `.admin.lock.recovering`
- * - exact `runs/<run-id>/.lock-journal-v3/**` synchronization journals
+ * - canonical entries in exact `runs/<run-id>/.lock-journal-v3/` journals
+ *   (unexpected or malformed entries remain fingerprint-visible)
  * - `*.tmp` write staging files
  *
  * The Git-plane fingerprint pathspec-excludes `.maswe/` entirely; this hasher is
@@ -48,16 +101,11 @@ async function hashMasweAuthoritativeState(cwd: string, hash: Hash): Promise<voi
     .filter((relative) => {
       const base = path.posix.basename(relative);
       if (MASWE_EPHEMERAL_BASENAMES.has(base)) return false;
-      if (base.endsWith(".tmp")) return false;
       const segments = relative.split("/");
-      if (
-        segments.length >= 3 &&
-        segments[0] === "runs" &&
-        segments[1] !== "" &&
-        segments[2] === ".lock-journal-v3"
-      ) {
-        return false;
+      if (isRunJournalPath(segments)) {
+        return !isKnownJournalSynchronizationPath(segments);
       }
+      if (base.endsWith(".tmp")) return false;
       return true;
     })
     .sort();
@@ -66,16 +114,30 @@ async function hashMasweAuthoritativeState(cwd: string, hash: Hash): Promise<voi
     const absolute = path.join(masweRoot, relative);
     let fileStat;
     try {
-      fileStat = await stat(absolute);
+      fileStat = await lstat(absolute);
     } catch {
       continue;
     }
-    if (!fileStat.isFile()) continue;
-    hash.update(`.maswe/${relative}`);
-    try {
-      hash.update(await readFile(absolute));
-    } catch {
-      hash.update("unreadable");
+    const identity = `.maswe/${relative}`;
+    const journalEntry = isRunJournalPath(relative.split("/"));
+    if (fileStat.isSymbolicLink() && journalEntry) {
+      hash.update(`${identity}\0symlink\0`);
+      try {
+        hash.update(await readlink(absolute));
+      } catch {
+        hash.update("unreadable");
+      }
+    } else if (fileStat.isFile()) {
+      hash.update(`${identity}\0file\0`);
+      try {
+        hash.update(await readFile(absolute));
+      } catch {
+        hash.update("unreadable");
+      }
+    } else if (fileStat.isDirectory() && journalEntry) {
+      hash.update(`${identity}\0directory\0`);
+    } else if (journalEntry) {
+      hash.update(`${identity}\0other\0`);
     }
   }
 }

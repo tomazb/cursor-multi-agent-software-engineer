@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   chmod,
+  link as hardLink,
   lstat,
   mkdir,
   mkdtemp,
@@ -137,6 +138,33 @@ test("missing permanent component after manifest publication fails closed", asyn
       error instanceof LockJournalError &&
       error.code === "LOCK_CORRUPT" &&
       /missing permanent/i.test(error.message),
+  );
+});
+
+test("unexpected root and kind entries fail closed after initialization", async () => {
+  const rootEntryRun = await freshRunDirectory("maswe-journal-extra-root-");
+  await initializeLockJournal(rootEntryRun);
+  await writeFile(
+    path.join(rootEntryRun, LOCK_JOURNAL_DIRECTORY, "unexpected"),
+    "unexpected\n",
+  );
+  await assert.rejects(
+    scanLockJournal(rootEntryRun, "data"),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+
+  const kindEntryRun = await freshRunDirectory("maswe-journal-extra-kind-");
+  await initializeLockJournal(kindEntryRun);
+  await symlink(
+    path.join(kindEntryRun, "outside"),
+    path.join(kindEntryRun, LOCK_JOURNAL_DIRECTORY, "data", "unexpected"),
+  );
+  await assert.rejects(
+    scanLockJournal(kindEntryRun, "data"),
+    (error: unknown) =>
+      error instanceof LockJournalError &&
+      error.code === "LOCK_UNSAFE_PATH_TYPE",
   );
 });
 
@@ -307,6 +335,20 @@ test("claim and temporary symlinks are rejected without being followed", async (
   );
 });
 
+test("malformed temporary basenames remain corrupt rather than ignorable", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-temp-name-");
+  await initializeLockJournal(runDirectory);
+  await writeFile(
+    path.join(journalPaths(runDirectory, "data").tmp, ".claim.abc.tmp"),
+    "not-a-protocol-temp\n",
+  );
+  await assert.rejects(
+    scanLockJournal(runDirectory, "data"),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
+  );
+});
+
 test("malformed filenames and unsupported record versions fail closed", async () => {
   const malformedRun = await freshRunDirectory("maswe-journal-name-");
   await initializeLockJournal(malformedRun);
@@ -341,9 +383,12 @@ test("wrong-digest, duplicate, and missing-target releases fail closed", async (
   const claim = await publishLockClaim(wrongDigestRun, "data", "store-write");
   const paths = journalPaths(wrongDigestRun, "data");
   const canonical = canonicalRelease(claim.claim);
+  const changedClaimDigest = `${claim.claimDigest.slice(0, -1)}${
+    claim.claimDigest.endsWith("0") ? "1" : "0"
+  }`;
   await writeFile(
     path.join(paths.releases, releaseBasename(claim.claim)),
-    canonical.bytes.replace(claim.claimDigest.slice(-1), "0"),
+    canonical.bytes.replace(claim.claimDigest, changedClaimDigest),
   );
   await assert.rejects(
     scanLockJournal(wrongDigestRun, "data"),
@@ -463,6 +508,27 @@ test("claim publication preserves both validation and cleanup failures", async (
     },
   );
   assert.deepEqual(await readdir(paths.claims), []);
+});
+
+test("ambiguous EEXIST after exact claim link reconciles as published", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-link-eexist-");
+  let injected = false;
+  const claim = await publishLockClaim(runDirectory, "data", "store-write", {
+    linkFile: async (existingPath, newPath) => {
+      await hardLink(existingPath, newPath);
+      if (!injected) {
+        injected = true;
+        const error = new Error("injected ambiguous EEXIST") as NodeJS.ErrnoException;
+        error.code = "EEXIST";
+        throw error;
+      }
+    },
+  });
+  assert.equal(claim.ticket, 1n);
+  assert.deepEqual(
+    await readdir(journalPaths(runDirectory, "data").claims),
+    ["00000000000000000001.json"],
+  );
 });
 
 test("two claimants may propose one ticket but publish contiguous unique claims", async () => {
@@ -681,6 +747,29 @@ test("forced corrupt-claim resolution is bound to exact raw bytes and preserves 
     (error: unknown) =>
       error instanceof LockJournalError && error.code === "LOCK_CORRUPT",
   );
+});
+
+test("corrupt-claim recovery revalidates exact bytes immediately before release link", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-raw-window-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "data");
+  const claimPath = path.join(paths.claims, "00000000000000000001.json");
+  await writeFile(claimPath, "{first-corrupt-claim");
+
+  await assert.rejects(
+    recoverCurrentLock(runDirectory, "data", {
+      force: true,
+      transition: async (event) => {
+        if (event === "RELEASE_LINK_ATTEMPT_READY") {
+          await writeFile(claimPath, "{changed-before-release-link");
+        }
+      },
+    }),
+    (error: unknown) =>
+      error instanceof LockJournalError &&
+      error.code === "LOCK_OWNERSHIP_LOST",
+  );
+  assert.deepEqual(await readdir(paths.releases), []);
 });
 
 test("corrupt-claim recovery digests exact binary bytes without UTF-8 replacement", async () => {

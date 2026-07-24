@@ -103,7 +103,10 @@ test("non-Git lock-file and temporary-file churn does not change fingerprint", a
   );
   await mkdir(journalReleases, { recursive: true });
   await writeFile(
-    path.join(journalReleases, "data.00000000000000000001.example.json"),
+    path.join(
+      journalReleases,
+      `data.00000000000000000001.raw.${"a".repeat(64)}.json`,
+    ),
     "published synchronization record\n",
     "utf8",
   );

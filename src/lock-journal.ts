@@ -185,6 +185,8 @@ export interface PublishClaimOptions {
     event: JournalTransition,
     context: JournalTransitionContext,
   ) => Promise<void>;
+  /** Test seam for injected hard-link result semantics. */
+  linkFile?: typeof link;
 }
 
 const LOCK_KINDS: LockKind[] = ["data", "admin", "admin-recovery"];
@@ -202,7 +204,7 @@ const UUID_PATTERN =
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const CLAIM_BASENAME_PATTERN = /^([0-9]{20})\.json$/;
 const TEMP_BASENAME_PATTERN =
-  /^\.(?:claim|release|link-probe)\.[0-9a-f-]+(?:\.published)?\.tmp$/;
+  /^\.(?:claim|release|link-probe|format)\.[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?:\.published)?\.tmp$/;
 
 function errno(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
@@ -918,6 +920,8 @@ async function publishManifest(
 ): Promise<void> {
   const temporary = path.join(
     path.dirname(manifestPath),
+    "data",
+    "tmp",
     `.format.${randomUUID()}.tmp`,
   );
   let handle;
@@ -1022,6 +1026,49 @@ function allFixedDirectories(runDirectory: string): string[] {
   return directories;
 }
 
+async function rejectUnexpectedEntry(
+  directory: string,
+  basename: string,
+): Promise<never> {
+  const unexpectedPath = path.join(directory, basename);
+  let stat;
+  try {
+    stat = await lstat(unexpectedPath);
+  } catch (error) {
+    if (errno(error) === "ENOENT") {
+      throw corrupt(`Unexpected journal entry changed during validation: ${unexpectedPath}`);
+    }
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new LockJournalError(
+      "LOCK_UNSAFE_PATH_TYPE",
+      `Unexpected journal namespace entry has an unsafe type: ${unexpectedPath}`,
+    );
+  }
+  throw corrupt(`Unexpected journal namespace entry: ${unexpectedPath}`);
+}
+
+async function validatePermanentNamespace(runDirectory: string): Promise<void> {
+  const root = path.join(runDirectory, LOCK_JOURNAL_DIRECTORY);
+  const allowedRoot = new Set(["format.json", ...LOCK_KINDS]);
+  for (const basename of await readdir(root)) {
+    if (!allowedRoot.has(basename)) {
+      await rejectUnexpectedEntry(root, basename);
+    }
+  }
+  for (const kind of LOCK_KINDS) {
+    const paths = journalPaths(runDirectory, kind);
+    const allowedKind = new Set(["claims", "releases", "tmp"]);
+    for (const basename of await readdir(paths.kind)) {
+      if (!allowedKind.has(basename)) {
+        await rejectUnexpectedEntry(paths.kind, basename);
+      }
+    }
+    await validateTemporaryEntries(paths.tmp);
+  }
+}
+
 async function hasPreManifestPublishedRecords(
   runDirectory: string,
 ): Promise<boolean> {
@@ -1059,12 +1106,14 @@ export async function initializeLockJournal(
         );
       }
     }
+    await validatePermanentNamespace(runDirectory);
     return;
   }
 
   for (const directory of fixedDirectories) {
     await createOrValidateDirectory(directory);
   }
+  await validatePermanentNamespace(runDirectory);
   if (await hasPreManifestPublishedRecords(runDirectory)) {
     // Another initializer may have completed the manifest and a claimant may then have
     // published while this actor was creating components. That is a valid completed journal,
@@ -1083,6 +1132,7 @@ export async function initializeLockJournal(
     await probeHardLink(journalPaths(runDirectory, kind).tmp, linkFile);
   }
   await publishManifest(manifestPath, linkFile);
+  await validatePermanentNamespace(runDirectory);
 }
 
 async function validateTemporaryEntries(tmpDirectory: string): Promise<void> {
@@ -1355,6 +1405,44 @@ async function finishTemporaryCleanup(
   throw new AggregateError(cleanupErrors, `${context} temporary cleanup failed`);
 }
 
+async function reconcileClaimPublication(
+  finalPath: string,
+  canonical: CanonicalRecord<ClaimRecordV3>,
+  publicationError: unknown,
+): Promise<"published" | "conflict"> {
+  let finalBytes: string;
+  try {
+    finalBytes = await readOrdinaryRecord(finalPath);
+  } catch (validationError) {
+    try {
+      await lstat(finalPath);
+    } catch (inspectionError) {
+      if (errno(inspectionError) === "ENOENT") {
+        throw new LockJournalError(
+          "LOCK_UNSUPPORTED_FILESYSTEM",
+          `Atomic no-clobber claim publication failed without a final record`,
+          { cause: publicationError },
+        );
+      }
+      throw inspectionError;
+    }
+    throw validationError;
+  }
+  const existing = parseClaimBytes(
+    finalBytes,
+    canonical.record.kind,
+    parseLockTicket(canonical.record.ticket),
+  );
+  if (
+    finalBytes === canonical.bytes &&
+    existing.owner === canonical.record.owner &&
+    existing.claimDigest === canonical.record.claimDigest
+  ) {
+    return "published";
+  }
+  return "conflict";
+}
+
 async function prepareAndPublishClaim(
   paths: LockJournalPaths,
   canonical: CanonicalRecord<ClaimRecordV3>,
@@ -1390,23 +1478,17 @@ async function prepareAndPublishClaim(
     await requirePreparedBytes(temporaryPath, canonical.bytes);
     await options.transition?.("CLAIM_LINK_ATTEMPT_READY", context);
     try {
-      await link(temporaryPath, finalPath);
+      await (options.linkFile ?? link)(temporaryPath, finalPath);
     } catch (error) {
-      if (errno(error) === "EEXIST") return "conflict";
-      try {
-        const existing = await readOrdinaryRecord(finalPath);
-        if (existing === canonical.bytes) {
-          await options.transition?.("CLAIM_PUBLISHED", context);
-          return "published";
-        }
-      } catch {
-        // The original link failure is authoritative when exact reconciliation fails.
-      }
-      throw new LockJournalError(
-        "LOCK_UNSUPPORTED_FILESYSTEM",
-        `Atomic no-clobber claim publication failed`,
-        { cause: error },
+      const reconciliation = await reconcileClaimPublication(
+        finalPath,
+        canonical,
+        error,
       );
+      if (reconciliation === "published") {
+        await options.transition?.("CLAIM_PUBLISHED", context);
+      }
+      return reconciliation;
     }
     await options.transition?.("CLAIM_PUBLISHED", context);
     const finalBytes = await readOrdinaryRecord(finalPath);
@@ -1789,22 +1871,34 @@ async function publishRawClaimRelease(
   runDirectory: string,
   kind: LockKind,
   observed: RawClaimOverlay,
+  options: Pick<PublishClaimOptions, "transition"> = {},
 ): Promise<CanonicalRecord<RawClaimReleaseRecordV3>> {
   const claimPath = path.join(
     journalPaths(runDirectory, kind).claims,
     observed.basename,
   );
-  const currentBytes = await readStableOrdinaryBytes(claimPath);
-  if (!currentBytes.equals(observed.rawBytes) || digest(currentBytes) !== observed.rawDigest) {
-    throw new LockJournalError(
-      "LOCK_OWNERSHIP_LOST",
-      `Corrupt ${kind} claim bytes changed before exact raw resolution`,
-    );
-  }
+  const requireUnchangedTarget = async (): Promise<void> => {
+    const currentBytes = await readStableOrdinaryBytes(claimPath);
+    if (
+      !currentBytes.equals(observed.rawBytes) ||
+      digest(currentBytes) !== observed.rawDigest
+    ) {
+      throw new LockJournalError(
+        "LOCK_OWNERSHIP_LOST",
+        `Corrupt ${kind} claim bytes changed before exact raw resolution`,
+      );
+    }
+  };
+  await requireUnchangedTarget();
   const canonical = canonicalRawClaimRelease(observed, kind);
   const paths = journalPaths(runDirectory, kind);
   const temporaryPath = path.join(paths.tmp, `.release.${randomUUID()}.tmp`);
   const finalPath = path.join(paths.releases, rawClaimReleaseBasename(observed, kind));
+  const context: JournalTransitionContext = {
+    kind,
+    ticket: observed.ticket,
+    owner: observed.rawDigest,
+  };
   let fileHandle;
   let created = false;
   let primaryError: unknown;
@@ -1821,6 +1915,9 @@ async function publishRawClaimRelease(
       // Permission modes are advisory on some supported platforms.
     }
     await requirePreparedBytes(temporaryPath, canonical.bytes);
+    await options.transition?.("RELEASE_PREPARED", context);
+    await options.transition?.("RELEASE_LINK_ATTEMPT_READY", context);
+    await requireUnchangedTarget();
     try {
       await link(temporaryPath, finalPath);
     } catch (error) {
@@ -1900,7 +1997,12 @@ export async function recoverCurrentLock(
           `Corrupt ${kind} ticket ${ticketText} cannot be resolved under the current policy`,
         );
       }
-      await publishRawClaimRelease(runDirectory, kind, rawClaim);
+      await publishRawClaimRelease(
+        runDirectory,
+        kind,
+        rawClaim,
+        options.transition ? { transition: options.transition } : {},
+      );
       return;
     }
 
