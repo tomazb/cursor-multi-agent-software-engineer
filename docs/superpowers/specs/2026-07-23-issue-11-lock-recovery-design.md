@@ -25,8 +25,9 @@ implemented with Node.js core filesystem APIs.
 - A claimant publishes a complete immutable claim at the next contiguous numeric ticket.
 - Complete records are prepared in `tmp/` and atomically published with a no-clobber hard link.
 - The owner is the valid unreleased claim with the smallest ticket for that lock kind.
-- Normal release, cancellation, and forced recovery publish one immutable release record targeting
-  an exact claim ticket, UUID, kind, and digest. They never delete or modify the claim.
+- For valid claims, normal release, cancellation, and forced recovery publish one immutable
+  release record targeting an exact claim ticket, UUID, kind, and digest. They never delete or
+  modify the claim. Corrupt-claim recovery uses the separately defined raw-path/digest target.
 - The administrative-recovery stream orders recoverers without a recursively higher recovery lock.
 - No conforming Issue #11 path deletes a claim, release, permanent journal directory, or reusable
   canonical owner pathname.
@@ -898,7 +899,7 @@ During Phase B, implementation updates:
 | [Node.js 22.22 `FileHandle.sync`](https://nodejs.org/download/release/v22.22.0/docs/api/fs.html#filehandlesync) | Requests that file data be flushed; the exact durability is operating-system and device specific. |
 | [Node.js 22.22 filesystem flags](https://nodejs.org/download/release/v22.22.0/docs/api/fs.html#file-system-flags) | `wx` fails if the path exists; Node warns exclusive flags may not work on network filesystems and maps create-exclusive semantics on Windows. |
 | [Node.js 22.22 `fsPromises.link`](https://nodejs.org/download/release/v22.22.0/docs/api/fs.html#fspromiseslinkexistingpath-newpath) | Node exposes path-based creation of a new hard link and fulfills with `undefined`; it exposes no `linkat` directory-handle parameters. |
-| [POSIX `open`/`openat`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/open.html) | `O_CREAT|O_EXCL` fails when the name exists; `openat` binds relative resolution to an existing directory descriptor and avoids pathname-parent races at the native API level. |
+| [POSIX `open`/`openat`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/open.html) | `O_CREAT\|O_EXCL` fails when the name exists; `openat` binds relative resolution to an existing directory descriptor and avoids pathname-parent races at the native API level. |
 | [POSIX `link`/`linkat`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/link.html) | `link` atomically creates a new directory entry and creates none on failure; `linkat` offers descriptor-relative resolution in native APIs. |
 | [POSIX `mkdir`/`mkdirat`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/mkdir.html) | `mkdir` creates an empty directory; `mkdirat` is descriptor-relative. Node exposes the former behavior but not the latter signature. |
 | [Linux `link(2)`](https://man7.org/linux/man-pages/man2/link.2.html) | Existing `newpath` is not overwritten, `EEXIST` reports conflict, hard links cannot cross filesystems, and unsupported filesystems may return `EPERM`. |

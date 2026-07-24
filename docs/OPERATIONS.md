@@ -80,10 +80,11 @@ maswe unlock-admin <run-id>
 maswe unlock-admin <run-id> --force   # only after confirming data/admin actors are quiescent
 ```
 
-Administrative recovery first publishes and owns a ticket in the separate `admin-recovery`
-stream. Resolving a dead predecessor does not grant ownership; contenders rescan, and exactly the
-smallest unreleased recovery ticket enters. A live recovery owner is never force-released.
-Corrupt/ambiguous recovery claims remain fail closed.
+Administrative recovery first publishes a ticket in the separate `admin-recovery` stream. During
+forced bootstrap, a contender may exactly release one eligible dead predecessor, but that
+publication does not grant recovery ownership. Every contender rescans; only the smallest
+unreleased recovery ticket may enter the recovery critical section. A live recovery owner is never
+force-released. Corrupt/ambiguous recovery claims remain fail closed.
 
 Useful semantic failures include `LOCK_LIVE_OWNER`, `LOCK_DEAD_OWNER`, `LOCK_QUEUED`,
 `LOCK_CORRUPT`, `LOCK_UNSAFE_PATH_TYPE`, `LOCK_OWNERSHIP_LOST`,

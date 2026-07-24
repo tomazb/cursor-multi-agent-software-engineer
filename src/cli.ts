@@ -33,7 +33,7 @@ Options:
   --config <path>  Use a specific config file.
   --cwd <path>     Run against a different repository directory.
   --json           Print machine-readable output.
-  --force          Assert operator quiescence and publish an exact recovery release.
+  --force          init: replace config; unlock*: assert quiescence and release exactly.
 `;
 }
 

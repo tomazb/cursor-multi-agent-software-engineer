@@ -293,10 +293,12 @@ Before protected work, the claimant validates every exact lower ticket/release p
 that its own canonical release is absent. Enumeration discovers state but is not proof that a
 lower ticket is absent.
 
-Release, queued cancellation, and forced recovery all publish the same deterministic immutable
-release marker for one exact kind, ticket, UUID, and claim digest. They never delete or edit a
-claim, release, successor, or journal directory. The `admin-recovery` stream uses the same ordering
-and has no recursively higher lock; a live recovery owner is never force-released.
+For valid claims, release, queued cancellation, and forced recovery all publish the same
+deterministic immutable release marker for one exact kind, ticket, UUID, and claim digest. Forced
+resolution of one eligible corrupt data/admin record instead uses `targetMode: "raw-claim"` bound
+to the stable claim filename and exact raw-byte digest. Neither form deletes or edits a claim,
+release, successor, or journal directory. The `admin-recovery` stream uses the same ordering and
+has no recursively higher lock; a live recovery owner is never force-released.
 
 Ticket zero is a read-only compatibility overlay for a PR #10 `.lock`, `.admin.lock`, or
 `.admin.lock.recovering` object. A v3 resolution binds its exact raw digest and leaves the legacy

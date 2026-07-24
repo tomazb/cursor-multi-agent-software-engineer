@@ -679,7 +679,7 @@ git commit -m "docs: document immutable ticket lock journals"
 - [ ] Audit production call sites:
 
   ```bash
-  rg -n 'rm\\(|unlink\\(|rmdir\\(|rename\\(|link\\(|open\\(|mkdir\\(|recursive:|force:|\\.lock-journal-v3|\\.admin\\.lock|\\.lock' src
+  rg -n 'rm\(|unlink\(|rmdir\(|rename\(|link\(|open\(|mkdir\(|recursive:|force:|\.lock-journal-v3|\.admin\.lock|\.lock' src
   ```
 
 - [ ] Confirm:
