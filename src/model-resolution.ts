@@ -180,7 +180,18 @@ function isApprovedSmokeModelId(modelId: string): boolean {
   });
 }
 
-function throwIfAmbiguousSmokeSelection(family: string, error: unknown): void {
+function isApprovedSmokeFamilyHint(value: string): boolean {
+  return (SMOKE_MODEL_FAMILY_ALLOWLIST as readonly string[]).includes(value);
+}
+
+function throwPreferredAmbiguity(preferred: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/Ambiguous model/i.test(message)) {
+    throw new Error(`Ambiguous preferred smoke-model selection '${preferred}': ${message}`);
+  }
+}
+
+function throwAutomaticAmbiguity(family: string, error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   if (/Ambiguous model/i.test(message)) {
     throw new Error(`Ambiguous smoke-model selection for approved family '${family}': ${message}`);
@@ -189,9 +200,10 @@ function throwIfAmbiguousSmokeSelection(family: string, error: unknown): void {
 
 /**
  * Pick a concrete catalogue model for smoke helpers.
- * Automatic selection resolves only within the ordered allowlist. An explicit
- * override is an exact-ID contract: it must be present and satisfy the same
- * family/effort policy, and it never falls back to another model.
+ * Automatic selection resolves only within the ordered allowlist. A preferred
+ * exact ID must be present and satisfy the same family/effort policy. For safe
+ * compatibility, a preferred value equal to one literal allowlist family may
+ * act as a family hint; no other absent or logical preferred value is eligible.
  */
 export function pickCatalogueModel(catalogue: Iterable<string>, preferred?: string): string {
   const ids = [...new Set([...catalogue].map((id) => id.trim().toLowerCase()).filter(Boolean))];
@@ -199,19 +211,29 @@ export function pickCatalogueModel(catalogue: Iterable<string>, preferred?: stri
     throw new Error("Model catalogue is empty. Run 'agent models' and confirm Cursor CLI auth.");
   }
 
-  const exactPreferred = preferred?.trim().toLowerCase();
-  if (exactPreferred) {
-    if (!ids.includes(exactPreferred)) {
-      throw new Error(
-        `Preferred exact smoke model '${preferred}' is absent from the discovered catalogue. Explicit overrides never fall back to another model.`,
-      );
+  const normalizedPreferred = preferred?.trim().toLowerCase();
+  if (normalizedPreferred) {
+    if (ids.includes(normalizedPreferred)) {
+      if (!isApprovedSmokeModelId(normalizedPreferred)) {
+        throw new Error(
+          `Preferred exact smoke model '${preferred}' is present but belongs to a disallowed family (approved families: ${SMOKE_MODEL_FAMILY_ALLOWLIST.join(", ")}).`,
+        );
+      }
+      return normalizedPreferred;
     }
-    if (!isApprovedSmokeModelId(exactPreferred)) {
-      throw new Error(
-        `Preferred exact smoke model '${preferred}' is present but belongs to a disallowed family (approved families: ${SMOKE_MODEL_FAMILY_ALLOWLIST.join(", ")}).`,
-      );
+
+    try {
+      const resolvedHint = resolveLogicalModelId(normalizedPreferred, ids);
+      if (isApprovedSmokeFamilyHint(normalizedPreferred)) {
+        return resolvedHint;
+      }
+    } catch (error) {
+      throwPreferredAmbiguity(preferred, error);
     }
-    return exactPreferred;
+
+    throw new Error(
+      `Preferred exact smoke model '${preferred}' is absent from the discovered catalogue. Only literal approved-family hints may resolve logically; explicit exact overrides never fall back.`,
+    );
   }
 
   const errors: string[] = [];
@@ -219,7 +241,7 @@ export function pickCatalogueModel(catalogue: Iterable<string>, preferred?: stri
     try {
       return resolveLogicalModelId(family, ids);
     } catch (error) {
-      throwIfAmbiguousSmokeSelection(family, error);
+      throwAutomaticAmbiguity(family, error);
       errors.push(error instanceof Error ? error.message : String(error));
     }
   }

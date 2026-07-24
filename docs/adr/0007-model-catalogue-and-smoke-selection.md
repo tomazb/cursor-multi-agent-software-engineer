@@ -1,4 +1,4 @@
-# ADR-0005: Treat catalogue rows and smoke overrides as executable policy inputs
+# ADR-0007: Treat catalogue rows and smoke preferences as executable policy inputs
 
 - Status: Accepted
 - Date: 2026-07-24
@@ -6,10 +6,10 @@
 ## Context
 
 Cursor CLI model discovery is executable configuration. MASWE uses its output to resolve logical
-role models and to select an exact model for opt-in authenticated smoke tests. Two narrow trust
+role models and to select a concrete model for opt-in authenticated smoke tests. Two narrow trust
 boundary gaps remained after v0.2:
 
-- a preferred smoke model could resolve outside the approved smoke-family allowlist; and
+- a preferred exact smoke model could resolve outside the approved smoke-family allowlist; and
 - an ID-shaped token followed by ordinary prose could be mistaken for a catalogue row.
 
 The existing exact-ID run snapshot and effort-aware logical resolution contracts must remain
@@ -48,24 +48,30 @@ Automatic smoke selection continues to resolve the ordered allowlist:
 2. `gpt-5.6-sol-high`
 3. `claude-fable-5`
 
-A preferred smoke override is now an exact-ID contract. MASWE first requires a case-normalized exact
-catalogue match, then verifies that the ID belongs to an approved logical family. An allowlist entry
-with an explicit effort suffix also constrains the override to that effort; for example,
-`gpt-5.6-sol-high` does not authorize a medium variant. An absent or disallowed override fails
-closed and never falls back to automatic selection. Ambiguous automatic family resolution also
-fails closed with a distinct ambiguity error.
+A preferred value that exactly matches a discovered catalogue ID is an exact-ID contract: MASWE
+requires that exact ID to belong to an approved logical family. An allowlist entry with an explicit
+effort suffix also constrains the exact ID to that effort; for example, `gpt-5.6-sol-high` does not
+authorize a medium variant. An absent or disallowed exact ID fails closed and never falls back.
 
-Authenticated smoke tests may set `MASWE_MODEL_BRAINSTORMER`, but its value must be an exact model ID
-returned by the same `agent models` catalogue and approved by this policy. Omitting the variable uses
-the ordered automatic allowlist.
+For compatibility with existing smoke fixtures, a preferred value may instead equal one literal
+allowlist entry and act as an approved family hint. No other absent or logical preferred value is
+eligible. This compatibility path cannot broaden the family policy: it invokes the same ordered,
+effort-aware resolver for that already approved allowlist token. Ambiguous exact or logical
+preferences fail closed with a distinct ambiguity error.
+
+Authenticated smoke tests may set `MASWE_MODEL_BRAINSTORMER`. Use an exact model ID returned by the
+same `agent models` catalogue when pinning a concrete smoke model. Omitting the variable uses the
+ordered automatic allowlist; a literal allowlist token is accepted only as the bounded family-hint
+compatibility form described above.
 
 ## Consequences
 
 ### Positive
 
-- Explicit and automatic smoke paths enforce one family and effort policy.
+- Explicit exact IDs and automatic selection enforce one family and effort policy.
+- The only logical preference compatibility path is itself the literal allowlist.
 - Leading-ID prose cannot become executable model configuration.
-- Failures distinguish absent overrides, disallowed families, malformed catalogue rows, and
+- Failures distinguish absent exact IDs, disallowed families, malformed catalogue rows, and
   ambiguous selection.
 - Persisted exact run IDs and new-run effort-aware resolution are unchanged.
 

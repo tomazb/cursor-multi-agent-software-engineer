@@ -16,7 +16,18 @@ agent models
 maswe doctor
 ```
 
-Model catalogue mismatches require a config edit, not a prompt workaround.
+Model catalogue mismatches require a config edit, not a prompt workaround. MASWE accepts the first
+model-ID field only from recognized catalogue rows: an ID alone or after a known selection prefix,
+optionally followed by `(default)`, a spaced dash description, a tab-separated column, or a column
+aligned with at least two spaces. ANSI decoration is stripped. A line such as
+`gpt-4-turbo is recommended for this task` is leading-ID prose, not a model row. Empty,
+headings-only, malformed-only, and otherwise unparseable catalogues fail closed.
+
+Authenticated smoke helpers choose only from the approved family allowlist. A preferred concrete
+smoke model must be an exact ID present in the discovered catalogue and must satisfy the same family
+and effort policy; an invalid exact preference never falls back. For compatibility, one literal
+allowlist family token may be used as a bounded family hint. Omit the preference for normal ordered
+automatic selection.
 
 ## Start
 

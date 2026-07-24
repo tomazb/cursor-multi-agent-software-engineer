@@ -23,9 +23,9 @@ The project follows semantic versioning once a public release process is establi
 - PR #10 regular-file locks are read as virtual ticket zero during a quiescent upgrade. New code
   never writes or deletes the legacy path; mixed old/new execution and rollback after v3
   publication are unsupported.
-- Explicit smoke-model overrides are now exact-ID contracts: the ID must be present in the live
-  catalogue and satisfy the same approved-family and effort policy as automatic smoke selection.
-  Invalid overrides fail closed without falling back.
+- Preferred exact smoke-model IDs must now be present in the live catalogue and satisfy the same
+  approved-family and effort policy as automatic selection; invalid exact preferences fail closed
+  without falling back. A literal allowlist token remains available only as a bounded family hint.
 - Cursor catalogue parsing now accepts only documented row structures, rejects single-space
   leading-ID prose, and reports malformed row candidates distinctly when no valid IDs remain.
 
