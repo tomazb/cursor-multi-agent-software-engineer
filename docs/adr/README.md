@@ -5,5 +5,6 @@
 - [ADR-0003: Independent read-only verification](0003-independent-read-only-verification.md)
 - [ADR-0004: Runtime adapters and configurable models](0004-runtime-adapters-and-configurable-models.md)
 - [ADR-0005: Deterministic git and GitHub side effects](0005-deterministic-git-and-github-side-effects.md)
+- [ADR-0006: Immutable ticket journals for local lock ownership](0006-immutable-local-lock-journals.md)
 
 Use the next sequential number. Record context, decision, consequences, and rejected alternatives. Do not rewrite accepted history silently; supersede an ADR with a new one when the decision changes.

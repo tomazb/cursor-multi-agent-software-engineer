@@ -15,7 +15,7 @@
 
 **Blocked prototype:** `a1ad79bedc8ca2a6a51d3af7597f5eb25c4faa23`
 
-**Status:** `APPROVED_FOR_PHASE_B_V3_IMPLEMENTATION`
+**Status:** `PHASE_B_V3_IMPLEMENTED; EXACT_HEAD_VERIFICATION_PENDING`
 
 **Goal:** Replace reusable-path lock ownership with a version-3 append-only ticket journal whose
 immutable no-clobber claims, exact-target releases, monotonic ordering, and self-serializing
@@ -58,6 +58,26 @@ passed. The unchanged baseline full suite reproduced five unrelated failures in
 `ready-review-corrections`, and `store-locking`; these predate v3 production changes and must not
 be hidden or attributed to Issue #11. Final verification must report their disposition without
 weakening unrelated behavior.
+
+## Implementation evidence before final verification
+
+The implementation followed the approved design without using the blocked v2 lifecycle:
+
+- `6f2c512` finalized the mandatory v3 invariants before production edits.
+- `f3b7c5f` added permanent journal initialization and hard-link capability validation.
+- `ef18458` added canonical record classification and fail-closed parsing.
+- `fdd7eff` added contiguous no-clobber claim publication.
+- `172d2d7` integrated exact-range ownership, canonical release, data/admin recovery,
+  administrative-recovery ordering, corrupt raw-digest resolution, legacy ticket zero, and store
+  call sites.
+- `366261f` added real-process crash/race barriers and opt-in 25/100 repetition selection.
+- `bb2a7b8` implemented and tested the exact fingerprint exclusion.
+
+The implementation uses `src/lock-journal.ts`; it did not cherry-pick the blocked v2 production
+lifecycle. `src/cli.ts` changes only user-facing recovery wording. Existing Issue #2 lock tests
+were adapted where their reusable-path assumptions were incompatible; optimistic versions, atomic
+run/artifact writes, approval/model/scope/verification policy, and state transitions were not
+weakened.
 
 ## Expected files
 

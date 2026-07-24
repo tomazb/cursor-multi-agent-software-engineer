@@ -49,7 +49,14 @@ MASWE must prevent untrusted requests, model output, repository content, and PR 
 - In both Git and non-Git working directories the fingerprint also covers authoritative `.maswe` state under `cwd` (project config, `runs/*/run.json`, durable artifacts) via the MASWE-plane hashing contract.
 - A mismatch fails the run.
 
-**Gap:** Detection occurs after the process runs; it is a mutation detector, not a preventive OS-level sandbox. External side effects outside the fingerprinted working directory are not covered. Ephemeral `.maswe` locks (`.lock`, `.admin.lock`, `.admin.lock.recovering`) and `*.tmp` staging files are intentionally excluded from the fingerprint. Non-Git directories do not fingerprint ordinary files outside `.maswe` (there is no Git status/diff plane); workspace identity fields still use the `not-a-git-repository` sentinel separately from the digest fingerprint.
+**Gap:** Detection occurs after the process runs; it is a mutation detector, not a preventive
+OS-level sandbox. External side effects outside the fingerprinted working directory are not
+covered. Ephemeral legacy locks, `*.tmp` staging files, and exact
+`runs/<run-id>/.lock-journal-v3/**` synchronization paths are intentionally excluded from the
+fingerprint; the exclusion does not apply to similarly named paths elsewhere under `.maswe`.
+Non-Git directories do not fingerprint ordinary files outside `.maswe` (there is no Git status/diff
+plane); workspace identity fields still use the `not-a-git-repository` sentinel separately from
+the digest fingerprint.
 
 ### T3 — Builder or resolver exceeds scope
 
@@ -165,6 +172,34 @@ A near-term change should pass large prompts through stdin or SDK calls rather t
 - Fallback models are disabled by default.
 
 **Future controls:** per-run token, time, and monetary budgets; concurrency quotas; organization-level kill switch.
+
+### T12 — Lock recovery releases a replacement owner
+
+**Threat:** A delayed owner or forced recoverer validates a reusable lock pathname, another process
+replaces it, and the delayed actor removes the replacement. Concurrent administrative recoverers
+could similarly overlap.
+
+**Controls:**
+
+- Version-3 ownership is an immutable claim in a permanent append-only journal, never a reusable
+  pathname or directory identity.
+- Claims and releases are complete, canonical, digest-validated regular files published with an
+  atomic no-clobber hard link.
+- The owner is the smallest valid unreleased contiguous ticket; every claimant validates exact
+  lower paths and its own release state immediately before protected work.
+- Normal release and force publish one canonical marker for an exact claim identity. They never
+  delete claims, releases, successors, or journal infrastructure.
+- Administrative recoverers use their own ordered stream. A live recovery claim cannot be
+  force-released.
+- Links, detectable junctions/reparse points, unexpected types, gaps, malformed records, digest
+  mismatch, unsupported filesystems, and ambiguous process identity fail closed.
+
+**Boundary:** This is cooperative same-host locking on a coherent local filesystem. `--force` is
+an operator assertion of quiescence, not process fencing; misuse cannot stop a genuinely active
+process. Malicious same-user or OS-level replacement of permanent journal infrastructure is outside
+the current threat model. NFS, SMB, distributed FUSE, object-store mounts, cross-host access, and
+filesystems without coherent no-clobber hard links are unsupported. General Windows support is not
+claimed without exact-head native NTFS validation.
 
 ## Least-privilege target design
 

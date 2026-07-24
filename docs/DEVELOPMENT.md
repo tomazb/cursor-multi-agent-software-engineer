@@ -25,12 +25,30 @@ npm run dev -- help
 npm run dev -- status --cwd /path/to/target
 ```
 
+Issue #11 lock-journal checks use real child processes and parent-controlled IPC barriers:
+
+```bash
+node --experimental-strip-types test/issue11-lock-journal.test.ts
+node --experimental-strip-types test/issue11-lock-contention.test.ts
+MASWE_ISSUE11_ALLOCATION_ITERATIONS=25 \
+  node --experimental-strip-types --test-name-pattern='allocation contention repetition' \
+  test/issue11-lock-contention.test.ts
+MASWE_ISSUE11_RELEASE_ITERATIONS=100 \
+  node --experimental-strip-types --test-name-pattern='owner recovery successor repetition' \
+  test/issue11-lock-contention.test.ts
+```
+
+The environment variables select iteration counts; watchdog timeouts only fail hangs and never
+advance a race. These commands are native Linux coverage on CI. Do not label them Windows-native
+without running the exact head on local NTFS.
+
 ## Source boundaries
 
 ```text
 src/domain.ts             stable contracts and data types
 src/state-machine.ts      all legal state transitions
 src/store.ts              RunStore interface and atomic file persistence
+src/lock-journal.ts       immutable local ticket claims, releases, and recovery
 src/orchestrator.ts       workflow policy and stage execution
 src/prompt-builder.ts     prompt-template assembly
 src/quality.ts            deterministic project command runner

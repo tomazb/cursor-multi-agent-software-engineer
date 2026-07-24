@@ -118,7 +118,11 @@ It does not contain Cursor SDK implementation details, shell output parsing, or 
     └── 09-resolution-report.md
 ```
 
-`run.json` is an event-bearing snapshot, not an event-sourced database. It stores enough history for audit and recovery in a single-process local deployment. Mutating operations take an exclusive data lock (temp+`link` complete `{pid,owner,at}` record) coordinated with explicit `unlock` through a dedicated `.admin.lock`. Automatic stale reclaim is not used for data locks **or** admin locks; operators use `maswe unlock` / `maswe unlock-admin`. `writeArtifact` rejects stale caller versions and only mutates authoritative on-disk state so concurrent cancellation or state transitions cannot lose events, approvals, counters, evidence, or failure records.
+`run.json` is an event-bearing snapshot, not an event-sourced database. It stores enough history
+for audit and recovery in a single-host local deployment. Mutating operations use the permanent
+per-run `.lock-journal-v3/` ticket journal described below. `writeArtifact` still rejects stale
+caller versions and only mutates authoritative on-disk state, so the lock change does not weaken
+optimistic versions or atomic run/artifact publication.
 
 Artifacts are SHA-256 hashed when written. A future store can place content in object storage and keep the same reference contract.
 
@@ -153,7 +157,14 @@ The optional SDK import means the CLI can build and run without installing the b
 - **Non-Git mode:** a stable namespace sentinel (not the invariant identity string) so the digest remains deterministic when nothing authoritative changes.
 - **Both modes:** authoritative `.maswe` state under the fingerprinted `cwd`, hashed only through the MASWE-plane hasher: project config, `runs/*/run.json`, and durable artifact files.
 
-Intentionally excluded from the MASWE portion (expected orchestration churn): `.lock`, `.admin.lock`, `.admin.lock.recovering`, and `*.tmp` staging files. Isolated worktrees fingerprint their own `cwd` (typically without a local `.maswe` store); non-isolated checkouts include the operator-tree `.maswe` so read-only roles cannot mutate handoffs undetected. Workspace identity fields (`baseSha` / `headSha` / `branch`) may still record `not-a-git-repository` for non-Git trees; that sentinel is separate from the fingerprint digest.
+Intentionally excluded from the MASWE portion (expected orchestration churn): `.lock`,
+`.admin.lock`, `.admin.lock.recovering`, exact
+`runs/<run-id>/.lock-journal-v3/**` journal paths, and `*.tmp` staging files. The journal exclusion
+is deliberately path-specific; a `.lock-journal-v3` name elsewhere under `.maswe` remains
+fingerprinted. Isolated worktrees fingerprint their own `cwd` (typically without a local `.maswe`
+store); non-isolated checkouts include the operator-tree `.maswe` so read-only roles cannot mutate
+handoffs undetected. Workspace identity fields (`baseSha` / `headSha` / `branch`) may still record
+`not-a-git-repository` for non-Git trees; that sentinel is separate from the fingerprint digest.
 
 Read-only runtimes compare the fingerprint before and after execution. Any difference fails the run. This is a mutation detector, not an operating-system sandbox. A future sandbox can prevent writes rather than merely detecting them.
 
@@ -256,7 +267,41 @@ See `docs/GITHUB_APP.md`.
 
 ## 9. Consistency and concurrency
 
-v0.2 uses optimistic `version` checks and atomic writes per run. Concurrent writers against the same run still fail closed rather than merge updates.
+v0.2 uses optimistic `version` checks and atomic writes per run. Concurrent writers against the
+same run still fail closed rather than merge updates.
+
+### 9.1 Immutable local lock journals
+
+Each run owns permanent, separately ordered `data`, `admin`, and `admin-recovery` streams:
+
+```text
+.lock-journal-v3/
+├── format.json
+├── data/{claims,releases,tmp}/
+├── admin/{claims,releases,tmp}/
+└── admin-recovery/{claims,releases,tmp}/
+```
+
+Infrastructure initialization creates each directory non-recursively and validates existing
+components without following links. Directories are never ownership identities and conforming
+code never deletes, replaces, or recursively removes them.
+
+Claims use contiguous 20-digit `BigInt` tickets beginning at one. A claimant writes and syncs
+canonical JSON to an exclusive temporary regular file, closes it, and hard-links it to the
+deterministic claim path without clobbering. The owner is the smallest valid unreleased ticket.
+Before protected work, the claimant validates every exact lower ticket/release path and rechecks
+that its own canonical release is absent. Enumeration discovers state but is not proof that a
+lower ticket is absent.
+
+Release, queued cancellation, and forced recovery all publish the same deterministic immutable
+release marker for one exact kind, ticket, UUID, and claim digest. They never delete or edit a
+claim, release, successor, or journal directory. The `admin-recovery` stream uses the same ordering
+and has no recursively higher lock; a live recovery owner is never force-released.
+
+Ticket zero is a read-only compatibility overlay for a PR #10 `.lock`, `.admin.lock`, or
+`.admin.lock.recovering` object. A v3 resolution binds its exact raw digest and leaves the legacy
+path untouched. New code never writes the legacy format, and mixed old/new active binaries are
+unsupported.
 
 The hosted design adds:
 

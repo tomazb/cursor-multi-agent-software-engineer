@@ -37,6 +37,16 @@ jobs:
       - name: Ready-review regression tests
         run: node --experimental-strip-types --test test/ready-review-corrections.test.ts
 
+      - name: Issue 11 allocation contention (25 iterations)
+        env:
+          MASWE_ISSUE11_ALLOCATION_ITERATIONS: "25"
+        run: node --experimental-strip-types --test-name-pattern='allocation contention repetition' test/issue11-lock-contention.test.ts
+
+      - name: Issue 11 owner/recovery/successor contention (100 iterations)
+        env:
+          MASWE_ISSUE11_RELEASE_ITERATIONS: "100"
+        run: node --experimental-strip-types --test-name-pattern='owner recovery successor repetition' test/issue11-lock-contention.test.ts
+
       - name: Full test suite
         run: npm test
 
