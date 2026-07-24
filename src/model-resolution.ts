@@ -171,10 +171,27 @@ export const SMOKE_MODEL_FAMILY_ALLOWLIST = [
   "claude-fable-5",
 ] as const;
 
+function isApprovedSmokeModelId(modelId: string): boolean {
+  const id = modelId.trim().toLowerCase();
+  return SMOKE_MODEL_FAMILY_ALLOWLIST.some((family) => {
+    if (logicalModelCore(id) !== logicalModelCore(family)) return false;
+    const requiredEffort = modelEffortTier(family);
+    return requiredEffort === undefined || modelEffortTier(id) === requiredEffort;
+  });
+}
+
+function throwIfAmbiguousSmokeSelection(family: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/Ambiguous model/i.test(message)) {
+    throw new Error(`Ambiguous smoke-model selection for approved family '${family}': ${message}`);
+  }
+}
+
 /**
  * Pick a concrete catalogue model for smoke helpers.
- * Resolves only within the ordered allowlist of approved logical families.
- * Never falls back to an unrelated provider/family via global sort.
+ * Automatic selection resolves only within the ordered allowlist. An explicit
+ * override is an exact-ID contract: it must be present and satisfy the same
+ * family/effort policy, and it never falls back to another model.
  */
 export function pickCatalogueModel(catalogue: Iterable<string>, preferred?: string): string {
   const ids = [...new Set([...catalogue].map((id) => id.trim().toLowerCase()).filter(Boolean))];
@@ -182,23 +199,27 @@ export function pickCatalogueModel(catalogue: Iterable<string>, preferred?: stri
     throw new Error("Model catalogue is empty. Run 'agent models' and confirm Cursor CLI auth.");
   }
 
-  const errors: string[] = [];
-  if (preferred?.trim()) {
-    try {
-      return resolveLogicalModelId(preferred.trim().toLowerCase(), ids);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      // Ambiguous preferred family must fail closed (no cross-family fallback).
-      if (/Ambiguous/i.test(message)) throw error;
-      errors.push(message);
+  const exactPreferred = preferred?.trim().toLowerCase();
+  if (exactPreferred) {
+    if (!ids.includes(exactPreferred)) {
+      throw new Error(
+        `Preferred exact smoke model '${preferred}' is absent from the discovered catalogue. Explicit overrides never fall back to another model.`,
+      );
     }
+    if (!isApprovedSmokeModelId(exactPreferred)) {
+      throw new Error(
+        `Preferred exact smoke model '${preferred}' is present but belongs to a disallowed family (approved families: ${SMOKE_MODEL_FAMILY_ALLOWLIST.join(", ")}).`,
+      );
+    }
+    return exactPreferred;
   }
 
+  const errors: string[] = [];
   for (const family of SMOKE_MODEL_FAMILY_ALLOWLIST) {
-    if (preferred?.trim() && family === preferred.trim().toLowerCase()) continue;
     try {
       return resolveLogicalModelId(family, ids);
     } catch (error) {
+      throwIfAmbiguousSmokeSelection(family, error);
       errors.push(error instanceof Error ? error.message : String(error));
     }
   }
