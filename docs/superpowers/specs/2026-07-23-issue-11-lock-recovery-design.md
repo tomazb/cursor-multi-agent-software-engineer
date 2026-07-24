@@ -216,14 +216,17 @@ fails closed; an unexpected ordinary entry is corruption. Final claims and relea
 non-link regular files. Well-formed regular orphan files are allowed only in `tmp/` and never
 affect ticket order.
 
-The MASWE-plane read-only fingerprint excludes only canonical protocol entries under exact
-`runs/<run-id>/.lock-journal-v3/` paths as synchronization churn. Unexpected or malformed journal
-entries remain fingerprint-visible, including unsafe links and unexpected root/kind entries. It
-must continue hashing `run.json`, artifacts, config, and every other `.maswe` path. Tests must
-prove that the narrow exclusion prevents valid lock activity from false-failing a read-only role
-while mutations to authoritative or unexpected journal paths still change the fingerprint. This
-is the journal equivalent of the existing exact lock-file exclusions, not a general `.maswe`
-weakening.
+The MASWE-plane read-only fingerprint excludes only type-validated permanent directories,
+the exact valid manifest, canonical digest-validated claims/releases, and well-formed ordinary
+temporary files under exact `runs/<run-id>/.lock-journal-v3/` paths as synchronization churn.
+Path shape alone never qualifies an entry for exclusion. Unexpected or malformed journal entries
+remain fingerprint-visible, including unsafe links, invalid canonical-looking record bytes, and
+unexpected root/kind entries. The fingerprint preserves literal POSIX backslashes and hashes the
+type of every non-excluded `.maswe` entry. It must continue hashing `run.json`, artifacts, config,
+and every other `.maswe` path. Tests must prove that the narrow exclusion prevents valid lock
+activity from false-failing a read-only role while mutations to authoritative or unexpected
+journal paths still change the fingerprint. This is the journal equivalent of the existing exact
+lock-file exclusions, not a general `.maswe` weakening.
 
 ## Record encoding
 

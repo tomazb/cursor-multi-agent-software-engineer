@@ -914,6 +914,27 @@ async function readManifest(manifestPath: string): Promise<"missing" | "valid"> 
 
 type LinkFile = typeof link;
 
+async function reconcileExactPublication(
+  finalPath: string,
+  expectedBytes: string,
+  publicationError: unknown,
+  context: string,
+): Promise<void> {
+  try {
+    const existing = await readOrdinaryRecord(finalPath);
+    if (existing !== expectedBytes) {
+      throw corrupt(`${context} has conflicting bytes`);
+    }
+  } catch (error) {
+    if (error instanceof LockJournalError) throw error;
+    throw new LockJournalError(
+      "LOCK_UNSUPPORTED_FILESYSTEM",
+      `${context} could not be reconciled after hard-link publication failed`,
+      { cause: publicationError },
+    );
+  }
+}
+
 async function publishManifest(
   manifestPath: string,
   linkFile: LinkFile,
@@ -943,13 +964,12 @@ async function publishManifest(
     try {
       await linkFile(temporary, manifestPath);
     } catch (error) {
-      if (errno(error) !== "EEXIST") {
-        throw new LockJournalError(
-          "LOCK_UNSUPPORTED_FILESYSTEM",
-          `Lock journal manifest requires atomic no-clobber hard-link publication`,
-          { cause: error },
-        );
-      }
+      await reconcileExactPublication(
+        manifestPath,
+        MANIFEST_BYTES,
+        error,
+        "Lock journal manifest",
+      );
     }
     await readManifest(manifestPath);
   } catch (error) {
@@ -1297,6 +1317,119 @@ export async function scanLockJournal(
     ...(legacy ? { legacy } : {}),
     ...(legacyRelease ? { legacyRelease } : {}),
   };
+}
+
+/**
+ * Return true only when one exact path is validated as non-authoritative v3
+ * synchronization infrastructure or an immutable canonical protocol record.
+ * Fingerprinting callers use false to keep malformed and unsafe lookalikes
+ * visible to the read-only verification boundary.
+ */
+export async function isCanonicalJournalFingerprintEntry(
+  runDirectory: string,
+  journalSegments: string[],
+): Promise<boolean> {
+  try {
+    if (journalSegments.length === 0) {
+      await inspectOrdinaryDirectory(
+        path.join(runDirectory, LOCK_JOURNAL_DIRECTORY),
+        { allowMissing: false },
+      );
+      return true;
+    }
+    if (journalSegments.length === 1) {
+      if (journalSegments[0] === "format.json") {
+        return (
+          (await readManifest(
+            path.join(runDirectory, LOCK_JOURNAL_DIRECTORY, "format.json"),
+          )) === "valid"
+        );
+      }
+      if (!LOCK_KINDS.includes(journalSegments[0] as LockKind)) return false;
+      await inspectOrdinaryDirectory(
+        journalPaths(runDirectory, journalSegments[0] as LockKind).kind,
+        { allowMissing: false },
+      );
+      return true;
+    }
+
+    const kind = journalSegments[0] as LockKind;
+    if (!LOCK_KINDS.includes(kind)) return false;
+    const paths = journalPaths(runDirectory, kind);
+    const stream = journalSegments[1];
+    if (journalSegments.length === 2) {
+      const directory =
+        stream === "claims"
+          ? paths.claims
+          : stream === "releases"
+            ? paths.releases
+            : stream === "tmp"
+              ? paths.tmp
+              : undefined;
+      if (!directory) return false;
+      await inspectOrdinaryDirectory(directory, { allowMissing: false });
+      return true;
+    }
+    if (journalSegments.length !== 3) return false;
+
+    const basename = journalSegments[2]!;
+    if (stream === "tmp") {
+      if (!TEMP_BASENAME_PATTERN.test(basename)) return false;
+      const stat = await lstat(path.join(paths.tmp, basename));
+      return !stat.isSymbolicLink() && stat.isFile();
+    }
+    if (stream === "claims") {
+      const match = CLAIM_BASENAME_PATTERN.exec(basename);
+      if (!match) return false;
+      const ticket = parseLockTicket(match[1]);
+      const bytes = await readOrdinaryRecord(path.join(paths.claims, basename));
+      parseClaimBytes(bytes, kind, ticket);
+      return true;
+    }
+    if (stream !== "releases") return false;
+
+    const releasePath = path.join(paths.releases, basename);
+    const bytes = await readOrdinaryRecord(releasePath);
+    const preliminary = JSON.parse(bytes) as Record<string, unknown>;
+    const ticket = parseLockTicket(preliminary.ticket, { allowZero: true });
+    if (ticket === 0n) {
+      const legacy = await inspectLegacyLock(runDirectory, kind);
+      if (
+        !legacy ||
+        basename !== legacyReleaseBasename(legacy, kind)
+      ) {
+        return false;
+      }
+      parseLegacyReleaseBytes(bytes, legacy, kind);
+      return true;
+    }
+
+    const ticketText = formatLockTicket(ticket);
+    const claimPath = path.join(paths.claims, `${ticketText}.json`);
+    const rawBytes = await readStableOrdinaryBytes(claimPath);
+    try {
+      const claimBytes = decodeCanonicalText(rawBytes, claimPath);
+      const claim = parseClaimBytes(claimBytes, kind, ticket);
+      if (basename !== releaseBasename(claim)) return false;
+      parseReleaseBytes(bytes, claim);
+      return true;
+    } catch (error) {
+      if (!(error instanceof LockJournalError) || error.code !== "LOCK_CORRUPT") {
+        throw error;
+      }
+      const rawClaim: RawClaimOverlay = {
+        ticket: ticketText,
+        basename: `${ticketText}.json`,
+        rawBytes,
+        rawDigest: digest(rawBytes),
+      };
+      if (basename !== rawClaimReleaseBasename(rawClaim, kind)) return false;
+      parseRawClaimReleaseBytes(bytes, rawClaim, kind);
+      return true;
+    }
+  } catch {
+    return false;
+  }
 }
 
 const PROCESS_STARTED_AT = new Date(
@@ -1755,24 +1888,14 @@ export async function publishClaimRelease(
     await requirePreparedBytes(temporaryPath, canonical.bytes);
     await options.transition?.("RELEASE_LINK_ATTEMPT_READY", context);
     try {
-      await link(temporaryPath, finalPath);
+      await (options.linkFile ?? link)(temporaryPath, finalPath);
     } catch (error) {
-      if (errno(error) !== "EEXIST") {
-        try {
-          const existing = await readOrdinaryRecord(finalPath);
-          if (existing === canonical.bytes) {
-            await options.transition?.("RELEASE_PUBLISHED", context);
-            return canonical;
-          }
-        } catch {
-          // The original publication failure remains authoritative.
-        }
-        throw new LockJournalError(
-          "LOCK_UNSUPPORTED_FILESYSTEM",
-          `Atomic no-clobber release publication failed`,
-          { cause: error },
-        );
-      }
+      await reconcileExactPublication(
+        finalPath,
+        canonical.bytes,
+        error,
+        "Canonical claim release",
+      );
     }
     const finalBytes = await readOrdinaryRecord(finalPath);
     const validated = parseReleaseBytes(finalBytes, exactClaim);
@@ -1801,6 +1924,7 @@ async function publishLegacyRelease(
   runDirectory: string,
   kind: LockKind,
   observed: LegacyLockOverlay,
+  linkFile: LinkFile = link,
 ): Promise<CanonicalRecord<LegacyReleaseRecordV3>> {
   const current = await inspectLegacyLock(runDirectory, kind);
   if (
@@ -1835,15 +1959,14 @@ async function publishLegacyRelease(
     }
     await requirePreparedBytes(temporaryPath, canonical.bytes);
     try {
-      await link(temporaryPath, finalPath);
+      await linkFile(temporaryPath, finalPath);
     } catch (error) {
-      if (errno(error) !== "EEXIST") {
-        throw new LockJournalError(
-          "LOCK_UNSUPPORTED_FILESYSTEM",
-          `Atomic legacy release publication failed`,
-          { cause: error },
-        );
-      }
+      await reconcileExactPublication(
+        finalPath,
+        canonical.bytes,
+        error,
+        "Canonical legacy release",
+      );
     }
     const finalBytes = await readOrdinaryRecord(finalPath);
     if (
@@ -1871,7 +1994,7 @@ async function publishRawClaimRelease(
   runDirectory: string,
   kind: LockKind,
   observed: RawClaimOverlay,
-  options: Pick<PublishClaimOptions, "transition"> = {},
+  options: Pick<PublishClaimOptions, "transition" | "linkFile"> = {},
 ): Promise<CanonicalRecord<RawClaimReleaseRecordV3>> {
   const claimPath = path.join(
     journalPaths(runDirectory, kind).claims,
@@ -1919,15 +2042,14 @@ async function publishRawClaimRelease(
     await options.transition?.("RELEASE_LINK_ATTEMPT_READY", context);
     await requireUnchangedTarget();
     try {
-      await link(temporaryPath, finalPath);
+      await (options.linkFile ?? link)(temporaryPath, finalPath);
     } catch (error) {
-      if (errno(error) !== "EEXIST") {
-        throw new LockJournalError(
-          "LOCK_UNSUPPORTED_FILESYSTEM",
-          `Atomic corrupt-claim resolution publication failed`,
-          { cause: error },
-        );
-      }
+      await reconcileExactPublication(
+        finalPath,
+        canonical.bytes,
+        error,
+        "Canonical corrupt-claim resolution",
+      );
     }
     const finalBytes = await readOrdinaryRecord(finalPath);
     if (
@@ -1954,7 +2076,11 @@ async function publishRawClaimRelease(
 export async function recoverCurrentLock(
   runDirectory: string,
   kind: LockKind,
-  options: { force: boolean; transition?: PublishClaimOptions["transition"] },
+  options: {
+    force: boolean;
+    transition?: PublishClaimOptions["transition"];
+    linkFile?: LinkFile;
+  },
 ): Promise<void> {
   const scan = await scanLockJournal(runDirectory, kind, {
     allowUnresolvedRawClaims: true,
@@ -1980,8 +2106,18 @@ export async function recoverCurrentLock(
           `Legacy ${kind} ticket zero is held by live pid ${scan.legacy.pid}`,
         );
       }
+    } else if (kind === "admin-recovery" && !options.force) {
+      throw new LockJournalError(
+        "LOCK_DEAD_OWNER",
+        `Dead legacy administrative-recovery ticket zero requires force`,
+      );
     }
-    await publishLegacyRelease(runDirectory, kind, scan.legacy);
+    await publishLegacyRelease(
+      runDirectory,
+      kind,
+      scan.legacy,
+      options.linkFile,
+    );
     return;
   }
 
@@ -2001,7 +2137,10 @@ export async function recoverCurrentLock(
         runDirectory,
         kind,
         rawClaim,
-        options.transition ? { transition: options.transition } : {},
+        {
+          ...(options.transition ? { transition: options.transition } : {}),
+          ...(options.linkFile ? { linkFile: options.linkFile } : {}),
+        },
       );
       return;
     }

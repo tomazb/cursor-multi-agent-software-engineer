@@ -574,6 +574,10 @@ git commit -m "feat: overlay legacy locks on ticket zero"
 - [ ] Assert lock-journal churn leaves read-only fingerprint unchanged.
 - [ ] Assert unexpected or malformed root/kind/record/temp journal entries remain
       fingerprint-visible and fail closed during journal validation.
+- [ ] Assert canonical-looking journal paths are excluded only after object-type and canonical
+      byte/digest validation; unsafe links and invalid JSON remain fingerprint-visible.
+- [ ] Assert non-journal symlinks/directories contribute their type and literal POSIX backslashes
+      are not normalized into journal separators.
 - [ ] Assert `run.json`, artifact, config, and non-journal `.maswe` mutation still changes the
       fingerprint.
 - [ ] Source-audit no deletion of claims/releases/permanent paths and no recursive lock deletion.

@@ -84,7 +84,7 @@ Administrative recovery first publishes a ticket in the separate `admin-recovery
 forced bootstrap, a contender may exactly release one eligible dead predecessor, but that
 publication does not grant recovery ownership. Every contender rescans; only the smallest
 unreleased recovery ticket may enter the recovery critical section. A live recovery owner is never
-force-released. Corrupt/ambiguous recovery claims remain fail closed.
+force-released. Corrupt/ambiguous recovery claims remain fail-closed.
 
 Useful semantic failures include `LOCK_LIVE_OWNER`, `LOCK_DEAD_OWNER`, `LOCK_QUEUED`,
 `LOCK_CORRUPT`, `LOCK_UNSAFE_PATH_TYPE`, `LOCK_OWNERSHIP_LOST`,
@@ -316,8 +316,8 @@ For the v3 lock-journal upgrade:
 2. Back up the tree and inspect legacy `.lock`, `.admin.lock`, and
    `.admin.lock.recovering` objects.
 3. Start only the new binary. It represents an existing PR #10 lock as virtual ticket zero and
-   publishes a digest-bound compatibility release when explicitly authorized; it never deletes
-   the legacy path.
+   publishes a digest-bound compatibility release only through `maswe unlock <run-id> --force`
+   or `maswe unlock-admin <run-id> --force`; it never deletes the legacy path.
 4. Do not run old and new binaries concurrently. Old binaries cannot see v3 claims.
 
 After the first v3 claim, rollback to an old binary is unsupported without a separately designed

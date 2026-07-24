@@ -199,6 +199,30 @@ test("unsupported hard-link publication fails closed under injected filesystem s
   );
 });
 
+test("manifest publication reconciles an exact final record after any link error", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-manifest-ambiguous-");
+  let injected = false;
+  await initializeLockJournal(runDirectory, {
+    linkFile: async (existingPath, newPath) => {
+      await hardLink(existingPath, newPath);
+      if (path.basename(newPath.toString()) === "format.json") {
+        injected = true;
+        const error = new Error("injected ambiguous manifest error") as NodeJS.ErrnoException;
+        error.code = "EIO";
+        throw error;
+      }
+    },
+  });
+  assert.equal(injected, true);
+  assert.equal(
+    await readFile(
+      path.join(runDirectory, LOCK_JOURNAL_DIRECTORY, "format.json"),
+      "utf8",
+    ),
+    '{"format":3,"protocol":"immutable-ticket-journal","ticketWidth":20}\n',
+  );
+});
+
 const CLAIM_INPUT = {
   kind: "data" as const,
   ticket: 1n,
@@ -708,6 +732,49 @@ test("dead legacy ticket zero is explicitly recoverable without force", async ()
   assert.equal(await readFile(legacyPath, "utf8"), legacyBytes);
 });
 
+test("dead legacy administrative-recovery ticket zero requires force", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-legacy-recovery-");
+  await writeFile(
+    path.join(runDirectory, ".admin.lock.recovering"),
+    `${JSON.stringify({
+      pid: 1_000_000_001,
+      owner: "legacy-dead-recovery",
+      at: "2026-07-24T10:00:00.000Z",
+    })}\n`,
+  );
+  await assert.rejects(
+    recoverCurrentLock(runDirectory, "admin-recovery", { force: false }),
+    (error: unknown) =>
+      error instanceof LockJournalError && error.code === "LOCK_DEAD_OWNER",
+  );
+  await recoverCurrentLock(runDirectory, "admin-recovery", { force: true });
+});
+
+test("legacy release reconciles an exact final record after any link error", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-legacy-ambiguous-");
+  await writeFile(
+    path.join(runDirectory, ".admin.lock"),
+    `${JSON.stringify({
+      pid: 1_000_000_001,
+      owner: "legacy-dead-owner",
+      at: "2026-07-24T10:00:00.000Z",
+    })}\n`,
+  );
+  let injected = false;
+  await recoverCurrentLock(runDirectory, "admin", {
+    force: false,
+    linkFile: async (existingPath, newPath) => {
+      await hardLink(existingPath, newPath);
+      injected = true;
+      const error = new Error("injected ambiguous legacy release") as NodeJS.ErrnoException;
+      error.code = "EIO";
+      throw error;
+    },
+  });
+  assert.equal(injected, true);
+  assert.ok((await scanLockJournal(runDirectory, "admin")).legacyRelease);
+});
+
 test("corrupt legacy ticket zero remains fail closed without force", async () => {
   const runDirectory = await freshRunDirectory("maswe-journal-legacy-corrupt-");
   const legacyPath = path.join(runDirectory, ".lock");
@@ -770,6 +837,30 @@ test("corrupt-claim recovery revalidates exact bytes immediately before release 
       error.code === "LOCK_OWNERSHIP_LOST",
   );
   assert.deepEqual(await readdir(paths.releases), []);
+});
+
+test("raw-claim release reconciles an exact final record after any link error", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-raw-ambiguous-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "data");
+  await writeFile(path.join(paths.claims, "00000000000000000001.json"), "{broken");
+  let injected = false;
+  await recoverCurrentLock(runDirectory, "data", {
+    force: true,
+    linkFile: async (existingPath, newPath) => {
+      await hardLink(existingPath, newPath);
+      injected = true;
+      const error = new Error("injected ambiguous raw release") as NodeJS.ErrnoException;
+      error.code = "EIO";
+      throw error;
+    },
+  });
+  assert.equal(injected, true);
+  assert.ok(
+    (await scanLockJournal(runDirectory, "data", {
+      allowUnresolvedRawClaims: true,
+    })).rawReleases.has("00000000000000000001"),
+  );
 });
 
 test("corrupt-claim recovery digests exact binary bytes without UTF-8 replacement", async () => {

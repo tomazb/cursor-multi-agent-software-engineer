@@ -15,6 +15,7 @@ import { DEFAULT_CONFIG } from "../src/config.ts";
 import type { RunRecord } from "../src/domain.ts";
 import { gitWorkspaceFingerprint } from "../src/git-snapshot.ts";
 import { ensureMasweGitExclude, ensureRunWorkspace } from "../src/git-workspace.ts";
+import { publishLockClaim } from "../src/lock-journal.ts";
 import { FileRunStore } from "../src/store.ts";
 
 const execFileAsync = promisify(execFile);
@@ -99,6 +100,9 @@ test("lock and temp churn under .maswe does not change fingerprint", async () =>
   await ensureMasweGitExclude(cwd);
   const store = new FileRunStore(cwd);
   const run = await store.create("fp-lock", "request", DEFAULT_CONFIG);
+  await mkdir(path.join(cwd, ".maswe", "runs", run.id, "artifacts"), {
+    recursive: true,
+  });
   const before = await gitWorkspaceFingerprint(cwd);
 
   await writeFile(
@@ -111,7 +115,6 @@ test("lock and temp churn under .maswe does not change fingerprint", async () =>
     `${JSON.stringify({ pid: process.pid, owner: "a", at: new Date().toISOString() })}\n`,
     "utf8",
   );
-  await mkdir(path.join(cwd, ".maswe", "runs", run.id, "artifacts"), { recursive: true });
   await writeFile(
     path.join(cwd, ".maswe", "runs", run.id, "artifacts", "note.attempt-1.md.tmp"),
     "temp\n",
@@ -127,10 +130,10 @@ test("lock and temp churn under .maswe does not change fingerprint", async () =>
     "claims",
   );
   await mkdir(journalClaims, { recursive: true });
-  await writeFile(
-    path.join(journalClaims, "00000000000000000099.json"),
-    "published synchronization record\n",
-    "utf8",
+  await publishLockClaim(
+    path.join(cwd, ".maswe", "runs", run.id),
+    "data",
+    "store-write",
   );
   const after = await gitWorkspaceFingerprint(cwd);
   assert.equal(before, after, "ephemeral lock/temp files must not affect fingerprint");
@@ -172,6 +175,85 @@ test("unexpected journal root and kind entries remain fingerprint-visible", asyn
     path.join(journalRoot, "data", "unexpected-link"),
   );
   assert.notEqual(await gitWorkspaceFingerprint(cwd), afterRoot);
+});
+
+test("non-journal symlinks contribute their type and target to the fingerprint", async () => {
+  const cwd = await initRepo();
+  await ensureMasweGitExclude(cwd);
+  await mkdir(path.join(cwd, ".maswe"), { recursive: true });
+  const before = await gitWorkspaceFingerprint(cwd);
+
+  await symlink("first-target", path.join(cwd, ".maswe", "unexpected-link"));
+  const afterLink = await gitWorkspaceFingerprint(cwd);
+  assert.notEqual(afterLink, before);
+});
+
+test(
+  "literal POSIX backslashes cannot masquerade as journal path separators",
+  { skip: process.platform === "win32" },
+  async () => {
+    const cwd = await initRepo();
+    await ensureMasweGitExclude(cwd);
+    await mkdir(path.join(cwd, ".maswe"), { recursive: true });
+    const before = await gitWorkspaceFingerprint(cwd);
+
+    await writeFile(
+      path.join(
+        cwd,
+        ".maswe",
+        "runs\\r\\.lock-journal-v3\\data\\claims\\00000000000000000001.json",
+      ),
+      "authoritative literal filename\n",
+    );
+    assert.notEqual(await gitWorkspaceFingerprint(cwd), before);
+  },
+);
+
+test("canonical-looking malformed and unsafe journal claims remain fingerprint-visible", async () => {
+  const cwd = await initRepo();
+  await ensureMasweGitExclude(cwd);
+  const store = new FileRunStore(cwd);
+  const run = await store.create("fp-journal-records", "request", DEFAULT_CONFIG);
+  const claims = path.join(
+    cwd,
+    ".maswe",
+    "runs",
+    run.id,
+    ".lock-journal-v3",
+    "data",
+    "claims",
+  );
+  const before = await gitWorkspaceFingerprint(cwd);
+
+  await writeFile(
+    path.join(claims, "00000000000000000099.json"),
+    "malformed claim\n",
+  );
+  const afterMalformed = await gitWorkspaceFingerprint(cwd);
+  assert.notEqual(afterMalformed, before);
+
+  await symlink(
+    path.join(cwd, "outside"),
+    path.join(claims, "00000000000000000098.json"),
+  );
+  assert.notEqual(await gitWorkspaceFingerprint(cwd), afterMalformed);
+});
+
+test("canonical journal kind path is excluded only when it is an ordinary directory", async () => {
+  const cwd = await initRepo();
+  await ensureMasweGitExclude(cwd);
+  const journalRoot = path.join(
+    cwd,
+    ".maswe",
+    "runs",
+    "kind-type",
+    ".lock-journal-v3",
+  );
+  await mkdir(journalRoot, { recursive: true });
+  const before = await gitWorkspaceFingerprint(cwd);
+
+  await symlink(path.join(cwd, "outside"), path.join(journalRoot, "data"));
+  assert.notEqual(await gitWorkspaceFingerprint(cwd), before);
 });
 
 test("isolated worktree fingerprint still detects worktree repository mutations", async () => {
