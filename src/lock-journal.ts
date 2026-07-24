@@ -1341,16 +1341,32 @@ async function reconcileExactClaimPath(
   );
 }
 
-function validateContiguousClaimRange(
+function orderedClaimTickets(
   claimsByTicket: Map<bigint, ClaimRecordV3>,
   rawClaimsByTicket: Map<bigint, RawClaimOverlay>,
 ): bigint[] {
-  const orderedTickets = [
+  return [
     ...claimsByTicket.keys(),
     ...rawClaimsByTicket.keys(),
   ].sort((left, right) =>
     left < right ? -1 : left > right ? 1 : 0
   );
+}
+
+function claimRangeHasGap(
+  claimsByTicket: Map<bigint, ClaimRecordV3>,
+  rawClaimsByTicket: Map<bigint, RawClaimOverlay>,
+): boolean {
+  return orderedClaimTickets(claimsByTicket, rawClaimsByTicket).some(
+    (ticket, index) => ticket !== BigInt(index + 1),
+  );
+}
+
+function validateContiguousClaimRange(
+  claimsByTicket: Map<bigint, ClaimRecordV3>,
+  rawClaimsByTicket: Map<bigint, RawClaimOverlay>,
+): bigint[] {
+  const orderedTickets = orderedClaimTickets(claimsByTicket, rawClaimsByTicket);
   for (let index = 0; index < orderedTickets.length; index += 1) {
     const expected = BigInt(index + 1);
     if (orderedTickets[index] !== expected) {
@@ -1388,7 +1404,10 @@ export async function scanLockJournal(
   const rawReleases = new Map<string, RawClaimReleaseRecordV3>();
   let legacyRelease: LegacyReleaseRecordV3 | undefined;
   const releaseEntries = await readdir(paths.releases);
-  if (releaseEntries.length > 0) {
+  if (
+    releaseEntries.length > 0 ||
+    claimRangeHasGap(claimsByTicket, rawClaimsByTicket)
+  ) {
     await mergeClaimEntries(
       paths,
       kind,

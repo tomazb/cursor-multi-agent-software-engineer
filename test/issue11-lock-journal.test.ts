@@ -529,6 +529,48 @@ test("scan reconciles a missing lower claim when the raw target was already obse
   assert.equal(scan.highestTicket, 2n);
 });
 
+test("scan reconciles a claims-only gap from the initial observation", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-claims-only-gap-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "data");
+  const claim1 = canonicalClaim(CLAIM_INPUT);
+  const claim2 = canonicalClaim({
+    ...CLAIM_INPUT,
+    ticket: 2n,
+    owner: "8d196f64-9811-4f6c-9234-a43f12847e93",
+  });
+  const claim3 = canonicalClaim({
+    ...CLAIM_INPUT,
+    ticket: 3n,
+    owner: "c461641e-3a91-4a9c-85e6-601a75517d33",
+  });
+  await writeFile(
+    path.join(paths.claims, "00000000000000000001.json"),
+    claim1.bytes,
+  );
+  await writeFile(
+    path.join(paths.claims, "00000000000000000003.json"),
+    claim3.bytes,
+  );
+
+  const scan = await scanLockJournal(runDirectory, "data", {
+    afterClaimsObserved: async () => {
+      await writeFile(
+        path.join(paths.claims, "00000000000000000002.json"),
+        claim2.bytes,
+      );
+    },
+  });
+
+  assert.deepEqual(scan.claims.map((claim) => claim.ticket), [
+    "00000000000000000001",
+    "00000000000000000002",
+    "00000000000000000003",
+  ]);
+  assert.equal(scan.releases.size, 0);
+  assert.equal(scan.highestTicket, 3n);
+});
+
 test("exact-path reconciliation preserves missing-target corruption for canonical and raw releases", async () => {
   const canonicalRun = await freshRunDirectory("maswe-journal-exact-missing-");
   await initializeLockJournal(canonicalRun);
