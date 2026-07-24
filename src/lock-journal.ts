@@ -1388,7 +1388,16 @@ export async function scanLockJournal(
   const rawReleases = new Map<string, RawClaimReleaseRecordV3>();
   let legacyRelease: LegacyReleaseRecordV3 | undefined;
   const releaseEntries = await readdir(paths.releases);
-  let reconciledClaimsAfterReleaseObservation = false;
+  if (releaseEntries.length > 0) {
+    await mergeClaimEntries(
+      paths,
+      kind,
+      await readdir(paths.claims),
+      claimsByTicket,
+      rawClaimsByTicket,
+      options.afterExactClaimFirstRead,
+    );
+  }
   for (const basename of releaseEntries) {
     const releasePath = path.join(paths.releases, basename);
     const bytes = await readOrdinaryRecord(releasePath);
@@ -1417,21 +1426,6 @@ export async function scanLockJournal(
       }
       legacyRelease = parseLegacyReleaseBytes(bytes, legacy, kind);
       continue;
-    }
-    if (
-      !claimsByTicket.has(ticket) &&
-      !rawClaimsByTicket.has(ticket) &&
-      !reconciledClaimsAfterReleaseObservation
-    ) {
-      await mergeClaimEntries(
-        paths,
-        kind,
-        await readdir(paths.claims),
-        claimsByTicket,
-        rawClaimsByTicket,
-        options.afterExactClaimFirstRead,
-      );
-      reconciledClaimsAfterReleaseObservation = true;
     }
     if (candidate.targetMode === "raw-claim") {
       if (!rawClaimsByTicket.has(ticket) && !claimsByTicket.has(ticket)) {

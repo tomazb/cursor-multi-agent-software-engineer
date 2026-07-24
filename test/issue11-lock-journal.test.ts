@@ -57,6 +57,31 @@ async function freshRunDirectory(prefix: string): Promise<string> {
   return runDirectory;
 }
 
+function rawDataReleaseFixture(ticket: string, rawBytes: Buffer): {
+  basename: string;
+  bytes: string;
+} {
+  const rawDigest = `sha256:${createHash("sha256").update(rawBytes).digest("hex")}`;
+  const withoutDigest = {
+    format: 3,
+    record: "release",
+    kind: "data",
+    ticket,
+    targetMode: "raw-claim",
+    claimPath: `${ticket}.json`,
+    rawDigest,
+  };
+  const releaseDigest = `sha256:${
+    createHash("sha256")
+      .update(`${JSON.stringify(withoutDigest)}\n`)
+      .digest("hex")
+  }`;
+  return {
+    basename: `data.${ticket}.raw.${rawDigest.slice("sha256:".length)}.json`,
+    bytes: `${JSON.stringify({ ...withoutDigest, releaseDigest })}\n`,
+  };
+}
+
 test("semantic lock errors retain stable Issue #11 codes and causes", () => {
   const cause = new Error("platform detail");
   for (const code of ERROR_CODES) {
@@ -420,28 +445,11 @@ test("scan reconciles the contiguous lower range for a later raw release", async
       await publishLockClaim(runDirectory, "data", "store-write");
       const ticket = "00000000000000000002";
       const rawBytes = Buffer.from("{stable-corrupt-claim");
-      const rawDigest = `sha256:${createHash("sha256").update(rawBytes).digest("hex")}`;
-      const withoutDigest = {
-        format: 3,
-        record: "release",
-        kind: "data",
-        ticket,
-        targetMode: "raw-claim",
-        claimPath: `${ticket}.json`,
-        rawDigest,
-      };
-      const releaseDigest = `sha256:${
-        createHash("sha256")
-          .update(`${JSON.stringify(withoutDigest)}\n`)
-          .digest("hex")
-      }`;
+      const release = rawDataReleaseFixture(ticket, rawBytes);
       await writeFile(path.join(paths.claims, `${ticket}.json`), rawBytes);
       await writeFile(
-        path.join(
-          paths.releases,
-          `data.${ticket}.raw.${rawDigest.slice("sha256:".length)}.json`,
-        ),
-        `${JSON.stringify({ ...withoutDigest, releaseDigest })}\n`,
+        path.join(paths.releases, release.basename),
+        release.bytes,
       );
     },
   });
@@ -451,6 +459,73 @@ test("scan reconciles the contiguous lower range for a later raw release", async
   ]);
   assert.equal(scan.rawClaims.has("00000000000000000002"), true);
   assert.equal(scan.rawReleases.has("00000000000000000002"), true);
+  assert.equal(scan.highestTicket, 2n);
+});
+
+test("scan reconciles a missing lower claim when the released target was already observed", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-known-target-range-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "data");
+  const claim1 = canonicalClaim(CLAIM_INPUT);
+  const claim2 = canonicalClaim({
+    ...CLAIM_INPUT,
+    ticket: 2n,
+    owner: "8d196f64-9811-4f6c-9234-a43f12847e93",
+  });
+  const release2 = canonicalRelease(claim2.record);
+  await writeFile(
+    path.join(paths.claims, "00000000000000000002.json"),
+    claim2.bytes,
+  );
+
+  const scan = await scanLockJournal(runDirectory, "data", {
+    afterClaimsObserved: async () => {
+      await writeFile(
+        path.join(paths.claims, "00000000000000000001.json"),
+        claim1.bytes,
+      );
+      await writeFile(
+        path.join(paths.releases, releaseBasename(claim2.record)),
+        release2.bytes,
+      );
+    },
+  });
+
+  assert.deepEqual(scan.claims.map((claim) => claim.ticket), [
+    "00000000000000000001",
+    "00000000000000000002",
+  ]);
+  assert.equal(scan.releases.has("00000000000000000002"), true);
+});
+
+test("scan reconciles a missing lower claim when the raw target was already observed", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-known-raw-range-");
+  await initializeLockJournal(runDirectory);
+  const paths = journalPaths(runDirectory, "data");
+  const claim1 = canonicalClaim(CLAIM_INPUT);
+  const ticket = "00000000000000000002";
+  const rawBytes = Buffer.from("{stable-corrupt-claim");
+  const release = rawDataReleaseFixture(ticket, rawBytes);
+  await writeFile(path.join(paths.claims, `${ticket}.json`), rawBytes);
+
+  const scan = await scanLockJournal(runDirectory, "data", {
+    afterClaimsObserved: async () => {
+      await writeFile(
+        path.join(paths.claims, "00000000000000000001.json"),
+        claim1.bytes,
+      );
+      await writeFile(
+        path.join(paths.releases, release.basename),
+        release.bytes,
+      );
+    },
+  });
+
+  assert.deepEqual(scan.claims.map((claim) => claim.ticket), [
+    "00000000000000000001",
+  ]);
+  assert.equal(scan.rawClaims.has(ticket), true);
+  assert.equal(scan.rawReleases.has(ticket), true);
   assert.equal(scan.highestTicket, 2n);
 });
 
