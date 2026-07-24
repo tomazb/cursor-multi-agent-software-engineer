@@ -228,7 +228,7 @@ export function pickCatalogueModel(catalogue: Iterable<string>, preferred?: stri
         return resolvedHint;
       }
     } catch (error) {
-      throwPreferredAmbiguity(preferred, error);
+      throwPreferredAmbiguity(normalizedPreferred, error);
     }
 
     throw new Error(
