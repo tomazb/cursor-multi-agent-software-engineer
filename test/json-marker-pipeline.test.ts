@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
-import { extractCursorCliOutput } from "../src/runtimes/cursor-cli.ts";
+import {
+  decodeCursorCliAssistantOutput,
+  extractCursorCliOutput,
+} from "../src/runtimes/cursor-cli.ts";
 import { parseRoleMarker, validateRoleMarkers } from "../src/markers.ts";
 
 function jsonResultEnvelope(logicalText: string): string {
@@ -58,6 +61,19 @@ test("valid: permitted trailing whitespace on the final marker line", () => {
   assert.equal(pipeline("notes\nREADY_FOR_BRAINSTORM_APPROVAL  \n").parsed.ok, true);
 });
 
+test("valid: explicit text mode returns logical text verbatim", () => {
+  const logical = "notes\nREADY_FOR_BRAINSTORM_APPROVAL\n";
+  const { extracted, parsed } = pipeline(logical, "text");
+  assert.equal(extracted, logical);
+  assert.equal(parsed.ok, true);
+});
+
+test("valid: stream-json terminal result is selected after decode", () => {
+  const { extracted, parsed } = pipeline("stream notes\nREADY_FOR_BRAINSTORM_APPROVAL\n", "stream-json");
+  assert.equal(extracted.includes('"type"'), false);
+  assert.equal(parsed.ok, true);
+});
+
 test("invalid authenticated-smoke shape: checklist quotes the marker then ends with bare marker", () => {
   // Sanitized reproduction of the PR #15 operator-smoke failure (model-authored
   // backtick quote in the decision checklist, not transport JSON quoting).
@@ -75,6 +91,7 @@ test("invalid authenticated-smoke shape: checklist quotes the marker then ends w
   assert.equal(parsed.ok, false);
   assert.match(parsed.ok ? "" : parsed.message, /quoted marker/i);
   assert.match(parsed.ok ? "" : parsed.message, /line \d+/i);
+  if (!parsed.ok) assert.equal(parsed.code, "quoted-marker");
 });
 
 test("invalid: marker only in explanatory prose", () => {
@@ -109,6 +126,7 @@ test("invalid: two identical bare markers", () => {
   const { parsed } = pipeline("READY_FOR_BRAINSTORM_APPROVAL\nREADY_FOR_BRAINSTORM_APPROVAL\n");
   assert.equal(parsed.ok, false);
   assert.match(parsed.ok ? "" : parsed.message, /duplicate/i);
+  if (!parsed.ok) assert.equal(parsed.code, "duplicate-markers");
 });
 
 test("invalid: two conflicting verifier markers after decode", () => {
@@ -123,16 +141,21 @@ test("invalid: marker followed by additional non-whitespace content", () => {
   const { parsed } = pipeline("READY_FOR_BRAINSTORM_APPROVAL trailing\n");
   assert.equal(parsed.ok, false);
   assert.match(parsed.ok ? "" : parsed.message, /embedded marker|final logical line|content after/i);
+  if (!parsed.ok) assert.equal(parsed.code, "content-after-marker");
 });
 
 test("invalid: marker before the final logical line", () => {
   const { parsed } = pipeline("READY_FOR_BRAINSTORM_APPROVAL\nmore notes afterward\n");
   assert.equal(parsed.ok, false);
   assert.match(parsed.ok ? "" : parsed.message, /final logical line|must end with/i);
+  if (!parsed.ok) assert.equal(parsed.code, "marker-not-final");
 });
 
 test("invalid: malformed transport JSON fails closed without treating envelope as text", () => {
   const raw = '{"type":"result","result":"body\\nREADY_FOR_BRAINSTORM_APPROVAL"';
+  const decoded = decodeCursorCliAssistantOutput(raw, "json");
+  assert.equal(decoded.ok, false);
+  if (!decoded.ok) assert.equal(decoded.code, "invalid-transport-json");
   const extracted = extractCursorCliOutput(raw, { outputFormat: "json" });
   assert.equal(extracted, "");
   assert.equal(parseRoleMarker("brainstormer", extracted).ok, false);
@@ -140,6 +163,9 @@ test("invalid: malformed transport JSON fails closed without treating envelope a
 
 test("invalid: missing authoritative result field fails closed", () => {
   const raw = `${JSON.stringify({ type: "result", message: "READY_FOR_BRAINSTORM_APPROVAL" })}\n`;
+  const decoded = decodeCursorCliAssistantOutput(raw, "json");
+  assert.equal(decoded.ok, false);
+  if (!decoded.ok) assert.equal(decoded.code, "unsupported-response-shape");
   const extracted = extractCursorCliOutput(raw, { outputFormat: "json" });
   assert.equal(extracted, "");
 });
@@ -166,6 +192,11 @@ test("json/stream-json modes never fall back to validating the raw envelope as l
   assert.equal(extractCursorCliOutput(raw, { outputFormat: "stream-json" }).includes("{"), false);
   // Raw envelope still looks like an embedded/quoted marker to the validator.
   assert.equal(parseRoleMarker("brainstormer", raw).ok, false);
+});
+
+test("explicit text mode does not sniff JSON envelopes", () => {
+  const raw = jsonResultEnvelope("notes\nREADY_FOR_BRAINSTORM_APPROVAL\n");
+  assert.equal(extractCursorCliOutput(raw, { outputFormat: "text" }), raw);
 });
 
 test("brainstorm prompt forbids repeating the terminal marker in checklists", async () => {

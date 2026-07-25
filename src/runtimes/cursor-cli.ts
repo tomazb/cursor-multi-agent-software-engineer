@@ -95,10 +95,9 @@ export function decodeCursorCliAssistantOutput(
       };
     }
   } catch {
-    if (outputFormat === "json") {
-      // Prefer NDJSON recovery below only for stream-json; json mode may still
-      // recover a single-line object after non-JSON noise in the NDJSON scan.
-    }
+    // Fall through to the NDJSON scan below. json mode may still recover a
+    // single-line result object after non-JSON noise; stream-json expects
+    // terminal result events on individual lines.
   }
 
   const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
@@ -157,50 +156,54 @@ export function decodeCursorCliAssistantOutput(
 /**
  * Extract assistant text from Cursor CLI `-p` stdout.
  *
- * When `outputFormat` is `json` or `stream-json`, returns only the decoded
- * authoritative logical text (or `""` on structured decode failure).
- * Text mode / omitted format keeps legacy raw-stdout behavior for callers that
- * intentionally pass unstructured samples.
+ * - Omitted `outputFormat`: legacy auto-detect (unwrap JSON/NDJSON when present,
+ *   otherwise return raw stdout). Used by older unit helpers.
+ * - `outputFormat: "text"`: return stdout verbatim (matches `execute()` text mode).
+ * - `outputFormat: "json" | "stream-json"`: structured decode only; never fall back
+ *   to raw envelope text.
  */
 export function extractCursorCliOutput(
   stdout: string,
-  options: { outputFormat?: CursorCliOutputFormat } = {},
+  options?: { outputFormat?: CursorCliOutputFormat },
 ): string {
-  const format = options.outputFormat ?? "text";
-  if (format === "text") {
-    // Legacy helper behavior: attempt structured unwrap when stdout is clearly
-    // JSON/NDJSON, otherwise return raw text. Explicit text mode in execute()
-    // bypasses this helper entirely.
-    const trimmed = stdout.trim();
-    if (!trimmed) return "";
-    try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return resultFromObject(parsed as Record<string, unknown>) ?? "";
-      }
-    } catch {
-      // NDJSON or text path below.
-    }
-    const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    let sawJson = false;
-    let terminal: string | undefined;
-    for (const line of lines) {
-      try {
-        const parsed = JSON.parse(line) as Record<string, unknown>;
-        sawJson = true;
-        if (parsed.type === "result" && typeof parsed.result === "string") {
-          terminal = parsed.result;
-        }
-      } catch {
-        // ignore non-JSON lines
-      }
-    }
-    if (sawJson) return terminal ?? "";
+  if (!options || options.outputFormat === undefined) {
+    return extractCursorCliOutputLegacyAuto(stdout);
+  }
+  if (options.outputFormat === "text") {
     return stdout;
   }
-
-  const decoded = decodeCursorCliAssistantOutput(stdout, format);
+  const decoded = decodeCursorCliAssistantOutput(stdout, options.outputFormat);
   return decoded.ok ? decoded.text : "";
+}
+
+/** Legacy helper: sniff JSON/NDJSON when present, otherwise keep raw stdout. */
+function extractCursorCliOutputLegacyAuto(stdout: string): string {
+  const trimmed = stdout.trim();
+  if (!trimmed) return "";
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return resultFromObject(parsed as Record<string, unknown>) ?? "";
+    }
+  } catch {
+    // NDJSON or text path below.
+  }
+  const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  let sawJson = false;
+  let terminal: string | undefined;
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      sawJson = true;
+      if (parsed.type === "result" && typeof parsed.result === "string") {
+        terminal = parsed.result;
+      }
+    } catch {
+      // ignore non-JSON lines
+    }
+  }
+  if (sawJson) return terminal ?? "";
+  return stdout;
 }
 
 function looksLikeNode(command: string): boolean {
