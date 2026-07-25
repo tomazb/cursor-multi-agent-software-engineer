@@ -110,26 +110,29 @@ Configured role models may use logical names (for example `grok-4.5`).
 
 Fail-closed catalogue discovery and logical→exact resolution apply to runtimes that implement catalogue discovery — currently **`CursorCliRuntime`** (`agent models`).
 
-- **New runs (`start`, Cursor CLI):** logical names are resolved against the local catalogue to exact executable IDs. When a configured logical model explicitly includes an effort suffix (`-high` / `-medium` / `-low`), only same-core catalogue IDs with that same effort are eligible; missing effort fails closed (no silent upgrade or downgrade). When no effort is specified, preference selects non-fast, then high>medium>low, then `cursor-` prefixed IDs within the same logical family. Catalogue parsing is fail-closed: only recognized catalogue rows contribute IDs; headings, aliases, metadata, and prose are ignored. Empty/unparseable catalogues are discovery failures.
-- **Run snapshot:** `start` stores those exact IDs in `run.config`. Environment and project-config mutations after start do not rewrite them.
-- **Existing-run stages (`run`, `approve`, `retry`, …):** validate the persisted exact ID against the live catalogue and use it as-is. Same-core / same-family / provider / effort-level substitution is forbidden. If the persisted exact ID disappears from the catalogue, execution fails closed naming that ID.
-- **Doctor (Cursor CLI):** discovers the catalogue first, resolves the brainstormer model with the same project-resolution logic as `start`, then probes with that exact ID. Doctor does **not** create a run and does **not** persist a `run.config` snapshot.
+- **Catalogue trust boundary:** only recognized stdout rows contribute IDs. Supported decorations include `(default)` and `[default]`, spaced dash descriptions, tab columns, and columns aligned with at least two spaces. Headings, aliases, metadata, and ordinary prose are ignored. Any ID-shaped row with an unsupported trailing structure makes the entire discovered catalogue unusable, even when other valid IDs survive. MASWE never resolves from a silently incomplete catalogue.
+- **New runs (`start`, Cursor CLI):** logical names are resolved against the complete local catalogue to exact executable IDs. When a configured logical model explicitly includes an effort suffix (`-high` / `-medium` / `-low`), only same-core catalogue IDs with that same effort are eligible; missing effort fails closed. When no effort is specified, preference selects non-fast, then high>medium>low, then `cursor-` prefixed IDs within the same logical family.
+- **Weak matches:** one substring-only candidate is an inexact match, not an ambiguity; multiple substring-only candidates are an ambiguity. Both fail closed and carry typed resolution classifications. Control flow does not inspect error-message prose.
+- **Authenticated smoke selection:** automatic selection tries the approved families in order and records a family-specific failure before continuing to the next family. A preferred value must be either an exact discovered ID that satisfies the family/effort policy or one literal allowlist family hint. An unresolved literal hint preserves the actionable resolver cause; unrelated logical aliases are rejected.
+- **Run snapshot:** `start` stores exact IDs in `run.config`. Environment and project-config mutations after start do not rewrite them.
+- **Existing-run stages (`run`, `approve`, `retry`, …):** validate the persisted exact ID against the live complete catalogue and use it as-is. Same-core / same-family / provider / effort-level substitution is forbidden. If the persisted exact ID disappears, execution fails closed naming that ID.
+- **Doctor (Cursor CLI):** discovers and validates the complete catalogue first, resolves the brainstormer model with the same project-resolution logic as `start`, then probes with that exact ID. Doctor does **not** create a run and does **not** persist a `run.config` snapshot.
 - **`CursorSdkRuntime`:** has no catalogue capability. Doctor/start do not call `agent models`; empty-catalogue pass-through keeps configured IDs as-is. SDK doctor must not be described as resolving through the CLI catalogue.
 
-Ambiguous cross-family matches and missing models fail closed. Treat a Cursor CLI doctor catalogue failure as a reason to inspect `agent models` output format/auth, not as proof the provider is unavailable.
+Treat a Cursor CLI doctor catalogue failure as a reason to inspect `agent models` output format and authentication, not as proof the provider is unavailable and not as permission to select from surviving rows.
 
 Doctor probe cleanup is based on recorded probe identity: once a `doctor-*` probe ID is assigned, final cleanup removes the probe worktree (if present) and `maswe/doctor-*` branch even when worktree creation failed after the branch was created. Cleanup is idempotent; cleanup failures surface as a `doctor-probe-cleanup` check without erasing the original doctor failure.
 
 Cursor CLI assistant extraction and terminal markers:
 
-- Pipeline: raw Cursor CLI stdout → validate/decode the supported transport envelope exactly once → select the authoritative string `result` field → normalize only permitted line endings / trailing whitespace → validate exactly one bare terminal marker on the final logical line.
-- `stream-json`: only terminal NDJSON events with `type: "result"` (last wins).
-- `json`: only result-bearing objects (`type: "result"` with string `result`, or typeless object with string `result`).
-- Text mode: raw stdout (Markdown may contain JSON snippets without triggering NDJSON detection).
-- Structured modes never fall back to validating the raw JSON envelope as logical text.
-- Exit 0 with no valid stdout assistant result fails closed; stderr is never treated as successful assistant content.
-- Marker validation rejects quoted examples, embedded tokens, duplicates, conflicts, non-final markers, and content after a marker. Diagnostics name the violated contract and logical line number without dumping full model output.
-- Authenticated validation for this contract used Cursor CLI `2026.07.23-e383d2b` on Linux; do not assume broader provider or platform coverage.
+- Pipeline: raw Cursor CLI stdout → try one whole JSON envelope → when the buffer is not one JSON value, scan individual JSON/NDJSON records → select the authoritative string `result` field → validate exactly one bare terminal marker on the final logical line.
+- `stream-json`: only terminal records with `type: "result"` contribute assistant output; the last valid terminal result wins.
+- `json`: result-bearing objects use `type: "result"` with string `result`, or a typeless object with string `result`. Line-by-line recovery is permitted only for the same authoritative result shapes.
+- Text mode: raw stdout (Markdown may contain JSON snippets without triggering structured decoding).
+- Structured modes never fall back to validating the raw JSON envelope as logical text. A malformed JSON-looking record fails with `invalid-transport-json`; plain non-JSON output fails with `unsupported-response-shape`; valid JSON events without an authoritative result fail with `missing-logical-output`.
+- Exit 0 with no valid assistant result fails closed and the sanitized decode code and message are placed in the runtime output consumed by the orchestrator. Stderr remains metadata and is never treated as successful assistant content.
+- Marker validation rejects quoted examples, embedded tokens, duplicates, conflicts, non-final markers, and content after a marker. Operator-visible messages name the violated contract and logical line number without dumping full model output.
+- Authenticated validation for the earlier JSON-marker repair used Cursor CLI `2026.07.23-e383d2b` on Linux. A new exact-head external validation is required after the Thermos blocker repairs; do not infer broader provider or platform coverage.
 
 ## 4. Configure quality commands
 
