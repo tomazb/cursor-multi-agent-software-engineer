@@ -100,4 +100,5 @@ The project follows semantic versioning once a public release process is establi
 - Deterministic quality command runner.
 - Read-only workspace fingerprint enforcement.
 - PR comment classification, scoped resolution, CI rerun, and fresh verification loop.
+- Cursor plugin manifest and `maswe` skill.
 - Unit and end-to-end workflow tests plus GitHub Actions CI.
