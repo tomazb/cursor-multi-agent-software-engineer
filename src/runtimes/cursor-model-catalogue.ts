@@ -3,7 +3,7 @@ const MODEL_ID_PATTERN = /^[a-zA-Z][a-zA-Z0-9._+-]{2,80}$/;
 const METADATA_ID_PATTERN =
   /^(?:alias|metadata|context|build|status|provider|timeout|tokens?|default|recommended)(?:[-_].*)?$/i;
 const ROW_PREFIX_PATTERN = /^(?:[>*•·▪▸❯✔✓☑]|[-+])\s+/;
-const KNOWN_BADGE_PATTERN = /^\s+\(default\)/i;
+const KNOWN_BADGE_PATTERN = /^\s+(?:\(default\)|\[default\])/i;
 
 export interface MalformedCatalogueRow {
   lineNumber: number;
@@ -25,9 +25,11 @@ type ParsedCatalogueRow =
  * Parse exact executable model IDs from Cursor `agent models` text output.
  *
  * Recognized rows contain an ID by itself or after a known selection prefix,
- * optionally followed by `(default)`, a spaced dash description, a tab-separated
- * column, or an aligned column separated by at least two spaces. Single-space
- * prose after an ID-shaped token is malformed and never contributes an ID.
+ * optionally followed by `(default)` / `[default]`, a spaced dash description,
+ * a tab-separated column, or an aligned column separated by at least two spaces.
+ * Single-space prose after an ID-shaped token is malformed and never contributes
+ * an ID. Callers that use the catalogue for resolution must reject any non-empty
+ * `malformedRows` result rather than selecting from a partial catalogue.
  */
 export function parseModelCatalogue(catalogueText: string): ParsedModelCatalogue {
   const ids = new Set<string>();
