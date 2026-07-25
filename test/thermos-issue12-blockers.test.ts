@@ -120,6 +120,49 @@ test("Thermos decoder cleanup: plain prose is unsupported shape, malformed JSON 
   if (!malformed.ok) assert.equal(malformed.code, "invalid-transport-json");
 });
 
+test("Codex P1: typeless whole-buffer results are accepted only in json mode", () => {
+  const logical = "report\nVERDICT: PASS";
+  const raw = JSON.stringify({ result: logical });
+
+  const json = decodeCursorCliAssistantOutput(raw, "json");
+  assert.deepEqual(json, { ok: true, text: logical });
+
+  const stream = decodeCursorCliAssistantOutput(raw, "stream-json");
+  assert.equal(stream.ok, false);
+  if (!stream.ok) {
+    assert.equal(stream.code, "unsupported-response-shape");
+    assert.match(stream.message, /stream-json.*type=result/i);
+  }
+});
+
+test("Codex P1: typed terminal results are accepted in both structured modes", () => {
+  const logical = "report\nVERDICT: PASS";
+  const raw = JSON.stringify({ type: "result", result: logical });
+
+  assert.deepEqual(decodeCursorCliAssistantOutput(raw, "json"), {
+    ok: true,
+    text: logical,
+  });
+  assert.deepEqual(decodeCursorCliAssistantOutput(raw, "stream-json"), {
+    ok: true,
+    text: logical,
+  });
+});
+
+test("Codex P1: record scanning applies the same format-aware typeless policy", () => {
+  const logical = "report\nVERDICT: PASS";
+  const raw = ["Cursor banner", JSON.stringify({ result: logical })].join("\n");
+
+  assert.deepEqual(decodeCursorCliAssistantOutput(raw, "json"), {
+    ok: true,
+    text: logical,
+  });
+
+  const stream = decodeCursorCliAssistantOutput(raw, "stream-json");
+  assert.equal(stream.ok, false);
+  if (!stream.ok) assert.equal(stream.code, "missing-logical-output");
+});
+
 function createDecodeFailureRuntime(cwd: string, config: typeof DEFAULT_CONFIG): CursorCliRuntime {
   return new CursorCliRuntime(config, {
     cwd,
@@ -141,6 +184,35 @@ function createDecodeFailureRuntime(cwd: string, config: typeof DEFAULT_CONFIG):
         exitCode: 0,
         stdout: '{"type":"result","result":"broken"',
         stderr: "auth detail that must not replace the structured diagnostic",
+        durationMs: 1,
+      };
+    },
+  });
+}
+
+function createTypelessStreamRuntime(cwd: string, config: typeof DEFAULT_CONFIG): CursorCliRuntime {
+  return new CursorCliRuntime(config, {
+    cwd,
+    spawnFn: async (_command, args) => {
+      if (args[0] === "models") {
+        return {
+          exitCode: 0,
+          stdout: [
+            "cursor-grok-4.5-high",
+            "cursor-claude-fable-5-high",
+            "cursor-claude-opus-4.8-high",
+            "gpt-5.6-sol-high",
+          ].join("\n"),
+          stderr: "",
+          durationMs: 1,
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          result: "unsupported envelope\nREADY_FOR_BRAINSTORM_APPROVAL",
+        }),
+        stderr: "raw stderr must not replace the structured diagnostic",
         durationMs: 1,
       };
     },
@@ -193,4 +265,54 @@ test("Thermos blocker 3: orchestrator persists the structured decode diagnostic 
     /brainstormer failed for all configured models: .*invalid-transport-json: .*malformed transport JSON/i,
   );
   assert.doesNotMatch(run.failure?.message ?? "", /No output was produced|auth detail/i);
+});
+
+test("Codex P1: typeless stream-json result cannot authorize a runtime marker", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-codex-stream-runtime-"));
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.runtime.command = process.execPath;
+  config.runtime.outputFormat = "stream-json";
+  config.roles.brainstormer.model = "cursor-grok-4.5-high";
+  config.policy.promptTransport = "argv";
+
+  const result = await createTypelessStreamRuntime(cwd, config).execute({
+    runId: "codex-stream-runtime",
+    role: "brainstormer",
+    prompt: "hello",
+    cwd,
+    roleConfig: config.roles.brainstormer,
+  });
+
+  assert.equal(result.status, "error");
+  assert.match(result.output, /^unsupported-response-shape: .*stream-json.*type=result/i);
+  assert.doesNotMatch(result.output, /raw stderr/);
+  assert.equal(result.metadata?.decodeCode, "unsupported-response-shape");
+});
+
+test("Codex P1: typeless stream-json marker cannot advance the orchestrator", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-codex-stream-orchestrator-"));
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.runtime.kind = "cursor-cli";
+  config.runtime.command = process.execPath;
+  config.runtime.outputFormat = "stream-json";
+  config.policy.promptTransport = "argv";
+  config.policy.useIsolatedWorktree = false;
+  config.policy.allowDirtyWorkspace = true;
+  config.quality.commands = [];
+
+  const run = await new Orchestrator(
+    cwd,
+    config,
+    createTypelessStreamRuntime(cwd, config),
+  ).start("typed stream result", "reject unsupported envelope");
+
+  assert.equal(run.state, "FAILED");
+  assert.match(
+    run.failure?.message ?? "",
+    /brainstormer failed for all configured models: .*unsupported-response-shape: .*stream-json.*type=result/i,
+  );
+  assert.doesNotMatch(
+    run.failure?.message ?? "",
+    /No output was produced|raw stderr|WAITING_FOR_BRAINSTORM_APPROVAL/i,
+  );
 });
