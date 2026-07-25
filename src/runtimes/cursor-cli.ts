@@ -18,67 +18,189 @@ import type { RunRecord } from "../domain.ts";
 
 export { parseModelCatalogueIds };
 
-/**
- * Extract assistant text from Cursor CLI `-p` stdout.
- *
- * - `outputFormat=json` / single JSON object: require a result-bearing object
- *   (`type: "result"` with string `result`, or top-level string `result`).
- * - `outputFormat=stream-json` / NDJSON: accept only terminal events with
- *   `type: "result"` and a string `result`. When multiple exist, the last one wins.
- * - Text mode (no JSON object / no NDJSON events): return raw stdout.
- * - Never accept arbitrary `text`/`message` fields from unrelated event types.
- */
-export function extractCursorCliOutput(stdout: string): string {
-  const trimmed = stdout.trim();
-  if (!trimmed) return "";
+export type CursorCliOutputFormat = MasweConfig["runtime"]["outputFormat"];
 
-  const resultFromObject = (parsed: Record<string, unknown>): string | undefined => {
-    if (parsed.type === "result" && typeof parsed.result === "string") {
-      return parsed.result;
+export type CursorCliOutputDecode =
+  | {
+      ok: true;
+      text: string;
+      shape: "json-result" | "stream-json-result" | "text";
     }
-    // Single-JSON success payloads sometimes omit type but still carry result.
-    if (parsed.type === undefined && typeof parsed.result === "string") {
-      return parsed.result;
-    }
-    return undefined;
-  };
+  | {
+      ok: false;
+      code: "invalid-transport-json" | "unsupported-response-shape" | "missing-logical-output";
+      message: string;
+    };
+
+function resultFromObject(parsed: Record<string, unknown>): string | undefined {
+  if (parsed.type === "result" && typeof parsed.result === "string") {
+    return parsed.result;
+  }
+  // Single-JSON success payloads sometimes omit type but still carry result.
+  if (parsed.type === undefined && typeof parsed.result === "string") {
+    return parsed.result;
+  }
+  return undefined;
+}
+
+/**
+ * Decode assistant text from Cursor CLI `-p` stdout.
+ *
+ * Pipeline for structured modes (`json` / `stream-json`):
+ * validate/decode the transport envelope exactly once → select the authoritative
+ * string `result` field → return that logical text only.
+ *
+ * - Never treat transport JSON quoting as model content.
+ * - Never accept arbitrary `text`/`message` fields from unrelated event types.
+ * - Structured modes never fall back to raw stdout (avoids marker validation on
+ *   serialized envelopes).
+ * - Text mode returns raw stdout unchanged.
+ */
+export function decodeCursorCliAssistantOutput(
+  stdout: string,
+  outputFormat: CursorCliOutputFormat = "text",
+): CursorCliOutputDecode {
+  if (outputFormat === "text") {
+    return { ok: true, text: stdout, shape: "text" };
+  }
+
+  const trimmed = stdout.trim();
+  if (!trimmed) {
+    return {
+      ok: false,
+      code: "missing-logical-output",
+      message: "Cursor CLI stdout was empty; no authoritative assistant result field",
+    };
+  }
 
   try {
     const parsed = JSON.parse(trimmed) as unknown;
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return resultFromObject(parsed as Record<string, unknown>) ?? "";
+      const text = resultFromObject(parsed as Record<string, unknown>);
+      if (text !== undefined) {
+        return { ok: true, text, shape: "json-result" };
+      }
+      return {
+        ok: false,
+        code: "unsupported-response-shape",
+        message:
+          'Cursor CLI JSON object lacked an authoritative string "result" field (type=result or typeless result)',
+      };
+    }
+    if (outputFormat === "json") {
+      return {
+        ok: false,
+        code: "unsupported-response-shape",
+        message: "Cursor CLI JSON stdout was not a result-bearing object",
+      };
     }
   } catch {
-    // NDJSON or text path below.
+    if (outputFormat === "json") {
+      // Prefer NDJSON recovery below only for stream-json; json mode may still
+      // recover a single-line object after non-JSON noise in the NDJSON scan.
+    }
   }
 
   const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   let sawJson = false;
+  let sawMalformed = false;
   let terminal: string | undefined;
   for (const line of lines) {
     try {
-      const parsed = JSON.parse(line) as Record<string, unknown>;
+      const parsed = JSON.parse(line) as unknown;
       sawJson = true;
-      if (parsed.type === "result" && typeof parsed.result === "string") {
-        terminal = parsed.result;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const text = resultFromObject(parsed as Record<string, unknown>);
+        if (text !== undefined && (parsed as Record<string, unknown>).type === "result") {
+          terminal = text;
+        } else if (
+          outputFormat === "json" &&
+          text !== undefined &&
+          (parsed as Record<string, unknown>).type === undefined
+        ) {
+          // Allow typeless result objects when recovered line-by-line.
+          terminal = text;
+        }
       }
     } catch {
-      // ignore non-JSON lines
+      sawMalformed = true;
     }
   }
-  if (sawJson) return terminal ?? "";
-  // Text-mode success: raw assistant stdout.
-  return stdout;
+
+  if (terminal !== undefined) {
+    return { ok: true, text: terminal, shape: "stream-json-result" };
+  }
+
+  if (sawJson) {
+    return {
+      ok: false,
+      code: "missing-logical-output",
+      message: 'Cursor CLI JSON/NDJSON contained no authoritative string "result" field',
+    };
+  }
+
+  if (sawMalformed || trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    return {
+      ok: false,
+      code: "invalid-transport-json",
+      message: "Cursor CLI stdout was not valid transport JSON for the configured output format",
+    };
+  }
+
+  return {
+    ok: false,
+    code: "unsupported-response-shape",
+    message: "Cursor CLI stdout did not match a supported json/stream-json assistant result shape",
+  };
 }
 
-function extractOutput(
+/**
+ * Extract assistant text from Cursor CLI `-p` stdout.
+ *
+ * When `outputFormat` is `json` or `stream-json`, returns only the decoded
+ * authoritative logical text (or `""` on structured decode failure).
+ * Text mode / omitted format keeps legacy raw-stdout behavior for callers that
+ * intentionally pass unstructured samples.
+ */
+export function extractCursorCliOutput(
   stdout: string,
-  outputFormat: MasweConfig["runtime"]["outputFormat"],
+  options: { outputFormat?: CursorCliOutputFormat } = {},
 ): string {
-  // Text is an explicit raw-output contract. JSON snippets in Markdown must not
-  // trigger the NDJSON detector used for json/stream-json modes.
-  if (outputFormat === "text") return stdout;
-  return extractCursorCliOutput(stdout);
+  const format = options.outputFormat ?? "text";
+  if (format === "text") {
+    // Legacy helper behavior: attempt structured unwrap when stdout is clearly
+    // JSON/NDJSON, otherwise return raw text. Explicit text mode in execute()
+    // bypasses this helper entirely.
+    const trimmed = stdout.trim();
+    if (!trimmed) return "";
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return resultFromObject(parsed as Record<string, unknown>) ?? "";
+      }
+    } catch {
+      // NDJSON or text path below.
+    }
+    const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    let sawJson = false;
+    let terminal: string | undefined;
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        sawJson = true;
+        if (parsed.type === "result" && typeof parsed.result === "string") {
+          terminal = parsed.result;
+        }
+      } catch {
+        // ignore non-JSON lines
+      }
+    }
+    if (sawJson) return terminal ?? "";
+    return stdout;
+  }
+
+  const decoded = decodeCursorCliAssistantOutput(stdout, format);
+  return decoded.ok ? decoded.text : "";
 }
 
 function looksLikeNode(command: string): boolean {
@@ -171,9 +293,17 @@ export class CursorCliRuntime implements AgentRuntime {
       );
     }
 
-    const extracted = extractOutput(result.stdout, this.config.runtime.outputFormat);
+    const outputFormat = this.config.runtime.outputFormat;
+    const decoded =
+      outputFormat === "text"
+        ? ({ ok: true, text: result.stdout, shape: "text" } as const)
+        : decodeCursorCliAssistantOutput(result.stdout, outputFormat);
+    const extracted = decoded.ok ? decoded.text : "";
     const success = result.exitCode === 0 && !result.timedOut;
-    if (success && !extracted) {
+    if (success && (!decoded.ok || !extracted)) {
+      const decodeError = decoded.ok
+        ? "Cursor CLI exited 0 but stdout contained no valid assistant result"
+        : decoded.message;
       return {
         status: "error",
         output: "",
@@ -188,7 +318,8 @@ export class CursorCliRuntime implements AgentRuntime {
           trust: shouldPassTrustFlag(this.config, request),
           configuredModel: request.roleConfig.model,
           resolvedModel,
-          error: "Cursor CLI exited 0 but stdout contained no valid assistant result",
+          error: decodeError,
+          ...(decoded.ok ? {} : { decodeCode: decoded.code }),
         },
       };
     }

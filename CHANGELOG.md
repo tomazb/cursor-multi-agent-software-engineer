@@ -14,6 +14,8 @@ The project follows semantic versioning once a public release process is establi
 - Deterministic real-process barrier tests for ticket contention, crash boundaries, exact release
   convergence, recovery ordering, and late-owner/successor safety.
 - Focused model-catalogue grammar and smoke-model allowlist regression tests.
+- JSON→marker pipeline regression coverage for Cursor CLI structured output decoding and
+  terminal-marker diagnostics.
 
 ### Changed
 
@@ -28,6 +30,11 @@ The project follows semantic versioning once a public release process is establi
   without falling back. A literal allowlist token remains available only as a bounded family hint.
 - Cursor catalogue parsing now accepts only documented row structures, rejects single-space
   leading-ID prose, and reports malformed row candidates distinctly when no valid IDs remain.
+- Cursor CLI `json` / `stream-json` extraction now fails closed on malformed or unsupported
+  envelopes instead of falling back to raw stdout, and marker validation reports distinct
+  quoted / embedded / duplicate / conflict / non-final diagnostics with logical line numbers.
+- Role prompts harden the terminal-marker contract so models must not repeat the machine token in
+  checklists, examples, or other body text.
 
 ### Planned
 

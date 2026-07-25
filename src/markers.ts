@@ -13,6 +13,14 @@ export type ParsedMarker =
   | {
       ok: false;
       message: string;
+      code?:
+        | "missing-marker"
+        | "quoted-marker"
+        | "embedded-marker"
+        | "duplicate-markers"
+        | "conflicting-markers"
+        | "marker-not-final"
+        | "content-after-marker";
     };
 
 export interface MarkerValidation {
@@ -82,11 +90,17 @@ export function requiredMarkerForRole(role: RoleId): string {
   }
 }
 
-function nonEmptyLines(output: string): string[] {
-  return output
-    .split(/\r?\n/)
-    .map((line) => line.trimEnd())
-    .filter((line) => line.trim().length > 0);
+type NumberedLine = { lineNumber: number; text: string };
+
+function numberedNonEmptyLines(output: string): NumberedLine[] {
+  const lines = output.split(/\r?\n/);
+  const numbered: NumberedLine[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const text = lines[i]!.trimEnd();
+    if (text.trim().length === 0) continue;
+    numbered.push({ lineNumber: i + 1, text });
+  }
+  return numbered;
 }
 
 function valueFromMarker(marker: string): "PASS" | "FAIL" | "IN_SCOPE" | "OUT_OF_SCOPE" | undefined {
@@ -95,6 +109,48 @@ function valueFromMarker(marker: string): "PASS" | "FAIL" | "IN_SCOPE" | "OUT_OF
   if (/^SCOPE:\s*IN_SCOPE$/i.test(marker)) return "IN_SCOPE";
   if (/^SCOPE:\s*OUT_OF_SCOPE$/i.test(marker)) return "OUT_OF_SCOPE";
   return undefined;
+}
+
+function looksQuotedMarker(line: string, token: RegExp): boolean {
+  const match = token.exec(line);
+  if (!match || match.index === undefined) return false;
+  const start = match.index;
+  const end = start + match[0].length;
+  const before = start > 0 ? line[start - 1]! : "";
+  const after = end < line.length ? line[end]! : "";
+  return /[`'"]/.test(before) || /[`'"]/.test(after);
+}
+
+function nonExactTokenDiagnostic(
+  role: RoleId,
+  line: NumberedLine,
+  token: RegExp,
+): Extract<ParsedMarker, { ok: false }> {
+  const trimmed = line.text.trim();
+  if (looksQuotedMarker(trimmed, token)) {
+    return {
+      ok: false,
+      code: "quoted-marker",
+      message: `${role} output contains a quoted marker example (line ${line.lineNumber}); put exactly one bare terminal marker on the final line`,
+    };
+  }
+  // Bare token plus trailing/leading content on the same line.
+  if (token.test(trimmed) && trimmed.replace(token, "").trim().length > 0) {
+    const match = token.exec(trimmed);
+    const atStart = match?.index === 0;
+    if (atStart) {
+      return {
+        ok: false,
+        code: "content-after-marker",
+        message: `${role} output has content after the marker on line ${line.lineNumber}; put exactly one bare terminal marker on the final logical line`,
+      };
+    }
+  }
+  return {
+    ok: false,
+    code: "embedded-marker",
+    message: `${role} output contains an embedded marker token (line ${line.lineNumber}); put exactly one bare terminal marker on the final logical line`,
+  };
 }
 
 export function parseRoleMarker(
@@ -106,52 +162,63 @@ export function parseRoleMarker(
   const spec = mode === "classify" ? CLASSIFY_SPEC : ROLE_SPECS[role];
   const required =
     mode === "classify" ? "SCOPE: IN_SCOPE|OUT_OF_SCOPE" : requiredMarkerForRole(role);
-  const lines = nonEmptyLines(output);
+  const lines = numberedNonEmptyLines(output);
   if (lines.length === 0) {
-    return { ok: false, message: `${role} output is missing required marker ${required}` };
+    return {
+      ok: false,
+      code: "missing-marker",
+      message: `${role} output is missing required marker ${required}`,
+    };
   }
 
   const exactMarkers: string[] = [];
-  let embedded = false;
+  let nonExact: Extract<ParsedMarker, { ok: false }> | undefined;
   for (const line of lines) {
-    const trimmed = line.trim();
+    const trimmed = line.text.trim();
     const normalized = spec.normalize(trimmed);
     if (normalized) {
       exactMarkers.push(normalized);
       continue;
     }
-    if (spec.token.test(trimmed)) {
-      embedded = true;
+    if (spec.token.test(trimmed) && !nonExact) {
+      nonExact = nonExactTokenDiagnostic(role, line, spec.token);
     }
   }
 
-  if (embedded) {
-    return {
-      ok: false,
-      message: `${role} output contains an embedded or quoted marker; put exactly one bare terminal marker on the final line`,
-    };
+  if (nonExact) {
+    return nonExact;
   }
 
   if (exactMarkers.length === 0) {
-    return { ok: false, message: `${role} output is missing required marker ${required}` };
+    return {
+      ok: false,
+      code: "missing-marker",
+      message: `${role} output is missing required marker ${required}`,
+    };
   }
 
   if (exactMarkers.length > 1) {
     const unique = new Set(exactMarkers);
-    return {
-      ok: false,
-      message: unique.size > 1
-        ? `${role} output has conflicting terminal markers: ${[...unique].join(" vs ")}`
-        : `${role} output has duplicate terminal markers`,
-    };
+    return unique.size > 1
+      ? {
+          ok: false,
+          code: "conflicting-markers",
+          message: `${role} output has conflicting terminal markers: ${[...unique].join(" vs ")}`,
+        }
+      : {
+          ok: false,
+          code: "duplicate-markers",
+          message: `${role} output has duplicate terminal markers`,
+        };
   }
 
-  const finalLine = lines[lines.length - 1]!.trim();
-  const finalMarker = spec.normalize(finalLine);
+  const finalLine = lines[lines.length - 1]!;
+  const finalMarker = spec.normalize(finalLine.text.trim());
   if (!finalMarker || finalMarker !== exactMarkers[0]) {
     return {
       ok: false,
-      message: `${role} output must end with exactly one bare terminal marker ${required}`,
+      code: "marker-not-final",
+      message: `${role} output must end with exactly one bare terminal marker ${required} on the final logical line`,
     };
   }
 

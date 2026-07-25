@@ -51,4 +51,8 @@ The **very last line** of your response must be exactly one of these bare marker
 VERDICT: PASS
 VERDICT: FAIL
 
-Do not wrap the marker in backticks, quotes, bold, or code fences. Do not mention those marker strings anywhere else in the response.
+Hard rules:
+- The chosen marker may appear only on that final line.
+- Do not wrap the marker in backticks, quotes, bold, or code fences.
+- Do not mention those marker strings anywhere else in the response.
+- If you need to refer to completion, say "the terminal marker" rather than repeating the token.

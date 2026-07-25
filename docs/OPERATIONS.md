@@ -120,12 +120,16 @@ Ambiguous cross-family matches and missing models fail closed. Treat a Cursor CL
 
 Doctor probe cleanup is based on recorded probe identity: once a `doctor-*` probe ID is assigned, final cleanup removes the probe worktree (if present) and `maswe/doctor-*` branch even when worktree creation failed after the branch was created. Cleanup is idempotent; cleanup failures surface as a `doctor-probe-cleanup` check without erasing the original doctor failure.
 
-Cursor CLI assistant extraction:
+Cursor CLI assistant extraction and terminal markers:
 
+- Pipeline: raw Cursor CLI stdout → validate/decode the supported transport envelope exactly once → select the authoritative string `result` field → normalize only permitted line endings / trailing whitespace → validate exactly one bare terminal marker on the final logical line.
 - `stream-json`: only terminal NDJSON events with `type: "result"` (last wins).
-- `json`: only result-bearing objects.
-- Text mode: raw stdout.
+- `json`: only result-bearing objects (`type: "result"` with string `result`, or typeless object with string `result`).
+- Text mode: raw stdout (Markdown may contain JSON snippets without triggering NDJSON detection).
+- Structured modes never fall back to validating the raw JSON envelope as logical text.
 - Exit 0 with no valid stdout assistant result fails closed; stderr is never treated as successful assistant content.
+- Marker validation rejects quoted examples, embedded tokens, duplicates, conflicts, non-final markers, and content after a marker. Diagnostics name the violated contract and logical line number without dumping full model output.
+- Authenticated validation for this contract used Cursor CLI `2026.07.23-e383d2b` on Linux; do not assume broader provider or platform coverage.
 
 ## 4. Configure quality commands
 
