@@ -2,6 +2,89 @@ import type { MasweConfig, RoleId } from "./domain.ts";
 import { ROLE_IDS } from "./domain.ts";
 
 export type ModelEffortTier = "high" | "medium" | "low";
+export type ModelResolutionErrorCode =
+  | "unknown-model"
+  | "inexact-model-match"
+  | "ambiguous-model-match"
+  | "effort-unavailable";
+
+export class ModelResolutionError extends Error {
+  readonly code: ModelResolutionErrorCode;
+
+  constructor(code: ModelResolutionErrorCode, message: string) {
+    super(message);
+    this.name = "ModelResolutionError";
+    this.code = code;
+  }
+}
+
+export class UnknownModelError extends ModelResolutionError {
+  readonly requested: string;
+  readonly catalogueSize: number;
+  readonly sample: readonly string[];
+
+  constructor(requested: string, catalogueSize: number, sample: readonly string[]) {
+    super(
+      "unknown-model",
+      `Unknown model '${requested}': no matching catalogue ID among ${catalogueSize} entries (sample: ${sample.join(", ") || "(none)"}). Run 'agent models' and update config.`,
+    );
+    this.name = "UnknownModelError";
+    this.requested = requested;
+    this.catalogueSize = catalogueSize;
+    this.sample = sample;
+  }
+}
+
+export class InexactModelMatchError extends ModelResolutionError {
+  readonly requested: string;
+  readonly candidate: string;
+
+  constructor(requested: string, candidate: string) {
+    super(
+      "inexact-model-match",
+      `Inexact model '${requested}': weak substring match [${candidate}] is not an exact logical model core. Use an exact catalogue ID or the complete configured logical model name.`,
+    );
+    this.name = "InexactModelMatchError";
+    this.requested = requested;
+    this.candidate = candidate;
+  }
+}
+
+export class AmbiguousModelError extends ModelResolutionError {
+  readonly requested: string;
+  readonly candidates: readonly string[];
+
+  constructor(requested: string, candidates: readonly string[]) {
+    super(
+      "ambiguous-model-match",
+      `Ambiguous model '${requested}': matches [${[...candidates].sort().join(", ")}]. Use an exact catalogue ID.`,
+    );
+    this.name = "AmbiguousModelError";
+    this.requested = requested;
+    this.candidates = candidates;
+  }
+}
+
+export class ModelEffortUnavailableError extends ModelResolutionError {
+  readonly requested: string;
+  readonly requestedEffort: ModelEffortTier;
+  readonly availableEfforts: readonly ModelEffortTier[];
+
+  constructor(
+    requested: string,
+    requestedEffort: ModelEffortTier,
+    availableEfforts: readonly ModelEffortTier[],
+  ) {
+    super(
+      "effort-unavailable",
+      `Requested effort '${requestedEffort}' for model '${requested}' is unavailable in the catalogue (same-core efforts present: ${availableEfforts.join(", ") || "none"}). Refusing silent effort substitution.`,
+    );
+    this.name = "ModelEffortUnavailableError";
+    this.requested = requested;
+    this.requestedEffort = requestedEffort;
+    this.availableEfforts = availableEfforts;
+  }
+}
 
 /**
  * Strip Cursor catalogue decoration to a logical model core.
@@ -43,6 +126,17 @@ function comparePreference(a: string, b: string): number {
     if (diff !== 0) return diff;
   }
   return (sa[3] as string).localeCompare(sb[3] as string);
+}
+
+function classifyWeakMatches(
+  requested: string,
+  ids: readonly string[],
+): InexactModelMatchError | AmbiguousModelError | undefined {
+  const needle = requested.trim().toLowerCase();
+  const weak = ids.filter((id) => id.includes(needle));
+  if (weak.length === 1) return new InexactModelMatchError(requested, weak[0]!);
+  if (weak.length > 1) return new AmbiguousModelError(requested, weak);
+  return undefined;
 }
 
 /**
@@ -90,24 +184,16 @@ export function resolveLogicalModelId(requested: string, catalogue: Iterable<str
 
   if (needleEffort && sameCore.length > 0) {
     const available = [
-      ...new Set(sameCore.map((id) => modelEffortTier(id)).filter(Boolean)),
-    ].join(", ");
-    throw new Error(
-      `Requested effort '${needleEffort}' for model '${requested}' is unavailable in the catalogue (same-core efforts present: ${available || "none"}). Refusing silent effort substitution.`,
-    );
+      ...new Set(sameCore.map((id) => modelEffortTier(id)).filter((tier): tier is ModelEffortTier => tier !== undefined)),
+    ];
+    throw new ModelEffortUnavailableError(requested, needleEffort, available);
   }
 
-  // No same-core family. Reject weak substring hits across different cores.
-  const weak = ids.filter((id) => id.includes(needle));
-  if (weak.length === 0) {
-    const sample = ids.slice(0, 8).join(", ") || "(none)";
-    throw new Error(
-      `Unknown model '${requested}': no matching catalogue ID among ${ids.length} entries (sample: ${sample}). Run 'agent models' and update config.`,
-    );
-  }
-  throw new Error(
-    `Ambiguous model '${requested}': matches [${weak.sort().join(", ")}]. Use an exact catalogue ID.`,
-  );
+  // No same-core family. Weak substring hits remain fail-closed, but one weak
+  // candidate is inexact rather than ambiguous and multiple candidates are typed.
+  const weakError = classifyWeakMatches(requested, ids);
+  if (weakError) throw weakError;
+  throw new UnknownModelError(requested, ids.length, ids.slice(0, 8));
 }
 
 /**
@@ -184,18 +270,36 @@ function isApprovedSmokeFamilyHint(value: string): boolean {
   return (SMOKE_MODEL_FAMILY_ALLOWLIST as readonly string[]).includes(value);
 }
 
-function throwPreferredAmbiguity(preferred: string, error: unknown): void {
-  const message = error instanceof Error ? error.message : String(error);
-  if (/Ambiguous model/i.test(message)) {
-    throw new Error(`Ambiguous preferred smoke-model selection '${preferred}': ${message}`);
+function describePreferredShapeFailure(
+  preferred: string,
+  ids: readonly string[],
+): Error {
+  const weakError = classifyWeakMatches(preferred, ids);
+  const allowed = `an exact ID present in the discovered catalogue or a literal approved-family hint (allowlist: ${SMOKE_MODEL_FAMILY_ALLOWLIST.join(", ")})`;
+  if (weakError instanceof AmbiguousModelError) {
+    return new Error(
+      `Ambiguous preferred smoke-model selection '${preferred}': the value is neither ${allowed}. ${weakError.message}`,
+    );
   }
+  if (weakError instanceof InexactModelMatchError) {
+    return new Error(
+      `Inexact preferred smoke-model selection '${preferred}': the value is neither ${allowed}. ${weakError.message}`,
+    );
+  }
+  return new Error(
+    `Preferred smoke model '${preferred}' is neither ${allowed}. Exact IDs never fall back.`,
+  );
 }
 
-function throwAutomaticAmbiguity(family: string, error: unknown): void {
+function describeAutomaticFailure(family: string, error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  if (/Ambiguous model/i.test(message)) {
-    throw new Error(`Ambiguous smoke-model selection for approved family '${family}': ${message}`);
+  if (error instanceof AmbiguousModelError) {
+    return `Ambiguous smoke-model selection for approved family '${family}': ${message}`;
   }
+  if (error instanceof InexactModelMatchError) {
+    return `Inexact smoke-model selection for approved family '${family}': ${message}`;
+  }
+  return `Approved family '${family}' unavailable: ${message}`;
 }
 
 /**
@@ -222,31 +326,42 @@ export function pickCatalogueModel(catalogue: Iterable<string>, preferred?: stri
       return normalizedPreferred;
     }
 
-    try {
-      const resolvedHint = resolveLogicalModelId(normalizedPreferred, ids);
-      if (isApprovedSmokeFamilyHint(normalizedPreferred)) {
+    if (isApprovedSmokeFamilyHint(normalizedPreferred)) {
+      try {
+        const resolvedHint = resolveLogicalModelId(normalizedPreferred, ids);
+        if (!isApprovedSmokeModelId(resolvedHint)) {
+          throw new Error(
+            `Resolved model '${resolvedHint}' does not satisfy the approved family/effort policy.`,
+          );
+        }
         return resolvedHint;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `Preferred approved smoke-model family hint '${preferred}' could not be resolved: ${message}`,
+        );
       }
-    } catch (error) {
-      throwPreferredAmbiguity(normalizedPreferred, error);
     }
 
-    throw new Error(
-      `Preferred smoke model '${preferred}' is neither an exact ID present in the discovered catalogue nor a literal approved-family hint (allowlist: ${SMOKE_MODEL_FAMILY_ALLOWLIST.join(", ")}). Exact IDs never fall back.`,
-    );
+    throw describePreferredShapeFailure(normalizedPreferred, ids);
   }
 
   const errors: string[] = [];
   for (const family of SMOKE_MODEL_FAMILY_ALLOWLIST) {
     try {
-      return resolveLogicalModelId(family, ids);
+      const resolved = resolveLogicalModelId(family, ids);
+      if (!isApprovedSmokeModelId(resolved)) {
+        throw new Error(
+          `Resolved model '${resolved}' does not satisfy the approved family/effort policy.`,
+        );
+      }
+      return resolved;
     } catch (error) {
-      throwAutomaticAmbiguity(family, error);
-      errors.push(error instanceof Error ? error.message : String(error));
+      errors.push(describeAutomaticFailure(family, error));
     }
   }
 
   throw new Error(
-    `No approved smoke model family available in the catalogue (allowlist: ${SMOKE_MODEL_FAMILY_ALLOWLIST.join(", ")}). ${errors[errors.length - 1] ?? ""}`.trim(),
+    `No approved smoke model family available in the catalogue (allowlist: ${SMOKE_MODEL_FAMILY_ALLOWLIST.join(", ")}). Attempts: ${errors.join(" | ")}`,
   );
 }
