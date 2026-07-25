@@ -16,6 +16,9 @@ The project follows semantic versioning once a public release process is establi
 - Focused model-catalogue grammar and smoke-model allowlist regression tests.
 - JSON→marker pipeline regression coverage for Cursor CLI structured output decoding and
   terminal-marker diagnostics.
+- Thermos blocker regressions covering bracketed default badges, partial-catalogue rejection,
+  cardinality-correct typed weak matches, ordered approved-family continuation, actionable
+  preferred-hint errors, and operator-visible structured decode failures.
 
 ### Changed
 
@@ -28,11 +31,20 @@ The project follows semantic versioning once a public release process is establi
 - Preferred exact smoke-model IDs must now be present in the live catalogue and satisfy the same
   approved-family and effort policy as automatic selection; invalid exact preferences fail closed
   without falling back. A literal allowlist token remains available only as a bounded family hint.
-- Cursor catalogue parsing now accepts only documented row structures, rejects single-space
-  leading-ID prose, and reports malformed row candidates distinctly when no valid IDs remain.
+- Cursor catalogue parsing now accepts only documented row structures, including `(default)` and
+  `[default]`, and rejects single-space leading-ID prose. Any malformed ID-shaped row rejects the
+  complete discovery result even when valid IDs survive, preventing resolution from a silently
+  incomplete catalogue.
+- Logical model weak matches use typed, cardinality-correct failures: one weak candidate is inexact,
+  multiple candidates are ambiguous, and effort-unavailable remains distinct. Smoke selection no
+  longer matches error prose and continues through later approved families after a family-specific
+  failure.
 - Cursor CLI `json` / `stream-json` extraction now fails closed on malformed or unsupported
-  envelopes instead of falling back to raw stdout, and marker validation reports distinct
-  quoted / embedded / duplicate / conflict / non-final diagnostics with logical line numbers.
+  envelopes instead of falling back to raw stdout. Exit-zero decode failures expose sanitized
+  `invalid-transport-json`, `unsupported-response-shape`, or `missing-logical-output` diagnostics
+  through the runtime output consumed by the orchestrator.
+- Marker validation reports distinct quoted / embedded / duplicate / conflict / non-final
+  diagnostics with logical line numbers.
 - Role prompts harden the terminal-marker contract so models must not repeat the machine token in
   checklists, examples, or other body text.
 
@@ -81,12 +93,12 @@ The project follows semantic versioning once a public release process is establi
 ### Added
 
 - Product requirements, architecture, security, operations, roadmap, and ADRs.
-- TypeScript workflow state machine and file-based event/artifact store.
 - Configurable brainstorming, design, build, verify, and PR resolver roles.
 - Cursor CLI, optional Cursor SDK, and mock runtime adapters.
 - Human approval gates and fail-closed transition policy.
 - Deterministic quality command runner.
 - Read-only workspace fingerprint enforcement.
 - PR comment classification, scoped resolution, CI rerun, and fresh verification loop.
-- Cursor plugin manifest and `maswe` skill.
+- Secret redaction for artifacts and quality command output.
+- Git worktree/branch manager with deterministic commits and scope checks.
 - Unit and end-to-end workflow tests plus GitHub Actions CI.
