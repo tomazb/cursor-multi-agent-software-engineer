@@ -35,14 +35,15 @@ export type CursorCliOutputDecode =
       message: string;
     };
 
-function resultFromObject(parsed: Record<string, unknown>): string | undefined {
-  if (parsed.type === "result" && typeof parsed.result === "string") {
-    return parsed.result;
-  }
-  // Single-JSON success payloads sometimes omit type but still carry result.
-  if (parsed.type === undefined && typeof parsed.result === "string") {
-    return parsed.result;
-  }
+function authoritativeResultFromObject(
+  parsed: Record<string, unknown>,
+  outputFormat: CursorCliOutputFormat,
+): string | undefined {
+  if (typeof parsed.result !== "string") return undefined;
+  if (parsed.type === "result") return parsed.result;
+  // Single-JSON mode may return a typeless success payload. Stream-json must
+  // remain event-typed so an unsupported envelope cannot authorize a marker.
+  if (outputFormat === "json" && parsed.type === undefined) return parsed.result;
   return undefined;
 }
 
@@ -78,7 +79,10 @@ export function decodeCursorCliAssistantOutput(
   try {
     const parsed = JSON.parse(trimmed) as unknown;
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const text = resultFromObject(parsed as Record<string, unknown>);
+      const text = authoritativeResultFromObject(
+        parsed as Record<string, unknown>,
+        outputFormat,
+      );
       if (text !== undefined) {
         return { ok: true, text };
       }
@@ -86,7 +90,9 @@ export function decodeCursorCliAssistantOutput(
         ok: false,
         code: "unsupported-response-shape",
         message:
-          'Cursor CLI JSON object lacked an authoritative string "result" field (type=result or typeless result)',
+          outputFormat === "stream-json"
+            ? 'Cursor CLI stream-json object lacked an authoritative string "result" field with type=result'
+            : 'Cursor CLI JSON object lacked an authoritative string "result" field (type=result or typeless result)',
       };
     }
     return {
@@ -108,14 +114,11 @@ export function decodeCursorCliAssistantOutput(
       const parsed = JSON.parse(line) as unknown;
       sawJson = true;
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        const record = parsed as Record<string, unknown>;
-        const text = resultFromObject(record);
-        if (text !== undefined && record.type === "result") {
-          terminal = text;
-        } else if (outputFormat === "json" && text !== undefined && record.type === undefined) {
-          // Allow typeless result objects when recovered line-by-line in json mode.
-          terminal = text;
-        }
+        const text = authoritativeResultFromObject(
+          parsed as Record<string, unknown>,
+          outputFormat,
+        );
+        if (text !== undefined) terminal = text;
       }
     } catch {
       if (/^[{[]/.test(line)) sawJsonLikeMalformed = true;
@@ -179,7 +182,7 @@ function extractCursorCliOutputLegacyAuto(stdout: string): string {
   try {
     const parsed = JSON.parse(trimmed) as unknown;
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return resultFromObject(parsed as Record<string, unknown>) ?? "";
+      return authoritativeResultFromObject(parsed as Record<string, unknown>, "json") ?? "";
     }
   } catch {
     // NDJSON or text path below.
