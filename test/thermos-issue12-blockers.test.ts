@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
+import { Orchestrator } from "../src/orchestrator.ts";
 import {
   AmbiguousModelError,
   InexactModelMatchError,
@@ -119,21 +120,19 @@ test("Thermos decoder cleanup: plain prose is unsupported shape, malformed JSON 
   if (!malformed.ok) assert.equal(malformed.code, "invalid-transport-json");
 });
 
-test("Thermos blocker 3: exit-zero decode diagnostics reach the runtime output consumed by operators", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-thermos-decode-diagnostic-"));
-  const config = structuredClone(DEFAULT_CONFIG);
-  config.runtime.command = process.execPath;
-  config.runtime.outputFormat = "json";
-  config.roles.brainstormer.model = "cursor-grok-4.5-high";
-  config.policy.promptTransport = "argv";
-
-  const runtime = new CursorCliRuntime(config, {
+function createDecodeFailureRuntime(cwd: string, config: typeof DEFAULT_CONFIG): CursorCliRuntime {
+  return new CursorCliRuntime(config, {
     cwd,
     spawnFn: async (_command, args) => {
       if (args[0] === "models") {
         return {
           exitCode: 0,
-          stdout: "cursor-grok-4.5-high\n",
+          stdout: [
+            "cursor-grok-4.5-high",
+            "cursor-claude-fable-5-high",
+            "cursor-claude-opus-4.8-high",
+            "gpt-5.6-sol-high",
+          ].join("\n"),
           stderr: "",
           durationMs: 1,
         };
@@ -146,7 +145,17 @@ test("Thermos blocker 3: exit-zero decode diagnostics reach the runtime output c
       };
     },
   });
+}
 
+test("Thermos blocker 3: exit-zero decode diagnostics reach the runtime output consumed by operators", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-thermos-decode-diagnostic-"));
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.runtime.command = process.execPath;
+  config.runtime.outputFormat = "json";
+  config.roles.brainstormer.model = "cursor-grok-4.5-high";
+  config.policy.promptTransport = "argv";
+
+  const runtime = createDecodeFailureRuntime(cwd, config);
   const result = await runtime.execute({
     runId: "thermos-decode",
     role: "brainstormer",
@@ -159,4 +168,29 @@ test("Thermos blocker 3: exit-zero decode diagnostics reach the runtime output c
   assert.match(result.output, /^invalid-transport-json: .*malformed transport JSON/i);
   assert.doesNotMatch(result.output, /auth detail/);
   assert.equal(result.metadata?.decodeCode, "invalid-transport-json");
+});
+
+test("Thermos blocker 3: orchestrator persists the structured decode diagnostic instead of a generic empty-output error", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-thermos-orchestrator-diagnostic-"));
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.runtime.kind = "cursor-cli";
+  config.runtime.command = process.execPath;
+  config.runtime.outputFormat = "json";
+  config.policy.promptTransport = "argv";
+  config.policy.useIsolatedWorktree = false;
+  config.policy.allowDirtyWorkspace = true;
+  config.quality.commands = [];
+
+  const run = await new Orchestrator(
+    cwd,
+    config,
+    createDecodeFailureRuntime(cwd, config),
+  ).start("decode diagnostic", "exercise the failure path");
+
+  assert.equal(run.state, "FAILED");
+  assert.match(
+    run.failure?.message ?? "",
+    /brainstormer failed for all configured models: .*invalid-transport-json: .*malformed transport JSON/i,
+  );
+  assert.doesNotMatch(run.failure?.message ?? "", /No output was produced|auth detail/i);
 });
