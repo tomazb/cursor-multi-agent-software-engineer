@@ -313,6 +313,6 @@ test("Codex P1: typeless stream-json marker cannot advance the orchestrator", as
   );
   assert.doesNotMatch(
     run.failure?.message ?? "",
-    /No output was produced|raw stderr|WAITING_FOR_BRAINSTORM_APPROVAL/i,
+    /No output was produced|raw stderr|READY_FOR_BRAINSTORM_APPROVAL/i,
   );
 });
