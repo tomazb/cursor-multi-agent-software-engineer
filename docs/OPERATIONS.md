@@ -130,7 +130,11 @@ Cursor CLI assistant extraction and terminal markers:
 - `json`: result-bearing objects use `type: "result"` with string `result`, or a typeless object with string `result`. Line-by-line recovery is permitted only for the same authoritative result shapes.
 - Text mode: raw stdout (Markdown may contain JSON snippets without triggering structured decoding).
 - Structured modes never fall back to validating the raw JSON envelope as logical text. A malformed JSON-looking record fails with `invalid-transport-json`; plain non-JSON output fails with `unsupported-response-shape`; valid JSON events without an authoritative result fail with `missing-logical-output`.
-- Exit 0 with no valid assistant result fails closed and the sanitized decode code and message are placed in the runtime output consumed by the orchestrator. The operator-visible codes remain `invalid-transport-json`, `unsupported-response-shape`, and `missing-logical-output`. Stderr content is discarded at the runtime boundary; only `stderrPresent` is retained.
+- Exit 0 with no valid assistant result fails closed and returns a `status: "error"` result carrying
+  a `RuntimeFailureDiagnostic`; the diagnostic is never treated as successful assistant content.
+  The operator-visible codes remain `invalid-transport-json`, `unsupported-response-shape`, and
+  `missing-logical-output`. Stderr content is discarded at the runtime boundary; only
+  `stderrPresent` is retained.
 - A non-zero exit never promotes structured or text stdout to assistant output. It returns a typed
   `cursor-cli-non-zero` or `cursor-cli-timeout` diagnostic with exit code, timeout state, duration,
   requested/configured model, prompt transport, stderr presence, and truncation state where
