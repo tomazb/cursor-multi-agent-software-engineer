@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { renderRun } from "../src/run-rendering.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
@@ -20,12 +23,45 @@ import {
 import { FileRunStore } from "../src/store.ts";
 
 const PERSISTED_CANARY = "ISSUE19_CANARY_PERSISTED_SECRET";
+const FINE_GRAINED_PAT =
+  "github_pat_11SYNTHETICPERSISTENCEONLY_abcdefghijklmnopqrstuvwxyz0123456789";
 const MODELS = [
   "cursor-grok-4.5-high",
   "gpt-5.6-sol-high",
   "cursor-claude-fable-5-high",
   "cursor-claude-opus-4.8-high",
 ];
+const execFileAsync = promisify(execFile);
+const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+
+interface ExpectedDurableRuntimeAttempt {
+  model: string;
+  code: string;
+  message: string;
+  requestedModel?: string;
+  configuredModel?: string;
+  exitCode?: number;
+  timedOut?: boolean;
+  durationMs?: number;
+  promptTransport?: string;
+  stderrPresent: boolean;
+  truncated: boolean;
+}
+
+interface ExpectedDurableRuntimeSummary {
+  attempts: ExpectedDurableRuntimeAttempt[];
+  totalAttempts: number;
+  omittedAttempts: number;
+  aggregateTruncated: boolean;
+}
+
+function runtimeSummary(run: unknown): ExpectedDurableRuntimeSummary | undefined {
+  return (
+    run as {
+      failure?: { runtime?: ExpectedDurableRuntimeSummary };
+    }
+  ).failure?.runtime;
+}
 
 function issue19Config(rejectModelFallback = false): MasweConfig {
   const config = structuredClone(DEFAULT_CONFIG);
@@ -90,6 +126,35 @@ class ThrowingFailureRuntime extends UnsafeFailureRuntime {
     throw new Error(
       `transport rejected ${request.roleConfig.model} token=${PERSISTED_CANARY}_THROWN`,
     );
+  }
+}
+
+class FineGrainedPatFailureRuntime extends UnsafeFailureRuntime {
+  override async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    this.attempts.push(request.roleConfig.model);
+    const raw = `provider rejected credential ${FINE_GRAINED_PAT}`;
+    return {
+      status: "error",
+      output: raw,
+      requestedModel: request.roleConfig.model,
+      actualModel: request.roleConfig.model,
+      failure: {
+        code: "runtime-error",
+        message: raw,
+        requestedModel: request.roleConfig.model,
+        configuredModel: request.roleConfig.model,
+        promptTransport: "stdin",
+        exitCode: 41,
+        timedOut: false,
+        durationMs: 29,
+        stderrPresent: true,
+        truncated: false,
+      },
+      metadata: {
+        diagnostic: raw,
+        stderrPresent: true,
+      },
+    };
   }
 }
 
@@ -171,6 +236,147 @@ test("unsafe runtime failure is absent from returned state, disk, events, artifa
   }
 
   assertNoCanary(loaded);
+});
+
+test("synthetic fine-grained GitHub PAT is absent from every durable and rendered sink", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-issue19-fine-pat-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const config = issue19Config(true);
+  const runtime = new FineGrainedPatFailureRuntime();
+  const store = new FileRunStore(cwd);
+  const orchestrator = new Orchestrator(cwd, config, runtime, store);
+
+  const failed = await orchestrator.start(
+    "Issue 19 fine-grained PAT",
+    "synthetic request",
+  );
+  assert.equal(failed.state, "FAILED");
+  assert.equal(JSON.stringify(failed).includes(FINE_GRAINED_PAT), false);
+  assert.equal(renderRun(failed).includes(FINE_GRAINED_PAT), false);
+
+  const runFile = path.join(
+    cwd,
+    ".maswe",
+    "runs",
+    failed.id,
+    "run.json",
+  );
+  assert.equal((await readFile(runFile, "utf8")).includes(FINE_GRAINED_PAT), false);
+
+  for (const json of [false, true]) {
+    const result = await execFileAsync(
+      process.execPath,
+      [
+        "--experimental-strip-types",
+        cliPath,
+        "status",
+        failed.id,
+        ...(json ? ["--json"] : []),
+        "--cwd",
+        cwd,
+      ],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.stdout.includes(FINE_GRAINED_PAT), false);
+    assert.match(result.stdout, /runtime-error/);
+  }
+
+  const retried = await orchestrator.retryFromFailed(failed.id);
+  assert.equal(retried.state, "FAILED");
+  assert.equal(JSON.stringify(retried).includes(FINE_GRAINED_PAT), false);
+  const retry = retried.events.find(
+    (event) => event.type === "RETRY_FROM_FAILED",
+  );
+  assert.ok(retry);
+  assert.equal(JSON.stringify(retry).includes(FINE_GRAINED_PAT), false);
+
+  const replacement = await orchestrator.supersede(retried.id);
+  const superseded = await store.load(retried.id);
+  assert.equal(JSON.stringify(superseded).includes(FINE_GRAINED_PAT), false);
+  assert.equal(JSON.stringify(replacement).includes(FINE_GRAINED_PAT), false);
+
+  for (const runId of [superseded.id, replacement.id]) {
+    const files = await allFiles(path.join(cwd, ".maswe", "runs", runId));
+    for (const file of files) {
+      assert.equal(
+        (await readFile(file, "utf8")).includes(FINE_GRAINED_PAT),
+        false,
+        `fine-grained PAT leaked in ${file}`,
+      );
+    }
+  }
+});
+
+test("one runtime attempt retains the bounded structured durable subset", async (t) => {
+  const { orchestrator } = await makeProject(t, true);
+
+  const run = await orchestrator.start(
+    "Issue 19 one structured attempt",
+    "synthetic request",
+  );
+  const summary = runtimeSummary(run);
+
+  assert.ok(summary);
+  assert.equal(summary.totalAttempts, 1);
+  assert.equal(summary.omittedAttempts, 0);
+  assert.equal(summary.attempts.length, 1);
+  assert.deepEqual(
+    {
+      model: summary.attempts[0]?.model,
+      code: summary.attempts[0]?.code,
+      requestedModel: summary.attempts[0]?.requestedModel,
+      exitCode: summary.attempts[0]?.exitCode,
+      timedOut: summary.attempts[0]?.timedOut,
+      durationMs: summary.attempts[0]?.durationMs,
+      stderrPresent: summary.attempts[0]?.stderrPresent,
+      truncated: summary.attempts[0]?.truncated,
+    },
+    {
+      model: MODELS[0],
+      code: "runtime-error",
+      requestedModel: MODELS[0],
+      exitCode: 23,
+      timedOut: false,
+      durationMs: 17,
+      stderrPresent: true,
+      truncated: true,
+    },
+  );
+  assertNoCanary(summary);
+});
+
+test("fallback failures retain structured metadata for every stored attempt and FAIL details", async (t) => {
+  const { orchestrator } = await makeProject(t);
+
+  const run = await orchestrator.start(
+    "Issue 19 several structured attempts",
+    "synthetic request",
+  );
+  const summary = runtimeSummary(run);
+
+  assert.ok(summary);
+  assert.equal(summary.totalAttempts, MODELS.length);
+  assert.equal(summary.omittedAttempts, 0);
+  assert.deepEqual(
+    summary.attempts.map((attempt) => attempt.model),
+    MODELS,
+  );
+  assert.ok(
+    summary.attempts.every(
+      (attempt) =>
+        attempt.exitCode === 23 &&
+        attempt.timedOut === false &&
+        attempt.durationMs === 17 &&
+        attempt.stderrPresent === true,
+    ),
+  );
+  const fail = run.events.findLast((event) => event.type === "FAIL");
+  assert.deepEqual(
+    (fail?.details as { runtime?: ExpectedDurableRuntimeSummary } | undefined)
+      ?.runtime,
+    summary,
+  );
+  assertNoCanary(fail?.details);
 });
 
 test("retry history re-sanitizes previousFailure before persistence", async (t) => {
@@ -315,6 +521,115 @@ test("fallback aggregate reports model attempts omitted after reaching its bound
   assertNoCanary(message);
   assert.ok([...message].length <= FAILURE_AGGREGATE_MAX_CODE_POINTS);
   assert.match(message, /8 additional model failures omitted after aggregate limit/);
+  const summary = runtimeSummary(run);
+  assert.ok(summary);
+  assert.equal(summary.totalAttempts, models.length);
+  assert.equal(summary.attempts.length, 8);
+  assert.equal(summary.omittedAttempts, 4);
+  assert.deepEqual(
+    summary.attempts.map((attempt) => attempt.model),
+    models.slice(0, 8),
+  );
+  assertNoCanary(summary);
+});
+
+test("model display identity is single-line and cannot impersonate aggregate entries", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-issue19-model-frame-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const configuredModel =
+    `${MODELS[0]}\r\n\u0000 | forged [runtime-error]: injected`;
+  const config = issue19Config(true);
+  for (const role of Object.keys(config.roles) as Array<
+    keyof typeof config.roles
+  >) {
+    config.roles[role].model = configuredModel;
+    config.roles[role].fallbackModels = [];
+  }
+  const runtime = new (class extends UnsafeFailureRuntime {
+    override async listModels(): Promise<string[]> {
+      return [configuredModel];
+    }
+  })();
+  const store = new FileRunStore(cwd);
+  const orchestrator = new Orchestrator(cwd, config, runtime, store);
+
+  const run = await orchestrator.start(
+    "Issue 19 model framing",
+    "synthetic request",
+  );
+  const summary = runtimeSummary(run);
+  assert.ok(summary);
+  assert.equal(runtime.attempts.length, 1);
+  assert.match(runtime.attempts[0] ?? "", /[\r\n\u0000]/);
+
+  const attempt = summary.attempts[0];
+  assert.ok(attempt);
+  for (const field of [
+    attempt.model,
+    attempt.requestedModel ?? "",
+    attempt.configuredModel ?? "",
+  ]) {
+    assert.doesNotMatch(field, /[\r\n\u0000-\u001f\u007f-\u009f]/);
+    assert.doesNotMatch(field, /\s\|\s|\[[^\]]+\]:/);
+  }
+  const human = renderRun(run);
+  assert.doesNotMatch(human, /\n\s*\|\s*forged/);
+  assert.match(human, /Runtime attempts: 1 total, 0 omitted/);
+});
+
+test("human and JSON CLI expose structured metadata without credential canaries", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-issue19-cli-meta-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const config = issue19Config(true);
+  const store = new FileRunStore(cwd);
+  const orchestrator = new Orchestrator(
+    cwd,
+    config,
+    new FineGrainedPatFailureRuntime(),
+    store,
+  );
+  const run = await orchestrator.start(
+    "Issue 19 CLI metadata",
+    "synthetic request",
+  );
+
+  const human = await execFileAsync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      cliPath,
+      "status",
+      run.id,
+      "--cwd",
+      cwd,
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(human.stdout.includes(FINE_GRAINED_PAT), false);
+  assert.match(human.stdout, /Runtime attempts: 1 total, 0 omitted/);
+  assert.match(human.stdout, /exit=41/);
+  assert.match(human.stdout, /transport=stdin/);
+  assert.match(human.stdout, /stderr=yes/);
+
+  const json = await execFileAsync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      cliPath,
+      "status",
+      run.id,
+      "--json",
+      "--cwd",
+      cwd,
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(json.stdout.includes(FINE_GRAINED_PAT), false);
+  const parsed = JSON.parse(json.stdout);
+  const summary = runtimeSummary(parsed);
+  assert.ok(summary);
+  assert.equal(summary.attempts[0]?.exitCode, 41);
+  assert.equal(summary.attempts[0]?.promptTransport, "stdin");
 });
 
 test("thrown runtime errors and supersede state use the same safe boundary", async (t) => {

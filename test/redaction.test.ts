@@ -17,6 +17,15 @@ test("redacts common API tokens and authorization headers", () => {
   assert.match(redacted, /\[REDACTED\]/);
 });
 
+test("redacts synthetic modern GitHub fine-grained PAT shapes", () => {
+  const token =
+    "github_pat_11SYNTHETICREDACTIONONLY_abcdefghijklmnopqrstuvwxyz0123456789";
+  const redacted = redactSecrets(`provider rejected ${token}`);
+
+  assert.equal(redacted.includes(token), false);
+  assert.equal(redacted, "provider rejected [REDACTED]");
+});
+
 test("redacts PEM private key blocks", () => {
   const input = `-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7
@@ -53,6 +62,57 @@ test("redacts standalone bearer tokens, URL credentials, and assignments", () =>
   assert.match(redacted, /Bearer \[REDACTED\]/);
   assert.match(redacted, /https:\/\/alice:\[REDACTED\]@example\.invalid\/private/);
   assert.match(redacted, /safe=yes/);
+});
+
+test("redacts HTTP username-only URI userinfo", () => {
+  const redacted = redactSecrets(
+    "https://opaque-http-credential@example.invalid/repo",
+  );
+  assert.equal(redacted.includes("opaque-http-credential"), false);
+  assert.match(
+    redacted,
+    /https:\/\/\[REDACTED\]@example\.invalid\/repo/,
+  );
+});
+
+test("redacts SSH and git+https username-only URI userinfo without changing ordinary email text", () => {
+  const input = [
+    "ssh://opaque-ssh-credential@example.invalid:2222/repo?ref=main#readme",
+    "git+https://opaque-git-credential@example.invalid/org/repo.git",
+    "contact release-engineering@example.invalid for help",
+  ].join("\n");
+  const redacted = redactSecrets(input);
+
+  assert.equal(redacted.includes("opaque-ssh-credential"), false);
+  assert.equal(redacted.includes("opaque-git-credential"), false);
+  assert.match(
+    redacted,
+    /ssh:\/\/\[REDACTED\]@example\.invalid:2222\/repo\?ref=main#readme/,
+  );
+  assert.match(
+    redacted,
+    /git\+https:\/\/\[REDACTED\]@example\.invalid\/org\/repo\.git/,
+  );
+  assert.match(redacted, /release-engineering@example\.invalid/);
+});
+
+test("redacts malformed credential-like URI authorities fail-safely", () => {
+  const input = [
+    "https://opaque-missing-host@",
+    "ssh://first:second:opaque@example.invalid/repo",
+  ].join("\n");
+
+  const redacted = redactSecrets(input);
+
+  assert.equal(redacted.includes("opaque-missing-host"), false);
+  assert.equal(redacted.includes("first:second:opaque"), false);
+  assert.equal(
+    redacted,
+    [
+      "https://[REDACTED]@",
+      "ssh://[REDACTED]@example.invalid/repo",
+    ].join("\n"),
+  );
 });
 
 test("redacts provider-prefixed API key assignments", () => {
@@ -155,6 +215,104 @@ test("redacts before truncating near a secret boundary", () => {
   assert.equal(result.text.includes("synthetic-secret-value"), false);
   assert.equal(result.text.includes("synthetic-"), false);
   assert.ok([...result.text].length <= 56);
+});
+
+test("redacts a long assignment crossing the retained diagnostic boundary", () => {
+  const prefix = "safe ".repeat(404);
+  const secret = "boundary-secret-prefix-" + "z".repeat(32_000);
+  const result = redactionModule.sanitizeDiagnostic(
+    `${prefix}token=${secret}`,
+    2_048,
+  );
+
+  assert.equal(result.truncated, true);
+  assert.equal(result.text.includes("boundary-secret-prefix"), false);
+  assert.equal(result.text.includes("token=boundary"), false);
+  assert.match(result.text, /token=\[REDACTED\]/);
+  assert.ok([...result.text].length <= 2_048);
+});
+
+test("assignment sanitizer work scales below the former quadratic curve", () => {
+  const moduleUrl = new URL("../src/redaction.ts", import.meta.url).href;
+  const script = `
+    import { performance } from "node:perf_hooks";
+    import { sanitizeDiagnostic } from ${JSON.stringify(moduleUrl)};
+
+    function median(values) {
+      const sorted = [...values].sort((a, b) => a - b);
+      return sorted[Math.floor(sorted.length / 2)];
+    }
+
+    function measure(size) {
+      const input = "A-".repeat(size / 2);
+      const samples = [];
+      sanitizeDiagnostic(input, 2_048);
+      for (let index = 0; index < 3; index += 1) {
+        const started = performance.now();
+        sanitizeDiagnostic(input, 2_048);
+        samples.push(performance.now() - started);
+      }
+      return median(samples);
+    }
+
+    const smallMs = measure(20_000);
+    const largeMs = measure(40_000);
+    process.stdout.write(JSON.stringify({ smallMs, largeMs, ratio: largeMs / smallMs }));
+  `;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      script,
+    ],
+    { encoding: "utf8", timeout: 15_000 },
+  );
+
+  assert.equal(
+    result.status,
+    0,
+    `sanitizer scaling probe failed: ${result.stderr}`,
+  );
+  const measured = JSON.parse(result.stdout) as {
+    smallMs: number;
+    largeMs: number;
+    ratio: number;
+  };
+  assert.ok(
+    measured.ratio < 3,
+    `doubling adversarial input scaled ${measured.ratio.toFixed(2)}x (${measured.smallMs.toFixed(2)}ms -> ${measured.largeMs.toFixed(2)}ms)`,
+  );
+});
+
+test("assignment sanitizer handles large match-heavy input within a hard bound", () => {
+  const moduleUrl = new URL("../src/redaction.ts", import.meta.url).href;
+  const script = `
+    import { sanitizeDiagnostic } from ${JSON.stringify(moduleUrl)};
+    const input = Array.from(
+      { length: 20_000 },
+      (_, index) => "TOKEN=synthetic-match-" + index,
+    ).join("\\n");
+    const result = sanitizeDiagnostic(input, 2_048);
+    if (!result.truncated || result.text.includes("synthetic-match-")) process.exit(2);
+  `;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      script,
+    ],
+    { encoding: "utf8", timeout: 10_000 },
+  );
+
+  assert.equal(
+    result.status,
+    0,
+    `match-heavy sanitizer probe failed: ${result.stderr}`,
+  );
 });
 
 test("diagnostic sanitization is deterministic for multiline mixed content", () => {

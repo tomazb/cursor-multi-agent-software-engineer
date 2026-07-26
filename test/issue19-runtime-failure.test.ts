@@ -12,6 +12,8 @@ import {
 } from "../src/runtimes/cursor-cli.ts";
 
 const CANARY = "ISSUE19_CANARY_RUNTIME_SECRET";
+const FINE_GRAINED_PAT =
+  "github_pat_11SYNTHETICRUNTIMEONLY_abcdefghijklmnopqrstuvwxyz0123456789";
 const MODEL = "cursor-grok-4.5-high";
 
 function config() {
@@ -147,6 +149,28 @@ test("Cursor authentication-like prose remains actionable without controlling cl
 
   assertSafeRuntimeFailure(result, "cursor-cli-non-zero");
   assert.match(result.output, /Authentication failed/);
+});
+
+test("Cursor runtime removes a synthetic fine-grained GitHub PAT at its first failure boundary", async (t) => {
+  const { cwd, runtime } = await fixture(t, {
+    exitCode: 1,
+    stdout: "",
+    stderr: `Git provider rejected ${FINE_GRAINED_PAT}`,
+    durationMs: 11,
+    timedOut: false,
+  });
+
+  const result = await runtime.execute(request(cwd));
+
+  assert.equal(result.status, "error");
+  assert.equal(JSON.stringify(result).includes(FINE_GRAINED_PAT), false);
+  assert.match(result.output, /Git provider rejected \[REDACTED\]/);
+  if (result.status !== "error") return;
+  assert.equal(result.failure.message.includes(FINE_GRAINED_PAT), false);
+  assert.equal(
+    JSON.stringify(result.metadata).includes(FINE_GRAINED_PAT),
+    false,
+  );
 });
 
 test("Cursor very large stderr is redacted before deterministic truncation", async (t) => {
