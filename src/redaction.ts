@@ -46,6 +46,9 @@ const PATTERNS: Array<{ pattern: RegExp; replacement: string }> = [
 export const FAILURE_DIAGNOSTIC_MAX_CODE_POINTS = 2_048;
 export const FAILURE_AGGREGATE_MAX_CODE_POINTS = 8_192;
 export const DIAGNOSTIC_TRUNCATION_MARKER = "… [truncated]";
+const DIAGNOSTIC_TRUNCATION_MARKER_CODE_POINTS = [
+  ...DIAGNOSTIC_TRUNCATION_MARKER,
+];
 
 export interface SanitizedDiagnostic {
   text: string;
@@ -81,21 +84,32 @@ export function sanitizeDiagnostic(
   }
 
   const redacted = redactSecrets(normalizeDiagnosticControls(input));
-  const codePoints = [...redacted];
-  if (codePoints.length <= maxCodePoints) {
-    return { text: redacted, truncated: false };
+  const markerLength = DIAGNOSTIC_TRUNCATION_MARKER_CODE_POINTS.length;
+  const prefixLimit = Math.max(0, maxCodePoints - markerLength);
+  const prefix: string[] = [];
+  let codePointCount = 0;
+
+  for (const codePoint of redacted) {
+    codePointCount += 1;
+    if (prefix.length < prefixLimit) {
+      prefix.push(codePoint);
+    }
+    if (codePointCount > maxCodePoints) {
+      if (markerLength >= maxCodePoints) {
+        return {
+          text: DIAGNOSTIC_TRUNCATION_MARKER_CODE_POINTS.slice(
+            0,
+            maxCodePoints,
+          ).join(""),
+          truncated: true,
+        };
+      }
+      return {
+        text: `${prefix.join("")}${DIAGNOSTIC_TRUNCATION_MARKER}`,
+        truncated: true,
+      };
+    }
   }
 
-  const marker = [...DIAGNOSTIC_TRUNCATION_MARKER];
-  if (marker.length >= maxCodePoints) {
-    return {
-      text: marker.slice(0, maxCodePoints).join(""),
-      truncated: true,
-    };
-  }
-  const prefixLength = maxCodePoints - marker.length;
-  return {
-    text: `${codePoints.slice(0, prefixLength).join("")}${DIAGNOSTIC_TRUNCATION_MARKER}`,
-    truncated: true,
-  };
+  return { text: redacted, truncated: false };
 }

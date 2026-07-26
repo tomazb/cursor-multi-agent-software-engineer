@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { redactSecrets } from "../src/redaction.ts";
 import * as redactionModule from "../src/redaction.ts";
@@ -153,4 +154,30 @@ test("diagnostic bound includes the marker and has exact Unicode edge behavior",
   assert.equal(over.truncated, true);
   assert.equal([...over.text].length, 16);
   assert.match(over.text, /… \[truncated\]$/);
+});
+
+test("bounds very large diagnostics without materializing every code point", () => {
+  const moduleUrl = new URL("../src/redaction.ts", import.meta.url).href;
+  const script = `
+    import { sanitizeDiagnostic } from ${JSON.stringify(moduleUrl)};
+    const result = sanitizeDiagnostic("x".repeat(64_000_000), 128);
+    if (!result.truncated || [...result.text].length !== 128) process.exit(2);
+  `;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--max-old-space-size=48",
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      script,
+    ],
+    { encoding: "utf8", timeout: 20_000 },
+  );
+
+  assert.equal(
+    result.status,
+    0,
+    `constrained-heap sanitizer failed: ${result.stderr}`,
+  );
 });
