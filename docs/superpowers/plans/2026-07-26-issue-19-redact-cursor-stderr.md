@@ -84,18 +84,35 @@ independent verifier. It does not erase the earlier validation history.
 
 - [x] Document the credential grammar, work window, scanner complexity rationale, durable schema,
   historical compatibility, model framing, limitations, and SDK exception follow-up.
+- [x] Commit the corrected contracts as `b0a2c02`.
 
 ### Task 10: Revalidate and publish the correction
 
-- [ ] Run dependency install, focused suites, PR #15/Issue #12/Thermos/unauthorized-marker suites,
+- [x] Run dependency install, focused suites, PR #15/Issue #12/Thermos/unauthorized-marker suites,
   full checks, both Issue #11 contention gates, build, dry pack, actual pack, and diff check.
-- [ ] Record old/new sanitizer medians and scaling on the same runtime environment.
-- [ ] Audit every synthetic canary across repository/generated/package/temporary state.
+- [x] Record old/new sanitizer medians and scaling on the same runtime environment.
+- [x] Audit every synthetic canary across repository/generated/package/temporary state.
 - [ ] Push the exact head and require exact-SHA CI.
 - [ ] Request CodeRabbit, Codex, and Copilot; reply to and resolve the three live threads only after
   exact-head CI is green.
 - [ ] Update the draft PR body without erasing the failed-head history.
 - [ ] Create a new external-validation handoff for the corrected exact head.
+
+Local correction validation used Node `v24.18.0` on Linux `7.1.4-204.fc44.x86_64`. The failing
+implementation's isolated three-repetition regression measured 20,000 and 40,000 adversarial code points at
+342.58 ms and 1,350.66 ms median respectively (3.94x on doubling); a supplementary two-repetition observation
+measured approximately 1.35 s and 5.39 s at 40,000 and 80,000. The bounded implementation measured 20,000,
+40,000, and 80,000 code points at 0.478 ms, 0.311 ms, and 0.311 ms median respectively across seven
+repetitions of 100 calls. Benchmarking supports, but does not replace, the source-level argument: bounded
+prefix collection caps work before the monotonic scanners run, and the former nested ambiguous repetition no
+longer exists.
+
+The direct focused correction set passed 48/48. The PR #15, Issue #12, Thermos, and unauthorized-marker
+compatibility set passed 98 tests with three opt-in skips. Both exact Issue #11 contention gates passed at 25
+allocation iterations and 100 release iterations. The full suite and `npm run check` each reported 340 tests,
+335 passing, five opt-in skips, and zero failures. Type checking, build, dry pack, actual pack (83 files),
+archive inspection, diff checking, and the generated-state canary audit passed; deliberate fixtures remained
+only in test source.
 
 ---
 
