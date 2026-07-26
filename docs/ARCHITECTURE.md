@@ -154,6 +154,14 @@ also require a `RuntimeFailureDiagnostic` with a stable code, safe message, requ
 model where known, stderr-presence flag, truncation flag, and applicable exit/timeout/duration/
 transport fields. The core never parses human-readable error prose to make policy decisions.
 
+When fallback candidates fail, the core converts each typed diagnostic into an explicit durable
+subset. `RunRecord.failure.runtime` is optional for schema-version-1 compatibility and contains at
+most eight attempts plus total/omitted counts and an aggregate-truncation flag. Each attempt keeps
+the attempted model display, code, a 512-code-point safe message, requested/configured model
+displays where supplied, exit/timeout/duration/transport fields where supplied, `stderrPresent`,
+and `truncated`. Model displays are single-line, delimiter-neutral, and capped at 256 code points;
+the actual configured model passed to the runtime is not rewritten.
+
 ### 3.9 Read-only enforcement
 
 `src/git-snapshot.ts` computes a SHA-256 workspace fingerprint for both Git and non-Git working directories:
@@ -349,9 +357,20 @@ The orchestrator never retries indefinitely.
 Failure persistence is defense in depth. Runtime adapters must return safe diagnostics;
 `src/failure-diagnostics.ts` re-sanitizes each runtime failure before fallback aggregation;
 `failRun()` sanitizes the aggregate before assigning `run.failure` and `FAIL` details; and the file
-store sanitizes failure/retry fields again before serialization. The exact limits are 2,048 Unicode
-code points per diagnostic and 8,192 per aggregate, including the truncation marker. Successful
-assistant artifacts retain the separate artifact-redaction contract.
+store sanitizes failure/retry fields and reconstructs the allowlisted attempt subset again before
+serialization. The exact limits are 2,048 Unicode code points per diagnostic, 8,192 per aggregate,
+512 per durable attempt message, 256 per durable model display, and eight stored attempts. Total
+and omitted attempt counts remain explicit. `FAIL.details.runtime` and retry
+`previousFailure.runtime` use the same bounded representation. Successful assistant artifacts
+retain the separate artifact-redaction contract.
+
+`sanitizeDiagnostic()` bounds work before pattern application. It collects at most the output
+budget plus 4,096 Unicode code points of lookahead and never more than 12,288, normalizing controls
+during that bounded scan. Purpose-specific URI-userinfo, assignment, and private-key scanners
+advance monotonically; the remaining fixed recognition expressions run on only that accepted
+window. The lookahead lets scanners consume recognized values that cross the retained output
+boundary, while reaching the accepted-window end closes long assignment/private-key values
+fail-safely.
 
 ## 11. Trust boundaries
 
@@ -376,6 +395,10 @@ GitHub input (future)
 
 - No structured telemetry exporter.
 - SDK adapter uses a one-shot local prompt and does not yet exploit durable SDK agents.
+- SDK import or `Agent.prompt` rejection can still reach the orchestrator as a generic caught
+  `runtime-error` instead of an adapter-produced `cursor-sdk-error`. It is sanitized and bounded
+  before persistence, but typed SDK-specific metadata requires a separate adapter lifecycle/test
+  seam change.
 - Reasoning effort is stored but not translated into provider-specific SDK parameters.
 - GitHub App check runs and authenticated PR automation remain v0.3+.
 

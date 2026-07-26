@@ -124,19 +124,49 @@ the digest fingerprint.
 - Failure diagnostics normalize unsafe controls, redact, and then truncate. Individual diagnostics
   are at most 2,048 Unicode code points and all-model aggregates at most 8,192, including the
   `… [truncated]` marker.
+- Diagnostic work is bounded before redaction. The sanitizer accepts at most the requested output
+  budget plus 4,096 Unicode code points of lookahead, with an absolute 12,288-code-point inspection
+  ceiling. The ordinary 2,048-code-point diagnostic therefore inspects at most 6,144 code points;
+  the 8,192-code-point aggregate inspects at most 12,288. Long assignments and incomplete private
+  key blocks are treated as secret through the accepted-window boundary, so truncation cannot
+  expose a recognized secret prefix.
 - The orchestrator and file store re-sanitize failure messages, `FAIL.details.reason`, and retry
-  `previousFailure.message` before persistence. CLI status rendering applies the same focused
-  safeguard.
+  `previousFailure.message` before persistence. They also reconstruct the allowlisted durable
+  runtime-attempt subset rather than serializing arbitrary adapter metadata. CLI status rendering
+  applies the same focused safeguard.
+- Durable runtime failure state stores at most eight attempts. Attempt messages are capped at 512
+  Unicode code points and model display fields at 256. Total and omitted attempt counts, aggregate
+  truncation, stable code, exit/timeout/duration/transport fields, stderr presence, and truncation
+  are retained where applicable.
+- Model identifiers used for execution remain unchanged. Their diagnostic display copies are
+  separately redacted, capped, collapsed to one line, and stripped of aggregate framing
+  delimiters before formatting or persistence.
 - MASWE has no raw provider-debug artifact or log channel. It does not persist an encrypted copy or
   any digest or hash of raw stderr.
 - Documentation instructs teams not to commit run artifacts by default.
 
 **Gaps and future work:**
 
-- Automatic secret redaction covers tested GitHub/OpenAI/Slack tokens, authorization and standalone
-  bearer forms, URL userinfo, common API-key/token/AWS-secret assignments, private-key blocks, and
-  sensitive query parameters. It is pattern-based, best-effort protection, not a DLP product or a
-  guarantee that arbitrary credentials can be recognized.
+- Automatic secret redaction covers tested classic GitHub tokens, modern `github_pat_` fine-grained
+  PAT shapes, OpenAI/Slack tokens, authorization and standalone bearer forms, URI userinfo, common
+  API-key/token/AWS-secret assignments, private-key blocks, and sensitive query parameters.
+  URI-userinfo recognition requires an explicit `http`, `https`, `ssh`, `git`, `git+https`,
+  `git+ssh`, `sftp`, or `ftp` `scheme://` prefix; it redacts username-only and username/password
+  forms while preserving the remaining URI. SCP-like `user@host:path`, ordinary email, arbitrary
+  schemes, and percent-decoded semantic interpretation are intentionally not inferred.
+- The accepted grammar is deliberately narrow: classic GitHub prefixes and `github_pat_` require at
+  least 20 token characters; authorization forms require an `Authorization: Bearer|Basic` header
+  or standalone `Bearer`; assignment keys are ASCII identifier names ending in a tested
+  API-key/token/secret/signature/AWS-secret suffix followed by `:` or `=` and a quoted or
+  delimiter-terminated value; sensitive query values require a tested `?`/`&` parameter name; and
+  private-key blocks require a `BEGIN … PRIVATE KEY` marker (an absent end marker redacts through
+  the accepted window).
+- The assignment, URI-authority, and private-key scanners advance monotonically. Remaining regular
+  expressions use non-overlapping or fixed-prefix grammars and run only on the bounded diagnostic
+  window; none contains the former nested ambiguous provider-prefix repetition. Benchmarks guard
+  scaling, but are supporting evidence rather than a formal complexity proof.
+- Recognition remains pattern-based, best-effort protection, not a DLP product or a guarantee that
+  arbitrary credentials can be recognized.
 - Default Cursor CLI prompt transport is stdin; argv remains available via `policy.promptTransport`.
 - No provider-specific privacy controls beyond local redaction.
 

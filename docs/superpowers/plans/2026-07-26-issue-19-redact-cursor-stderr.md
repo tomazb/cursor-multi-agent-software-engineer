@@ -4,7 +4,7 @@
 
 **Goal:** Prevent raw Cursor CLI stderr from entering durable MASWE failure state while retaining bounded, structured operator diagnostics.
 
-**Architecture:** Add a shared diagnostic sanitizer on top of `redactSecrets()`, return typed safe failures from the Cursor CLI adapter, aggregate typed failures within fixed budgets, and re-sanitize failure-specific fields at orchestration/store persistence boundaries. Successful artifact handling remains unchanged.
+**Architecture:** Bound diagnostic inspection before purpose-specific redaction, return typed safe failures from the Cursor CLI adapter, aggregate typed failures within fixed budgets, persist only an explicit bounded attempt subset, and re-sanitize failure-specific fields at orchestration/store persistence boundaries. Successful artifact handling remains unchanged.
 
 **Tech Stack:** TypeScript ESM, Node.js 22 test runner, JSON Schema, Markdown documentation.
 
@@ -16,6 +16,86 @@
 - Preserve `invalid-transport-json`, `unsupported-response-shape`, and `missing-logical-output`.
 - Keep state transitions in `src/state-machine.ts`; do not add provider imports to core workflow code.
 - Every behavioral change starts with a failing test and ends with focused plus full verification.
+
+## Independent-verifier correction amendment
+
+Authoritative failed head:
+`7b3ba017195e7ecde6722d748d678e98d567aaa9`.
+
+This amendment preserves the original Issue #19 plan and adds the repair sequence required by the
+independent verifier. It does not erase the earlier validation history.
+
+### Task 6: Capture the independent failures
+
+**Files:**
+- Modify: `test/redaction.test.ts`
+- Modify: `test/issue19-runtime-failure.test.ts`
+- Modify: `test/issue19-persistence.test.ts`
+- Modify: `test/schema.test.ts`
+
+- [x] Add synthetic `github_pat_`, username-only URI, ordinary-email, scaling, match-heavy,
+  durable-attempt, schema-v1, model-framing, and human/JSON CLI regressions.
+- [x] Record the expected red failures outside the subprocess-suppressing workspace sandbox.
+- [x] Commit tests only as `63c7c2b`.
+
+### Task 7: Replace unbounded/ambiguous diagnostic matching
+
+**Files:**
+- Modify: `src/redaction.ts`
+- Modify: `test/redaction.test.ts`
+
+- [x] Replace the nested ambiguous assignment expression with a monotonic assignment scanner.
+- [x] Add monotonic URI-authority and incomplete-private-key scanners.
+- [x] Recognize synthetic `github_pat_` shapes and full userinfo for supported `scheme://` URIs.
+- [x] Inspect at most output budget + 4,096 code points and never more than 12,288 before redaction.
+- [x] Preserve the 2,048/8,192 output limits and close secrets crossing the retained boundary.
+- [x] Commit the focused repair as `213edcf`.
+
+### Task 8: Persist the bounded durable attempt subset
+
+**Files:**
+- Modify: `src/domain.ts`
+- Modify: `src/failure-diagnostics.ts`
+- Modify: `src/orchestrator.ts`
+- Modify: `src/store.ts`
+- Modify: `src/run-rendering.ts`
+- Modify: `schemas/run-record.schema.json`
+- Modify: `test/issue19-persistence.test.ts`
+- Modify: `test/schema.test.ts`
+
+- [x] Add optional `failure.runtime` with at most eight attempts, total/omitted counts, and aggregate
+  truncation.
+- [x] Retain allowlisted code/model/message/exit/timeout/duration/transport/stderr/truncation fields.
+- [x] Cap attempt messages at 512 and model display fields at 256 code points.
+- [x] Normalize model display framing without changing the model passed to execution.
+- [x] Reconstruct/sanitize the subset for run failure, `FAIL`, retry, migration, supersede, and CLI.
+- [x] Commit the durable contract as `f82a6ac`.
+
+### Task 9: Correct documentation and contracts
+
+**Files:**
+- Modify: `docs/SECURITY.md`
+- Modify: `docs/ARCHITECTURE.md`
+- Modify: `docs/OPERATIONS.md`
+- Modify: `docs/ARTIFACT_CONTRACTS.md`
+- Modify: `docs/superpowers/specs/2026-07-26-issue-19-redact-cursor-stderr-design.md`
+- Modify: this plan
+- Modify: `CHANGELOG.md`
+
+- [x] Document the credential grammar, work window, scanner complexity rationale, durable schema,
+  historical compatibility, model framing, limitations, and SDK exception follow-up.
+
+### Task 10: Revalidate and publish the correction
+
+- [ ] Run dependency install, focused suites, PR #15/Issue #12/Thermos/unauthorized-marker suites,
+  full checks, both Issue #11 contention gates, build, dry pack, actual pack, and diff check.
+- [ ] Record old/new sanitizer medians and scaling on the same runtime environment.
+- [ ] Audit every synthetic canary across repository/generated/package/temporary state.
+- [ ] Push the exact head and require exact-SHA CI.
+- [ ] Request CodeRabbit, Codex, and Copilot; reply to and resolve the three live threads only after
+  exact-head CI is green.
+- [ ] Update the draft PR body without erasing the failed-head history.
+- [ ] Create a new external-validation handoff for the corrected exact head.
 
 ---
 

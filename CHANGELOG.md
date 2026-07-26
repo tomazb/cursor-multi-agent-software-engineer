@@ -21,6 +21,8 @@ The project follows semantic versioning once a public release process is establi
   preferred-hint errors, and operator-visible structured decode failures.
 - Typed runtime failure diagnostics and focused persistence/leak regressions for non-zero Cursor
   CLI stderr, fallback aggregation, retry/supersede history, and CLI rendering.
+- Optional schema-version-1 durable runtime failure summaries with up to eight bounded attempts,
+  explicit total/omitted counts, safe operational fields, and single-line model displays.
 
 ### Changed
 
@@ -55,6 +57,15 @@ The project follows semantic versioning once a public release process is establi
   defense-in-depth sanitization; individual diagnostics are capped at 2,048 Unicode code points
   and all-model aggregates at 8,192, with an omitted-attempt count when later fallback diagnostics
   cannot fit.
+- Failure redaction now recognizes tested synthetic `github_pat_` fine-grained PAT shapes and
+  username-only/user-password URI userinfo for explicit Git/provider schemes without treating
+  ordinary email as credentials.
+- Diagnostic sanitization now bounds inspection before pattern application (4,096 code points of
+  lookahead, 12,288 absolute ceiling) and uses monotonic assignment, URI-authority, and private-key
+  scanners instead of the former ambiguous nested assignment expression.
+- Runtime fallback metadata now survives into `run.failure.runtime`, applicable `FAIL` details,
+  retry history, superseded runs, and human/JSON status output. Durable attempt messages are capped
+  at 512 code points, model display fields at 256, and arbitrary adapter metadata remains excluded.
 
 ### Planned
 

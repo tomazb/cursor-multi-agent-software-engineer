@@ -66,12 +66,46 @@ The run's configuration is a snapshot. Changing `.maswe/config.json` affects onl
 
 New failures may include `failure.code`, currently `runtime-models-exhausted` or `workflow-failure`,
 alongside the existing message, timestamp, and optional resume state. The code is optional for
-backward compatibility with existing schema-version-1 records.
+backward compatibility with existing schema-version-1 records. They may also include the optional
+schema-version-1-compatible object:
+
+```json
+{
+  "runtime": {
+    "attempts": [
+      {
+        "model": "cursor-grok-4.5-high",
+        "code": "cursor-cli-non-zero",
+        "message": "Cursor CLI exited non-zero.",
+        "requestedModel": "cursor-grok-4.5-high",
+        "configuredModel": "cursor-grok-4.5-high",
+        "exitCode": 7,
+        "timedOut": false,
+        "durationMs": 42,
+        "promptTransport": "stdin",
+        "stderrPresent": true,
+        "truncated": false
+      }
+    ],
+    "totalAttempts": 1,
+    "omittedAttempts": 0,
+    "aggregateTruncated": false
+  }
+}
+```
+
+`attempts` stores at most eight entries. `totalAttempts` counts every executed fallback;
+`omittedAttempts` is the difference between the total and stored entries. Attempt messages are
+bounded to 512 Unicode code points and `model`, `requestedModel`, and `configuredModel` display
+fields to 256. All fields except `model`, `code`, `message`, `stderrPresent`, and `truncated` are
+optional per attempt. Arbitrary runtime metadata is not part of this contract.
 
 Failure messages and `FAIL.details.reason` are normalized, redacted, and bounded to 8,192 Unicode
 code points including `… [truncated]`. `RETRY_FROM_FAILED.details.previousFailure.message` receives
-the same safeguard. Loading an older record sanitizes these operator-visible fields in memory
-before status/inspection rendering.
+the same safeguard. `FAIL.details.runtime` and
+`RETRY_FROM_FAILED.details.previousFailure.runtime` use the same bounded durable subset. Loading an
+older record with no runtime object preserves the old shape; loading a record with the optional
+object reconstructs and sanitizes only the documented fields before status/inspection rendering.
 
 Cursor CLI runtime error results are not artifacts. Raw stderr, raw error metadata, and stderr
 digests are never part of the run or artifact contract. Safe runtime diagnostics expose a stable
@@ -241,9 +275,9 @@ Each transition event includes:
 
 Runtime fields are optional because not every adapter exposes them.
 
-For `FAIL`, details may also include the durable failure `code` and bounded safe `reason`. For
-`RETRY_FROM_FAILED`, `previousFailure` is the already-safe failure record and is re-sanitized at the
-store boundary.
+For `FAIL`, details may also include the durable failure `code`, bounded safe `reason`, and optional
+bounded `runtime` summary. For `RETRY_FROM_FAILED`, `previousFailure` is the already-safe failure
+record and its message/runtime subset is re-sanitized at the store boundary.
 
 ## Future schema hardening
 

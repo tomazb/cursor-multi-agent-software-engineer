@@ -143,6 +143,11 @@ Cursor CLI assistant extraction and terminal markers:
   diagnostics are capped at 2,048 code points and the all-model fallback message at 8,192; both
   bounds include `… [truncated]`. If later fallback diagnostics cannot fit, the message reports
   their omitted-attempt count while the configured attempts still execute.
+- Before redaction, diagnostic inspection is capped at the output budget plus 4,096 code points
+  and never exceeds 12,288. The lookahead closes recognized assignments/private-key blocks that
+  cross the retained output boundary. URI userinfo is recognized for `http`, `https`, `ssh`,
+  `git`, `git+https`, `git+ssh`, `sftp`, and `ftp` `scheme://` forms; ordinary email and SCP-like
+  `user@host:path` text are not treated as URI credentials.
 - Authentication-like text can remain useful in the redacted excerpt, but it does not select a
   control-flow classification. Catalogue and doctor errors use the same bounded sanitizer.
 - Marker validation rejects quoted examples, embedded tokens, duplicates, conflicts, non-final markers, and content after a marker. Operator-visible messages name the violated contract and logical line number without dumping full model output.
@@ -276,8 +281,14 @@ Inspect:
 
 - `run.failure` in `run.json` (includes `resumeState` when recoverable).
 - Last transition details.
-- The stable failure code, requested model, exit/timeout/duration/transport fields, stderr-presence
-  flag, and bounded redacted diagnostic available for that failure.
+- The stable aggregate failure code and bounded message.
+- Optional `run.failure.runtime`: `attempts` (at most eight), `totalAttempts`,
+  `omittedAttempts`, and `aggregateTruncated`. Each stored attempt has a safe model display, stable
+  code, a message capped at 512 code points, requested/configured model displays where supplied,
+  exit/timeout/duration/transport fields where supplied, `stderrPresent`, and `truncated`.
+- Human `maswe status` prints the attempt count and structured operational fields. `--json` emits
+  the same durable object. Model display values are single-line and delimiter-neutral; they do not
+  change the exact model value used for execution.
 - Cursor authentication and model availability.
 
 Raw provider stderr is not available in `run.json`, events, artifacts, retry history, status output,

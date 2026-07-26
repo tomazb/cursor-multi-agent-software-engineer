@@ -5,6 +5,9 @@
 - Approved implementation request: GitHub Issue #19.
 - Recorded base: `caba625fd9367a5fecb10f19f499f7cd5b4998ef`.
 - Branch: `issue/19-redact-cursor-stderr`.
+- Independent-verifier failed head: `7b3ba017195e7ecde6722d748d678e98d567aaa9`.
+- Repair scope: modern GitHub PATs, URI userinfo, sanitizer work bounds, durable attempt metadata,
+  and model-identity framing. The prior `FAIL` remains part of the validation history.
 - Scope excludes Issues #16, #17, #18, #13, and #3.
 
 ## Source-to-sink audit
@@ -42,28 +45,67 @@ field. Control flow consumes the discriminant and code; it never parses human-re
 
 ### Redaction and diagnostic bounding
 
-One shared helper normalizes unsafe controls (preserving newline and tab), invokes `redactSecrets()`, and only
-then truncates. Truncation is measured in Unicode code points, not UTF-16 code units or UTF-8 bytes.
+One shared helper bounds its input work first, normalizes unsafe controls (preserving newline and
+tab), invokes `redactSecrets()` on the accepted window, and only then truncates. Truncation is
+measured in Unicode code points, not UTF-16 code units or UTF-8 bytes.
 
 - Maximum individual diagnostic: 2,048 Unicode code points, including the truncation marker.
 - Maximum all-model aggregate: 8,192 Unicode code points, including the truncation marker.
+- Redaction lookahead: 4,096 Unicode code points beyond the requested output budget.
+- Absolute accepted diagnostic window: 12,288 Unicode code points.
 - Marker: `… [truncated]`.
 
 The helper is deterministic for identical input. It exposes whether truncation occurred. Per-model entries are
 bounded before aggregation. Once the aggregate budget is exhausted, later fallbacks still run and the final
 bounded message reports how many later model failures were omitted from the diagnostic text.
 
-`redactSecrets()` is extended only for tested credential forms: GitHub/OpenAI/Slack tokens, authorization and
-standalone bearer forms, URL userinfo, common API-key/token/AWS-secret assignments, private-key blocks, and
-sensitive query parameters. Synthetic fixtures are used exclusively.
+The bounded lookahead ensures that a recognized credential beginning near the retained boundary can
+be consumed in full. A long assignment or incomplete private-key block that reaches the accepted
+window end remains redacted through that boundary. The sanitizer never constructs a code-point
+array from the complete attacker-controlled input.
+
+`redactSecrets()` is extended only for tested credential forms: classic GitHub and modern
+`github_pat_` tokens, OpenAI/Slack tokens, authorization and standalone bearer forms, URI userinfo,
+common API-key/token/AWS-secret assignments, private-key blocks, and sensitive query parameters.
+URI userinfo requires `http`, `https`, `ssh`, `git`, `git+https`, `git+ssh`, `sftp`, or `ftp`
+followed by `://`; username-only and username/password forms are redacted in full while scheme,
+host, port, path, query, and fragment remain. Ordinary email and SCP-like prose are not inferred as
+credentials. Synthetic fixtures are used exclusively.
+
+Assignment, URI-authority, and private-key matching uses purpose-specific monotonic scanners.
+Remaining expressions have fixed/non-overlapping grammars and run on the bounded accepted window.
+The former nested ambiguous provider-prefix assignment repetition is removed.
+
+### Durable failure-attempt contract
+
+`RunRecord.failure` keeps the compatible optional `code`, required `message`/`at`, and optional
+`resumeState`. It may additionally carry optional `runtime`:
+
+- `attempts`: at most eight `DurableRuntimeFailureAttempt` entries;
+- `totalAttempts`: every executed model attempt;
+- `omittedAttempts`: attempts not stored because of the eight-entry limit; and
+- `aggregateTruncated`: whether aggregate diagnostic text was omitted by its budget.
+
+Each attempt requires a safe `model`, typed `code`, safe `message`, `stderrPresent`, and
+`truncated`. It optionally carries `requestedModel`, `configuredModel`, `exitCode`, `timedOut`,
+`durationMs`, and `promptTransport`. Attempt messages are capped at 512 code points and model
+display fields at 256. The aggregate remains capped at 8,192. `FAIL.details.runtime` and retry
+`previousFailure.runtime` reuse this object. Old records without it retain their historical shape.
+Records containing it are reconstructed from this allowlist; arbitrary adapter metadata is
+discarded.
+
+Model values used for execution are unchanged. Diagnostic display copies replace CR/LF, NUL,
+C0/C1 controls, Unicode line separators, and aggregate delimiter characters before per-attempt
+formatting, persistence, and human rendering.
 
 ### Defense in depth
 
 The Cursor CLI adapter emits no raw stderr-derived string: output, typed diagnostic, and metadata are safe and
 bounded. The orchestrator sanitizes runtime failures and caught exceptions before aggregation. `failRun()`
 sanitizes once more before assigning `run.failure` or applying `FAIL`. The file store applies a focused
-persistence safeguard to `run.failure.message`, `FAIL.details.reason`, and retry `previousFailure.message` so
-an unsafe adapter or future caller cannot trivially persist a recognizable secret.
+persistence safeguard to failure messages and reconstructs the optional runtime attempt subset in
+`run.failure`, `FAIL` details, and retry `previousFailure` so an unsafe adapter or future caller
+cannot trivially persist a recognizable secret or arbitrary runtime object.
 
 The safeguard is deliberately failure-specific. Successful model artifacts continue through
 `writeArtifact()` and its existing `redactSecrets()` contract. Exit-zero Cursor structured-output failures
@@ -83,18 +125,22 @@ arbitrary secrets are always detectable.
 2. Cursor CLI classifies the outcome without decoding non-zero stdout as authoritative assistant output.
 3. Stderr is normalized, redacted, and bounded; raw stderr is discarded at the runtime return boundary.
 4. The orchestrator receives a typed error, creates a bounded per-model failure, and attempts an allowed fallback.
-5. If all candidates fail, it renders one bounded aggregate.
-6. `failRun()` and the store sanitize failure-specific persisted fields before writing `run.json`.
-7. Retry and CLI inspection consume the already-safe durable representation.
+5. If all candidates fail, it renders one bounded aggregate and one independently bounded durable
+   attempt summary.
+6. `failRun()` and the store sanitize failure-specific persisted fields before writing `run.json`;
+   applicable `FAIL` details receive the same runtime summary.
+7. Retry, supersede, and CLI inspection consume the already-safe durable representation.
 
 ## Testing strategy
 
 - Redaction/boundary unit tests cover all required synthetic forms, placement, multiline input, controls,
-  Unicode boundaries, determinism, and truncation adjacent to secrets.
+  Unicode boundaries, determinism, truncation adjacent to secrets, adversarial no-match scaling,
+  match-heavy input, and the fixed work window.
 - Cursor runtime tests cover empty/structured stdout, timeout, large stderr, safe metadata, operational fields,
   catalogue/doctor failure output, and contract-equivalent PR #15 decode behavior.
 - Orchestrator integration tests use unsafe runtime stubs to prove defense in depth across returned records,
-  disk JSON, events, artifacts, retry history, supersede handling, fallback aggregation, and CLI rendering.
+  disk JSON, events, artifacts, retry history, supersede handling, fallback aggregation, structured
+  attempt bounds, model framing, and human/JSON CLI rendering.
 - Compatibility suites cover text/JSON/stream-json success, structured decode failures, model checks, read-only
   fingerprints, mock workflows, retry/schema migration, and artifact redaction.
 
@@ -103,3 +149,14 @@ arbitrary secrets are always detectable.
 1. Adapter-only redaction: closes the known Cursor path but leaves persistence vulnerable to other/future adapters.
 2. Store-only redaction: permits raw stderr to cross runtime/orchestrator boundaries and loses useful typed fields.
 3. Persist encrypted/raw stderr or a digest: creates a forbidden durable debug channel and comparison risk.
+4. Safe-regex-only full-input processing: removes the specific ambiguous expression but leaves CPU
+   proportional to unbounded input before the 2,048-code-point output cap.
+5. Persist the complete runtime metadata object: retains adapter-specific/unbounded state and weakens
+   the orchestration/runtime boundary.
+
+## Non-blocking SDK follow-up
+
+Current `CursorSdkRuntime` returns typed `cursor-sdk-error` for a non-finished SDK result, but dynamic
+import or `Agent.prompt` rejection still escapes to the generic orchestrator catch. That path is
+redacted and bounded before persistence. Converting those exceptions inside the SDK adapter needs a
+separate injection/lifecycle test seam and is not part of this Cursor CLI correction.
