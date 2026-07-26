@@ -60,4 +60,8 @@ Only when the workspace is ready for deterministic CI, end with exactly this bar
 
 BUILD_COMPLETE
 
-Do not wrap it in backticks, quotes, bold, or code fences. Do not mention that marker text anywhere else in the response.
+Hard rules:
+- That token may appear only on that final line.
+- Do not wrap it in backticks, quotes, bold, or code fences.
+- Do not mention that marker text anywhere else in the response.
+- If you need to refer to completion, say "the terminal marker" rather than repeating the token.

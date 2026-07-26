@@ -30,14 +30,18 @@ Produce one self-contained Markdown artifact containing:
 8. Compatibility and rollout strategy.
 9. Test strategy mapped to every acceptance criterion.
 10. An ordered implementation plan with small reviewable tasks, files likely to change, and verification commands.
-11. Risks, alternatives rejected, and decisions needing human approval.
+11. Risks, alternatives rejected, and decisions needing human approval. Do not include, quote, or code-span the machine terminal marker token in that section.
 
 Separate requirements from implementation choices. Do not silently broaden scope.
 
 ## Terminal marker (mandatory)
 
-The **very last line** of your response must be exactly this bare marker and nothing else on that line:
+After the Markdown body, the **very last line** of your response must be exactly this bare machine token and nothing else on that line:
 
 READY_FOR_DESIGN_APPROVAL
 
-Do not wrap it in backticks, quotes, bold, or code fences. Do not mention that marker text anywhere else in the response.
+Hard rules:
+- That token may appear only on that final line.
+- Do not wrap it in backticks, quotes, bold, or code fences.
+- Do not mention that marker text anywhere else in the response — including headings, bullet lists, examples, and code spans.
+- If you need to refer to completion, say "the terminal marker" rather than repeating the token.

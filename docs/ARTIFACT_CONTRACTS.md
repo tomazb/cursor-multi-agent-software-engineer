@@ -9,7 +9,9 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
 - Retries write attempt-scoped immutable files (`*.attempt-<n>.md`) and keep a latest logical pointer by name.
 - Digests are recomputed and compared on every read; mismatches fail closed.
 - Agents must not rely on prior chat messages that are absent from the supplied prompt.
-- Model output cannot authorize a transition unless the orchestrator recognizes the required terminal marker: exactly one bare marker token on the final line (no backticks, quotes, or earlier mentions of the token).
+- Model output cannot authorize a transition unless the orchestrator recognizes the required terminal marker after structured response decoding: exactly one bare marker token on the final logical line of the authoritative assistant text (no backticks, quotes, earlier mentions, duplicates, or conflicting markers).
+- For Cursor CLI `json` / `stream-json` modes, marker validation runs only on the decoded authoritative `result` string. Transport JSON quoting is not treated as embedded model content. Malformed envelopes, unsupported shapes, and missing `result` fields fail closed before marker validation.
+- Operator-visible marker diagnostics distinguish quoted examples, embedded tokens, duplicates, conflicts, non-final markers, and content after a marker, without echoing the full model output.
 - Common secrets are redacted before persistence.
 - JSON schemas live under `schemas/` for configuration and run records.
 - Persisted `run.config.roles.*.model` values are exact executable catalogue IDs after `start`. Loading a run migrates defaults then runs the same config assertions as project load (without applying process environment overrides).
@@ -69,7 +71,7 @@ Required content:
 - Recommended approach.
 - Risks and open questions.
 - Draft measurable acceptance criteria.
-- Approval checklist.
+- Approval checklist in ordinary language (must not quote or repeat the machine terminal marker token).
 
 Required terminal marker:
 
@@ -77,7 +79,7 @@ Required terminal marker:
 READY_FOR_BRAINSTORM_APPROVAL
 ```
 
-Strict marker validation rejects missing, quoted, embedded, or non-final-line markers.
+Strict marker validation rejects missing, quoted, embedded, duplicate, conflicting, or non-final-line markers. Diagnostics identify the violated contract after structured response decoding.
 
 ## `03-specification-and-design.md`
 

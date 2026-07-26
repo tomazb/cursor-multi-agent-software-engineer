@@ -23,14 +23,18 @@ Produce a self-contained Markdown artifact with:
 5. Recommended approach and why it wins.
 6. Risks, open questions, and explicit non-goals.
 7. Draft measurable acceptance criteria.
-8. A decision checklist for the human approval gate.
+8. A decision checklist for the human approval gate, written in ordinary language. Never include, quote, or code-span the machine terminal marker token in that checklist (or anywhere else in the body).
 
 Never claim facts about the repository without inspecting it. Never modify files.
 
 ## Terminal marker (mandatory)
 
-The **very last line** of your response must be exactly this bare marker and nothing else on that line:
+After the Markdown body, the **very last line** of your response must be exactly this bare machine token and nothing else on that line:
 
 READY_FOR_BRAINSTORM_APPROVAL
 
-Do not wrap it in backticks, quotes, bold, or code fences. Do not mention that marker text anywhere else in the response.
+Hard rules:
+- That token may appear only on that final line.
+- Do not wrap it in backticks, quotes, bold, or code fences.
+- Do not mention that marker text anywhere else in the response — including headings, bullet lists, examples, code spans, and the decision checklist.
+- If you need to refer to completion, say "the terminal marker" rather than repeating the token.

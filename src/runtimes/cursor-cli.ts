@@ -11,44 +11,182 @@ import {
   resolveProjectModels,
   validatePersistedExactModel,
 } from "../model-resolution.ts";
+import { parseModelCatalogue, parseModelCatalogueIds } from "./cursor-model-catalogue.ts";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { RunRecord } from "../domain.ts";
 
-/**
- * Extract assistant text from Cursor CLI `-p` stdout.
- *
- * - `outputFormat=json` / single JSON object: require a result-bearing object
- *   (`type: "result"` with string `result`, or top-level string `result`).
- * - `outputFormat=stream-json` / NDJSON: accept only terminal events with
- *   `type: "result"` and a string `result`. When multiple exist, the last one wins.
- * - Text mode (no JSON object / no NDJSON events): return raw stdout.
- * - Never accept arbitrary `text`/`message` fields from unrelated event types.
- */
-export function extractCursorCliOutput(stdout: string): string {
-  const trimmed = stdout.trim();
-  if (!trimmed) return "";
+export { parseModelCatalogueIds };
 
-  const resultFromObject = (parsed: Record<string, unknown>): string | undefined => {
-    if (parsed.type === "result" && typeof parsed.result === "string") {
-      return parsed.result;
+export type CursorCliOutputFormat = MasweConfig["runtime"]["outputFormat"];
+export type CursorCliOutputDecodeCode =
+  | "invalid-transport-json"
+  | "unsupported-response-shape"
+  | "missing-logical-output";
+
+export type CursorCliOutputDecode =
+  | {
+      ok: true;
+      text: string;
     }
-    // Single-JSON success payloads sometimes omit type but still carry result.
-    if (parsed.type === undefined && typeof parsed.result === "string") {
-      return parsed.result;
-    }
-    return undefined;
-  };
+  | {
+      ok: false;
+      code: CursorCliOutputDecodeCode;
+      message: string;
+    };
+
+function authoritativeResultFromObject(
+  parsed: Record<string, unknown>,
+  outputFormat: CursorCliOutputFormat,
+): string | undefined {
+  if (typeof parsed.result !== "string") return undefined;
+  if (parsed.type === "result") return parsed.result;
+  // Single-JSON mode may return a typeless success payload. Stream-json must
+  // remain event-typed so an unsupported envelope cannot authorize a marker.
+  if (outputFormat === "json" && parsed.type === undefined) return parsed.result;
+  return undefined;
+}
+
+/**
+ * Decode assistant text from Cursor CLI `-p` stdout.
+ *
+ * Structured modes first try one whole JSON envelope, then scan NDJSON records
+ * when the whole buffer is not one JSON value. Only the authoritative string
+ * `result` field is returned as logical assistant text.
+ *
+ * - Never treat transport JSON quoting as model content.
+ * - Never accept arbitrary `text`/`message` fields from unrelated event types.
+ * - Structured modes never fall back to raw stdout.
+ * - Text mode returns raw stdout unchanged.
+ */
+export function decodeCursorCliAssistantOutput(
+  stdout: string,
+  outputFormat: CursorCliOutputFormat = "text",
+): CursorCliOutputDecode {
+  if (outputFormat === "text") {
+    return { ok: true, text: stdout };
+  }
+
+  const trimmed = stdout.trim();
+  if (!trimmed) {
+    return {
+      ok: false,
+      code: "missing-logical-output",
+      message: "Cursor CLI stdout was empty; no authoritative assistant result field",
+    };
+  }
 
   try {
     const parsed = JSON.parse(trimmed) as unknown;
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return resultFromObject(parsed as Record<string, unknown>) ?? "";
+      const text = authoritativeResultFromObject(
+        parsed as Record<string, unknown>,
+        outputFormat,
+      );
+      if (text !== undefined) {
+        return { ok: true, text };
+      }
+      return {
+        ok: false,
+        code: "unsupported-response-shape",
+        message:
+          outputFormat === "stream-json"
+            ? 'Cursor CLI stream-json object lacked an authoritative string "result" field with type=result'
+            : 'Cursor CLI JSON object lacked an authoritative string "result" field (type=result or typeless result)',
+      };
+    }
+    return {
+      ok: false,
+      code: "unsupported-response-shape",
+      message: "Cursor CLI JSON stdout was not a result-bearing object",
+    };
+  } catch {
+    // Whole-buffer parse failed. Scan individual records so stream-json and
+    // json output with non-JSON banner lines can still expose a terminal result.
+  }
+
+  const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  let sawJson = false;
+  let sawJsonLikeMalformed = false;
+  let terminal: string | undefined;
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      sawJson = true;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const text = authoritativeResultFromObject(
+          parsed as Record<string, unknown>,
+          outputFormat,
+        );
+        if (text !== undefined) terminal = text;
+      }
+    } catch {
+      if (/^[{[]/.test(line)) sawJsonLikeMalformed = true;
+    }
+  }
+
+  if (sawJsonLikeMalformed) {
+    return {
+      ok: false,
+      code: "invalid-transport-json",
+      message: "Cursor CLI stdout contained malformed transport JSON for the configured output format",
+    };
+  }
+
+  if (terminal !== undefined) {
+    return { ok: true, text: terminal };
+  }
+
+  if (sawJson) {
+    return {
+      ok: false,
+      code: "missing-logical-output",
+      message: 'Cursor CLI JSON/NDJSON contained no authoritative string "result" field',
+    };
+  }
+
+  return {
+    ok: false,
+    code: "unsupported-response-shape",
+    message: "Cursor CLI stdout did not match a supported json/stream-json assistant result shape",
+  };
+}
+
+/**
+ * Extract assistant text from Cursor CLI `-p` stdout.
+ *
+ * - Omitted `outputFormat`: legacy auto-detect (unwrap JSON/NDJSON when present,
+ *   otherwise return raw stdout). Used only by older test helpers.
+ * - `outputFormat: "text"`: return stdout verbatim (matches `execute()` text mode).
+ * - `outputFormat: "json" | "stream-json"`: structured decode only; never fall back
+ *   to raw envelope text.
+ */
+export function extractCursorCliOutput(
+  stdout: string,
+  options?: { outputFormat?: CursorCliOutputFormat },
+): string {
+  if (!options || options.outputFormat === undefined) {
+    return extractCursorCliOutputLegacyAuto(stdout);
+  }
+  if (options.outputFormat === "text") {
+    return stdout;
+  }
+  const decoded = decodeCursorCliAssistantOutput(stdout, options.outputFormat);
+  return decoded.ok ? decoded.text : "";
+}
+
+/** Legacy test helper: sniff JSON/NDJSON when present, otherwise keep raw stdout. */
+function extractCursorCliOutputLegacyAuto(stdout: string): string {
+  const trimmed = stdout.trim();
+  if (!trimmed) return "";
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return authoritativeResultFromObject(parsed as Record<string, unknown>, "json") ?? "";
     }
   } catch {
     // NDJSON or text path below.
   }
-
   const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   let sawJson = false;
   let terminal: string | undefined;
@@ -60,77 +198,16 @@ export function extractCursorCliOutput(stdout: string): string {
         terminal = parsed.result;
       }
     } catch {
-      // ignore non-JSON lines
+      // Ignore non-JSON lines in this legacy test-only compatibility path.
     }
   }
   if (sawJson) return terminal ?? "";
-  // Text-mode success: raw assistant stdout.
   return stdout;
-}
-
-function extractOutput(
-  stdout: string,
-  outputFormat: MasweConfig["runtime"]["outputFormat"],
-): string {
-  // Text is an explicit raw-output contract. JSON snippets in Markdown must not
-  // trigger the NDJSON detector used for json/stream-json modes.
-  if (outputFormat === "text") return stdout;
-  return extractCursorCliOutput(stdout);
 }
 
 function looksLikeNode(command: string): boolean {
   const base = path.basename(command);
   return base === "node" || base === "nodejs" || command === process.execPath;
-}
-
-const MODEL_ID_PATTERN = /^[a-zA-Z][a-zA-Z0-9._+-]{2,80}$/;
-const METADATA_ID_PATTERN =
-  /^(?:alias|metadata|context|build|status|provider|timeout|tokens?|default|recommended)(?:[-_].*)?$/i;
-
-/**
- * Parse exact executable model IDs from Cursor `agent models` text output.
- *
- * Fail-closed: only recognized catalogue row shapes contribute an ID. Headings,
- * aliases, metadata, prose, and annotation tokens are ignored. The first
- * model-ID field on each row is preferred; later slug-like tokens on the same
- * line are not collected.
- */
-export function parseModelCatalogueIds(catalogueText: string): Set<string> {
-  const ids = new Set<string>();
-  const stripped = catalogueText.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
-  for (const line of stripped.split(/\r?\n/)) {
-    const id = parseCatalogueRow(line);
-    if (id) ids.add(id);
-  }
-  return ids;
-}
-
-function parseCatalogueRow(line: string): string | undefined {
-  let trimmed = line.trim();
-  if (!trimmed) return undefined;
-
-  // Headings and key/value metadata (alias:, metadata:, Available models:, …).
-  if (/^[A-Za-z][\w ./-]*:\s*$/.test(trimmed)) return undefined;
-  if (/^[A-Za-z][\w-]*\s*:/.test(trimmed)) return undefined;
-
-  // Pure annotation / bullet noise.
-  if (/^\(.*\)$/.test(trimmed)) return undefined;
-  if (/^#+/.test(trimmed)) return undefined;
-
-  // Common row prefixes: bullets and selection indicators.
-  trimmed = trimmed.replace(/^(?:[>*•·▪▸❯✔✓☑]|[-+])\s+/, "");
-  if (!trimmed) return undefined;
-
-  // Prose lines do not start with an executable model ID.
-  const match = trimmed.match(/^([a-zA-Z][a-zA-Z0-9._+-]{2,80})(?=\s|$|\(|-|–|—)/);
-  if (!match) return undefined;
-  const id = match[1]!.toLowerCase();
-  if (!MODEL_ID_PATTERN.test(id)) return undefined;
-  if (!/[0-9]/.test(id)) return undefined;
-  if (METADATA_ID_PATTERN.test(id)) return undefined;
-
-  // Remainder may be a description (" - Name") or "(default)" — never scanned for IDs.
-  return id;
 }
 
 export function shouldPassTrustFlag(
@@ -218,12 +295,21 @@ export class CursorCliRuntime implements AgentRuntime {
       );
     }
 
-    const extracted = extractOutput(result.stdout, this.config.runtime.outputFormat);
+    const outputFormat = this.config.runtime.outputFormat;
+    const decoded = decodeCursorCliAssistantOutput(result.stdout, outputFormat);
+    const extracted = decoded.ok ? decoded.text : "";
     const success = result.exitCode === 0 && !result.timedOut;
-    if (success && !extracted) {
+    if (success && (!decoded.ok || !extracted)) {
+      const decodeCode: CursorCliOutputDecodeCode = decoded.ok
+        ? "missing-logical-output"
+        : decoded.code;
+      const decodeError = decoded.ok
+        ? "Cursor CLI exited 0 but stdout contained no valid assistant result"
+        : decoded.message;
+      const operatorError = `${decodeCode}: ${decodeError}`;
       return {
         status: "error",
-        output: "",
+        output: operatorError,
         requestedModel: resolvedModel,
         actualModel: resolvedModel,
         metadata: {
@@ -235,7 +321,8 @@ export class CursorCliRuntime implements AgentRuntime {
           trust: shouldPassTrustFlag(this.config, request),
           configuredModel: request.roleConfig.model,
           resolvedModel,
-          error: "Cursor CLI exited 0 but stdout contained no valid assistant result",
+          error: decodeError,
+          decodeCode,
         },
       };
     }
@@ -276,7 +363,21 @@ export class CursorCliRuntime implements AgentRuntime {
       );
     }
     // Stdout only — never treat stderr prose as a valid catalogue.
-    const parsed = [...parseModelCatalogueIds(models.stdout)];
+    const catalogue = parseModelCatalogue(models.stdout);
+    const parsed = [...catalogue.ids];
+    if (catalogue.malformedRows.length > 0) {
+      const sample = catalogue.malformedRows
+        .slice(0, 3)
+        .map((row) => `line ${row.lineNumber} ('${row.candidate}')`)
+        .join(", ");
+      const validSummary =
+        parsed.length === 0
+          ? "no valid executable model IDs"
+          : `${parsed.length} valid executable model ID${parsed.length === 1 ? "" : "s"} also parsed`;
+      throw new Error(
+        `Model catalogue discovery failed: '${this.config.runtime.command} models' returned malformed catalogue row candidates (${sample}); ${validSummary}. Refusing partial catalogue resolution because omitted rows could change model family or effort selection.`,
+      );
+    }
     if (parsed.length === 0) {
       throw new Error(
         `Model catalogue discovery failed: '${this.config.runtime.command} models' exited successfully but no executable model IDs could be parsed from stdout. Confirm Cursor CLI auth and catalogue format.`,

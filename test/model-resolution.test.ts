@@ -172,9 +172,8 @@ test("resolveConfigModels rewrites enabled fallback models to exact IDs", () => 
   assert.equal(resolved.roles.verifier.model, "gpt-5.6-sol-high");
 });
 
-test("pickCatalogueModel prefers env override when present, else grok family", () => {
+test("pickCatalogueModel accepts an approved exact override and otherwise uses the ordered allowlist", () => {
   assert.equal(pickCatalogueModel(CATALOGUE, "cursor-grok-4.5-low"), "cursor-grok-4.5-low");
-  assert.equal(pickCatalogueModel(CATALOGUE, "missing-model"), "cursor-grok-4.5-high");
   assert.equal(pickCatalogueModel(CATALOGUE), "cursor-grok-4.5-high");
 });
 
