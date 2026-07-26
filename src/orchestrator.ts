@@ -1,5 +1,7 @@
 import type {
   AgentRuntime,
+  DurableRuntimeFailureAttempt,
+  DurableRuntimeFailureSummary,
   RoleId,
   RunFailureCode,
   RunRecord,
@@ -29,11 +31,14 @@ import type { MasweConfig } from "./domain.ts";
 import {
   appendFailureAggregate,
   assertRuntimeIdentity,
+  DURABLE_RUNTIME_FAILURE_ATTEMPT_LIMIT,
   ensureRuntimeSuccess,
+  makeDurableRuntimeFailureSummary,
   reportOmittedFailureAttempts,
   runFailureCode,
   runFailureDetails,
   runFailureMessage,
+  runFailureRuntime,
   RuntimeModelsExhaustedError,
   runtimeAttemptFailure,
   safeFailureMessage,
@@ -341,6 +346,7 @@ export class Orchestrator {
         run,
         runFailureMessage(error),
         runFailureCode(error),
+        runFailureRuntime(error),
       );
     }
   }
@@ -450,6 +456,7 @@ export class Orchestrator {
     run: RunRecord,
     message: string,
     code: RunFailureCode = "workflow-failure",
+    runtime?: DurableRuntimeFailureSummary,
   ): Promise<RunRecord> {
     const resumeState = isTerminal(run.state) ? undefined : run.state;
     const safeMessage = safeFailureMessage(message);
@@ -458,11 +465,12 @@ export class Orchestrator {
       message: safeMessage,
       at: new Date().toISOString(),
       ...(resumeState ? { resumeState } : {}),
+      ...(runtime ? { runtime } : {}),
     };
     await this.store.save(run);
     if (!isTerminal(run.state)) {
       const failed = await this.store.applyEvent(run, "FAIL", "orchestrator", {
-        ...runFailureDetails(code, safeMessage),
+        ...runFailureDetails(code, safeMessage, runtime),
         ...(resumeState ? { resumeState } : {}),
       });
       return this.finalizeTerminal(failed);
@@ -507,6 +515,8 @@ export class Orchestrator {
     let aggregateHasEntries = false;
     let aggregateFull = false;
     let omittedFailureAttempts = 0;
+    let totalFailureAttempts = 0;
+    const durableAttempts: DurableRuntimeFailureAttempt[] = [];
     const workdir = workingDirectoryFor(run);
 
     for (const model of candidates) {
@@ -532,12 +542,20 @@ export class Orchestrator {
         }
         return result;
       } catch (error) {
+        totalFailureAttempts += 1;
+        const failure = runtimeAttemptFailure(model, error);
+        if (
+          durableAttempts.length <
+          DURABLE_RUNTIME_FAILURE_ATTEMPT_LIMIT
+        ) {
+          durableAttempts.push(failure.durable);
+        }
         if (aggregateFull) {
           omittedFailureAttempts += 1;
         } else {
           const appended = appendFailureAggregate(
             aggregate,
-            runtimeAttemptFailure(model, error),
+            failure.rendered,
             aggregateHasEntries,
           );
           aggregate = appended.text;
@@ -546,8 +564,17 @@ export class Orchestrator {
         }
       }
     }
+    const message = reportOmittedFailureAttempts(
+      aggregate,
+      omittedFailureAttempts,
+    );
     throw new RuntimeModelsExhaustedError(
-      reportOmittedFailureAttempts(aggregate, omittedFailureAttempts),
+      message,
+      makeDurableRuntimeFailureSummary(
+        durableAttempts,
+        totalFailureAttempts,
+        aggregateFull,
+      ),
     );
   }
 

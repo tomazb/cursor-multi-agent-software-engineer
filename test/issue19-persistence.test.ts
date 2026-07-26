@@ -289,11 +289,23 @@ test("synthetic fine-grained GitHub PAT is absent from every durable and rendere
   );
   assert.ok(retry);
   assert.equal(JSON.stringify(retry).includes(FINE_GRAINED_PAT), false);
+  const previousFailure = (
+    retry?.details as {
+      previousFailure?: {
+        runtime?: ExpectedDurableRuntimeSummary;
+      };
+    }
+  )?.previousFailure;
+  assert.equal(
+    previousFailure?.runtime?.attempts[0]?.exitCode,
+    41,
+  );
 
   const replacement = await orchestrator.supersede(retried.id);
   const superseded = await store.load(retried.id);
   assert.equal(JSON.stringify(superseded).includes(FINE_GRAINED_PAT), false);
   assert.equal(JSON.stringify(replacement).includes(FINE_GRAINED_PAT), false);
+  assert.equal(runtimeSummary(superseded)?.attempts[0]?.exitCode, 41);
 
   for (const runId of [superseded.id, replacement.id]) {
     const files = await allFiles(path.join(cwd, ".maswe", "runs", runId));
@@ -319,6 +331,7 @@ test("one runtime attempt retains the bounded structured durable subset", async 
   assert.ok(summary);
   assert.equal(summary.totalAttempts, 1);
   assert.equal(summary.omittedAttempts, 0);
+  assert.equal(summary.aggregateTruncated, false);
   assert.equal(summary.attempts.length, 1);
   assert.deepEqual(
     {
@@ -357,6 +370,7 @@ test("fallback failures retain structured metadata for every stored attempt and 
   assert.ok(summary);
   assert.equal(summary.totalAttempts, MODELS.length);
   assert.equal(summary.omittedAttempts, 0);
+  assert.equal(summary.aggregateTruncated, true);
   assert.deepEqual(
     summary.attempts.map((attempt) => attempt.model),
     MODELS,
@@ -526,6 +540,7 @@ test("fallback aggregate reports model attempts omitted after reaching its bound
   assert.equal(summary.totalAttempts, models.length);
   assert.equal(summary.attempts.length, 8);
   assert.equal(summary.omittedAttempts, 4);
+  assert.equal(summary.aggregateTruncated, true);
   assert.deepEqual(
     summary.attempts.map((attempt) => attempt.model),
     models.slice(0, 8),

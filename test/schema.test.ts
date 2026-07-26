@@ -106,8 +106,9 @@ test("run-record schema validates optional bounded durable runtime failure metad
     await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
   ) as JsonSchema;
   const failureSchema = schema.properties?.failure;
-  const runtimeSchema = failureSchema?.properties?.runtime;
-  assert.ok(runtimeSchema, "failure.runtime schema");
+  const runtimeSchemaReference = failureSchema?.properties?.runtime;
+  assert.ok(runtimeSchemaReference, "failure.runtime schema");
+  const runtimeSchema = resolveRef(schema, runtimeSchemaReference);
   assert.deepEqual(runtimeSchema.required, [
     "attempts",
     "totalAttempts",
@@ -139,12 +140,14 @@ test("run-record schema validates optional bounded durable runtime failure metad
 
   const attemptsSchema = runtimeSchema.properties?.attempts;
   assert.equal(attemptsSchema?.maxItems, 8);
+  assert.ok(attemptsSchema?.items);
+  const attemptSchema = resolveRef(schema, attemptsSchema.items);
   assert.equal(
-    attemptsSchema?.items?.properties?.message?.maxLength,
+    attemptSchema.properties?.message?.maxLength,
     512,
   );
   assert.equal(
-    attemptsSchema?.items?.properties?.model?.maxLength,
+    attemptSchema.properties?.model?.maxLength,
     256,
   );
 });
@@ -166,9 +169,58 @@ test("schema-version-1 migration loads an old failure record without runtime met
 
   assert.deepEqual(migrated.failure, oldRecord.failure);
   assert.equal(
-    "runtime" in (migrated.failure as Record<string, unknown>),
+    "runtime" in (migrated.failure as unknown as Record<string, unknown>),
     false,
   );
+});
+
+test("schema-version-1 migration bounds and sanitizes optional runtime metadata", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-runtime-migration-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("runtime migration", "check", DEFAULT_CONFIG);
+  const canary = "MIGRATION_RUNTIME_CANARY";
+  const raw = JSON.parse(JSON.stringify(run)) as Record<string, unknown>;
+  raw.failure = {
+    code: "runtime-models-exhausted",
+    message: `token=${canary}`,
+    at: "2026-07-01T00:00:00.000Z",
+    runtime: {
+      attempts: Array.from({ length: 12 }, (_, index) => ({
+        model: `model-${index}\n | forged [runtime-error]: entry`,
+        code: index === 0 ? "not-a-runtime-code" : "runtime-error",
+        message: `token=${canary}-${index}${"x".repeat(1_000)}`,
+        requestedModel: `requested-${index}\u0000`,
+        stderrPresent: true,
+        truncated: false,
+        adapterMetadata: { raw: canary },
+      })),
+      totalAttempts: 12,
+      omittedAttempts: 0,
+      aggregateTruncated: true,
+      adapterMetadata: { raw: canary },
+    },
+  };
+
+  const migrated = migrateRunRecord(raw);
+  const serialized = JSON.stringify(migrated.failure);
+  const runtime = migrated.failure?.runtime;
+
+  assert.equal(serialized.includes(canary), false);
+  assert.ok(runtime);
+  assert.equal(runtime.attempts.length, 8);
+  assert.equal(runtime.totalAttempts, 12);
+  assert.equal(runtime.omittedAttempts, 4);
+  assert.equal(runtime.attempts[0]?.code, "runtime-error");
+  assert.ok(
+    runtime.attempts.every(
+      (attempt) =>
+        [...attempt.message].length <= 512 &&
+        !/[\r\n\u0000-\u001f\u007f-\u009f]/.test(attempt.model) &&
+        !("adapterMetadata" in attempt),
+    ),
+  );
+  assert.equal("adapterMetadata" in runtime, false);
 });
 
 test("run-record schema rejects non-hex sha256 digests", async () => {

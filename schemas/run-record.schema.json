@@ -94,13 +94,93 @@
         "code": {
           "enum": ["runtime-models-exhausted", "workflow-failure"]
         },
-        "message": { "type": "string" },
+        "message": { "type": "string", "maxLength": 8192 },
         "at": { "type": "string" },
-        "resumeState": { "type": "string" }
+        "resumeState": { "type": "string" },
+        "runtime": { "$ref": "#/$defs/durableRuntimeFailureSummary" }
       }
     }
   },
   "$defs": {
+    "durableRuntimeFailureAttempt": {
+      "type": "object",
+      "required": [
+        "model",
+        "code",
+        "message",
+        "stderrPresent",
+        "truncated"
+      ],
+      "properties": {
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "code": {
+          "enum": [
+            "cursor-cli-non-zero",
+            "cursor-cli-timeout",
+            "cursor-cli-spawn",
+            "cursor-sdk-error",
+            "runtime-error",
+            "invalid-transport-json",
+            "unsupported-response-shape",
+            "missing-logical-output"
+          ]
+        },
+        "message": { "type": "string", "maxLength": 512 },
+        "requestedModel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "configuredModel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "exitCode": { "type": "integer" },
+        "timedOut": { "type": "boolean" },
+        "durationMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "promptTransport": { "enum": ["stdin", "argv"] },
+        "stderrPresent": { "type": "boolean" },
+        "truncated": { "type": "boolean" }
+      }
+    },
+    "durableRuntimeFailureSummary": {
+      "type": "object",
+      "required": [
+        "attempts",
+        "totalAttempts",
+        "omittedAttempts",
+        "aggregateTruncated"
+      ],
+      "properties": {
+        "attempts": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/durableRuntimeFailureAttempt"
+          }
+        },
+        "totalAttempts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "omittedAttempts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "aggregateTruncated": { "type": "boolean" }
+      }
+    },
     "evidenceBinding": {
       "type": "object",
       "required": ["headSha", "passed", "at"],

@@ -145,6 +145,35 @@ export type RunFailureCode =
   | "runtime-models-exhausted"
   | "workflow-failure";
 
+export interface DurableRuntimeFailureAttempt {
+  model: string;
+  code: RuntimeFailureCode;
+  message: string;
+  requestedModel?: string;
+  configuredModel?: string;
+  exitCode?: number;
+  timedOut?: boolean;
+  durationMs?: number;
+  promptTransport?: PromptTransport;
+  stderrPresent: boolean;
+  truncated: boolean;
+}
+
+export interface DurableRuntimeFailureSummary {
+  attempts: DurableRuntimeFailureAttempt[];
+  totalAttempts: number;
+  omittedAttempts: number;
+  aggregateTruncated: boolean;
+}
+
+export interface RunFailure {
+  code?: RunFailureCode;
+  message: string;
+  at: string;
+  resumeState?: WorkflowState;
+  runtime?: DurableRuntimeFailureSummary;
+}
+
 export interface RunRecord {
   schemaVersion: 1;
   version: number;
@@ -170,12 +199,7 @@ export interface RunRecord {
   evidence?: RunEvidence;
   supersedes?: string;
   supersededBy?: string;
-  failure?: {
-    code?: RunFailureCode;
-    message: string;
-    at: string;
-    resumeState?: WorkflowState;
-  };
+  failure?: RunFailure;
 }
 
 export interface RuntimeRequest {

@@ -25,6 +25,7 @@ import {
   redactSecrets,
   sanitizeDiagnostic,
 } from "./redaction.ts";
+import { sanitizeDurableRuntimeFailureSummary } from "./failure-diagnostics.ts";
 import { transition } from "./state-machine.ts";
 
 function now(): string {
@@ -104,10 +105,19 @@ function sanitizeEventDetails(
   details: Record<string, unknown> | undefined,
 ): Record<string, unknown> | undefined {
   if (!details) return undefined;
-  if (type === "FAIL" && typeof details.reason === "string") {
-    const reason = details.reason;
+  if (
+    type === "FAIL" &&
+    (typeof details.reason === "string" || "runtime" in details)
+  ) {
     const safe = structuredClone(details);
-    safe.reason = sanitizePersistedFailureMessage(reason);
+    if (typeof details.reason === "string") {
+      safe.reason = sanitizePersistedFailureMessage(details.reason);
+    }
+    if ("runtime" in details) {
+      const runtime = sanitizeDurableRuntimeFailureSummary(details.runtime);
+      if (runtime) safe.runtime = runtime;
+      else delete safe.runtime;
+    }
     return safe;
   }
   const previousFailure = details.previousFailure;
@@ -122,6 +132,11 @@ function sanitizeEventDetails(
     const safe = structuredClone(details);
     const previous = safe.previousFailure as Record<string, unknown>;
     previous.message = sanitizePersistedFailureMessage(message);
+    if ("runtime" in previous) {
+      const runtime = sanitizeDurableRuntimeFailureSummary(previous.runtime);
+      if (runtime) previous.runtime = runtime;
+      else delete previous.runtime;
+    }
     return safe;
   }
   return details;
@@ -130,6 +145,13 @@ function sanitizeEventDetails(
 function sanitizeRunFailureState(run: RunRecord): RunRecord {
   if (run.failure) {
     run.failure.message = sanitizePersistedFailureMessage(run.failure.message);
+    if ("runtime" in run.failure) {
+      const runtime = sanitizeDurableRuntimeFailureSummary(
+        run.failure.runtime,
+      );
+      if (runtime) run.failure.runtime = runtime;
+      else delete run.failure.runtime;
+    }
   }
   for (const event of run.events) {
     const safeDetails = sanitizeEventDetails(event.type, event.details);
