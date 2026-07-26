@@ -1,0 +1,204 @@
+# Issue 19 Cursor CLI Failure Redaction Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Prevent raw Cursor CLI stderr from entering durable MASWE failure state while retaining bounded, structured operator diagnostics.
+
+**Architecture:** Add a shared diagnostic sanitizer on top of `redactSecrets()`, return typed safe failures from the Cursor CLI adapter, aggregate typed failures within fixed budgets, and re-sanitize failure-specific fields at orchestration/store persistence boundaries. Successful artifact handling remains unchanged.
+
+**Tech Stack:** TypeScript ESM, Node.js 22 test runner, JSON Schema, Markdown documentation.
+
+## Global Constraints
+
+- Raw stderr is transient and must never be persisted, hashed, logged, attached, or returned in runtime metadata.
+- Individual diagnostics are at most 2,048 Unicode code points; fallback aggregates are at most 8,192 Unicode code points.
+- Normalize controls, redact, then truncate with `… [truncated]`.
+- Preserve `invalid-transport-json`, `unsupported-response-shape`, and `missing-logical-output`.
+- Keep state transitions in `src/state-machine.ts`; do not add provider imports to core workflow code.
+- Every behavioral change starts with a failing test and ends with focused plus full verification.
+
+---
+
+### Task 1: Redaction and deterministic diagnostic bounds
+
+**Files:**
+- Modify: `test/redaction.test.ts`
+- Modify: `src/redaction.ts`
+
+**Interfaces:**
+- Produces: `sanitizeDiagnostic(input: string, maxCodePoints?: number): SanitizedDiagnostic`
+- Produces: `FAILURE_DIAGNOSTIC_MAX_CODE_POINTS`, `FAILURE_AGGREGATE_MAX_CODE_POINTS`
+
+- [ ] **Step 1: Write failing unit tests**
+
+Add synthetic cases for GitHub/OpenAI/Slack tokens, authorization and standalone bearer values, URL userinfo,
+assignments, AWS secrets, PEM blocks, query parameters, placement/multiplicity, controls, Unicode boundaries,
+redaction-before-truncation, and deterministic repeated invocation.
+
+- [ ] **Step 2: Run the redaction suite and record RED**
+
+Run: `node --experimental-strip-types --test test/redaction.test.ts`
+
+Expected: failures showing standalone bearer, URL credentials, assignments, query parameters, control
+normalization, and bounded diagnostics are not implemented.
+
+- [ ] **Step 3: Implement the smallest sanitizer**
+
+Extend narrowly tested patterns in `redactSecrets()`. Implement control normalization and a code-point-aware
+truncator whose returned `text` never exceeds its supplied maximum and whose `truncated` flag is deterministic.
+
+- [ ] **Step 4: Run the redaction suite GREEN**
+
+Run: `node --experimental-strip-types --test test/redaction.test.ts`
+
+Expected: all redaction and boundary tests pass.
+
+### Task 2: Typed Cursor CLI runtime failures
+
+**Files:**
+- Create: `test/issue19-runtime-failure.test.ts`
+- Modify: `src/domain.ts`
+- Modify: `src/runtimes/cursor-cli.ts`
+- Modify: `src/runtimes/cursor-sdk.ts`
+- Modify: `src/runtimes/mock.ts`
+- Modify compatibility assertions in `test/rc-review-corrections.test.ts`
+
+**Interfaces:**
+- Produces: discriminated `RuntimeResult`
+- Produces: `RuntimeFailureDiagnostic` and stable `RuntimeFailureCode`
+
+- [ ] **Step 1: Write failing runtime cases**
+
+Inject process results for non-zero empty stdout, non-zero structured stdout, timeout, large stderr,
+authentication-like stderr, catalogue failure, doctor failure, and exit-zero decode failure. Assert no raw
+secret in output/metadata, useful operational fields, fixed bounds, stable codes, and preserved decode codes.
+
+- [ ] **Step 2: Run the runtime suite and record RED**
+
+Run: `node --experimental-strip-types --test test/issue19-runtime-failure.test.ts test/thermos-issue12-blockers.test.ts`
+
+Expected: Issue #19 tests fail because raw stderr appears in output/metadata and typed failure fields are absent.
+
+- [ ] **Step 3: Implement typed safe results**
+
+Classify Cursor outcomes using process fields and tested authentication phrases. Never decode non-zero stdout as
+assistant success. Return only sanitized diagnostic data and booleans such as `stderrPresent`; omit `stderr`.
+Sanitize catalogue/doctor strings. Adapt SDK/mock construction to the discriminated result contract.
+
+- [ ] **Step 4: Run runtime suites GREEN**
+
+Run: `node --experimental-strip-types --test test/issue19-runtime-failure.test.ts test/cursor-cli-output.test.ts test/thermos-issue12-blockers.test.ts test/rc-review-corrections.test.ts`
+
+Expected: all runtime and PR #15 structured-output regressions pass.
+
+### Task 3: Orchestrator aggregation and durable-state safeguards
+
+**Files:**
+- Create: `test/issue19-persistence.test.ts`
+- Modify: `src/orchestrator.ts`
+- Modify: `src/store.ts`
+- Modify: `src/cli.ts`
+- Modify: `schemas/run-record.schema.json` only if the durable failure shape changes
+
+**Interfaces:**
+- Consumes: `RuntimeFailureDiagnostic`, `sanitizeDiagnostic`
+- Produces: bounded per-model and aggregate failure rendering
+- Produces: failure-specific `sanitizeRunForPersistence()` behavior
+
+- [ ] **Step 1: Write failing integration tests**
+
+Use a deliberately unsafe runtime stub. Drive start/fallback/failure, inspect returned and persisted `run.json`,
+events, artifacts, retry `previousFailure`, supersede state, human/JSON CLI status, and both fallback policy
+branches. Assert canaries are absent and model/code/exit/timeout metadata remains actionable.
+
+- [ ] **Step 2: Run the persistence suite and record RED**
+
+Run: `node --experimental-strip-types --test test/issue19-persistence.test.ts`
+
+Expected: canaries appear in `run.failure`, `FAIL.details.reason`, retry history, and status output.
+
+- [ ] **Step 3: Implement bounded structured aggregation**
+
+Replace prose-only `ensureSuccess()` errors with an explicit runtime failure error carrying structured fields.
+Bound each failure before adding it, stop aggregate construction at 8,192 code points, and sanitize thrown
+runtime exceptions. `failRun()` sanitizes before assigning or applying events.
+
+- [ ] **Step 4: Add persistence and CLI defense in depth**
+
+Before store serialization, sanitize only `run.failure.message`, `FAIL.details.reason`, and
+`RETRY_FROM_FAILED.details.previousFailure.message`. Defensively sanitize the human-rendered failure line.
+Do not blanket-redact successful run fields or artifacts.
+
+- [ ] **Step 5: Run integration and compatibility suites GREEN**
+
+Run: `node --experimental-strip-types --test test/issue19-persistence.test.ts test/orchestrator.test.ts test/failed-run-provenance.test.ts test/store.test.ts test/schema.test.ts test/readonly-fingerprint.test.ts`
+
+Expected: all persistence and existing workflow behavior passes.
+
+### Task 4: Documentation and contracts
+
+**Files:**
+- Modify: `docs/SECURITY.md`
+- Modify: `docs/ARCHITECTURE.md`
+- Modify: `docs/OPERATIONS.md`
+- Modify: `docs/ARTIFACT_CONTRACTS.md`
+- Modify: `CHANGELOG.md`
+
+**Interfaces:**
+- Documents the exact transient boundary, persisted fields, limits, limitations, and no-raw-debug policy.
+
+- [ ] **Step 1: Update documentation**
+
+Document successful assistant output versus exit-zero decode failure versus non-zero process failure, the two
+code-point bounds, operator metadata, redaction limitations, retry behavior, and the absence of a raw-debug
+channel. Remove any operations guidance that says raw runtime stderr is persisted.
+
+- [ ] **Step 2: Review claims against tests**
+
+Search for `stderr`, `failure`, and `redact` in changed docs and ensure every security claim is enforced by a
+test or explicitly described as best-effort.
+
+### Task 5: Validation, review, and publication
+
+**Files:**
+- Modify only files justified by test/review findings.
+
+**Interfaces:**
+- Produces exact-head validation and draft PR evidence.
+
+- [ ] **Step 1: Install and run focused validation**
+
+Run `npm ci`, `npm run typecheck`, direct Issue #19 suites, structured decoder/runtime suites,
+unauthorized-marker suites, Issue #12/Thermos suites, ready-review suite, and Issue #11 contention gates.
+
+- [ ] **Step 2: Run complete validation**
+
+Run `npm test`, `npm run build`, `npm run pack:dry`, `npm run check`, and `git diff --check`.
+
+- [ ] **Step 3: Audit leaks and package**
+
+Search the working tree excluding `.git`/`node_modules`, inspect `.maswe/runs`, `dist`, temporary fixtures, and
+the `npm pack --dry-run` manifest. Confirm canaries occur only in deliberate test source/assertions and required
+documentation examples.
+
+- [ ] **Step 4: Run CodeRabbit review**
+
+Run `coderabbit review --prompt-only --base main`, address critical/warning findings with a new failing
+regression first, then repeat focused and full checks.
+
+- [ ] **Step 5: Commit and push**
+
+Inspect scope with `git status -sb` and the full diff. Create bounded commits, push
+`issue/19-redact-cursor-stderr`, and record the exact head.
+
+- [ ] **Step 6: Open draft PR and request reviews**
+
+Open draft title `Redact persisted Cursor CLI failure diagnostics`, body containing `Closes #19` and all
+requested evidence. Request CodeRabbit, Codex, and Copilot according to repository practice. Do not merge or
+enable auto-merge.
+
+- [ ] **Step 7: Bind CI to exact head**
+
+Wait for exact-head checks, record run/job IDs and checked SHA, and stop as `BLOCKED_VALIDATION` if exact-head CI
+cannot be established.
+
