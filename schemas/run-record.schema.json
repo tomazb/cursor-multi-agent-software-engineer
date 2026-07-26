@@ -91,6 +91,9 @@
       "type": "object",
       "required": ["message", "at"],
       "properties": {
+        "code": {
+          "enum": ["runtime-models-exhausted", "workflow-failure"]
+        },
         "message": { "type": "string" },
         "at": { "type": "string" },
         "resumeState": { "type": "string" }

@@ -1,4 +1,11 @@
-import type { AgentRuntime, RoleId, RunRecord, RuntimeResult, WorkflowState } from "./domain.ts";
+import type {
+  AgentRuntime,
+  RoleId,
+  RunFailureCode,
+  RunRecord,
+  RuntimeResult,
+  WorkflowState,
+} from "./domain.ts";
 import { buildCommentClassifierPrompt, buildRolePrompt } from "./prompt-builder.ts";
 import { gitRevParse, isGitWorkspaceClean } from "./git-snapshot.ts";
 import {
@@ -19,13 +26,18 @@ import { renderQualityReport, runQualityChecks } from "./quality.ts";
 import { isHumanGate, isTerminal } from "./state-machine.ts";
 import { FileRunStore, type RunStore } from "./store.ts";
 import type { MasweConfig } from "./domain.ts";
+import {
+  appendFailureAggregate,
+  assertRuntimeIdentity,
+  ensureRuntimeSuccess,
+  runFailureCode,
+  runFailureDetails,
+  runFailureMessage,
+  RuntimeModelsExhaustedError,
+  runtimeAttemptFailure,
+  safeFailureMessage,
+} from "./failure-diagnostics.ts";
 import path from "node:path";
-
-function ensureSuccess(result: RuntimeResult, role: RoleId): void {
-  if (result.status !== "finished") {
-    throw new Error(`${role} failed: ${result.output || "No output was produced."}`);
-  }
-}
 
 export function extractVerifierDefects(report: string): string {
   const lines = report.split(/\r?\n/);
@@ -324,8 +336,11 @@ export class Orchestrator {
           throw new Error(`State ${run.state} requires a user or integration event.`);
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return this.failRun(run, message);
+      return this.failRun(
+        run,
+        runFailureMessage(error),
+        runFailureCode(error),
+      );
     }
   }
 
@@ -430,17 +445,23 @@ export class Orchestrator {
     });
   }
 
-  private async failRun(run: RunRecord, message: string): Promise<RunRecord> {
+  private async failRun(
+    run: RunRecord,
+    message: string,
+    code: RunFailureCode = "workflow-failure",
+  ): Promise<RunRecord> {
     const resumeState = isTerminal(run.state) ? undefined : run.state;
+    const safeMessage = safeFailureMessage(message);
     run.failure = {
-      message,
+      code,
+      message: safeMessage,
       at: new Date().toISOString(),
       ...(resumeState ? { resumeState } : {}),
     };
     await this.store.save(run);
     if (!isTerminal(run.state)) {
       const failed = await this.store.applyEvent(run, "FAIL", "orchestrator", {
-        reason: message,
+        ...runFailureDetails(code, safeMessage),
         ...(resumeState ? { resumeState } : {}),
       });
       return this.finalizeTerminal(failed);
@@ -481,7 +502,9 @@ export class Orchestrator {
     const candidates = run.config.policy.rejectModelFallback
       ? [configured.model]
       : [configured.model, ...(configured.fallbackModels ?? [])];
-    const failures: string[] = [];
+    let aggregate = `${role} failed for all configured models: `;
+    let aggregateHasEntries = false;
+    let aggregateFull = false;
     const workdir = workingDirectoryFor(run);
 
     for (const model of candidates) {
@@ -497,22 +520,29 @@ export class Orchestrator {
             run.workspace?.worktreePath && path.resolve(workdir) === path.resolve(run.workspace.worktreePath),
           ),
         });
-        ensureSuccess(result, role);
+        ensureRuntimeSuccess(result, role);
         if (
           run.config.policy.rejectModelFallback &&
           result.actualModel &&
           result.actualModel !== result.requestedModel
         ) {
-          throw new Error(
-            `${role} requested ${result.requestedModel}, but runtime reported ${result.actualModel}.`,
-          );
+          assertRuntimeIdentity(result, role);
         }
         return result;
       } catch (error) {
-        failures.push(`${model}: ${error instanceof Error ? error.message : String(error)}`);
+        if (!aggregateFull) {
+          const appended = appendFailureAggregate(
+            aggregate,
+            runtimeAttemptFailure(model, error),
+            aggregateHasEntries,
+          );
+          aggregate = appended.text;
+          aggregateFull = appended.full;
+          aggregateHasEntries = true;
+        }
       }
     }
-    throw new Error(`${role} failed for all configured models: ${failures.join(" | ")}`);
+    throw new RuntimeModelsExhaustedError(aggregate);
   }
 
   async markPrOpened(runId: string): Promise<RunRecord> {

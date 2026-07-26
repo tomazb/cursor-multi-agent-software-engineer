@@ -84,6 +84,15 @@ class UnsafeFailureRuntime implements AgentRuntime {
   }
 }
 
+class ThrowingFailureRuntime extends UnsafeFailureRuntime {
+  override async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    this.attempts.push(request.roleConfig.model);
+    throw new Error(
+      `transport rejected ${request.roleConfig.model} token=${PERSISTED_CANARY}_THROWN`,
+    );
+  }
+}
+
 async function makeProject(
   t: test.TestContext,
   rejectModelFallback = false,
@@ -256,4 +265,32 @@ test("fallback aggregate is bounded while retaining each reachable model identit
     assert.match(message, new RegExp(model.replaceAll(".", "\\.")));
   }
   assert.match(message, /… \[truncated\]$/);
+});
+
+test("thrown runtime errors and supersede state use the same safe boundary", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-issue19-supersede-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const config = issue19Config(true);
+  const runtime = new ThrowingFailureRuntime();
+  const store = new FileRunStore(cwd);
+  const orchestrator = new Orchestrator(cwd, config, runtime, store);
+
+  const original = await orchestrator.start("Issue 19 thrown", "synthetic request");
+  assert.equal(original.state, "FAILED");
+  assertNoCanary(original);
+  assert.match(original.failure?.message ?? "", /transport rejected/);
+
+  const replacement = await orchestrator.supersede(original.id);
+  assert.equal(replacement.supersedes, original.id);
+  assertNoCanary(replacement);
+  assertNoCanary(await store.load(original.id));
+  assertNoCanary(await store.load(replacement.id));
+
+  for (const runId of [original.id, replacement.id]) {
+    const persisted = await readFile(
+      path.join(cwd, ".maswe", "runs", runId, "run.json"),
+      "utf8",
+    );
+    assert.equal(persisted.includes(PERSISTED_CANARY), false);
+  }
 });

@@ -722,7 +722,12 @@ test("Cursor execute never treats stderr as successful assistant content", async
   });
   assert.equal(result.status, "error");
   assert.notEqual(result.output, "from-stderr\nREADY_FOR_BRAINSTORM_APPROVAL\n");
-  assert.match(String(result.metadata?.stderr ?? ""), /from-stderr/);
+  assert.equal(Object.hasOwn(result.metadata ?? {}, "stderr"), false);
+  assert.equal(result.metadata?.stderrPresent, true);
+  if (result.status === "error") {
+    assert.equal(result.failure.code, "missing-logical-output");
+  }
+  assert.doesNotMatch(JSON.stringify(result), /from-stderr/);
 });
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,15 @@
-import type { AgentRuntime, MasweConfig, RuntimeDoctorResult, RuntimeRequest, RuntimeResult } from "../domain.ts";
+import type {
+  AgentRuntime,
+  MasweConfig,
+  RuntimeDoctorResult,
+  RuntimeErrorResult,
+  RuntimeFailureCode,
+  RuntimeRequest,
+  RuntimeResult,
+} from "../domain.ts";
 import { gitWorkspaceFingerprint, isGitRepository } from "../git-snapshot.ts";
 import { spawnCaptured, type SpawnResult } from "../process.ts";
+import { sanitizeDiagnostic } from "../redaction.ts";
 import {
   cleanupDoctorProbeResources,
   ensureRunWorkspace,
@@ -232,6 +241,56 @@ type EnsureProbeWorkspaceFn = (
   run: RunRecord,
 ) => Promise<{ worktreePath?: string }>;
 
+function safeDiagnosticText(input: string): string {
+  return sanitizeDiagnostic(input).text;
+}
+
+function cursorFailureResult(options: {
+  code: RuntimeFailureCode;
+  message: string;
+  requestedModel: string;
+  configuredModel: string;
+  promptTransport: "stdin" | "argv";
+  stderrPresent: boolean;
+  exitCode?: number;
+  timedOut?: boolean;
+  durationMs?: number;
+  trust: boolean;
+  metadata?: Record<string, unknown>;
+}): RuntimeErrorResult {
+  const sanitized = sanitizeDiagnostic(options.message);
+  return {
+    status: "error",
+    output: sanitized.text,
+    requestedModel: options.requestedModel,
+    actualModel: options.requestedModel,
+    failure: {
+      code: options.code,
+      message: sanitized.text,
+      requestedModel: options.requestedModel,
+      configuredModel: options.configuredModel,
+      promptTransport: options.promptTransport,
+      ...(options.exitCode !== undefined ? { exitCode: options.exitCode } : {}),
+      ...(options.timedOut !== undefined ? { timedOut: options.timedOut } : {}),
+      ...(options.durationMs !== undefined ? { durationMs: options.durationMs } : {}),
+      stderrPresent: options.stderrPresent,
+      truncated: sanitized.truncated,
+    },
+    metadata: {
+      ...(options.exitCode !== undefined ? { exitCode: options.exitCode } : {}),
+      ...(options.timedOut !== undefined ? { timedOut: options.timedOut } : {}),
+      ...(options.durationMs !== undefined ? { durationMs: options.durationMs } : {}),
+      promptTransport: options.promptTransport,
+      trust: options.trust,
+      configuredModel: options.configuredModel,
+      resolvedModel: options.requestedModel,
+      stderrPresent: options.stderrPresent,
+      diagnosticTruncated: sanitized.truncated,
+      ...(options.metadata ?? {}),
+    },
+  };
+}
+
 export class CursorCliRuntime implements AgentRuntime {
   private readonly config: MasweConfig;
   private readonly cwd: string;
@@ -287,7 +346,30 @@ export class CursorCliRuntime implements AgentRuntime {
       args.push(request.prompt);
     }
 
-    const result = await this.spawnFn(this.config.runtime.command, args, spawnOptions);
+    const startedAt = Date.now();
+    let result: SpawnResult;
+    try {
+      result = await this.spawnFn(this.config.runtime.command, args, spawnOptions);
+    } catch (error) {
+      const after = await gitWorkspaceFingerprint(request.cwd);
+      if (request.roleConfig.permissions === "read-only" && before !== after) {
+        throw new Error(
+          `${request.role} changed the workspace despite read-only policy. Review and revert the changes before continuing.`,
+        );
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      return cursorFailureResult({
+        code: "cursor-cli-spawn",
+        message: `Cursor CLI process could not be started: ${detail}`,
+        requestedModel: resolvedModel,
+        configuredModel: request.roleConfig.model,
+        promptTransport: useStdin ? "stdin" : "argv",
+        stderrPresent: false,
+        timedOut: false,
+        durationMs: Date.now() - startedAt,
+        trust: shouldPassTrustFlag(this.config, request),
+      });
+    }
     const after = await gitWorkspaceFingerprint(request.cwd);
     if (request.roleConfig.permissions === "read-only" && before !== after) {
       throw new Error(
@@ -307,59 +389,93 @@ export class CursorCliRuntime implements AgentRuntime {
         ? "Cursor CLI exited 0 but stdout contained no valid assistant result"
         : decoded.message;
       const operatorError = `${decodeCode}: ${decodeError}`;
-      return {
-        status: "error",
-        output: operatorError,
+      return cursorFailureResult({
+        code: decodeCode,
+        message: operatorError,
         requestedModel: resolvedModel,
-        actualModel: resolvedModel,
+        configuredModel: request.roleConfig.model,
+        promptTransport: useStdin ? "stdin" : "argv",
+        stderrPresent: result.stderr.length > 0,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut ?? false,
+        durationMs: result.durationMs,
+        trust: shouldPassTrustFlag(this.config, request),
         metadata: {
-          exitCode: result.exitCode,
-          stderr: result.stderr,
-          durationMs: result.durationMs,
-          timedOut: result.timedOut ?? false,
-          promptTransport: useStdin ? "stdin" : "argv",
-          trust: shouldPassTrustFlag(this.config, request),
-          configuredModel: request.roleConfig.model,
-          resolvedModel,
           error: decodeError,
           decodeCode,
         },
-      };
+      });
+    }
+
+    if (!success) {
+      const code: RuntimeFailureCode = result.timedOut
+        ? "cursor-cli-timeout"
+        : "cursor-cli-non-zero";
+      const summary = result.timedOut
+        ? `Cursor CLI timed out after ${result.durationMs}ms (exit ${result.exitCode}).`
+        : `Cursor CLI exited non-zero with code ${result.exitCode}.`;
+      const diagnostic = result.stderr.trim();
+      return cursorFailureResult({
+        code,
+        message: diagnostic ? `${summary} Diagnostic: ${diagnostic}` : summary,
+        requestedModel: resolvedModel,
+        configuredModel: request.roleConfig.model,
+        promptTransport: useStdin ? "stdin" : "argv",
+        stderrPresent: result.stderr.length > 0,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut ?? false,
+        durationMs: result.durationMs,
+        trust: shouldPassTrustFlag(this.config, request),
+      });
     }
 
     return {
-      status: success ? "finished" : "error",
+      status: "finished",
       // Never treat stderr as successful assistant content.
-      output: success ? extracted : extracted || result.stderr,
+      output: extracted,
       requestedModel: resolvedModel,
       actualModel: resolvedModel,
       metadata: {
         exitCode: result.exitCode,
-        stderr: result.stderr,
         durationMs: result.durationMs,
         timedOut: result.timedOut ?? false,
         promptTransport: useStdin ? "stdin" : "argv",
         trust: shouldPassTrustFlag(this.config, request),
         configuredModel: request.roleConfig.model,
         resolvedModel,
+        stderrPresent: result.stderr.length > 0,
       },
     };
   }
 
   async listModels(): Promise<string[]> {
     if (this.catalogueCache) return this.catalogueCache;
-    const models = await this.spawnFn(this.config.runtime.command, ["models"], {
-      cwd: this.cwd,
-      timeoutMs: this.config.policy.commandTimeoutMs,
-    });
+    let models: SpawnResult;
+    try {
+      models = await this.spawnFn(this.config.runtime.command, ["models"], {
+        cwd: this.cwd,
+        timeoutMs: this.config.policy.commandTimeoutMs,
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        safeDiagnosticText(
+          `Failed to start model catalogue discovery via '${this.config.runtime.command} models': ${detail}`,
+        ),
+      );
+    }
     if (models.timedOut) {
       throw new Error(
-        `Model catalogue discovery timed out via '${this.config.runtime.command} models' after ${this.config.policy.commandTimeoutMs}ms`,
+        safeDiagnosticText(
+          `Model catalogue discovery timed out via '${this.config.runtime.command} models' after ${this.config.policy.commandTimeoutMs}ms${models.stderr.trim() ? `. Diagnostic: ${models.stderr.trim()}` : ""}`,
+        ),
       );
     }
     if (models.exitCode !== 0) {
       throw new Error(
-        `Failed to list models via '${this.config.runtime.command} models' (exit ${models.exitCode}): ${models.stderr.trim()}`,
+        safeDiagnosticText(
+          `Failed to list models via '${this.config.runtime.command} models' (exit ${models.exitCode})${models.stderr.trim() ? `: ${models.stderr.trim()}` : "."}`,
+        ),
       );
     }
     // Stdout only — never treat stderr prose as a valid catalogue.
@@ -397,12 +513,17 @@ export class CursorCliRuntime implements AgentRuntime {
         timeoutMs: this.config.policy.commandTimeoutMs,
       });
       const cliOk = version.exitCode === 0;
+      const versionText = version.stdout.trim() || version.stderr.trim();
       checks.push({
         name: "cursor-cli",
         ok: cliOk,
         message: cliOk
-          ? `${this.config.runtime.command} is available: ${version.stdout.trim() || version.stderr.trim()}`
-          : `${this.config.runtime.command} returned exit code ${version.exitCode}: ${version.stderr.trim()}`,
+          ? safeDiagnosticText(
+              `${this.config.runtime.command} is available${versionText ? `: ${versionText}` : "."}`,
+            )
+          : safeDiagnosticText(
+              `${this.config.runtime.command} returned exit code ${version.exitCode}${version.stderr.trim() ? `: ${version.stderr.trim()}` : "."}`,
+            ),
       });
       checks.push({
         name: "prompt-transport",
@@ -433,7 +554,9 @@ export class CursorCliRuntime implements AgentRuntime {
               checks.push({
                 name: `model-${role}`,
                 ok: false,
-                message: error instanceof Error ? error.message : String(error),
+                message: safeDiagnosticText(
+                  error instanceof Error ? error.message : String(error),
+                ),
               });
             }
           }
@@ -441,7 +564,9 @@ export class CursorCliRuntime implements AgentRuntime {
           checks.push({
             name: "model-catalogue",
             ok: false,
-            message: error instanceof Error ? error.message : String(error),
+            message: safeDiagnosticText(
+              error instanceof Error ? error.message : String(error),
+            ),
           });
           for (const [role, roleConfig] of Object.entries(this.config.roles)) {
             checks.push({
@@ -506,7 +631,9 @@ export class CursorCliRuntime implements AgentRuntime {
       checks.push({
         name: "cursor-cli",
         ok: false,
-        message: error instanceof Error ? error.message : String(error),
+        message: safeDiagnosticText(
+          error instanceof Error ? error.message : String(error),
+        ),
       });
     } finally {
       const cleanup = await this.cleanupDoctorProbeSafe(probeCwd);

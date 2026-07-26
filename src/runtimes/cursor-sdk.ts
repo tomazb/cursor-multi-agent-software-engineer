@@ -1,5 +1,6 @@
 import type { AgentRuntime, RuntimeDoctorResult, RuntimeRequest, RuntimeResult } from "../domain.ts";
 import { gitWorkspaceFingerprint } from "../git-snapshot.ts";
+import { sanitizeDiagnostic } from "../redaction.ts";
 
 const importOptional = new Function("specifier", "return import(specifier)") as (
   specifier: string,
@@ -28,8 +29,27 @@ export class CursorSdkRuntime implements AgentRuntime {
       );
     }
     const output = typeof result.result === "string" ? result.result : JSON.stringify(result.result, null, 2);
+    if (result.status !== "finished") {
+      const diagnostic = sanitizeDiagnostic(output || `Cursor SDK returned status ${String(result.status)}`);
+      return {
+        status: "error",
+        output: diagnostic.text,
+        requestedModel: request.roleConfig.model,
+        actualModel: result.model?.id,
+        agentId: result.agentId,
+        runId: result.id,
+        failure: {
+          code: "cursor-sdk-error",
+          message: diagnostic.text,
+          requestedModel: request.roleConfig.model,
+          stderrPresent: false,
+          truncated: diagnostic.truncated,
+        },
+        metadata: { status: result.status, diagnosticTruncated: diagnostic.truncated },
+      };
+    }
     return {
-      status: result.status === "finished" ? "finished" : "error",
+      status: "finished",
       output,
       requestedModel: request.roleConfig.model,
       actualModel: result.model?.id,

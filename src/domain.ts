@@ -141,6 +141,10 @@ export interface RunEvidence {
   mergeReady?: EvidenceBinding;
 }
 
+export type RunFailureCode =
+  | "runtime-models-exhausted"
+  | "workflow-failure";
+
 export interface RunRecord {
   schemaVersion: 1;
   version: number;
@@ -167,6 +171,7 @@ export interface RunRecord {
   supersedes?: string;
   supersededBy?: string;
   failure?: {
+    code?: RunFailureCode;
     message: string;
     at: string;
     resumeState?: WorkflowState;
@@ -184,8 +189,30 @@ export interface RuntimeRequest {
   managedWorktree?: boolean;
 }
 
-export interface RuntimeResult {
-  status: "finished" | "error";
+export type RuntimeFailureCode =
+  | "cursor-cli-non-zero"
+  | "cursor-cli-timeout"
+  | "cursor-cli-spawn"
+  | "cursor-sdk-error"
+  | "runtime-error"
+  | "invalid-transport-json"
+  | "unsupported-response-shape"
+  | "missing-logical-output";
+
+export interface RuntimeFailureDiagnostic {
+  code: RuntimeFailureCode;
+  message: string;
+  requestedModel: string;
+  configuredModel?: string;
+  promptTransport?: PromptTransport;
+  exitCode?: number;
+  timedOut?: boolean;
+  durationMs?: number;
+  stderrPresent: boolean;
+  truncated: boolean;
+}
+
+interface RuntimeResultBase {
   output: string;
   requestedModel: string;
   actualModel?: string;
@@ -193,6 +220,17 @@ export interface RuntimeResult {
   runId?: string;
   metadata?: Record<string, unknown>;
 }
+
+export interface RuntimeFinishedResult extends RuntimeResultBase {
+  status: "finished";
+}
+
+export interface RuntimeErrorResult extends RuntimeResultBase {
+  status: "error";
+  failure: RuntimeFailureDiagnostic;
+}
+
+export type RuntimeResult = RuntimeFinishedResult | RuntimeErrorResult;
 
 export interface RuntimeDoctorResult {
   ok: boolean;

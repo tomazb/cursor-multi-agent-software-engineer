@@ -7,6 +7,11 @@ import { Orchestrator } from "./orchestrator.ts";
 import { createRuntime } from "./runtime.ts";
 import { FileRunStore } from "./store.ts";
 import type { AgentRuntime } from "./domain.ts";
+import {
+  FAILURE_AGGREGATE_MAX_CODE_POINTS,
+  sanitizeDiagnostic,
+} from "./redaction.ts";
+import { renderRun } from "./run-rendering.ts";
 
 function usage(): string {
   return `Cursor Multi-Agent Software Engineer (maswe)
@@ -58,29 +63,6 @@ function positional(args: string[]): string[] {
     values.push(value);
   }
   return values;
-}
-
-function renderRun(run: RunRecord): string {
-  const artifacts = run.artifacts.length
-    ? run.artifacts.map((artifact) => `  - ${artifact.name}: ${artifact.path}`).join("\n")
-    : "  - none";
-  const workspace = run.workspace
-    ? `Workspace: branch=${run.workspace.branch}, head=${run.workspace.headSha.slice(0, 12)}, worktree=${run.workspace.worktreePath ?? "(repo)"}`
-    : "Workspace: (unset)";
-  return [
-    `Run: ${run.id}`,
-    `Title: ${run.title}`,
-    `State: ${run.state}`,
-    `Updated: ${run.updatedAt}`,
-    workspace,
-    `Approvals: brainstorm=${run.approvals.brainstorm}, design=${run.approvals.design}`,
-    `Cycles: build/verify=${run.counters.buildVerifyCycles}, comments=${run.counters.commentResolutionCycles}`,
-    "Artifacts:",
-    artifacts,
-    ...(run.failure ? [`Failure: ${run.failure.message}`] : []),
-    ...(run.supersedes ? [`Supersedes: ${run.supersedes}`] : []),
-    ...(run.supersededBy ? [`Superseded by: ${run.supersededBy}`] : []),
-  ].join("\n");
 }
 
 function orchestratorForProject(cwd: string, config: MasweConfig, store: FileRunStore): Orchestrator {
@@ -257,6 +239,11 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
+  console.error(
+    sanitizeDiagnostic(
+      error instanceof Error ? error.message : String(error),
+      FAILURE_AGGREGATE_MAX_CODE_POINTS,
+    ).text,
+  );
   process.exitCode = 1;
 });

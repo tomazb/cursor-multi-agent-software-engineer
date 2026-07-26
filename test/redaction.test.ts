@@ -142,3 +142,15 @@ test("diagnostic sanitization is deterministic for multiline mixed content", () 
   );
   assert.match(JSON.stringify(first), /details remain useful/);
 });
+
+test("diagnostic bound includes the marker and has exact Unicode edge behavior", () => {
+  const sanitizeDiagnostic = redactionModule.sanitizeDiagnostic;
+  const exact = `${"a".repeat(15)}😀`;
+  const within = sanitizeDiagnostic(exact, 16);
+  const over = sanitizeDiagnostic(`${exact}b`, 16);
+
+  assert.deepEqual(within, { text: exact, truncated: false });
+  assert.equal(over.truncated, true);
+  assert.equal([...over.text].length, 16);
+  assert.match(over.text, /… \[truncated\]$/);
+});
