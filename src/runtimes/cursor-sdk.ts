@@ -6,6 +6,21 @@ const importOptional = new Function("specifier", "return import(specifier)") as 
   specifier: string,
 ) => Promise<Record<string, any>>;
 
+export function serializeCursorSdkResult(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    const serialized = JSON.stringify(value, null, 2);
+    if (typeof serialized === "string") return serialized;
+  } catch {
+    // Fall through to a string representation for non-JSON values such as BigInt.
+  }
+  try {
+    return String(value ?? "");
+  } catch {
+    return "[unserializable Cursor SDK result]";
+  }
+}
+
 export class CursorSdkRuntime implements AgentRuntime {
   async listModels(): Promise<string[]> {
     // SDK catalogue discovery is not available here; require exact IDs in config.
@@ -28,7 +43,7 @@ export class CursorSdkRuntime implements AgentRuntime {
         `${request.role} changed the workspace despite read-only policy. Review and revert the changes before continuing.`,
       );
     }
-    const output = typeof result.result === "string" ? result.result : JSON.stringify(result.result, null, 2);
+    const output = serializeCursorSdkResult(result.result);
     if (result.status !== "finished") {
       const diagnostic = sanitizeDiagnostic(output || `Cursor SDK returned status ${String(result.status)}`);
       return {
