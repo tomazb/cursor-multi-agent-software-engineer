@@ -55,6 +55,29 @@ test("redacts standalone bearer tokens, URL credentials, and assignments", () =>
   assert.match(redacted, /safe=yes/);
 });
 
+test("redacts provider-prefixed API key assignments", () => {
+  const input = [
+    "CURSOR_API_KEY=cursor-prefixed-synthetic-value",
+    "OPENAI_API_KEY: openai-prefixed-synthetic-value",
+    'ANTHROPIC_API_KEY="anthropic-prefixed-synthetic-value"',
+  ].join("\n");
+
+  const redacted = redactSecrets(input);
+
+  assert.equal(redacted.includes("cursor-prefixed-synthetic-value"), false);
+  assert.equal(redacted.includes("openai-prefixed-synthetic-value"), false);
+  assert.equal(redacted.includes("anthropic-prefixed-synthetic-value"), false);
+  assert.equal(redacted.match(/\[REDACTED\]/g)?.length, 3);
+  assert.equal(
+    redacted,
+    [
+      "CURSOR_API_KEY=[REDACTED]",
+      "OPENAI_API_KEY: [REDACTED]",
+      'ANTHROPIC_API_KEY="[REDACTED]"',
+    ].join("\n"),
+  );
+});
+
 test("redacts multiple synthetic secret forms at the start, middle, and end", () => {
   const input = [
     "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA starts the line",

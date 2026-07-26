@@ -267,6 +267,40 @@ test("fallback aggregate is bounded while retaining each reachable model identit
   assert.match(message, /… \[truncated\]$/);
 });
 
+test("fallback aggregate reports model attempts omitted after reaching its bound", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-issue19-many-fallbacks-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const models = Array.from(
+    { length: 12 },
+    (_, index) => `synthetic-model-${String(index + 1).padStart(2, "0")}`,
+  );
+  const config = issue19Config(false);
+  config.roles.brainstormer.model = models[0]!;
+  config.roles.brainstormer.fallbackModels = models.slice(1);
+  const runtime = new (class extends UnsafeFailureRuntime {
+    override async listModels(): Promise<string[]> {
+      return [...MODELS, ...models];
+    }
+  })();
+  const orchestrator = new Orchestrator(
+    cwd,
+    config,
+    runtime,
+    new FileRunStore(cwd),
+  );
+
+  const run = await orchestrator.start(
+    "Issue 19 many fallbacks",
+    "synthetic request",
+  );
+  const message = run.failure?.message ?? "";
+
+  assert.deepEqual(runtime.attempts, models);
+  assertNoCanary(message);
+  assert.ok([...message].length <= FAILURE_AGGREGATE_MAX_CODE_POINTS);
+  assert.match(message, /8 additional model failures omitted after aggregate limit/);
+});
+
 test("thrown runtime errors and supersede state use the same safe boundary", async (t) => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-issue19-supersede-"));
   t.after(() => rm(cwd, { recursive: true, force: true }));

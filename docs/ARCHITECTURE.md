@@ -336,7 +336,8 @@ Failures fall into categories:
 1. **Startup/configuration:** missing CLI, key, SDK, model, or invalid config. The run fails immediately.
 2. **Agent run failure:** nonzero CLI exit, timeout, process-spawn failure, exit-zero structured
    decode failure, or SDK error. The configured fallback policy applies to typed, individually
-   bounded failures. The final all-model aggregate is bounded independently.
+   bounded failures. The final all-model aggregate is bounded independently and reports the count
+   of later model failures omitted after its diagnostic budget is exhausted.
 3. **Quality failure:** routes to `BUILDING` while under cycle limit.
 4. **Verification failure:** routes to `BUILDING` while under cycle limit.
 5. **Scope failure:** routes to `WAITING_FOR_HUMAN` without edits.

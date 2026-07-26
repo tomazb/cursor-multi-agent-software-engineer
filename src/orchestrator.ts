@@ -30,6 +30,7 @@ import {
   appendFailureAggregate,
   assertRuntimeIdentity,
   ensureRuntimeSuccess,
+  reportOmittedFailureAttempts,
   runFailureCode,
   runFailureDetails,
   runFailureMessage,
@@ -505,6 +506,7 @@ export class Orchestrator {
     let aggregate = `${role} failed for all configured models: `;
     let aggregateHasEntries = false;
     let aggregateFull = false;
+    let omittedFailureAttempts = 0;
     const workdir = workingDirectoryFor(run);
 
     for (const model of candidates) {
@@ -530,7 +532,9 @@ export class Orchestrator {
         }
         return result;
       } catch (error) {
-        if (!aggregateFull) {
+        if (aggregateFull) {
+          omittedFailureAttempts += 1;
+        } else {
           const appended = appendFailureAggregate(
             aggregate,
             runtimeAttemptFailure(model, error),
@@ -542,7 +546,9 @@ export class Orchestrator {
         }
       }
     }
-    throw new RuntimeModelsExhaustedError(aggregate);
+    throw new RuntimeModelsExhaustedError(
+      reportOmittedFailureAttempts(aggregate, omittedFailureAttempts),
+    );
   }
 
   async markPrOpened(runId: string): Promise<RunRecord> {

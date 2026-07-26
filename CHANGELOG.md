@@ -53,7 +53,8 @@ The project follows semantic versioning once a public release process is establi
   adapter. Raw stderr is omitted from runtime metadata and cannot enter run failures, events,
   artifacts, retry history, or normal CLI output. The orchestrator and store apply focused
   defense-in-depth sanitization; individual diagnostics are capped at 2,048 Unicode code points
-  and all-model aggregates at 8,192.
+  and all-model aggregates at 8,192, with an omitted-attempt count when later fallback diagnostics
+  cannot fit.
 
 ### Planned
 

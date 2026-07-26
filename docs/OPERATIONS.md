@@ -141,7 +141,8 @@ Cursor CLI assistant extraction and terminal markers:
   applicable. Process-spawn rejection uses `cursor-cli-spawn`.
 - Diagnostics normalize unsafe controls, redact, then truncate by Unicode code points. Per-model
   diagnostics are capped at 2,048 code points and the all-model fallback message at 8,192; both
-  bounds include `… [truncated]`.
+  bounds include `… [truncated]`. If later fallback diagnostics cannot fit, the message reports
+  their omitted-attempt count while the configured attempts still execute.
 - Authentication-like text can remain useful in the redacted excerpt, but it does not select a
   control-flow classification. Catalogue and doctor errors use the same bounded sanitizer.
 - Marker validation rejects quoted examples, embedded tokens, duplicates, conflicts, non-final markers, and content after a marker. Operator-visible messages name the violated contract and logical line number without dumping full model output.

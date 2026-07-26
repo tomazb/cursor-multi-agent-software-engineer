@@ -30,7 +30,7 @@ const PATTERNS: Array<{ pattern: RegExp; replacement: string }> = [
   },
   {
     pattern:
-      /\b((?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|token)\s*[=:]\s*["']?)[^"'&,\s;]+(["']?)/gi,
+      /\b((?:(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|token))\s*[=:]\s*["']?)[^"'&,\s;]+(["']?)/gi,
     replacement: "$1[REDACTED]$2",
   },
   {

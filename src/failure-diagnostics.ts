@@ -68,6 +68,23 @@ export function appendFailureAggregate(
   return { text: sanitized.text, full: sanitized.truncated };
 }
 
+export function reportOmittedFailureAttempts(
+  aggregate: string,
+  omittedAttempts: number,
+): string {
+  if (omittedAttempts === 0) return aggregate;
+  const suffix = ` | ${omittedAttempts} additional model failure${omittedAttempts === 1 ? "" : "s"} omitted after aggregate limit`;
+  const suffixLength = [...suffix].length;
+  const prefix = sanitizeDiagnostic(
+    aggregate,
+    FAILURE_AGGREGATE_MAX_CODE_POINTS - suffixLength,
+  ).text;
+  return sanitizeDiagnostic(
+    `${prefix}${suffix}`,
+    FAILURE_AGGREGATE_MAX_CODE_POINTS,
+  ).text;
+}
+
 export function runFailureCode(error: unknown): RunFailureCode {
   if (error instanceof RuntimeModelsExhaustedError) return error.code;
   return "workflow-failure";

@@ -50,7 +50,8 @@ then truncates. Truncation is measured in Unicode code points, not UTF-16 code u
 - Marker: `… [truncated]`.
 
 The helper is deterministic for identical input. It exposes whether truncation occurred. Per-model entries are
-bounded before aggregation, and aggregation stops once the aggregate budget is exhausted.
+bounded before aggregation. Once the aggregate budget is exhausted, later fallbacks still run and the final
+bounded message reports how many later model failures were omitted from the diagnostic text.
 
 `redactSecrets()` is extended only for tested credential forms: GitHub/OpenAI/Slack tokens, authorization and
 standalone bearer forms, URL userinfo, common API-key/token/AWS-secret assignments, private-key blocks, and
