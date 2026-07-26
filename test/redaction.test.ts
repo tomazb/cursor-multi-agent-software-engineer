@@ -60,7 +60,7 @@ test("redacts standalone bearer tokens, URL credentials, and assignments", () =>
     assert.equal(redacted.includes(secret), false, `leaked ${secret}`);
   }
   assert.match(redacted, /Bearer \[REDACTED\]/);
-  assert.match(redacted, /https:\/\/alice:\[REDACTED\]@example\.invalid\/private/);
+  assert.match(redacted, /https:\/\/\[REDACTED\]@example\.invalid\/private/);
   assert.match(redacted, /safe=yes/);
 });
 
@@ -218,7 +218,7 @@ test("redacts before truncating near a secret boundary", () => {
 });
 
 test("redacts a long assignment crossing the retained diagnostic boundary", () => {
-  const prefix = "safe ".repeat(404);
+  const prefix = "safe ".repeat(403);
   const secret = "boundary-secret-prefix-" + "z".repeat(32_000);
   const result = redactionModule.sanitizeDiagnostic(
     `${prefix}token=${secret}`,
