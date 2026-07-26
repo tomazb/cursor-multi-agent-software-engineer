@@ -78,6 +78,26 @@ test("redacts provider-prefixed API key assignments", () => {
   );
 });
 
+test("redacts JSON-quoted secret, token, and signature assignments", () => {
+  const input =
+    '{"access_token":"json-access-value","secret":"json-secret-value","signature":"json-signature-value","sig":"json-sig-value"}';
+
+  const redacted = redactSecrets(input);
+
+  for (const secret of [
+    "json-access-value",
+    "json-secret-value",
+    "json-signature-value",
+    "json-sig-value",
+  ]) {
+    assert.equal(redacted.includes(secret), false, `leaked ${secret}`);
+  }
+  assert.equal(
+    redacted,
+    '{"access_token":"[REDACTED]","secret":"[REDACTED]","signature":"[REDACTED]","sig":"[REDACTED]"}',
+  );
+});
+
 test("redacts multiple synthetic secret forms at the start, middle, and end", () => {
   const input = [
     "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA starts the line",

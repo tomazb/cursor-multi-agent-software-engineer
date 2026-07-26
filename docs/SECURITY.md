@@ -128,7 +128,7 @@ the digest fingerprint.
   `previousFailure.message` before persistence. CLI status rendering applies the same focused
   safeguard.
 - MASWE has no raw provider-debug artifact or log channel. It does not persist an encrypted copy or
-  an unsalted digest of raw stderr.
+  any digest or hash of raw stderr.
 - Documentation instructs teams not to commit run artifacts by default.
 
 **Gaps and future work:**

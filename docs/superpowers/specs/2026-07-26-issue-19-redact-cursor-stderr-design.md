@@ -33,7 +33,7 @@ must sanitize and bound those failures without introducing provider-specific SDK
 ### Typed runtime failures
 
 `RuntimeResult` becomes a discriminated success/error contract. Error results carry a
-`RuntimeFailureDiagnostic` with a stable code, safe message, optional safe excerpt, and operational fields:
+`RuntimeFailureDiagnostic` with a stable code, safe message, and operational fields:
 exit code, timeout state, duration, requested/configured model, and prompt transport. Cursor CLI uses codes
 that distinguish non-zero exit, timeout, exit-zero structured decode, catalogue failure, and
 process-spawn/runtime errors. Authentication-like prose remains operator-visible after sanitization under the

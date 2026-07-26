@@ -252,6 +252,22 @@ test("FileRunStore sanitizes unsafe failure and retry event callers", async (t) 
   );
 });
 
+test("unrelated event details do not require failure-sanitizer cloneability", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-issue19-event-details-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create(
+    "Issue 19 unrelated details",
+    "synthetic request",
+    issue19Config(true),
+  );
+  const details = new Proxy({ note: "preserved" }, {});
+
+  const started = await store.applyEvent(run, "START", "test", details);
+  assert.equal(started.events.at(-1)?.details?.note, "preserved");
+  assert.equal((await store.load(run.id)).events.at(-1)?.details?.note, "preserved");
+});
+
 test("fallback aggregate is bounded while retaining each reachable model identity", async (t) => {
   const { orchestrator } = await makeProject(t);
 

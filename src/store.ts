@@ -104,21 +104,27 @@ function sanitizeEventDetails(
   details: Record<string, unknown> | undefined,
 ): Record<string, unknown> | undefined {
   if (!details) return undefined;
-  const safe = structuredClone(details);
-  if (type === "FAIL" && typeof safe.reason === "string") {
-    safe.reason = sanitizePersistedFailureMessage(safe.reason);
+  if (type === "FAIL" && typeof details.reason === "string") {
+    const reason = details.reason;
+    const safe = structuredClone(details);
+    safe.reason = sanitizePersistedFailureMessage(reason);
+    return safe;
   }
+  const previousFailure = details.previousFailure;
   if (
     type === "RETRY_FROM_FAILED" &&
-    safe.previousFailure &&
-    typeof safe.previousFailure === "object"
+    previousFailure &&
+    typeof previousFailure === "object" &&
+    typeof (previousFailure as Record<string, unknown>).message === "string"
   ) {
+    const message = (previousFailure as Record<string, unknown>)
+      .message as string;
+    const safe = structuredClone(details);
     const previous = safe.previousFailure as Record<string, unknown>;
-    if (typeof previous.message === "string") {
-      previous.message = sanitizePersistedFailureMessage(previous.message);
-    }
+    previous.message = sanitizePersistedFailureMessage(message);
+    return safe;
   }
-  return safe;
+  return details;
 }
 
 function sanitizeRunFailureState(run: RunRecord): RunRecord {
