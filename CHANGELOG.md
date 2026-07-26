@@ -19,6 +19,8 @@ The project follows semantic versioning once a public release process is establi
 - Thermos blocker regressions covering bracketed default badges, partial-catalogue rejection,
   cardinality-correct typed weak matches, ordered approved-family continuation, actionable
   preferred-hint errors, and operator-visible structured decode failures.
+- Typed runtime failure diagnostics and focused persistence/leak regressions for non-zero Cursor
+  CLI stderr, fallback aggregation, retry/supersede history, and CLI rendering.
 
 ### Changed
 
@@ -47,6 +49,11 @@ The project follows semantic versioning once a public release process is establi
   diagnostics with logical line numbers.
 - Role prompts harden the terminal-marker contract so models must not repeat the machine token in
   checklists, examples, or other body text.
+- Non-zero Cursor CLI stderr is now normalized, redacted, and bounded before leaving the runtime
+  adapter. Raw stderr is omitted from runtime metadata and cannot enter run failures, events,
+  artifacts, retry history, or normal CLI output. The orchestrator and store apply focused
+  defense-in-depth sanitization; individual diagnostics are capped at 2,048 Unicode code points
+  and all-model aggregates at 8,192.
 
 ### Planned
 

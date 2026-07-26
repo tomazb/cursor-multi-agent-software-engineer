@@ -81,8 +81,9 @@ Expected: Issue #19 tests fail because raw stderr appears in output/metadata and
 
 - [ ] **Step 3: Implement typed safe results**
 
-Classify Cursor outcomes using process fields and tested authentication phrases. Never decode non-zero stdout as
-assistant success. Return only sanitized diagnostic data and booleans such as `stderrPresent`; omit `stderr`.
+Classify Cursor outcomes using structured process fields only. Authentication-like prose remains useful inside
+the redacted non-zero diagnostic but never controls classification. Never decode non-zero stdout as assistant
+success. Return only sanitized diagnostic data and booleans such as `stderrPresent`; omit `stderr`.
 Sanitize catalogue/doctor strings. Adapt SDK/mock construction to the discriminated result contract.
 
 - [ ] **Step 4: Run runtime suites GREEN**
@@ -201,4 +202,3 @@ enable auto-merge.
 
 Wait for exact-head checks, record run/job IDs and checked SHA, and stop as `BLOCKED_VALIDATION` if exact-head CI
 cannot be established.
-

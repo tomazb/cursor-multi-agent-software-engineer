@@ -130,7 +130,16 @@ Cursor CLI assistant extraction and terminal markers:
 - `json`: result-bearing objects use `type: "result"` with string `result`, or a typeless object with string `result`. Line-by-line recovery is permitted only for the same authoritative result shapes.
 - Text mode: raw stdout (Markdown may contain JSON snippets without triggering structured decoding).
 - Structured modes never fall back to validating the raw JSON envelope as logical text. A malformed JSON-looking record fails with `invalid-transport-json`; plain non-JSON output fails with `unsupported-response-shape`; valid JSON events without an authoritative result fail with `missing-logical-output`.
-- Exit 0 with no valid assistant result fails closed and the sanitized decode code and message are placed in the runtime output consumed by the orchestrator. Stderr remains metadata and is never treated as successful assistant content.
+- Exit 0 with no valid assistant result fails closed and the sanitized decode code and message are placed in the runtime output consumed by the orchestrator. The operator-visible codes remain `invalid-transport-json`, `unsupported-response-shape`, and `missing-logical-output`. Stderr content is discarded at the runtime boundary; only `stderrPresent` is retained.
+- A non-zero exit never promotes structured or text stdout to assistant output. It returns a typed
+  `cursor-cli-non-zero` or `cursor-cli-timeout` diagnostic with exit code, timeout state, duration,
+  requested/configured model, prompt transport, stderr presence, and truncation state where
+  applicable. Process-spawn rejection uses `cursor-cli-spawn`.
+- Diagnostics normalize unsafe controls, redact, then truncate by Unicode code points. Per-model
+  diagnostics are capped at 2,048 code points and the all-model fallback message at 8,192; both
+  bounds include `… [truncated]`.
+- Authentication-like text can remain useful in the redacted excerpt, but it does not select a
+  control-flow classification. Catalogue and doctor errors use the same bounded sanitizer.
 - Marker validation rejects quoted examples, embedded tokens, duplicates, conflicts, non-final markers, and content after a marker. Operator-visible messages name the violated contract and logical line number without dumping full model output.
 - Authenticated validation for the earlier JSON-marker repair used Cursor CLI `2026.07.23-e383d2b` on Linux. A new exact-head external validation is required after the Thermos blocker repairs; do not infer broader provider or platform coverage.
 
@@ -262,8 +271,14 @@ Inspect:
 
 - `run.failure` in `run.json` (includes `resumeState` when recoverable).
 - Last transition details.
-- Runtime stderr captured in the failure or stage output.
+- The stable failure code, requested model, exit/timeout/duration/transport fields, stderr-presence
+  flag, and bounded redacted diagnostic available for that failure.
 - Cursor authentication and model availability.
+
+Raw provider stderr is not available in `run.json`, events, artifacts, retry history, status output,
+or a debug file. MASWE intentionally has no persistent raw-stderr channel. Reproduce a failure
+directly with the provider CLI only under your organization’s secure debugging procedures; never
+paste credential-bearing stderr into run artifacts, logs, issues, or PR comments.
 
 Retry the same run after fixing the cause:
 

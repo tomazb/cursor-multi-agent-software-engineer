@@ -35,9 +35,10 @@ must sanitize and bound those failures without introducing provider-specific SDK
 `RuntimeResult` becomes a discriminated success/error contract. Error results carry a
 `RuntimeFailureDiagnostic` with a stable code, safe message, optional safe excerpt, and operational fields:
 exit code, timeout state, duration, requested/configured model, and prompt transport. Cursor CLI uses codes
-that distinguish non-zero exit, timeout, exit-zero structured decode, authentication-like failure when a
-tested source phrase supports it, catalogue failure, and process-spawn/runtime errors. Control flow consumes
-the discriminant and code; it never parses human-readable prose.
+that distinguish non-zero exit, timeout, exit-zero structured decode, catalogue failure, and
+process-spawn/runtime errors. Authentication-like prose remains operator-visible after sanitization under the
+non-zero code, but it does not control classification because Cursor CLI exposes no structured authentication
+field. Control flow consumes the discriminant and code; it never parses human-readable prose.
 
 ### Redaction and diagnostic bounding
 
@@ -101,4 +102,3 @@ arbitrary secrets are always detectable.
 1. Adapter-only redaction: closes the known Cursor path but leaves persistence vulnerable to other/future adapters.
 2. Store-only redaction: permits raw stderr to cross runtime/orchestrator boundaries and loses useful typed fields.
 3. Persist encrypted/raw stderr or a digest: creates a forbidden durable debug channel and comparison risk.
-

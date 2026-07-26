@@ -118,15 +118,31 @@ the digest fingerprint.
 - `.env*` is ignored except the example file.
 - SDK API key is passed through process environment/options, not persisted in run config.
 - Persisted workspace `remote` provenance is sanitized at capture time: HTTP(S)/`ssh://` userinfo is stripped; malformed credential-like remotes are omitted rather than stored raw.
+- Raw Cursor CLI stderr is transient process-adapter data. Non-zero exits return only a structured
+  failure code, process metadata, and a normalized/redacted/bounded operator diagnostic. Runtime
+  metadata records `stderrPresent` rather than stderr content.
+- Failure diagnostics normalize unsafe controls, redact, and then truncate. Individual diagnostics
+  are at most 2,048 Unicode code points and all-model aggregates at most 8,192, including the
+  `… [truncated]` marker.
+- The orchestrator and file store re-sanitize failure messages, `FAIL.details.reason`, and retry
+  `previousFailure.message` before persistence. CLI status rendering applies the same focused
+  safeguard.
+- MASWE has no raw provider-debug artifact or log channel. It does not persist an encrypted copy or
+  an unsalted digest of raw stderr.
 - Documentation instructs teams not to commit run artifacts by default.
 
 **Gaps and future work:**
 
-- Automatic secret redaction covers common token/PEM/Authorization patterns; it is best-effort, not a DLP product.
+- Automatic secret redaction covers tested GitHub/OpenAI/Slack tokens, authorization and standalone
+  bearer forms, URL userinfo, common API-key/token/AWS-secret assignments, private-key blocks, and
+  sensitive query parameters. It is pattern-based, best-effort protection, not a DLP product or a
+  guarantee that arbitrary credentials can be recognized.
 - Default Cursor CLI prompt transport is stdin; argv remains available via `policy.promptTransport`.
 - No provider-specific privacy controls beyond local redaction.
 
-A near-term change should pass large prompts through stdin or SDK calls rather than command-line arguments where supported.
+Authentication-like stderr prose remains visible only after sanitization under the structured
+non-zero classification. It does not drive control flow because Cursor CLI does not expose a typed
+authentication field.
 
 ### T8 — Artifact tampering
 

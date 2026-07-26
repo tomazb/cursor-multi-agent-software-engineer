@@ -144,10 +144,15 @@ doctor(): Promise<RuntimeDoctorResult>
 Implemented adapters:
 
 - `MockRuntime`: deterministic outputs for tests and workflow development.
-- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode. **New runs** resolve logical model names via `resolveProjectModels` against a fail-closed structured catalogue parse; **existing-run stages** call `validatePersistedExactModel` and never substitute. Unwraps JSON/`stream-json` stdout by decoding the transport envelope once and reading only the authoritative string `result` field (text mode keeps raw stdout); never treats stderr as successful assistant content; structured modes never fall back to raw envelope text. Terminal markers are validated only on that decoded logical text. Adds `--mode ask` for read-only roles and `--force` only for write roles; adds `--trust` when `policy.trustManagedWorktrees` is set for MASWE-managed worktrees. Doctor discovers the catalogue before the stdin probe and cleans probe branch/worktree by recorded probe identity in `finally`.
+- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode. **New runs** resolve logical model names via `resolveProjectModels` against a fail-closed structured catalogue parse; **existing-run stages** call `validatePersistedExactModel` and never substitute. Unwraps JSON/`stream-json` stdout by decoding the transport envelope once and reading only the authoritative string `result` field (text mode keeps raw stdout); never treats stderr as successful assistant content; structured modes never fall back to raw envelope text. Terminal markers are validated only on that decoded logical text. Non-zero process stderr stays inside the adapter: the returned error contains a structured failure code, safe execution metadata, and a redacted bounded diagnostic; metadata stores `stderrPresent`, never raw stderr. Adds `--mode ask` for read-only roles and `--force` only for write roles; adds `--trust` when `policy.trustManagedWorktrees` is set for MASWE-managed worktrees. Doctor discovers the catalogue before the stdin probe and cleans probe branch/worktree by recorded probe identity in `finally`.
 - `CursorSdkRuntime`: dynamically imports `@cursor/sdk` and runs a local one-shot `Agent.prompt` call (no catalogue capability; empty-catalogue pass-through stays SDK-only).
 
 The optional SDK import means the CLI can build and run without installing the beta SDK.
+
+`RuntimeResult` is discriminated by `status`. Finished results carry assistant output. Error results
+also require a `RuntimeFailureDiagnostic` with a stable code, safe message, requested/configured
+model where known, stderr-presence flag, truncation flag, and applicable exit/timeout/duration/
+transport fields. The core never parses human-readable error prose to make policy decisions.
 
 ### 3.9 Read-only enforcement
 
@@ -329,7 +334,9 @@ The hosted design adds:
 Failures fall into categories:
 
 1. **Startup/configuration:** missing CLI, key, SDK, model, or invalid config. The run fails immediately.
-2. **Agent run failure:** nonzero CLI exit or SDK error. The configured fallback policy applies.
+2. **Agent run failure:** nonzero CLI exit, timeout, process-spawn failure, exit-zero structured
+   decode failure, or SDK error. The configured fallback policy applies to typed, individually
+   bounded failures. The final all-model aggregate is bounded independently.
 3. **Quality failure:** routes to `BUILDING` while under cycle limit.
 4. **Verification failure:** routes to `BUILDING` while under cycle limit.
 5. **Scope failure:** routes to `WAITING_FOR_HUMAN` without edits.
@@ -337,6 +344,13 @@ Failures fall into categories:
 7. **Policy exhaustion:** cycle limit produces `FAILED`.
 
 The orchestrator never retries indefinitely.
+
+Failure persistence is defense in depth. Runtime adapters must return safe diagnostics;
+`src/failure-diagnostics.ts` re-sanitizes each runtime failure before fallback aggregation;
+`failRun()` sanitizes the aggregate before assigning `run.failure` and `FAIL` details; and the file
+store sanitizes failure/retry fields again before serialization. The exact limits are 2,048 Unicode
+code points per diagnostic and 8,192 per aggregate, including the truncation marker. Successful
+assistant artifacts retain the separate artifact-redaction contract.
 
 ## 11. Trust boundaries
 
