@@ -7,9 +7,64 @@
 - Branch: `issue/19-redact-cursor-stderr`.
 - Historical head with the authoritative independent-verifier `FAIL`:
   `7b3ba017195e7ecde6722d748d678e98d567aaa9`.
+- Second historical head with the authoritative second independent-verifier `FAIL`:
+  `fcf4d1b11ad4d347550410327fa0799bdd906430`.
 - Repair scope: modern GitHub PATs, URI userinfo, sanitizer work bounds, durable attempt metadata,
   and model-identity framing. The prior `FAIL` remains part of the validation history.
+- Second repair scope: successful-event runtime identity display framing, strict nested durable
+  runtime schema allowlists, deterministic Node `v22.22.2` child-test communication, and a
+  supported-runtime constrained-heap probe.
 - Scope excludes Issues #16, #17, #18, #13, and #3.
+
+## Second independent-verifier correction
+
+The second verifier returned `FAIL` for exact head
+`fcf4d1b11ad4d347550410327fa0799bdd906430`. That verdict and the earlier verdict for
+`7b3ba017195e7ecde6722d748d678e98d567aaa9` remain failed historical evidence and cannot approve a
+later SHA.
+
+### Successful-event identity display boundary
+
+Runtime invocation and exact-model comparison continue to use the runtime's original
+`requestedModel` and `actualModel` values. Before a successful workflow event is persisted, one
+orchestrator helper constructs display-only copies. Model copies use the existing 256-code-point
+model-display policy. `agentId` and `runtimeRunId` cross the same runtime-to-persistence boundary,
+so a separately named 256-code-point runtime-identifier display policy applies to those optional
+fields. Both policies normalize controls, line and paragraph separators, bidi framing controls,
+and aggregate delimiters; preserve ordinary identifiers; and are deterministic and idempotent.
+
+The helper is used for `BRAINSTORM_COMPLETED`, `DESIGN_COMPLETED`, `BUILD_COMPLETED`,
+`VERIFY_PASSED`, `VERIFY_PASSED_AFTER_REVIEW`, `VERIFY_FAILED`, and `RESOLUTION_COMPLETED`.
+Artifacts and runtime invocation inputs are unchanged.
+
+### Strict nested durable runtime schema
+
+`$defs.durableRuntimeFailureAttempt` and `$defs.durableRuntimeFailureSummary` are schema-closed
+with `additionalProperties: false`. No historical parent object is closed by this correction.
+Schema-version-1 failures without `runtime`, including historically long messages, remain valid.
+Migration continues reconstructing the allowlisted runtime subset and dropping unknown data.
+
+### Node `v22.22.2` deterministic child-test communication
+
+Node `v22.22.2` is supported by the declared `>=22.15` engine range. In the affected test context,
+small results emitted by child Node programs through buffered JavaScript stdout can be absent even
+after a zero exit. Tests therefore use explicit deterministic channels: synchronous child writes
+for compact machine results and unique file-backed stdout/stderr descriptors when exercising the
+unchanged production CLI. The Node stand-in used by the doctor stdin probe reads its test payload
+synchronously. Missing or malformed results remain hard failures, diagnostics remain on stderr,
+timeouts and cleanup remain bounded, and production CLI rendering is unchanged.
+
+CI retains current Node 22 coverage and adds an exact Node `22.22.2` compatibility job running the
+full `npm run check` and package dry run while verifying the checked-out SHA.
+
+### Constrained-heap scope
+
+The constrained-heap regression uses an 8,000,000-character one-byte input, a 48 MiB V8 old-space
+limit, and an exact 128-code-point output assertion. On Node `v22.22.2`, a representative historical
+full code-point array aborts with exit 134 at approximately 108,988 KiB maximum RSS, while the
+bounded-prefix sanitizer exits 0 at approximately 78,772 KiB maximum RSS. This exercises the
+security property that sanitizer overhead does not allocate storage for every input code point; it
+does not claim an absolute process-memory bound.
 
 ## Source-to-sink audit
 

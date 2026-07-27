@@ -130,6 +130,111 @@ failures. The final fixed-prefix inspection-window regression brought the exact 
 345 passing, five opt-in skips, and zero failures. Delayed clone-order, stderr-order, and historical-schema
 regressions brought the current total to 354 tests, 349 passing, five opt-in skips, and zero failures.
 
+## Second independent-verifier correction amendment
+
+Second historical failed head:
+`fcf4d1b11ad4d347550410327fa0799bdd906430`.
+
+The second independent verifier returned `FAIL` for four bounded correction areas: successful-event
+identity framing, nested runtime-schema closure, Node `v22.22.2` deterministic tests, and the
+constrained-heap test input. Neither historical `FAIL` is approval for a corrected SHA.
+
+### Task 11: Successful-event display framing
+
+**Files:**
+- Create: `test/issue19-success-event-persistence.test.ts`
+- Modify: `src/failure-diagnostics.ts`
+- Modify: `src/orchestrator.ts`
+
+**Interfaces:**
+- Produces: `runtimeEventIdentityDetails(result: RuntimeFinishedResult)`
+- Produces: `normalizeRuntimeIdentifierDisplay(value: string)`
+- Preserves: raw runtime request values and raw exact-model comparison
+
+- [ ] Add a successful hostile runtime covering brainstorm, design, builder, verifier pass,
+  verifier accepted failure, post-review verifier pass, and resolver completion.
+- [ ] Assert returned records, disk JSON, event details, retry/supersede copies, human output, and
+  JSON output contain bounded single-line display values and no raw control canary.
+- [ ] Run the focused test on the starting head and commit tests only.
+- [ ] Implement the two display policies and one event-details helper; use it at every listed event.
+- [ ] Re-run focused and orchestrator compatibility tests and commit the implementation.
+
+### Task 12: Strict nested durable runtime schema
+
+**Files:**
+- Modify: `test/schema.test.ts`
+- Modify: `schemas/run-record.schema.json`
+- Modify minimally: `src/domain.ts` and `src/failure-diagnostics.ts` only if needed for code-list synchronization
+
+- [ ] Extend the local schema evaluator to enforce `additionalProperties: false`.
+- [ ] Add positive attempt/summary cases; negative adapter metadata, arbitrary summary property,
+  nested stderr, and unknown-object cases; historical, migration, retry, and supersede cases; and
+  runtime-failure-code enum synchronization.
+- [ ] Run the schema test on the open definitions and commit tests only.
+- [ ] Add `additionalProperties: false` only to the two durable runtime definitions.
+- [ ] Re-run schema, persistence, retry, and supersede suites and commit the schema closure.
+
+### Task 13: Node `v22.22.2` child-test transport
+
+**Files:**
+- Create: `test/node22-child-output.test.ts`
+- Create: `test/helpers/child-process.ts`
+- Modify: `test/issue19-persistence.test.ts`
+- Modify: `test/merge-blockers-round3.test.ts`
+- Modify: `test/ready-review-corrections.test.ts`
+- Modify: `test/redaction.test.ts`
+- Modify: `src/runtimes/cursor-cli.ts`
+
+- [ ] Add a focused reproduction importing `node:test`, launching a child Node program, and requiring
+  a compact machine result; record the expected Node `v22.22.2` red failure and commit tests only.
+- [ ] Add unique temporary file-backed capture for tests that must exercise unchanged CLI stdout.
+- [ ] Change compact child programs to `fs.writeSync`; make the Node-only doctor stand-in read stdin
+  synchronously; preserve diagnostics, cleanup, and existing timeouts.
+- [ ] Run each previously failing file, `npm test`, and `npm run check` under exact Node `v22.22.2`.
+- [ ] Run the same tests under current Node 22 and commit the compatibility correction.
+
+### Task 14: Constrained-heap compatibility
+
+**Files:**
+- Modify: `test/redaction.test.ts`
+
+- [ ] Replace the 64,000,000-character input with 8,000,000 characters under the existing 48 MiB
+  heap and 20-second timeout.
+- [ ] Keep the exact 128-code-point result assertion and normal-CI execution.
+- [ ] Record Node `v22.22.2` old-array exit 134 / approximately 108,988 KiB RSS and bounded-prefix
+  exit 0 / approximately 78,772 KiB RSS.
+- [ ] Run on exact Node `v22.22.2` and current Node 22 and commit.
+
+### Task 15: Exact-version CI and contracts
+
+**Files:**
+- Modify: `.github/workflows/ci.yml`
+- Modify: `docs/SECURITY.md`
+- Modify: `docs/ARCHITECTURE.md`
+- Modify: `docs/OPERATIONS.md`
+- Modify: `docs/ARTIFACT_CONTRACTS.md`
+- Modify: `docs/superpowers/specs/2026-07-26-issue-19-redact-cursor-stderr-design.md`
+- Modify: this plan
+- Modify: `CHANGELOG.md`
+
+- [ ] Add a separate exact Node `22.22.2` compatibility job that verifies the SHA, prints the
+  version, installs with the existing safe flags, runs `npm run check`, and runs `npm run pack:dry`.
+- [ ] Document display-only successful identities, unchanged execution semantics, nested schema
+  closure, exact-version CI, constrained-heap scope, and both historical verifier failures.
+- [ ] Commit CI and documentation without claiming readiness.
+
+### Task 16: Exact local validation, publication, and revalidation handoff
+
+- [ ] Run the complete requested Node `v22.22.2` focused/full/build/check/package/contention/audit
+  protocol, then repeat the deterministic protocol on current Node 22 without mixing measurements.
+- [ ] Push the correction commits without rebasing, squashing, or force-pushing.
+- [ ] Wait for exact-head current-Node and Node `22.22.2` CI jobs and verify their checked-out SHA.
+- [ ] Request CodeRabbit, Codex, and Copilot; classify, reply to, and resolve every actionable finding
+  only after exact-head evidence exists.
+- [ ] Update draft PR #20 while retaining both failed-head histories and post a new exact-head
+  independent-revalidation handoff.
+- [ ] Keep the PR draft, Issue #19 open, auto-merge disabled, and do not merge.
+
 ---
 
 ### Task 1: Redaction and deterministic diagnostic bounds
