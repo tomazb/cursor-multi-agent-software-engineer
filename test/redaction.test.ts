@@ -36,6 +36,17 @@ MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7
   assert.match(redacted, /\[REDACTED\]/);
 });
 
+test("redacts a private-key block that crosses the inspection window", () => {
+  const result = redactionModule.sanitizeDiagnostic(
+    `-----BEGIN PRIVATE KEY-----\nPEM-WINDOW-CANARY-${"x".repeat(7_000)}\n-----END PRIVATE KEY-----`,
+  );
+
+  assert.equal(result.truncated, true);
+  assert.equal(result.text.includes("PEM-WINDOW-CANARY"), false);
+  assert.match(result.text, /BEGIN PRIVATE KEY-----\n\[REDACTED\]/);
+  assert.ok([...result.text].length <= 2_048);
+});
+
 test("leaves ordinary text unchanged", () => {
   const input = "Build passed. See docs/SECURITY.md for policy.";
   assert.equal(redactSecrets(input), input);
@@ -194,6 +205,24 @@ test("quoted assignment scanning honors odd and even escaped delimiters", () => 
   assert.equal(
     evenBackslashRedacted,
     '{"client_secret":"[REDACTED]","safe":"preserved"}',
+  );
+});
+
+test("redacts assignments with escaped JSON structural quotes", () => {
+  const input = String.raw`payload={\"token\":\"ESCAPED-JSON-CANARY\"}`;
+  const escapedContentQuote = String.raw`payload={\"token\":\"prefix\\\"ESCAPED-INNER-QUOTE-CANARY\"}`;
+  const redacted = redactSecrets(input);
+  const escapedContentRedacted = redactSecrets(escapedContentQuote);
+
+  assert.equal(redacted.includes("ESCAPED-JSON-CANARY"), false);
+  assert.equal(redacted, String.raw`payload={\"token\":\"[REDACTED]\"}`);
+  assert.equal(
+    escapedContentRedacted.includes("ESCAPED-INNER-QUOTE-CANARY"),
+    false,
+  );
+  assert.equal(
+    escapedContentRedacted,
+    String.raw`payload={\"token\":\"[REDACTED]\"}`,
   );
 });
 

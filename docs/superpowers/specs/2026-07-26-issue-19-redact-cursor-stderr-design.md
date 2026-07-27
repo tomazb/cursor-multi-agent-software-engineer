@@ -63,7 +63,8 @@ bounded message reports how many later model failures were omitted from the diag
 The bounded lookahead ensures that a recognized credential beginning near the retained boundary can
 be consumed in full. A long assignment, incomplete private-key block, or supported URI authority
 that reaches the accepted-window end remains redacted through that boundary. Quoted assignment
-values treat a quote as a delimiter only when it is preceded by an even-length backslash run. The
+values treat a quote as a delimiter only when it is preceded by an even-length backslash run; one
+JSON-encoded structural-quote layer is recognized with its corresponding backslash parity. The
 sanitizer never constructs a code-point array from the complete attacker-controlled input.
 
 `redactSecrets()` is extended only for tested credential forms: classic GitHub and modern

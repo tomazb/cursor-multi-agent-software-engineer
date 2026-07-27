@@ -160,9 +160,10 @@ the digest fingerprint.
   least 20 token characters; authorization forms require an `Authorization: Bearer|Basic` header
   or standalone `Bearer`; assignment keys are ASCII identifier names ending in a tested
   API-key/token/secret/signature/AWS-secret suffix followed by `:` or `=` and a quoted or
-  delimiter-terminated value (quoted values honor odd/even backslash escaping before a quote);
-  sensitive query values require a tested `?`/`&` parameter name; and private-key blocks require a
-  `BEGIN … PRIVATE KEY` marker (an absent end marker redacts through the accepted window).
+  delimiter-terminated value (quoted values honor odd/even backslash escaping before a quote, and
+  one JSON-encoded structural-quote layer is recognized); sensitive query values require a tested
+  `?`/`&` parameter name; and private-key blocks require a `BEGIN … PRIVATE KEY` marker (an absent
+  end marker redacts through the accepted window).
 - The assignment, URI-authority, and private-key scanners advance monotonically. Remaining regular
   expressions use non-overlapping or fixed-prefix grammars and run only on the bounded diagnostic
   window; none contains the former nested ambiguous provider-prefix repetition. Benchmarks guard

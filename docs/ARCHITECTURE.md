@@ -371,7 +371,7 @@ advance monotonically; the remaining fixed recognition expressions run on only t
 window. The lookahead lets scanners consume recognized values that cross the retained output
 boundary, while reaching the accepted-window end closes long assignment/private-key values and
 incomplete supported URI authorities fail-safely. Quoted assignment scanning honors odd/even
-backslash escaping before delimiters.
+backslash escaping before delimiters and recognizes one JSON-encoded structural-quote layer.
 
 ## 11. Trust boundaries
 

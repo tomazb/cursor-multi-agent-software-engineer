@@ -115,6 +115,8 @@ archive inspection, diff checking, and the generated-state canary audit passed; 
 only in test source. After review-induced SDK, escaped-assignment, overlong-URI, framing-control, performance
 probe, and rendering clarifications, the final local `npm run check` reported 345 tests, 340 passing, five
 opt-in skips, and zero failures; both contention gates and the 83-file dry/actual pack audit passed again.
+The escaped structural-JSON and long-PEM review regressions brought the latest local total to 347 tests,
+342 passing, five opt-in skips, and zero failures.
 
 ---
 

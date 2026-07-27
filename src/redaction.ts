@@ -134,7 +134,14 @@ function redactAssignments(input: string): string {
     if (!SENSITIVE_ASSIGNMENT_KEY.test(keyTail)) continue;
 
     let separator = keyEnd;
-    if (input[separator] === '"' || input[separator] === "'") separator += 1;
+    if (input[separator] === '"' || input[separator] === "'") {
+      separator += 1;
+    } else if (
+      input[separator] === "\\" &&
+      (input[separator + 1] === '"' || input[separator + 1] === "'")
+    ) {
+      separator += 2;
+    }
     while (
       separator < input.length &&
       isWhitespace(input[separator]!)
@@ -150,17 +157,33 @@ function redactAssignments(input: string): string {
       separator += 1;
     }
 
-    const quote =
-      input[separator] === '"' || input[separator] === "'"
-        ? input[separator]
-        : undefined;
-    const valueStart = quote ? separator + 1 : separator;
+    let quote: string | undefined;
+    let escapedStructuralQuote = false;
+    let valueStart = separator;
+    if (input[separator] === '"' || input[separator] === "'") {
+      quote = input[separator];
+      valueStart = separator + 1;
+    } else if (
+      input[separator] === "\\" &&
+      (input[separator + 1] === '"' || input[separator + 1] === "'")
+    ) {
+      quote = input[separator + 1];
+      escapedStructuralQuote = true;
+      valueStart = separator + 2;
+    }
     let valueEnd = valueStart;
     if (quote) {
       let backslashRun = 0;
       while (valueEnd < input.length) {
         const value = input[valueEnd]!;
-        if (value === quote && backslashRun % 2 === 0) break;
+        if (
+          value === quote &&
+          ((!escapedStructuralQuote && backslashRun % 2 === 0) ||
+            (escapedStructuralQuote && backslashRun % 4 === 1))
+        ) {
+          if (escapedStructuralQuote) valueEnd -= 1;
+          break;
+        }
         backslashRun = value === "\\" ? backslashRun + 1 : 0;
         valueEnd += 1;
       }

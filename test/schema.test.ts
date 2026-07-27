@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
-import { readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { FileRunStore, migrateRunRecord } from "../src/store.ts";
-import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 
 type JsonSchema = {
