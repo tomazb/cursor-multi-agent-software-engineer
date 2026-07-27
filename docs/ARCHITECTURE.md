@@ -362,7 +362,9 @@ serialization. The exact limits are 2,048 Unicode code points per diagnostic, 8,
 512 per durable attempt message, 256 per durable model display, and eight stored attempts. Total
 and omitted attempt counts remain explicit. `FAIL.details.runtime` and retry
 `previousFailure.runtime` use the same bounded representation. Successful assistant artifacts
-retain the separate artifact-redaction contract.
+retain the separate artifact-redaction contract. Persistence sanitization inspects no more than the
+first eight raw attempt slots, so malformed records cannot turn the eight-entry output limit into
+an unbounded scan.
 
 `sanitizeDiagnostic()` bounds work before pattern application. It collects at most the output
 budget plus 4,096 Unicode code points of lookahead and never more than 12,288, normalizing controls

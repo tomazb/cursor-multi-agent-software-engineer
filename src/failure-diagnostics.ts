@@ -187,6 +187,7 @@ export function sanitizeDurableRuntimeFailureSummary(
   for (
     let index = 0;
     index < rawAttempts.length &&
+    index < DURABLE_RUNTIME_FAILURE_ATTEMPT_LIMIT &&
     attempts.length < DURABLE_RUNTIME_FAILURE_ATTEMPT_LIMIT;
     index += 1
   ) {

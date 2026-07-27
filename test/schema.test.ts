@@ -73,7 +73,13 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
       assert.match(String(value), new RegExp(effective.pattern), `${label} pattern`);
     }
   }
-  if (effective.type === "integer" || effective.type === "number") {
+  if (effective.type === "integer") {
+    assert.equal(typeof value, "number", label);
+    assert.ok(Number.isInteger(value), `${label} integer`);
+    if (effective.minimum !== undefined) assert.ok(Number(value) >= effective.minimum, label);
+    if (effective.maximum !== undefined) assert.ok(Number(value) <= effective.maximum, label);
+  }
+  if (effective.type === "number") {
     assert.equal(typeof value, "number", label);
     if (effective.minimum !== undefined) assert.ok(Number(value) >= effective.minimum, label);
     if (effective.maximum !== undefined) assert.ok(Number(value) <= effective.maximum, label);

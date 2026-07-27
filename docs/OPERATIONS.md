@@ -287,6 +287,9 @@ Inspect:
   `omittedAttempts`, and `aggregateTruncated`. Each stored attempt has a safe model display, stable
   code, a message capped at 512 code points, requested/configured model displays where supplied,
   exit/timeout/duration/transport fields where supplied, `stderrPresent`, and `truncated`.
+- Loading or migrating runtime metadata inspects only the first eight raw attempt slots. Invalid
+  entries are dropped; the sanitizer does not scan an attacker-sized malformed array looking for
+  later valid entries.
 - Human `maswe status` prints the attempt count and structured operational fields. `--json` emits
   the same durable object. Model display values are single-line and delimiter-neutral; they do not
   change the exact model value used for execution.

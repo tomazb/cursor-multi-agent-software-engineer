@@ -99,6 +99,8 @@ schema-version-1-compatible object:
 bounded to 512 Unicode code points and `model`, `requestedModel`, and `configuredModel` display
 fields to 256. All fields except `model`, `code`, `message`, `stderrPresent`, and `truncated` are
 optional per attempt. Arbitrary runtime metadata is not part of this contract.
+Store and migration safeguards inspect only the first eight raw attempt slots and discard invalid
+entries, keeping sanitization work bounded even for malformed historical input.
 
 Failure messages and `FAIL.details.reason` are normalized, redacted, and bounded to 8,192 Unicode
 code points including `… [truncated]`. `RETRY_FROM_FAILED.details.previousFailure.message` receives

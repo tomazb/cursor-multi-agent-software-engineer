@@ -69,6 +69,7 @@ independent verifier. It does not erase the earlier validation history.
 - [x] Cap attempt messages at 512 and model display fields at 256 code points.
 - [x] Normalize model display framing without changing the model passed to execution.
 - [x] Reconstruct/sanitize the subset for run failure, `FAIL`, retry, migration, supersede, and CLI.
+- [x] Bound reconstruction work to the first eight raw attempt slots for malformed persisted input.
 - [x] Commit the durable contract as `f82a6ac`.
 
 ### Task 9: Correct documentation and contracts
@@ -116,7 +117,9 @@ only in test source. After review-induced SDK, escaped-assignment, overlong-URI,
 probe, and rendering clarifications, the final local `npm run check` reported 345 tests, 340 passing, five
 opt-in skips, and zero failures; both contention gates and the 83-file dry/actual pack audit passed again.
 The escaped structural-JSON and long-PEM review regressions brought the latest local total to 347 tests,
-342 passing, five opt-in skips, and zero failures.
+342 passing, five opt-in skips, and zero failures. The final bounded durable-array inspection and integer
+schema-helper regressions brought the current total to 349 tests, 344 passing, five opt-in skips, and zero
+failures.
 
 ---
 

@@ -137,7 +137,9 @@ the digest fingerprint.
 - Durable runtime failure state stores at most eight attempts. Attempt messages are capped at 512
   Unicode code points and model display fields at 256. Total and omitted attempt counts, aggregate
   truncation, stable code, exit/timeout/duration/transport fields, stderr presence, and truncation
-  are retained where applicable.
+  are retained where applicable. Re-sanitizing a loaded or tampered record inspects only its first
+  eight raw attempt slots; invalid entries are discarded rather than triggering an unbounded search
+  for later valid-looking data.
 - Model identifiers used for execution remain unchanged. Their diagnostic display copies are
   separately redacted, capped, collapsed to one line, and stripped of aggregate framing
   delimiters before formatting or persistence.

@@ -22,7 +22,8 @@ The project follows semantic versioning once a public release process is establi
 - Typed runtime failure diagnostics and focused persistence/leak regressions for non-zero Cursor
   CLI stderr, fallback aggregation, retry/supersede history, and CLI rendering.
 - Optional schema-version-1 durable runtime failure summaries with up to eight bounded attempts,
-  explicit total/omitted counts, safe operational fields, and single-line model displays.
+  explicit total/omitted counts, safe operational fields, single-line model displays, and an
+  eight-slot inspection bound when sanitizing malformed persisted attempt arrays.
 
 ### Changed
 

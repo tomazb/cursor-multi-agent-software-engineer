@@ -95,7 +95,8 @@ Each attempt requires a safe `model`, typed `code`, safe `message`, `stderrPrese
 display fields at 256. The aggregate remains capped at 8,192. `FAIL.details.runtime` and retry
 `previousFailure.runtime` reuse this object. Old records without it retain their historical shape.
 Records containing it are reconstructed from this allowlist; arbitrary adapter metadata is
-discarded.
+discarded. Reconstruction inspects only the first eight raw attempt slots, discarding malformed
+entries instead of scanning an unbounded input array to fill the durable subset.
 
 Model values used for execution are unchanged. Diagnostic display copies replace CR/LF, NUL,
 C0/C1 controls, Unicode line/paragraph separators, bidi overrides/isolates, and aggregate delimiter
