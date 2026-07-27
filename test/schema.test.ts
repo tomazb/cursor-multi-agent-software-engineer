@@ -47,15 +47,17 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
     assert.ok(value && !Array.isArray(value), label);
     const obj = value as Record<string, unknown>;
     for (const key of effective.required ?? []) {
-      assert.ok(key in obj, `${label}.${key} required`);
+      assert.ok(Object.hasOwn(obj, key), `${label}.${key} required`);
     }
     for (const [key, child] of Object.entries(effective.properties ?? {})) {
-      if (key in obj) assertMatches(root, child, obj[key], `${label}.${key}`);
+      if (Object.hasOwn(obj, key)) {
+        assertMatches(root, child, obj[key], `${label}.${key}`);
+      }
     }
     if (effective.additionalProperties === false) {
       for (const key of Object.keys(obj)) {
         assert.ok(
-          key in (effective.properties ?? {}),
+          Object.hasOwn(effective.properties ?? {}, key),
           `${label}.${key} additionalProperties`,
         );
       }
