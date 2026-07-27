@@ -369,8 +369,9 @@ budget plus 4,096 Unicode code points of lookahead and never more than 12,288, n
 during that bounded scan. Purpose-specific URI-userinfo, assignment, and private-key scanners
 advance monotonically; the remaining fixed recognition expressions run on only that accepted
 window. The lookahead lets scanners consume recognized values that cross the retained output
-boundary, while reaching the accepted-window end closes long assignment/private-key values
-fail-safely.
+boundary, while reaching the accepted-window end closes long assignment/private-key values and
+incomplete supported URI authorities fail-safely. Quoted assignment scanning honors odd/even
+backslash escaping before delimiters.
 
 ## 11. Trust boundaries
 

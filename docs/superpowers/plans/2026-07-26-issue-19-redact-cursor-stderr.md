@@ -19,7 +19,7 @@
 
 ## Independent-verifier correction amendment
 
-Authoritative failed head:
+Historical head with the authoritative independent-verifier `FAIL`:
 `7b3ba017195e7ecde6722d748d678e98d567aaa9`.
 
 This amendment preserves the original Issue #19 plan and adds the repair sequence required by the
@@ -112,7 +112,9 @@ compatibility set passed 98 tests with three opt-in skips. Both exact Issue #11 
 allocation iterations and 100 release iterations. The full suite and `npm run check` each reported 340 tests,
 335 passing, five opt-in skips, and zero failures. Type checking, build, dry pack, actual pack (83 files),
 archive inspection, diff checking, and the generated-state canary audit passed; deliberate fixtures remained
-only in test source.
+only in test source. After review-induced SDK, escaped-assignment, overlong-URI, framing-control, performance
+probe, and rendering clarifications, the final local `npm run check` reported 345 tests, 340 passing, five
+opt-in skips, and zero failures; both contention gates and the 83-file dry/actual pack audit passed again.
 
 ---
 

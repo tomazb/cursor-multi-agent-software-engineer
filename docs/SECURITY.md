@@ -152,21 +152,26 @@ the digest fingerprint.
   API-key/token/AWS-secret assignments, private-key blocks, and sensitive query parameters.
   URI-userinfo recognition requires an explicit `http`, `https`, `ssh`, `git`, `git+https`,
   `git+ssh`, `sftp`, or `ftp` `scheme://` prefix; it redacts username-only and username/password
-  forms while preserving the remaining URI. SCP-like `user@host:path`, ordinary email, arbitrary
-  schemes, and percent-decoded semantic interpretation are intentionally not inferred.
+  forms while preserving the remaining URI. If a supported URI authority reaches a truncated
+  inspection-window boundary before `@` or another authority delimiter, the incomplete authority
+  is redacted fail-closed. SCP-like `user@host:path`, ordinary email, arbitrary schemes, and
+  percent-decoded semantic interpretation are intentionally not inferred.
 - The accepted grammar is deliberately narrow: classic GitHub prefixes and `github_pat_` require at
   least 20 token characters; authorization forms require an `Authorization: Bearer|Basic` header
   or standalone `Bearer`; assignment keys are ASCII identifier names ending in a tested
   API-key/token/secret/signature/AWS-secret suffix followed by `:` or `=` and a quoted or
-  delimiter-terminated value; sensitive query values require a tested `?`/`&` parameter name; and
-  private-key blocks require a `BEGIN … PRIVATE KEY` marker (an absent end marker redacts through
-  the accepted window).
+  delimiter-terminated value (quoted values honor odd/even backslash escaping before a quote);
+  sensitive query values require a tested `?`/`&` parameter name; and private-key blocks require a
+  `BEGIN … PRIVATE KEY` marker (an absent end marker redacts through the accepted window).
 - The assignment, URI-authority, and private-key scanners advance monotonically. Remaining regular
   expressions use non-overlapping or fixed-prefix grammars and run only on the bounded diagnostic
   window; none contains the former nested ambiguous provider-prefix repetition. Benchmarks guard
   scaling, but are supporting evidence rather than a formal complexity proof.
 - Recognition remains pattern-based, best-effort protection, not a DLP product or a guarantee that
   arbitrary credentials can be recognized.
+- Diagnostic framing replaces C0/C1 controls, Unicode line/paragraph separators, bidi overrides,
+  and bidi isolates; CR/LF normalization and tab/newline preservation otherwise remain as
+  documented.
 - Default Cursor CLI prompt transport is stdin; argv remains available via `policy.promptTransport`.
 - No provider-specific privacy controls beyond local redaction.
 

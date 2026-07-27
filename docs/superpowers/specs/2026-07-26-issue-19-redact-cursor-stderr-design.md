@@ -5,7 +5,8 @@
 - Approved implementation request: GitHub Issue #19.
 - Recorded base: `caba625fd9367a5fecb10f19f499f7cd5b4998ef`.
 - Branch: `issue/19-redact-cursor-stderr`.
-- Independent-verifier failed head: `7b3ba017195e7ecde6722d748d678e98d567aaa9`.
+- Historical head with the authoritative independent-verifier `FAIL`:
+  `7b3ba017195e7ecde6722d748d678e98d567aaa9`.
 - Repair scope: modern GitHub PATs, URI userinfo, sanitizer work bounds, durable attempt metadata,
   and model-identity framing. The prior `FAIL` remains part of the validation history.
 - Scope excludes Issues #16, #17, #18, #13, and #3.
@@ -60,9 +61,10 @@ bounded before aggregation. Once the aggregate budget is exhausted, later fallba
 bounded message reports how many later model failures were omitted from the diagnostic text.
 
 The bounded lookahead ensures that a recognized credential beginning near the retained boundary can
-be consumed in full. A long assignment or incomplete private-key block that reaches the accepted
-window end remains redacted through that boundary. The sanitizer never constructs a code-point
-array from the complete attacker-controlled input.
+be consumed in full. A long assignment, incomplete private-key block, or supported URI authority
+that reaches the accepted-window end remains redacted through that boundary. Quoted assignment
+values treat a quote as a delimiter only when it is preceded by an even-length backslash run. The
+sanitizer never constructs a code-point array from the complete attacker-controlled input.
 
 `redactSecrets()` is extended only for tested credential forms: classic GitHub and modern
 `github_pat_` tokens, OpenAI/Slack tokens, authorization and standalone bearer forms, URI userinfo,
@@ -95,8 +97,8 @@ Records containing it are reconstructed from this allowlist; arbitrary adapter m
 discarded.
 
 Model values used for execution are unchanged. Diagnostic display copies replace CR/LF, NUL,
-C0/C1 controls, Unicode line separators, and aggregate delimiter characters before per-attempt
-formatting, persistence, and human rendering.
+C0/C1 controls, Unicode line/paragraph separators, bidi overrides/isolates, and aggregate delimiter
+characters before per-attempt formatting, persistence, and human rendering.
 
 ### Defense in depth
 

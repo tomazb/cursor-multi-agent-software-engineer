@@ -145,7 +145,8 @@ Cursor CLI assistant extraction and terminal markers:
   their omitted-attempt count while the configured attempts still execute.
 - Before redaction, diagnostic inspection is capped at the output budget plus 4,096 code points
   and never exceeds 12,288. The lookahead closes recognized assignments/private-key blocks that
-  cross the retained output boundary. URI userinfo is recognized for `http`, `https`, `ssh`,
+  cross the retained output boundary, and an incomplete supported URI authority that reaches the
+  inspection boundary is redacted fail-closed. URI userinfo is recognized for `http`, `https`, `ssh`,
   `git`, `git+https`, `git+ssh`, `sftp`, and `ftp` `scheme://` forms; ordinary email and SCP-like
   `user@host:path` text are not treated as URI credentials.
 - Authentication-like text can remain useful in the redacted excerpt, but it does not select a

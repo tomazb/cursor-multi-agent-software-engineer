@@ -589,7 +589,10 @@ test("model display identity is single-line and cannot impersonate aggregate ent
   }
   const human = renderRun(run);
   assert.doesNotMatch(human, /\n\s*\|\s*forged/);
-  assert.match(human, /Runtime attempts: 1 total, 0 omitted/);
+  assert.match(
+    human,
+    /Runtime attempts: 1 total, 1 stored, 0 omitted by durable cap/,
+  );
 });
 
 test("human and JSON CLI expose structured metadata without credential canaries", async (t) => {
@@ -621,7 +624,10 @@ test("human and JSON CLI expose structured metadata without credential canaries"
     { encoding: "utf8" },
   );
   assert.equal(human.stdout.includes(FINE_GRAINED_PAT), false);
-  assert.match(human.stdout, /Runtime attempts: 1 total, 0 omitted/);
+  assert.match(
+    human.stdout,
+    /Runtime attempts: 1 total, 1 stored, 0 omitted by durable cap/,
+  );
   assert.match(human.stdout, /exit=41/);
   assert.match(human.stdout, /transport=stdin/);
   assert.match(human.stdout, /stderr=yes/);

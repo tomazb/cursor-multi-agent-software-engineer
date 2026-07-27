@@ -62,7 +62,9 @@ The project follows semantic versioning once a public release process is establi
   ordinary email as credentials.
 - Diagnostic sanitization now bounds inspection before pattern application (4,096 code points of
   lookahead, 12,288 absolute ceiling) and uses monotonic assignment, URI-authority, and private-key
-  scanners instead of the former ambiguous nested assignment expression.
+  scanners instead of the former ambiguous nested assignment expression. Quoted assignments honor
+  escaped delimiters, incomplete supported URI authorities fail closed at the inspection boundary,
+  and Unicode line/paragraph and bidi framing controls are neutralized.
 - Runtime fallback metadata now survives into `run.failure.runtime`, applicable `FAIL` details,
   retry history, superseded runs, and human/JSON status output. Durable attempt messages are capped
   at 512 code points, model display fields at 256, and arbitrary adapter metadata remains excluded.

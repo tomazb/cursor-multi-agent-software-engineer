@@ -115,6 +115,27 @@ test("redacts malformed credential-like URI authorities fail-safely", () => {
   );
 });
 
+test("redacts URI userinfo that crosses the bounded inspection window", () => {
+  const secret = "URI-WINDOW-CANARY-" + "x".repeat(7_000);
+  const passwordResult = redactionModule.sanitizeDiagnostic(
+    `https://user:${secret}@example.invalid/repo`,
+    2_048,
+  );
+  const usernameResult = redactionModule.sanitizeDiagnostic(
+    `ssh://${secret}@example.invalid/repo`,
+    2_048,
+  );
+
+  for (const result of [passwordResult, usernameResult]) {
+    assert.equal(result.truncated, true);
+    assert.equal(result.text.includes("URI-WINDOW-CANARY"), false);
+    assert.ok([...result.text].length <= 2_048);
+  }
+  assert.equal(passwordResult.text.includes("https://user:"), false);
+  assert.match(passwordResult.text, /^https:\/\/\[REDACTED\]/);
+  assert.match(usernameResult.text, /^ssh:\/\/\[REDACTED\]/);
+});
+
 test("redacts provider-prefixed API key assignments", () => {
   const input = [
     "CURSOR_API_KEY=cursor-prefixed-synthetic-value",
@@ -158,6 +179,24 @@ test("redacts JSON-quoted secret, token, and signature assignments", () => {
   );
 });
 
+test("quoted assignment scanning honors odd and even escaped delimiters", () => {
+  const oddBackslashInput = String.raw`{"client_secret":"prefix\"ESCAPED-QUOTE-CANARY","safe":"preserved"}`;
+  const evenBackslashInput = String.raw`{"client_secret":"prefix\\","safe":"preserved"}`;
+
+  const oddBackslashRedacted = redactSecrets(oddBackslashInput);
+  const evenBackslashRedacted = redactSecrets(evenBackslashInput);
+
+  assert.equal(oddBackslashRedacted.includes("ESCAPED-QUOTE-CANARY"), false);
+  assert.equal(
+    oddBackslashRedacted,
+    '{"client_secret":"[REDACTED]","safe":"preserved"}',
+  );
+  assert.equal(
+    evenBackslashRedacted,
+    '{"client_secret":"[REDACTED]","safe":"preserved"}',
+  );
+});
+
 test("redacts multiple synthetic secret forms at the start, middle, and end", () => {
   const input = [
     "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA starts the line",
@@ -197,6 +236,15 @@ test("sanitizes controls and bounds diagnostics by Unicode code points", () => {
   assert.ok([...result.text].length <= 32);
   assert.match(result.text, /… \[truncated\]$/);
   assert.doesNotMatch(result.text, /[\u0000\u001b]/);
+});
+
+test("neutralizes Unicode line separators and bidi framing controls", () => {
+  const input = "safe\u2028line\u2029paragraph\u202Ereversed\u2066isolated\u2069";
+  const result = redactionModule.sanitizeDiagnostic(input);
+
+  assert.equal(result.truncated, false);
+  assert.doesNotMatch(result.text, /[\u2028\u2029\u202A-\u202E\u2066-\u2069]/);
+  assert.equal(result.text, "safe\uFFFDline\uFFFDparagraph\uFFFDreversed\uFFFDisolated\uFFFD");
 });
 
 test("redacts before truncating near a secret boundary", () => {
@@ -246,11 +294,16 @@ test("assignment sanitizer work scales below the former quadratic curve", () => 
     function measure(size) {
       const input = "A-".repeat(size / 2);
       const samples = [];
-      sanitizeDiagnostic(input, 2_048);
-      for (let index = 0; index < 3; index += 1) {
-        const started = performance.now();
+      const callsPerSample = 100;
+      for (let index = 0; index < 5; index += 1) {
         sanitizeDiagnostic(input, 2_048);
-        samples.push(performance.now() - started);
+      }
+      for (let sample = 0; sample < 7; sample += 1) {
+        const started = performance.now();
+        for (let call = 0; call < callsPerSample; call += 1) {
+          sanitizeDiagnostic(input, 2_048);
+        }
+        samples.push((performance.now() - started) / callsPerSample);
       }
       return median(samples);
     }

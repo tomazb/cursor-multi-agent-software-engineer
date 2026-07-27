@@ -514,7 +514,7 @@ export class Orchestrator {
     let aggregate = `${role} failed for all configured models: `;
     let aggregateHasEntries = false;
     let aggregateFull = false;
-    let omittedFailureAttempts = 0;
+    let aggregateOmittedAttempts = 0;
     let totalFailureAttempts = 0;
     const durableAttempts: DurableRuntimeFailureAttempt[] = [];
     const workdir = workingDirectoryFor(run);
@@ -551,7 +551,7 @@ export class Orchestrator {
           durableAttempts.push(failure.durable);
         }
         if (aggregateFull) {
-          omittedFailureAttempts += 1;
+          aggregateOmittedAttempts += 1;
         } else {
           const appended = appendFailureAggregate(
             aggregate,
@@ -566,7 +566,7 @@ export class Orchestrator {
     }
     const message = reportOmittedFailureAttempts(
       aggregate,
-      omittedFailureAttempts,
+      aggregateOmittedAttempts,
     );
     throw new RuntimeModelsExhaustedError(
       message,

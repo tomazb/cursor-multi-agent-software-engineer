@@ -57,13 +57,17 @@ function isWhitespace(value: string): boolean {
   return /\s/.test(value);
 }
 
-function redactUriUserinfo(input: string): string {
+function redactUriUserinfo(
+  input: string,
+  incompleteWindow: boolean,
+): string {
   let cursor = 0;
   let output = "";
   URI_USERINFO_SCHEME.lastIndex = 0;
 
   for (const match of input.matchAll(URI_USERINFO_SCHEME)) {
     const schemeStart = match.index;
+    if (schemeStart < cursor) continue;
     const authorityStart = schemeStart + match[0].length;
     let authorityEnd = authorityStart;
     while (authorityEnd < input.length) {
@@ -80,7 +84,18 @@ function redactUriUserinfo(input: string): string {
     }
 
     const at = input.lastIndexOf("@", authorityEnd - 1);
-    if (at < authorityStart || at >= authorityEnd) continue;
+    if (at < authorityStart || at >= authorityEnd) {
+      if (
+        incompleteWindow &&
+        authorityEnd === input.length &&
+        authorityEnd > authorityStart
+      ) {
+        output += input.slice(cursor, authorityStart);
+        output += "[REDACTED]";
+        cursor = authorityEnd;
+      }
+      continue;
+    }
     if (at === authorityStart) continue;
 
     output += input.slice(cursor, authorityStart);
@@ -142,7 +157,11 @@ function redactAssignments(input: string): string {
     const valueStart = quote ? separator + 1 : separator;
     let valueEnd = valueStart;
     if (quote) {
-      while (valueEnd < input.length && input[valueEnd] !== quote) {
+      let backslashRun = 0;
+      while (valueEnd < input.length) {
+        const value = input[valueEnd]!;
+        if (value === quote && backslashRun % 2 === 0) break;
+        backslashRun = value === "\\" ? backslashRun + 1 : 0;
         valueEnd += 1;
       }
     } else {
@@ -198,12 +217,19 @@ function redactPrivateKeyBlocks(input: string): string {
   return cursor === 0 ? input : `${output}${input.slice(cursor)}`;
 }
 
-export function redactSecrets(input: string): string {
-  let result = redactUriUserinfo(input);
+function redactSecretsWithinWindow(
+  input: string,
+  incompleteWindow: boolean,
+): string {
+  let result = redactUriUserinfo(input, incompleteWindow);
   for (const { pattern, replacement } of PATTERNS) {
     result = result.replace(pattern, replacement);
   }
   return redactPrivateKeyBlocks(redactAssignments(result));
+}
+
+export function redactSecrets(input: string): string {
+  return redactSecretsWithinWindow(input, false);
 }
 
 function boundedNormalizedDiagnosticPrefix(
@@ -227,7 +253,11 @@ function boundedNormalizedDiagnosticPrefix(
           scalar === 0x0b ||
           scalar === 0x0c ||
           (scalar >= 0x0e && scalar <= 0x1f) ||
-          (scalar >= 0x7f && scalar <= 0x9f)
+          (scalar >= 0x7f && scalar <= 0x9f) ||
+          scalar === 0x2028 ||
+          scalar === 0x2029 ||
+          (scalar >= 0x202a && scalar <= 0x202e) ||
+          (scalar >= 0x2066 && scalar <= 0x2069)
           ? "\uFFFD"
           : codePoint,
       );
@@ -293,7 +323,10 @@ export function sanitizeDiagnostic(
     DIAGNOSTIC_MAX_INSPECTION_CODE_POINTS,
   );
   const accepted = boundedNormalizedDiagnosticPrefix(input, inspectionLimit);
-  const redacted = redactSecrets(accepted.text);
+  const redacted = redactSecretsWithinWindow(
+    accepted.text,
+    accepted.omitted,
+  );
   return truncateSanitizedDiagnostic(
     redacted,
     maxCodePoints,

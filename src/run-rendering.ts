@@ -14,7 +14,7 @@ function renderRuntimeFailure(run: RunRecord): string[] {
   );
   if (!runtime) return [];
   const lines = [
-    `Runtime attempts: ${runtime.totalAttempts} total, ${runtime.omittedAttempts} omitted${runtime.aggregateTruncated ? ", aggregate truncated" : ""}`,
+    `Runtime attempts: ${runtime.totalAttempts} total, ${runtime.attempts.length} stored, ${runtime.omittedAttempts} omitted by durable cap${runtime.aggregateTruncated ? ", aggregate truncated" : ""}`,
   ];
   for (const attempt of runtime.attempts) {
     const fields = [
