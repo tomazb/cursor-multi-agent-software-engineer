@@ -104,7 +104,7 @@ test("schema assertion rejects fractional values for integer fields", () => {
 
   assert.throws(
     () => assertMatches(integerSchema, integerSchema, 1.5, "integer"),
-    /integer/,
+    /integer integer/,
   );
 });
 
@@ -346,6 +346,7 @@ test("schema accepts retry and supersede records with allowlisted runtime metada
       previousFailure,
     },
   );
+  assert.doesNotThrow(() => assertMatches(schema, schema, retried, "retry"));
 
   const replacement = await store.create(
     retried.title,
@@ -358,7 +359,6 @@ test("schema accepts retry and supersede records with allowlisted runtime metada
   await store.save(replacement);
 
   for (const [label, record] of [
-    ["retry", await store.load(retried.id)],
     ["superseded", await store.load(retried.id)],
     ["replacement", await store.load(replacement.id)],
   ] as const) {

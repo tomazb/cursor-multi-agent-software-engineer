@@ -51,6 +51,7 @@ export async function spawnFileCaptured(
         resolve({ code, signal, timedOut });
       });
       if (options.input !== undefined) {
+        child.stdin?.on("error", () => undefined);
         child.stdin?.end(options.input);
       }
       if (options.timeoutMs !== undefined) {
