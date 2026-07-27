@@ -185,12 +185,12 @@ constrained-heap test input. Neither historical `FAIL` is approval for a correct
 - Modify: `test/redaction.test.ts`
 - Modify: `src/runtimes/cursor-cli.ts`
 
-- [ ] Add a focused reproduction importing `node:test`, launching a child Node program, and requiring
+- [x] Add a focused reproduction importing `node:test`, launching a child Node program, and requiring
   a compact machine result; record the expected Node `v22.22.2` red failure and commit tests only.
-- [ ] Add unique temporary file-backed capture for tests that must exercise unchanged CLI stdout.
-- [ ] Change compact child programs to `fs.writeSync`; make the Node-only doctor stand-in read stdin
+- [x] Add unique temporary file-backed capture for tests that must exercise unchanged CLI stdout.
+- [x] Change compact child programs to `fs.writeSync`; make the Node-only doctor stand-in read stdin
   synchronously; preserve diagnostics, cleanup, and existing timeouts.
-- [ ] Run each previously failing file, `npm test`, and `npm run check` under exact Node `v22.22.2`.
+- [x] Run each previously failing file, `npm test`, and `npm run check` under exact Node `v22.22.2`.
 - [ ] Run the same tests under current Node 22 and commit the compatibility correction.
 
 ### Task 14: Constrained-heap compatibility
@@ -198,10 +198,10 @@ constrained-heap test input. Neither historical `FAIL` is approval for a correct
 **Files:**
 - Modify: `test/redaction.test.ts`
 
-- [ ] Replace the 64,000,000-character input with 8,000,000 characters under the existing 48 MiB
+- [x] Replace the 64,000,000-character input with 8,000,000 characters under the existing 48 MiB
   heap and 20-second timeout.
-- [ ] Keep the exact 128-code-point result assertion and normal-CI execution.
-- [ ] Record Node `v22.22.2` old-array exit 134 / approximately 108,988 KiB RSS and bounded-prefix
+- [x] Keep the exact 128-code-point result assertion and normal-CI execution.
+- [x] Record Node `v22.22.2` old-array exit 134 / approximately 108,988 KiB RSS and bounded-prefix
   exit 0 / approximately 78,772 KiB RSS.
 - [ ] Run on exact Node `v22.22.2` and current Node 22 and commit.
 
@@ -217,9 +217,9 @@ constrained-heap test input. Neither historical `FAIL` is approval for a correct
 - Modify: this plan
 - Modify: `CHANGELOG.md`
 
-- [ ] Add a separate exact Node `22.22.2` compatibility job that verifies the SHA, prints the
+- [x] Add a separate exact Node `22.22.2` compatibility job that verifies the SHA, prints the
   version, installs with the existing safe flags, runs `npm run check`, and runs `npm run pack:dry`.
-- [ ] Document display-only successful identities, unchanged execution semantics, nested schema
+- [x] Document display-only successful identities, unchanged execution semantics, nested schema
   closure, exact-version CI, constrained-heap scope, and both historical verifier failures.
 - [ ] Commit CI and documentation without claiming readiness.
 

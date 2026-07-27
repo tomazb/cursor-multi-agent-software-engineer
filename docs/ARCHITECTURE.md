@@ -162,6 +162,12 @@ displays where supplied, exit/timeout/duration/transport fields where supplied, 
 and `truncated`. Model displays are single-line, delimiter-neutral, and capped at 256 code points;
 the actual configured model passed to the runtime is not rewritten.
 
+Successful runtime-backed transition events cross the same untrusted runtime-to-persistence
+boundary. `runtimeEventIdentityDetails()` creates display-only copies of `requestedModel` and
+`actualModel` with the model-display policy, and optional `agentId` and `runtimeRunId` with a
+separately named bounded identifier policy. Runtime invocation and exact-model enforcement consume
+the original values before those copies are constructed.
+
 ### 3.9 Read-only enforcement
 
 `src/git-snapshot.ts` computes a SHA-256 workspace fingerprint for both Git and non-Git working directories:
@@ -367,6 +373,11 @@ first eight raw attempt slots, so malformed records cannot turn the eight-entry 
 an unbounded scan. Event sanitization excludes raw runtime objects before cloning the remaining
 details, then attaches the reconstructed subset.
 
+The run-record JSON Schema enforces the same nested contract:
+`durableRuntimeFailureAttempt` and `durableRuntimeFailureSummary` reject additional properties.
+Historical schema-version-1 failures without runtime metadata and historical parent extensions
+remain compatible.
+
 `sanitizeDiagnostic()` bounds work before pattern application. It collects at most the output
 budget plus 4,096 Unicode code points of lookahead and never more than 12,288, normalizing controls
 during that bounded scan. Purpose-specific URI-userinfo, assignment, and private-key scanners
@@ -383,6 +394,13 @@ separately unbounded successful-artifact redaction path proportional to accepted
 
 Cursor CLI adapters apply this bounded sanitizer directly to stderr before trimming or interpolating
 it into runtime, catalogue, or doctor summaries.
+
+CI runs the full deterministic check on both the current Node 22 release and exact Node `22.22.2`.
+Test-only child programs use synchronous compact-result writes or unique file-backed descriptors
+where buffered JavaScript pipe output is version-sensitive; production CLI output is unchanged.
+The constrained-heap sanitizer test uses an 8,000,000-character one-byte input under a 48 MiB V8
+old-space limit and asserts an exact 128-code-point result. It tests incremental sanitizer overhead,
+not an absolute total-process memory ceiling.
 
 ## 11. Trust boundaries
 

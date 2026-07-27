@@ -144,11 +144,23 @@ the digest fingerprint.
 - Model identifiers used for execution remain unchanged. Their diagnostic display copies are
   separately redacted, capped, collapsed to one line, and stripped of aggregate framing
   delimiters before formatting or persistence.
+- Successful runtime-backed workflow events apply that same 256-code-point model-display policy to
+  `requestedModel` and `actualModel`. Optional `agentId` and `runtimeRunId` values use a separately
+  named 256-code-point identifier-display policy at the same persistence boundary. These display
+  copies do not alter runtime invocation, exact-model comparison, catalogue selection, or fallback
+  ordering.
+- The JSON Schema closes the nested durable runtime attempt and summary allowlists with
+  `additionalProperties: false`. Historical schema-version-1 parent objects remain open where
+  required for compatibility, and failures without runtime metadata remain valid.
 - MASWE has no raw provider-debug artifact or log channel. It does not persist an encrypted copy or
   any digest or hash of raw stderr.
 - Cursor CLI failure adapters sanitize the bounded stderr window before trimming or composing
   summaries; catalogue and doctor diagnostics use the same ordering.
 - Documentation instructs teams not to commit run artifacts by default.
+- The normal constrained-heap regression uses an 8,000,000-character one-byte input, a 48 MiB V8
+  old-space limit, and an exact 128-code-point output assertion. It guards against sanitizer
+  overhead proportional to every input code point; it is not an absolute bound on total process
+  memory or the input representation itself.
 
 **Gaps and future work:**
 

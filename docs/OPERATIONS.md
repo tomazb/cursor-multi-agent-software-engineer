@@ -298,6 +298,12 @@ Inspect:
 - Human `maswe status` prints the attempt count and structured operational fields. `--json` emits
   the same durable object. Model display values are single-line and delimiter-neutral; they do not
   change the exact model value used for execution.
+- Successful runtime-backed events apply the same bounded model-display policy to
+  `requestedModel` and `actualModel`; optional agent/run identifiers use their own bounded display
+  policy. The runtime still receives and validates the original identifiers.
+- The nested runtime attempt and summary objects are schema-closed. Unknown adapter metadata,
+  nested raw stderr, and arbitrary summary properties are rejected rather than becoming durable
+  contract fields.
 - Cursor authentication and model availability.
 
 Raw provider stderr is not available in `run.json`, events, artifacts, retry history, status output,
@@ -346,6 +352,17 @@ A basic CI job can build and test MASWE itself. Using MASWE to alter a target re
 - Deterministic publish steps outside the model.
 
 Do not let a model push or merge directly in production CI. Let it edit the checkout, then use scripted git and GitHub steps after policy gates pass.
+
+MASWE's own CI retains a current Node 22 job and an exact Node `22.22.2` compatibility job. Both
+verify the checked-out SHA and run the full deterministic check; the exact-version job also runs
+the package dry run. Test-only child-process result capture uses explicit synchronous or unique
+file-backed channels to avoid Node-version-sensitive buffered pipe output without changing CLI
+rendering.
+
+The normal constrained-heap sanitizer regression runs an 8,000,000-character one-byte input with a
+48 MiB V8 old-space limit, an exact 128-code-point output assertion, and a hard timeout. This
+detects the historical full-code-point-array overhead while keeping the initial input feasible on
+supported Node 22 releases; it does not establish an absolute process-memory bound.
 
 ## 10. Upgrades
 

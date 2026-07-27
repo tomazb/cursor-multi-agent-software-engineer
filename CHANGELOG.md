@@ -24,6 +24,10 @@ The project follows semantic versioning once a public release process is establi
 - Optional schema-version-1 durable runtime failure summaries with up to eight bounded attempts,
   explicit total/omitted counts, safe operational fields, single-line model displays, and an
   eight-slot inspection bound when sanitizing malformed persisted attempt arrays.
+- Successful-event identity framing regressions covering brainstorm, design, build, verifier
+  success/failure, post-review verification, resolution, retry/supersede state, and human/JSON
+  rendering.
+- Exact Node `22.22.2` CI compatibility coverage alongside the current Node 22 job.
 
 ### Changed
 
@@ -71,6 +75,17 @@ The project follows semantic versioning once a public release process is establi
   retry history, superseded runs, and human/JSON status output. Durable attempt messages are capped
   at 512 code points, model display fields at 256, raw runtime arrays are sanitized before event
   detail cloning, and arbitrary adapter metadata remains excluded.
+- Successful runtime-backed events now persist bounded, single-line, delimiter-neutral display
+  copies of model and runtime identifiers while leaving invocation and exact-model checks
+  unchanged.
+- The nested durable runtime attempt and summary JSON Schema definitions now reject additional
+  properties while retaining historical schema-version-1 compatibility.
+- Test child-process result transport is deterministic on Node `22.22.2`: compact machine results
+  use synchronous writes and CLI capture uses unique file-backed descriptors. The production CLI
+  output contract is unchanged.
+- The 48 MiB constrained-heap sanitizer regression now uses an empirically supported
+  8,000,000-character input and retains its exact 128-code-point bound, hard timeout, and ability to
+  distinguish the historical full-code-point-array implementation.
 - Cursor stderr is bounded and redacted before trimming or summary interpolation. Historical
   schema-version-1 failure messages remain schema-compatible and are bounded during migration.
 - URI-userinfo redaction now records the last `@` during the forward authority scan, preventing

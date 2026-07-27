@@ -99,7 +99,10 @@ schema-version-1-compatible object:
 `omittedAttempts` is the difference between the total and stored entries. Attempt messages are
 bounded to 512 Unicode code points and `model`, `requestedModel`, and `configuredModel` display
 fields to 256. All fields except `model`, `code`, `message`, `stderrPresent`, and `truncated` are
-optional per attempt. Arbitrary runtime metadata is not part of this contract.
+optional per attempt. Arbitrary runtime metadata is not part of this contract. The
+`durableRuntimeFailureAttempt` and `durableRuntimeFailureSummary` schema definitions both set
+`additionalProperties: false`, so nested raw stderr, adapter metadata, and unknown summary fields
+are rejected.
 Store and migration safeguards inspect only the first eight raw attempt slots and discard invalid
 entries, keeping sanitization work bounded even for malformed historical input.
 
@@ -279,6 +282,13 @@ Each transition event includes:
 ```
 
 Runtime fields are optional because not every adapter exposes them.
+
+For runtime-backed successful transitions, `requestedModel` and `actualModel` are display-only
+copies normalized with the same single-line, aggregate-delimiter-neutral, 256-code-point policy as
+durable failure model fields. Optional `agentId` and `runtimeRunId` use a separately named bounded
+identifier-display policy. Runtime invocation, catalogue selection, fallback ordering, and
+requested-versus-actual comparison use the original values and are not changed by event
+persistence.
 
 For `FAIL`, details may also include the durable failure `code`, bounded safe `reason`, and optional
 bounded `runtime` summary. For `RETRY_FROM_FAILED`, `previousFailure` is the already-safe failure
