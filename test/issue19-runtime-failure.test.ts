@@ -198,6 +198,37 @@ test("Cursor very large stderr is redacted before deterministic truncation", asy
   assert.match(first.output, /… \[truncated\]$/);
 });
 
+test("Cursor sanitizes provider stderr before any trimming or interpolation", async (t) => {
+  const raw = `token=${CANARY}`;
+  const guarded = new Proxy(Object.create(null) as Record<string, unknown>, {
+    get(_target, property) {
+      if (property === "length") return raw.length;
+      if (property === "codePointAt") return raw.codePointAt.bind(raw);
+      if (property === "trim") {
+        return () => {
+          throw new Error("raw provider stderr was trimmed before sanitization");
+        };
+      }
+      if (typeof property === "string" && /^\d+$/.test(property)) {
+        return raw[Number(property)];
+      }
+      return undefined;
+    },
+  }) as unknown as string;
+  const { cwd, runtime } = await fixture(t, {
+    exitCode: 2,
+    stdout: "",
+    stderr: guarded,
+    durationMs: 5,
+    timedOut: false,
+  });
+
+  const result = await runtime.execute(request(cwd));
+
+  assertSafeRuntimeFailure(result, "cursor-cli-non-zero");
+  assert.equal(JSON.stringify(result).includes(CANARY), false);
+});
+
 test("Cursor process-spawn failure is typed and safe", async (t) => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-issue19-spawn-"));
   t.after(() => rm(cwd, { recursive: true, force: true }));

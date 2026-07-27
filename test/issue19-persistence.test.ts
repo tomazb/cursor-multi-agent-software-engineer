@@ -495,6 +495,69 @@ test("FileRunStore sanitizes unsafe failure and retry event callers", async (t) 
   );
 });
 
+function guardedMalformedAttempts(): unknown[] {
+  const attempts = Array.from({ length: 100 }, () => null);
+  Object.defineProperty(attempts, 8, {
+    get() {
+      throw new Error("event sanitizer cloned beyond its durable bound");
+    },
+  });
+  return attempts;
+}
+
+test("FAIL event sanitizes runtime attempts before cloning details", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-fail-event-bound-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("bounded FAIL event", "request", issue19Config(true));
+
+  const failed = await store.applyEvent(run, "FAIL", "test", {
+    reason: "runtime exhausted",
+    runtime: {
+      attempts: guardedMalformedAttempts(),
+      totalAttempts: 100,
+      aggregateTruncated: false,
+    },
+  });
+
+  const runtime = failed.events.at(-1)?.details?.runtime as
+    | ExpectedDurableRuntimeSummary
+    | undefined;
+  assert.ok(runtime);
+  assert.equal(runtime.attempts.length, 0);
+  assert.equal(runtime.omittedAttempts, 100);
+});
+
+test("retry event sanitizes runtime attempts before cloning previous failure", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-retry-event-bound-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("bounded retry event", "request", issue19Config(true));
+  const failed = await store.applyEvent(run, "FAIL", "test", {
+    reason: "runtime exhausted",
+  });
+
+  const retried = await store.applyEvent(failed, "RETRY_FROM_FAILED", "test", {
+    resumeState: "BRAINSTORMING",
+    previousFailure: {
+      message: "runtime exhausted",
+      at: new Date().toISOString(),
+      runtime: {
+        attempts: guardedMalformedAttempts(),
+        totalAttempts: 100,
+        aggregateTruncated: false,
+      },
+    },
+  });
+
+  const previous = retried.events.at(-1)?.details?.previousFailure as
+    | { runtime?: ExpectedDurableRuntimeSummary }
+    | undefined;
+  assert.ok(previous?.runtime);
+  assert.equal(previous.runtime.attempts.length, 0);
+  assert.equal(previous.runtime.omittedAttempts, 100);
+});
+
 test("unrelated event details do not require failure-sanitizer cloneability", async (t) => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-issue19-event-details-"));
   t.after(() => rm(cwd, { recursive: true, force: true }));

@@ -166,6 +166,26 @@ test("run-record schema validates optional bounded durable runtime failure metad
   );
 });
 
+test("schema version 1 still accepts historical unbounded failure messages", async () => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const failureSchema = schema.properties?.failure;
+  assert.ok(failureSchema);
+
+  assert.doesNotThrow(() =>
+    assertMatches(
+      schema,
+      failureSchema,
+      {
+        message: "historical stderr ".repeat(1_000),
+        at: "2026-07-01T00:00:00.000Z",
+      },
+      "failure",
+    )
+  );
+});
+
 test("schema-version-1 migration loads an old failure record without runtime metadata", async (t) => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-old-failure-"));
   t.after(() => rm(cwd, { recursive: true, force: true }));
