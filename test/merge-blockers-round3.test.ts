@@ -13,7 +13,7 @@ import { MockRuntime } from "../src/runtimes/mock.ts";
 import { FileRunStore } from "../src/store.ts";
 import { CursorCliRuntime } from "../src/runtimes/cursor-cli.ts";
 import { createRuntime } from "../src/runtime.ts";
-import { spawn } from "node:child_process";
+import { spawnFileCaptured } from "./helpers/child-process.ts";
 
 const execFileAsync = promisify(execFile);
 const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
@@ -36,24 +36,14 @@ function runCli(
   args: string[],
   env: NodeJS.ProcessEnv = {},
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
-  return new Promise((resolve) => {
-    const child = spawn(
-      process.execPath,
-      ["--experimental-strip-types", cliPath, ...args],
-      {
-        cwd,
-        env: { ...process.env, ...env },
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
-    let stdout = "";
-    let stderr = "";
-    child.stdout?.setEncoding("utf8");
-    child.stderr?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk) => (stdout += chunk));
-    child.stderr?.on("data", (chunk) => (stderr += chunk));
-    child.on("close", (code) => resolve({ code, stdout, stderr }));
-  });
+  return spawnFileCaptured(
+    process.execPath,
+    ["--experimental-strip-types", cliPath, ...args],
+    {
+      cwd,
+      env: { ...process.env, ...env },
+    },
+  );
 }
 
 test("retry rejects advanced branch without modifying either SHA", async () => {

@@ -352,6 +352,7 @@ test("redacts a long assignment crossing the retained diagnostic boundary", () =
 test("assignment sanitizer work scales below the former quadratic curve", () => {
   const moduleUrl = new URL("../src/redaction.ts", import.meta.url).href;
   const script = `
+    import { writeSync } from "node:fs";
     import { performance } from "node:perf_hooks";
     import { sanitizeDiagnostic } from ${JSON.stringify(moduleUrl)};
 
@@ -379,7 +380,7 @@ test("assignment sanitizer work scales below the former quadratic curve", () => 
 
     const smallMs = measure(20_000);
     const largeMs = measure(40_000);
-    process.stdout.write(JSON.stringify({ smallMs, largeMs, ratio: largeMs / smallMs }));
+    writeSync(1, JSON.stringify({ smallMs, largeMs, ratio: largeMs / smallMs }));
   `;
   const result = spawnSync(
     process.execPath,
@@ -440,6 +441,7 @@ test("assignment sanitizer handles large match-heavy input within a hard bound",
 test("URI userinfo scanning scales below the reviewed quadratic curve", () => {
   const moduleUrl = new URL("../src/redaction.ts", import.meta.url).href;
   const script = `
+    import { writeSync } from "node:fs";
     import { performance } from "node:perf_hooks";
     import { redactSecrets } from ${JSON.stringify(moduleUrl)};
 
@@ -462,7 +464,7 @@ test("URI userinfo scanning scales below the reviewed quadratic curve", () => {
 
     const smallMs = measure(4_000);
     const largeMs = measure(8_000);
-    process.stdout.write(JSON.stringify({ smallMs, largeMs, ratio: largeMs / smallMs }));
+    writeSync(1, JSON.stringify({ smallMs, largeMs, ratio: largeMs / smallMs }));
   `;
   const result = spawnSync(
     process.execPath,

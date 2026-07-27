@@ -1,9 +1,7 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { renderRun } from "../src/run-rendering.ts";
@@ -22,6 +20,7 @@ import {
   FAILURE_DIAGNOSTIC_MAX_CODE_POINTS,
 } from "../src/redaction.ts";
 import { FileRunStore } from "../src/store.ts";
+import { spawnFileCaptured } from "./helpers/child-process.ts";
 
 const PERSISTED_CANARY = "ISSUE19_CANARY_PERSISTED_SECRET";
 const FINE_GRAINED_PAT =
@@ -32,7 +31,6 @@ const MODELS = [
   "cursor-claude-fable-5-high",
   "cursor-claude-opus-4.8-high",
 ];
-const execFileAsync = promisify(execFile);
 const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
 
 interface ExpectedDurableRuntimeAttempt {
@@ -287,7 +285,7 @@ test("synthetic fine-grained GitHub PAT is absent from every durable and rendere
   assert.equal((await readFile(runFile, "utf8")).includes(FINE_GRAINED_PAT), false);
 
   for (const json of [false, true]) {
-    const result = await execFileAsync(
+    const result = await spawnFileCaptured(
       process.execPath,
       [
         "--experimental-strip-types",
@@ -298,8 +296,9 @@ test("synthetic fine-grained GitHub PAT is absent from every durable and rendere
         "--cwd",
         cwd,
       ],
-      { encoding: "utf8" },
+      { cwd },
     );
+    assert.equal(result.code, 0, result.stderr);
     assert.equal(result.stdout.includes(FINE_GRAINED_PAT), false);
     assert.match(result.stdout, /runtime-error/);
   }
@@ -697,7 +696,7 @@ test("human and JSON CLI expose structured metadata without credential canaries"
     "synthetic request",
   );
 
-  const human = await execFileAsync(
+  const human = await spawnFileCaptured(
     process.execPath,
     [
       "--experimental-strip-types",
@@ -707,8 +706,9 @@ test("human and JSON CLI expose structured metadata without credential canaries"
       "--cwd",
       cwd,
     ],
-    { encoding: "utf8" },
+    { cwd },
   );
+  assert.equal(human.code, 0, human.stderr);
   assert.equal(human.stdout.includes(FINE_GRAINED_PAT), false);
   assert.match(
     human.stdout,
@@ -718,7 +718,7 @@ test("human and JSON CLI expose structured metadata without credential canaries"
   assert.match(human.stdout, /transport=stdin/);
   assert.match(human.stdout, /stderr=yes/);
 
-  const json = await execFileAsync(
+  const json = await spawnFileCaptured(
     process.execPath,
     [
       "--experimental-strip-types",
@@ -729,8 +729,9 @@ test("human and JSON CLI expose structured metadata without credential canaries"
       "--cwd",
       cwd,
     ],
-    { encoding: "utf8" },
+    { cwd },
   );
+  assert.equal(json.code, 0, json.stderr);
   assert.equal(json.stdout.includes(FINE_GRAINED_PAT), false);
   const parsed = JSON.parse(json.stdout);
   const summary = runtimeSummary(parsed);

@@ -600,7 +600,7 @@ export class CursorCliRuntime implements AgentRuntime {
           const probeArgs = looksLikeNode(this.config.runtime.command)
             ? [
                 "-e",
-                'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>process.exit(d==="maswe-stdin-probe"?0:1))',
+                'const d=require("node:fs").readFileSync(0,"utf8");process.exit(d==="maswe-stdin-probe"?0:1)',
               ]
             : [
                 "-p",

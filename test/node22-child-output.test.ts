@@ -5,8 +5,9 @@ import { spawnCaptured } from "../src/process.ts";
 
 test("child Node compact machine output remains available after node:test is active", () => {
   const script = `
+    import { writeSync } from "node:fs";
     const result = { channel: "buffered-stdout", value: 22 };
-    process.stdout.write(JSON.stringify(result));
+    writeSync(1, JSON.stringify(result));
   `;
   const child = spawnSync(
     process.execPath,
@@ -29,12 +30,9 @@ test("child Node compact machine output remains available after node:test is act
 test("child Node stdin probe receives the complete payload after node:test is active", async () => {
   const script = `
     const fs = require("node:fs");
-    let input = "";
-    process.stdin.on("data", (chunk) => input += chunk);
-    process.stdin.on("end", () => {
-      fs.writeSync(1, JSON.stringify({ input }));
-      process.exit(input === "maswe-stdin-probe" ? 0 : 1);
-    });
+    const input = fs.readFileSync(0, "utf8");
+    fs.writeSync(1, JSON.stringify({ input }));
+    process.exit(input === "maswe-stdin-probe" ? 0 : 1);
   `;
   const child = await spawnCaptured(
     process.execPath,
