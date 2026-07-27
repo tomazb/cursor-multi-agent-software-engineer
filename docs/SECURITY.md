@@ -165,7 +165,9 @@ the digest fingerprint.
   delimiter-terminated value (quoted values honor odd/even backslash escaping before a quote, and
   one JSON-encoded structural-quote layer is recognized); sensitive query values require a tested
   `?`/`&` parameter name; and private-key blocks require a `BEGIN … PRIVATE KEY` marker (an absent
-  end marker redacts through the accepted window).
+  end marker redacts through the accepted window). The bounded accepted-window end is a string
+  boundary for fixed token-prefix recognition, so a tested token extending beyond the lookahead
+  cannot expose its retained prefix.
 - The assignment, URI-authority, and private-key scanners advance monotonically. Remaining regular
   expressions use non-overlapping or fixed-prefix grammars and run only on the bounded diagnostic
   window; none contains the former nested ambiguous provider-prefix repetition. Benchmarks guard

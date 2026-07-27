@@ -119,7 +119,8 @@ opt-in skips, and zero failures; both contention gates and the 83-file dry/actua
 The escaped structural-JSON and long-PEM review regressions brought the latest local total to 347 tests,
 342 passing, five opt-in skips, and zero failures. The final bounded durable-array inspection and integer
 schema-helper regressions brought the current total to 349 tests, 344 passing, five opt-in skips, and zero
-failures.
+failures. The final fixed-prefix inspection-window regression brought the exact local total to 350 tests,
+345 passing, five opt-in skips, and zero failures without requiring a production-code change.
 
 ---
 
