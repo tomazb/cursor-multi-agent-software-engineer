@@ -17,6 +17,7 @@ import {
 export const DURABLE_RUNTIME_FAILURE_ATTEMPT_LIMIT = 8;
 export const DURABLE_RUNTIME_FAILURE_MESSAGE_MAX_CODE_POINTS = 512;
 export const DURABLE_RUNTIME_MODEL_MAX_CODE_POINTS = 256;
+export const RUNTIME_IDENTIFIER_DISPLAY_MAX_CODE_POINTS = 256;
 
 const RUNTIME_FAILURE_CODES = new Set<RuntimeFailureCode>([
   "cursor-cli-non-zero",
@@ -83,10 +84,14 @@ function safeRuntimeFailureCode(value: unknown): RuntimeFailureCode {
     : "runtime-error";
 }
 
-export function normalizeModelDisplay(value: string): string {
+function normalizeIdentifierDisplay(
+  value: string,
+  maxCodePoints: number,
+  emptyDisplay: string,
+): string {
   const sanitized = sanitizeDiagnostic(
     value,
-    DURABLE_RUNTIME_MODEL_MAX_CODE_POINTS,
+    maxCodePoints,
   ).text;
   const singleLine = sanitized
     .replace(/[\r\n\t\u2028\u2029]+/g, " ")
@@ -95,7 +100,45 @@ export function normalizeModelDisplay(value: string): string {
     .replace(/\]/g, ")")
     .replace(/\s+/g, " ")
     .trim();
-  return singleLine || "(empty model)";
+  return singleLine || emptyDisplay;
+}
+
+export function normalizeModelDisplay(value: string): string {
+  return normalizeIdentifierDisplay(
+    value,
+    DURABLE_RUNTIME_MODEL_MAX_CODE_POINTS,
+    "(empty model)",
+  );
+}
+
+export function normalizeRuntimeIdentifierDisplay(value: string): string {
+  return normalizeIdentifierDisplay(
+    value,
+    RUNTIME_IDENTIFIER_DISPLAY_MAX_CODE_POINTS,
+    "(empty runtime identifier)",
+  );
+}
+
+export function runtimeEventIdentityDetails(
+  result: RuntimeFinishedResult,
+): {
+  requestedModel: string;
+  actualModel?: string;
+  agentId?: string;
+  runtimeRunId?: string;
+} {
+  return {
+    requestedModel: normalizeModelDisplay(result.requestedModel),
+    ...(result.actualModel !== undefined
+      ? { actualModel: normalizeModelDisplay(result.actualModel) }
+      : {}),
+    ...(result.agentId !== undefined
+      ? { agentId: normalizeRuntimeIdentifierDisplay(result.agentId) }
+      : {}),
+    ...(result.runId !== undefined
+      ? { runtimeRunId: normalizeRuntimeIdentifierDisplay(result.runId) }
+      : {}),
+  };
 }
 
 function optionalModelDisplay(value: unknown): string | undefined {

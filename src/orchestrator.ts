@@ -5,7 +5,7 @@ import type {
   RoleId,
   RunFailureCode,
   RunRecord,
-  RuntimeResult,
+  RuntimeFinishedResult,
   WorkflowState,
 } from "./domain.ts";
 import { buildCommentClassifierPrompt, buildRolePrompt } from "./prompt-builder.ts";
@@ -40,6 +40,7 @@ import {
   runFailureMessage,
   runFailureRuntime,
   RuntimeModelsExhaustedError,
+  runtimeEventIdentityDetails,
   runtimeAttemptFailure,
   safeFailureMessage,
 } from "./failure-diagnostics.ts";
@@ -302,10 +303,7 @@ export class Orchestrator {
             {
               passed,
               required: run.config.gates.requireVerifierPass,
-              requestedModel: result.requestedModel,
-              actualModel: result.actualModel,
-              agentId: result.agentId,
-              runtimeRunId: result.runId,
+              ...runtimeEventIdentityDetails(result),
               headSha: evaluatedSha,
               marker: markers.marker,
             },
@@ -393,10 +391,7 @@ export class Orchestrator {
     }
 
     return this.store.applyEvent(run, "BUILD_COMPLETED", "builder", {
-      requestedModel: result.requestedModel,
-      actualModel: result.actualModel,
-      agentId: result.agentId,
-      runtimeRunId: result.runId,
+      ...runtimeEventIdentityDetails(result),
       marker: markers.marker,
       ...(beforeSha ? { inputHeadSha: beforeSha, headSha: beforeSha } : {}),
       ...(outputHeadSha ? { outputHeadSha } : {}),
@@ -442,10 +437,7 @@ export class Orchestrator {
     }
 
     return this.store.applyEvent(run, "RESOLUTION_COMPLETED", "prResolver", {
-      requestedModel: result.requestedModel,
-      actualModel: result.actualModel,
-      agentId: result.agentId,
-      runtimeRunId: result.runId,
+      ...runtimeEventIdentityDetails(result),
       marker: markers.marker,
       ...(beforeSha ? { inputHeadSha: beforeSha, headSha: beforeSha } : {}),
       ...(outputHeadSha ? { outputHeadSha } : {}),
@@ -492,10 +484,7 @@ export class Orchestrator {
     await this.store.writeArtifact(run, artifactName, result.output);
     const evaluatedSha = headSha ?? run.workspace?.headSha;
     return this.store.applyEvent(run, successEvent, role, {
-      requestedModel: result.requestedModel,
-      actualModel: result.actualModel,
-      agentId: result.agentId,
-      runtimeRunId: result.runId,
+      ...runtimeEventIdentityDetails(result),
       marker: markers.marker,
       ...(evaluatedSha ? { headSha: evaluatedSha } : {}),
     });
@@ -506,7 +495,7 @@ export class Orchestrator {
     role: RoleId,
     prompt: string,
     roleOverride?: RunRecord["config"]["roles"][RoleId],
-  ): Promise<RuntimeResult> {
+  ): Promise<RuntimeFinishedResult> {
     const configured = roleOverride ?? run.config.roles[role];
     const candidates = run.config.policy.rejectModelFallback
       ? [configured.model]

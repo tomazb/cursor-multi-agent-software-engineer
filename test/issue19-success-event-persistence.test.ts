@@ -13,6 +13,10 @@ import type {
   RuntimeResult,
   WorkflowEventType,
 } from "../src/domain.ts";
+import {
+  normalizeModelDisplay,
+  normalizeRuntimeIdentifierDisplay,
+} from "../src/failure-diagnostics.ts";
 import { Orchestrator } from "../src/orchestrator.ts";
 import { renderRun } from "../src/run-rendering.ts";
 import { FileRunStore } from "../src/store.ts";
@@ -277,4 +281,20 @@ test("exact-model enforcement compares raw runtime identities before display nor
   assert.equal(run.state, "FAILED");
   assert.deepEqual(runtime.invocationModels, [SAFE_EXECUTION_MODEL]);
   assert.match(run.failure?.message ?? "", /runtime reported/i);
+});
+
+test("runtime identity display policies preserve ordinary identifiers and are idempotent", () => {
+  assert.equal(
+    normalizeModelDisplay("gpt-5.6-sol-high"),
+    "gpt-5.6-sol-high",
+  );
+  assert.equal(
+    normalizeRuntimeIdentifierDisplay("agent-run_123"),
+    "agent-run_123",
+  );
+
+  const modelOnce = normalizeModelDisplay(HOSTILE_MODEL_DISPLAY);
+  const agentOnce = normalizeRuntimeIdentifierDisplay(HOSTILE_AGENT_DISPLAY);
+  assert.equal(normalizeModelDisplay(modelOnce), modelOnce);
+  assert.equal(normalizeRuntimeIdentifierDisplay(agentOnce), agentOnce);
 });
