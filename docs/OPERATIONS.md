@@ -148,7 +148,9 @@ Cursor CLI assistant extraction and terminal markers:
   cross the retained output boundary, and an incomplete supported URI authority that reaches the
   inspection boundary is redacted fail-closed. URI userinfo is recognized for `http`, `https`, `ssh`,
   `git`, `git+https`, `git+ssh`, `sftp`, and `ftp` `scheme://` forms; ordinary email and SCP-like
-  `user@host:path` text are not treated as URI credentials.
+  `user@host:path` text are not treated as URI credentials. URI authorities are scanned once
+  forwards, including on larger successful-artifact content; operators should treat benchmark
+  evidence as a regression guard rather than a formal proof.
 - Authentication-like text can remain useful in the redacted excerpt, but it does not select a
   control-flow classification. Catalogue and doctor errors use the same bounded sanitizer.
 - Marker validation rejects quoted examples, embedded tokens, duplicates, conflicts, non-final markers, and content after a marker. Operator-visible messages name the violated contract and logical line number without dumping full model output.

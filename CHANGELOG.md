@@ -73,6 +73,8 @@ The project follows semantic versioning once a public release process is establi
   detail cloning, and arbitrary adapter metadata remains excluded.
 - Cursor stderr is bounded and redacted before trimming or summary interpolation. Historical
   schema-version-1 failure messages remain schema-compatible and are bounded during migration.
+- URI-userinfo redaction now records the last `@` during the forward authority scan, preventing
+  quadratic rescans on repeated credential-free URLs in successful artifact content.
 
 ### Planned
 

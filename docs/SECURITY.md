@@ -172,9 +172,13 @@ the digest fingerprint.
   each prefix's documented ASCII token alphabet and redacts fail-closed if that candidate reaches
   the truncated accepted-window end, even before the complete-token minimum is observable.
 - The fixed-token-prefix, assignment, URI-authority, and private-key scanners advance
-  monotonically. Remaining regular expressions use non-overlapping grammars and run only on the
-  bounded diagnostic window; none contains the former nested ambiguous provider-prefix repetition.
-  Benchmarks guard scaling, but are supporting evidence rather than a formal complexity proof.
+  monotonically. The URI scanner records the last `@` during its forward authority pass; it does
+  not search the already-consumed prefix again for each URI. That property also keeps the separate,
+  potentially larger successful-artifact `redactSecrets()` path linear in the accepted text.
+  Remaining regular expressions use non-overlapping grammars and failure diagnostics run them only
+  on the bounded diagnostic window; none contains the former nested ambiguous provider-prefix
+  repetition. Benchmarks guard scaling, but are supporting evidence rather than a formal
+  complexity proof.
 - Recognition remains pattern-based, best-effort protection, not a DLP product or a guarantee that
   arbitrary credentials can be recognized.
 - Diagnostic framing replaces C0/C1 controls, Unicode line/paragraph separators, bidi overrides,

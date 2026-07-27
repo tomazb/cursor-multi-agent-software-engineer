@@ -99,14 +99,16 @@ independent verifier. It does not erase the earlier validation history.
 - [ ] Update the draft PR body without erasing the failed-head history.
 - [ ] Create a new external-validation handoff for the corrected exact head.
 
-Local correction validation used Node `v24.18.0` on Linux `7.1.4-204.fc44.x86_64`. The failing
-implementation's isolated three-repetition regression measured 20,000 and 40,000 adversarial code points at
-342.58 ms and 1,350.66 ms median respectively (3.94x on doubling); a supplementary two-repetition observation
-measured approximately 1.35 s and 5.39 s at 40,000 and 80,000. The bounded implementation measured 20,000,
-40,000, and 80,000 code points at 0.478 ms, 0.311 ms, and 0.311 ms median respectively across seven
-repetitions of 100 calls. Benchmarking supports, but does not replace, the source-level argument: bounded
-prefix collection caps work before the monotonic scanners run, and the former nested ambiguous repetition no
-longer exists.
+Correction benchmarks use only Node `v22.22.2` on Linux `7.1.4-204.fc44.x86_64` (`x64`). With one
+warm-up and five measured calls per size, failed head `7b3ba017` processed 20,000 and 40,000
+assignment-adversarial code points in 282.23 ms and 1,127.37 ms median respectively (3.99x);
+the corrected scanner measured 0.62 ms and 0.55 ms (0.89x) under the same protocol. A separate
+seven-sample URI-artifact probe used 4,000 and 8,000 credential-free supported URIs: the backward
+search implementation at `d1eaf35` measured 76.87 ms and 292.82 ms (3.81x), while the forward
+authority scan measured 4.88 ms and 10.74 ms (2.20x). Benchmarking supports, but does not replace,
+the source-level argument: diagnostic prefix collection is capped before monotonic scanners run,
+the former nested ambiguous assignment repetition is gone, and URI authorities record the last
+`@` during their single forward pass instead of rescanning the already-consumed prefix.
 
 The direct focused correction set passed 48/48. The PR #15, Issue #12, Thermos, and unauthorized-marker
 compatibility set passed 98 tests with three opt-in skips. Both exact Issue #11 contention gates passed at 25

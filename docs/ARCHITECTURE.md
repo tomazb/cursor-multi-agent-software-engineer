@@ -377,6 +377,9 @@ incomplete supported URI authorities fail-safely. The monotonic fixed-token-pref
 redacts a candidate that reaches an incomplete accepted-window end, preventing a recognizable
 token prefix from surviving final truncation. Quoted assignment scanning honors odd/even
 backslash escaping before delimiters and recognizes one JSON-encoded structural-quote layer.
+The shared URI scanner records `@` positions during its single forward authority pass rather than
+repeatedly searching the preceding string. This keeps both bounded failure diagnostics and the
+separately unbounded successful-artifact redaction path proportional to accepted input size.
 
 Cursor CLI adapters apply this bounded sanitizer directly to stderr before trimming or interpolating
 it into runtime, catalogue, or doctor summaries.

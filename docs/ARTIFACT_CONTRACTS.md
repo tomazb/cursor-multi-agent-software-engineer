@@ -13,7 +13,8 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
 - For Cursor CLI `json` / `stream-json` modes, marker validation runs only on the decoded authoritative `result` string. Transport JSON quoting is not treated as embedded model content. Malformed envelopes, unsupported shapes, and missing `result` fields fail closed before marker validation.
 - Operator-visible marker diagnostics distinguish quoted examples, embedded tokens, duplicates, conflicts, non-final markers, and content after a marker, without echoing the full model output.
 - Common secrets are redacted before persistence. Successful model output follows the artifact
-  redaction contract; failure diagnostics additionally follow the bounded failure contract below.
+  redaction contract; its URI-authority scanner advances once forwards without rescanning prior
+  content. Failure diagnostics additionally follow the bounded failure contract below.
 - JSON schemas live under `schemas/` for configuration and run records.
 - Persisted `run.config.roles.*.model` values are exact executable catalogue IDs after `start`. Loading a run migrates defaults then runs the same config assertions as project load (without applying process environment overrides).
 

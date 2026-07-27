@@ -77,9 +77,12 @@ followed by `://`; username-only and username/password forms are redacted in ful
 host, port, path, query, and fragment remain. Ordinary email and SCP-like prose are not inferred as
 credentials. Synthetic fixtures are used exclusively.
 
-Assignment, URI-authority, and private-key matching uses purpose-specific monotonic scanners.
-Remaining expressions have fixed/non-overlapping grammars and run on the bounded accepted window.
-The former nested ambiguous provider-prefix assignment repetition is removed.
+Assignment, URI-authority, and private-key matching uses purpose-specific monotonic scanners. The
+URI scanner records the last `@` while advancing through the current authority and never performs
+a backward search over already-consumed content. This is required because the same scanner also
+handles successful artifacts whose content is not subject to the failure-diagnostic inspection
+cap. Remaining expressions have fixed/non-overlapping grammars and run on the bounded accepted
+window. The former nested ambiguous provider-prefix assignment repetition is removed.
 
 ### Durable failure-attempt contract
 
