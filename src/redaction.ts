@@ -112,6 +112,7 @@ function redactUriUserinfo(
     if (schemeStart < cursor) continue;
     const authorityStart = schemeStart + match[0].length;
     let authorityEnd = authorityStart;
+    let at = -1;
     while (authorityEnd < input.length) {
       const value = input[authorityEnd]!;
       if (
@@ -122,10 +123,10 @@ function redactUriUserinfo(
       ) {
         break;
       }
+      if (value === "@") at = authorityEnd;
       authorityEnd += 1;
     }
 
-    const at = input.lastIndexOf("@", authorityEnd - 1);
     if (at < authorityStart || at >= authorityEnd) {
       if (
         incompleteWindow &&
