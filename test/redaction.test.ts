@@ -305,6 +305,10 @@ test("redacts prefixed tokens that cross the bounded inspection window", () => {
       inspectionLimit - filler.length - prefix.length - canary.length - 1;
     return `${prefix}${canary}${"A".repeat(paddingLength)}${boundary}${"B".repeat(3_000)}`;
   };
+  const hyphenOnlyAcceptedPrefix = (prefix: string): string => {
+    const paddingLength = inspectionLimit - filler.length - prefix.length;
+    return `${prefix}${"-".repeat(paddingLength)}${"B".repeat(3_000)}`;
+  };
   const tokens = [
     `ghp_TOKENWINDOWCANARY${"A".repeat(7_000)}`,
     crossingToken("sk-", "-"),
@@ -318,6 +322,15 @@ test("redacts prefixed tokens that cross the bounded inspection window", () => {
     assert.equal(result.text.includes("TOKENWINDOWCANARY"), false);
     assert.doesNotMatch(result.text, /(?:ghp_|sk-|xoxb-)TOKEN/);
     assert.ok([...result.text].length <= 2_048);
+  }
+
+  for (const prefix of ["sk-", "xoxb-"]) {
+    const result = redactionModule.sanitizeDiagnostic(
+      `${filler}${hyphenOnlyAcceptedPrefix(prefix)}`,
+    );
+
+    assert.equal(result.truncated, true);
+    assert.equal(result.text.includes(prefix), false);
   }
 });
 
