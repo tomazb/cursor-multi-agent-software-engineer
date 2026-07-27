@@ -118,6 +118,11 @@ archive inspection, diff checking, and the generated-state canary audit passed; 
 only in test source. After review-induced SDK, escaped-assignment, overlong-URI, framing-control, performance
 probe, and rendering clarifications, the final local `npm run check` reported 345 tests, 340 passing, five
 opt-in skips, and zero failures; both contention gates and the 83-file dry/actual pack audit passed again.
+After the final URI forward-scan review correction, the Node `v22.22.2` focused failure/security/schema
+set passed 63/63 and the direct PR #15, Issue #12, Thermos, and marker set passed 76 tests (74 passing,
+two opt-in skips). The pinned Node `v22.22.2` `npm run check` reported 355 tests, 350 passing, five
+opt-in skips, and zero failures. Both exact contention gates, dry and actual 83-file package inspection,
+archive extraction, `git diff --check`, and generated-state canary audit passed again.
 The escaped structural-JSON and long-PEM review regressions brought the latest local total to 347 tests,
 342 passing, five opt-in skips, and zero failures. The final bounded durable-array inspection and integer
 schema-helper regressions brought the current total to 349 tests, 344 passing, five opt-in skips, and zero
