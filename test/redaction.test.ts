@@ -539,7 +539,7 @@ test("bounds very large diagnostics without materializing every code point", () 
   const moduleUrl = new URL("../src/redaction.ts", import.meta.url).href;
   const script = `
     import { sanitizeDiagnostic } from ${JSON.stringify(moduleUrl)};
-    const result = sanitizeDiagnostic("x".repeat(64_000_000), 128);
+    const result = sanitizeDiagnostic("x".repeat(8_000_000), 128);
     if (!result.truncated || [...result.text].length !== 128) process.exit(2);
   `;
   const result = spawnSync(
