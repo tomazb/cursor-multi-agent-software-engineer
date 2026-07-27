@@ -251,6 +251,9 @@ test("schema-version-1 migration bounds and sanitizes optional runtime metadata"
       (attempt) =>
         [...attempt.message].length <= 512 &&
         !/[\r\n\u0000-\u001f\u007f-\u009f]/.test(attempt.model) &&
+        !/[\r\n\u0000-\u001f\u007f-\u009f]/.test(
+          attempt.requestedModel ?? "",
+        ) &&
         !("adapterMetadata" in attempt),
     ),
   );

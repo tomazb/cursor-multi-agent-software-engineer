@@ -437,6 +437,60 @@ test("assignment sanitizer handles large match-heavy input within a hard bound",
   );
 });
 
+test("URI userinfo scanning scales below the reviewed quadratic curve", () => {
+  const moduleUrl = new URL("../src/redaction.ts", import.meta.url).href;
+  const script = `
+    import { performance } from "node:perf_hooks";
+    import { redactSecrets } from ${JSON.stringify(moduleUrl)};
+
+    function median(values) {
+      const sorted = [...values].sort((a, b) => a - b);
+      return sorted[Math.floor(sorted.length / 2)];
+    }
+
+    function measure(uriCount) {
+      const input = "https://host.invalid/repository\\n".repeat(uriCount);
+      const samples = [];
+      redactSecrets(input);
+      for (let sample = 0; sample < 3; sample += 1) {
+        const started = performance.now();
+        redactSecrets(input);
+        samples.push(performance.now() - started);
+      }
+      return median(samples);
+    }
+
+    const smallMs = measure(4_000);
+    const largeMs = measure(8_000);
+    process.stdout.write(JSON.stringify({ smallMs, largeMs, ratio: largeMs / smallMs }));
+  `;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      script,
+    ],
+    { encoding: "utf8", timeout: 10_000 },
+  );
+
+  assert.equal(
+    result.status,
+    0,
+    `URI scanner scaling probe failed: ${result.stderr}`,
+  );
+  const measured = JSON.parse(result.stdout) as {
+    smallMs: number;
+    largeMs: number;
+    ratio: number;
+  };
+  assert.ok(
+    measured.ratio < 3,
+    `doubling credential-free URI input scaled ${measured.ratio.toFixed(2)}x (${measured.smallMs.toFixed(2)}ms -> ${measured.largeMs.toFixed(2)}ms)`,
+  );
+});
+
 test("diagnostic sanitization is deterministic for multiline mixed content", () => {
   const sanitizeDiagnostic = (
     redactionModule as Record<string, unknown>
