@@ -372,10 +372,10 @@ during that bounded scan. Purpose-specific URI-userinfo, assignment, and private
 advance monotonically; the remaining fixed recognition expressions run on only that accepted
 window. The lookahead lets scanners consume recognized values that cross the retained output
 boundary, while reaching the accepted-window end closes long assignment/private-key values and
-incomplete supported URI authorities fail-safely. Fixed token-prefix expressions see the accepted
-window end as a string boundary, so recognized long tokens are redacted before final truncation.
-Quoted assignment scanning honors odd/even backslash escaping before delimiters and recognizes one
-JSON-encoded structural-quote layer.
+incomplete supported URI authorities fail-safely. The monotonic fixed-token-prefix scanner also
+redacts a candidate that reaches an incomplete accepted-window end, preventing a recognizable
+token prefix from surviving final truncation. Quoted assignment scanning honors odd/even
+backslash escaping before delimiters and recognizes one JSON-encoded structural-quote layer.
 
 ## 11. Trust boundaries
 

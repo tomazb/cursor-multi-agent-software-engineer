@@ -65,7 +65,9 @@ be consumed in full. A long assignment, incomplete private-key block, or support
 that reaches the accepted-window end remains redacted through that boundary. Quoted assignment
 values treat a quote as a delimiter only when it is preceded by an even-length backslash run; one
 JSON-encoded structural-quote layer is recognized with its corresponding backslash parity. The
-sanitizer never constructs a code-point array from the complete attacker-controlled input.
+fixed-token-prefix scanner likewise redacts a candidate that reaches the incomplete window end,
+including when only prefix-valid punctuation has been observed. The sanitizer never constructs a
+code-point array from the complete attacker-controlled input.
 
 `redactSecrets()` is extended only for tested credential forms: classic GitHub and modern
 `github_pat_` tokens, OpenAI/Slack tokens, authorization and standalone bearer forms, URI userinfo,

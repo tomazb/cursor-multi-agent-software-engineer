@@ -165,13 +165,13 @@ the digest fingerprint.
   delimiter-terminated value (quoted values honor odd/even backslash escaping before a quote, and
   one JSON-encoded structural-quote layer is recognized); sensitive query values require a tested
   `?`/`&` parameter name; and private-key blocks require a `BEGIN … PRIVATE KEY` marker (an absent
-  end marker redacts through the accepted window). The bounded accepted-window end is a string
-  boundary for fixed token-prefix recognition, so a tested token extending beyond the lookahead
-  cannot expose its retained prefix.
-- The assignment, URI-authority, and private-key scanners advance monotonically. Remaining regular
-  expressions use non-overlapping or fixed-prefix grammars and run only on the bounded diagnostic
-  window; none contains the former nested ambiguous provider-prefix repetition. Benchmarks guard
-  scaling, but are supporting evidence rather than a formal complexity proof.
+  end marker redacts through the accepted window). The fixed-token-prefix scanner consumes only
+  each prefix's documented ASCII token alphabet and redacts fail-closed if that candidate reaches
+  the truncated accepted-window end, even before the complete-token minimum is observable.
+- The fixed-token-prefix, assignment, URI-authority, and private-key scanners advance
+  monotonically. Remaining regular expressions use non-overlapping grammars and run only on the
+  bounded diagnostic window; none contains the former nested ambiguous provider-prefix repetition.
+  Benchmarks guard scaling, but are supporting evidence rather than a formal complexity proof.
 - Recognition remains pattern-based, best-effort protection, not a DLP product or a guarantee that
   arbitrary credentials can be recognized.
 - Diagnostic framing replaces C0/C1 controls, Unicode line/paragraph separators, bidi overrides,

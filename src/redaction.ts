@@ -1,18 +1,5 @@
 const PATTERNS: Array<{ pattern: RegExp; replacement: string }> = [
   {
-    pattern:
-      /\b(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g,
-    replacement: "[REDACTED]",
-  },
-  {
-    pattern: /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/g,
-    replacement: "[REDACTED]",
-  },
-  {
-    pattern: /\b(xox[baprs]-)[A-Za-z0-9-]{10,}\b/g,
-    replacement: "$1[REDACTED]",
-  },
-  {
     pattern: /(Authorization:\s*(?:Bearer|Basic)\s+)[^\s]+/gi,
     replacement: "$1[REDACTED]",
   },
@@ -43,6 +30,33 @@ const PRIVATE_KEY_BEGIN =
   /-----BEGIN [A-Z ]{0,64}PRIVATE KEY-----/g;
 const SENSITIVE_ASSIGNMENT_KEY =
   /(?:^|[_-])(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret|token|signature|sig|aws[_-]?secret[_-]?access[_-]?key)$/i;
+const FIXED_PREFIX_TOKENS = [
+  {
+    prefix: "github_pat_",
+    minimumValueLength: 20,
+    allows: isAsciiWordCharacter,
+  },
+  ...["ghp_", "gho_", "ghu_", "ghs_", "ghr_"].map((prefix) => ({
+    prefix,
+    minimumValueLength: 20,
+    allows: isAsciiWordCharacter,
+  })),
+  {
+    prefix: "sk-proj-",
+    minimumValueLength: 20,
+    allows: isApiTokenCharacter,
+  },
+  {
+    prefix: "sk-",
+    minimumValueLength: 20,
+    allows: isApiTokenCharacter,
+  },
+  ...["xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-"].map((prefix) => ({
+    prefix,
+    minimumValueLength: 10,
+    allows: isSlackTokenCharacter,
+  })),
+] as const;
 
 export interface SanitizedDiagnostic {
   text: string;
@@ -53,8 +67,68 @@ function isIdentifierCharacter(value: string): boolean {
   return /[A-Za-z0-9_-]/.test(value);
 }
 
+function isAsciiWordCharacter(value: string): boolean {
+  return /[A-Za-z0-9_]/.test(value);
+}
+
+function isApiTokenCharacter(value: string): boolean {
+  return /[A-Za-z0-9_-]/.test(value);
+}
+
+function isSlackTokenCharacter(value: string): boolean {
+  return /[A-Za-z0-9-]/.test(value);
+}
+
 function isWhitespace(value: string): boolean {
   return /\s/.test(value);
+}
+
+function redactFixedPrefixTokens(
+  input: string,
+  incompleteWindow: boolean,
+): string {
+  const output: string[] = [];
+  let cursor = 0;
+  let index = 0;
+
+  while (index < input.length) {
+    if (index > 0 && isAsciiWordCharacter(input[index - 1]!)) {
+      index += 1;
+      continue;
+    }
+
+    const token = FIXED_PREFIX_TOKENS.find(({ prefix }) =>
+      input.startsWith(prefix, index)
+    );
+    if (!token) {
+      index += 1;
+      continue;
+    }
+
+    const valueStart = index + token.prefix.length;
+    let valueEnd = valueStart;
+    while (valueEnd < input.length && token.allows(input[valueEnd]!)) {
+      valueEnd += 1;
+    }
+    const acceptedLength = valueEnd - valueStart;
+    const crossesInspectionBoundary =
+      incompleteWindow && valueEnd === input.length;
+    if (
+      acceptedLength < token.minimumValueLength &&
+      !crossesInspectionBoundary
+    ) {
+      index += 1;
+      continue;
+    }
+
+    output.push(input.slice(cursor, index), "[REDACTED]");
+    cursor = valueEnd;
+    index = valueEnd;
+  }
+
+  if (output.length === 0) return input;
+  output.push(input.slice(cursor));
+  return output.join("");
 }
 
 function redactUriUserinfo(
@@ -245,6 +319,7 @@ function redactSecretsWithinWindow(
   incompleteWindow: boolean,
 ): string {
   let result = redactUriUserinfo(input, incompleteWindow);
+  result = redactFixedPrefixTokens(result, incompleteWindow);
   for (const { pattern, replacement } of PATTERNS) {
     result = result.replace(pattern, replacement);
   }
