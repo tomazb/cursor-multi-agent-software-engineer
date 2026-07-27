@@ -294,6 +294,33 @@ test("redacts before truncating near a secret boundary", () => {
   assert.ok([...result.text].length <= 56);
 });
 
+test("redacts prefixed tokens that cross the bounded inspection window", () => {
+  const filler = "f".repeat(2_030);
+  const inspectionLimit =
+    redactionModule.FAILURE_DIAGNOSTIC_MAX_CODE_POINTS +
+    redactionModule.DIAGNOSTIC_REDACTION_LOOKAHEAD_CODE_POINTS;
+  const crossingToken = (prefix: string, boundary: string): string => {
+    const canary = "TOKENWINDOWCANARY";
+    const paddingLength =
+      inspectionLimit - filler.length - prefix.length - canary.length - 1;
+    return `${prefix}${canary}${"A".repeat(paddingLength)}${boundary}${"B".repeat(3_000)}`;
+  };
+  const tokens = [
+    `ghp_TOKENWINDOWCANARY${"A".repeat(7_000)}`,
+    crossingToken("sk-", "-"),
+    crossingToken("xoxb-", "-"),
+  ];
+
+  for (const token of tokens) {
+    const result = redactionModule.sanitizeDiagnostic(`${filler}${token}`);
+
+    assert.equal(result.truncated, true);
+    assert.equal(result.text.includes("TOKENWINDOWCANARY"), false);
+    assert.doesNotMatch(result.text, /(?:ghp_|sk-|xoxb-)TOKEN/);
+    assert.ok([...result.text].length <= 2_048);
+  }
+});
+
 test("redacts a long assignment crossing the retained diagnostic boundary", () => {
   const prefix = "safe ".repeat(403);
   const secret = "boundary-secret-prefix-" + "z".repeat(32_000);
