@@ -295,7 +295,7 @@ test("redacts before truncating near a secret boundary", () => {
 });
 
 test("redacts prefixed tokens that cross the bounded inspection window", () => {
-  const filler = "f".repeat(2_030);
+  const filler = `${"f".repeat(2_029)} `;
   const inspectionLimit =
     redactionModule.FAILURE_DIAGNOSTIC_MAX_CODE_POINTS +
     redactionModule.DIAGNOSTIC_REDACTION_LOOKAHEAD_CODE_POINTS;
