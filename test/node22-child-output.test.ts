@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { spawnCaptured } from "../src/process.ts";
+import { spawnFileCaptured } from "./helpers/child-process.ts";
 
 test("child Node compact machine output remains available after node:test is active", () => {
   const script = `
@@ -48,4 +49,19 @@ test("child Node stdin probe receives the complete payload after node:test is ac
   assert.deepEqual(JSON.parse(child.stdout), {
     input: "maswe-stdin-probe",
   });
+});
+
+test("file-backed child capture handles early stdin closure deterministically", async () => {
+  const child = await spawnFileCaptured(
+    process.execPath,
+    ["--eval", "process.exit(0)"],
+    {
+      cwd: process.cwd(),
+      input: "x".repeat(16 * 1024 * 1024),
+      timeoutMs: 5_000,
+    },
+  );
+
+  assert.equal(child.code, 0, child.stderr);
+  assert.equal(child.timedOut, false);
 });
