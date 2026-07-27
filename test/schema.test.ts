@@ -246,6 +246,14 @@ test("durable runtime schema accepts only its documented nested allowlist", asyn
       },
     },
     {
+      label: "attempt.prototypeNamedProperty",
+      target: attemptSchema,
+      value: {
+        ...validAttempt,
+        toString: "must not inherit schema properties",
+      },
+    },
+    {
       label: "summary.arbitrary",
       target: runtimeSchema,
       value: {
