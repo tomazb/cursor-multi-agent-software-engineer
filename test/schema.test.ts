@@ -83,6 +83,15 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
   }
 }
 
+test("schema assertion rejects fractional values for integer fields", () => {
+  const integerSchema = { type: "integer" };
+
+  assert.throws(
+    () => assertMatches(integerSchema, integerSchema, 1.5, "integer"),
+    /integer/,
+  );
+});
+
 test("DEFAULT_CONFIG satisfies config JSON schema required shape", async () => {
   const schema = JSON.parse(
     await readFile(path.join(process.cwd(), "schemas/config.schema.json"), "utf8"),

@@ -15,6 +15,7 @@ import type {
   RuntimeRequest,
   RuntimeResult,
 } from "../src/domain.ts";
+import { sanitizeDurableRuntimeFailureSummary } from "../src/failure-diagnostics.ts";
 import { Orchestrator } from "../src/orchestrator.ts";
 import {
   FAILURE_AGGREGATE_MAX_CODE_POINTS,
@@ -62,6 +63,28 @@ function runtimeSummary(run: unknown): ExpectedDurableRuntimeSummary | undefined
     }
   ).failure?.runtime;
 }
+
+test("durable runtime metadata bounds inspection of malformed attempt arrays", () => {
+  const attempts = Array.from({ length: 100 }, () => null);
+  Object.defineProperty(attempts, 8, {
+    get() {
+      throw new Error("attempt sanitizer scanned beyond its durable bound");
+    },
+  });
+
+  const summary = sanitizeDurableRuntimeFailureSummary({
+    attempts,
+    totalAttempts: 100,
+    aggregateTruncated: false,
+  });
+
+  assert.deepEqual(summary, {
+    attempts: [],
+    totalAttempts: 100,
+    omittedAttempts: 100,
+    aggregateTruncated: false,
+  });
+});
 
 function issue19Config(rejectModelFallback = false): MasweConfig {
   const config = structuredClone(DEFAULT_CONFIG);
