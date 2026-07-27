@@ -106,12 +106,18 @@ characters before per-attempt formatting, persistence, and human rendering.
 
 ### Defense in depth
 
-The Cursor CLI adapter emits no raw stderr-derived string: output, typed diagnostic, and metadata are safe and
-bounded. The orchestrator sanitizes runtime failures and caught exceptions before aggregation. `failRun()`
-sanitizes once more before assigning `run.failure` or applying `FAIL`. The file store applies a focused
-persistence safeguard to failure messages and reconstructs the optional runtime attempt subset in
-`run.failure`, `FAIL` details, and retry `previousFailure` so an unsafe adapter or future caller
-cannot trivially persist a recognizable secret or arbitrary runtime object.
+The Cursor CLI adapter emits no raw stderr-derived string: output, typed diagnostic, and metadata
+are safe and bounded. It sanitizes stderr before trimming or summary interpolation. The
+orchestrator sanitizes runtime failures and caught exceptions before aggregation. `failRun()`
+sanitizes once more before assigning `run.failure` or applying `FAIL`. The file store applies a
+focused persistence safeguard to failure messages and reconstructs the optional runtime attempt
+subset in `run.failure`, `FAIL` details, and retry `previousFailure`; event paths exclude raw runtime
+before cloning other details. An unsafe adapter or future caller therefore cannot trivially persist
+a recognizable secret, arbitrary runtime object, or attacker-sized attempt array.
+
+Schema version 1 keeps the historical `failure.message` field unconstrained for compatibility with
+records written before bounded diagnostics. Migration sanitizes that field before use; all newly
+persisted records remain bounded by implementation policy.
 
 The safeguard is deliberately failure-specific. Successful model artifacts continue through
 `writeArtifact()` and its existing `redactSecrets()` contract. Exit-zero Cursor structured-output failures

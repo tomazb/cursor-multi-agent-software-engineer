@@ -245,6 +245,10 @@ function safeDiagnosticText(input: string): string {
   return sanitizeDiagnostic(input).text;
 }
 
+function boundedTrimmedDiagnosticText(input: string): string {
+  return sanitizeDiagnostic(input).text.trim();
+}
+
 function cursorFailureResult(options: {
   code: RuntimeFailureCode;
   message: string;
@@ -414,7 +418,7 @@ export class CursorCliRuntime implements AgentRuntime {
       const summary = result.timedOut
         ? `Cursor CLI timed out after ${result.durationMs}ms (exit ${result.exitCode}).`
         : `Cursor CLI exited non-zero with code ${result.exitCode}.`;
-      const diagnostic = result.stderr.trim();
+      const diagnostic = boundedTrimmedDiagnosticText(result.stderr);
       return cursorFailureResult({
         code,
         message: diagnostic ? `${summary} Diagnostic: ${diagnostic}` : summary,
@@ -464,17 +468,18 @@ export class CursorCliRuntime implements AgentRuntime {
         ),
       );
     }
+    const modelsDiagnostic = boundedTrimmedDiagnosticText(models.stderr);
     if (models.timedOut) {
       throw new Error(
         safeDiagnosticText(
-          `Model catalogue discovery timed out via '${this.config.runtime.command} models' after ${this.config.policy.commandTimeoutMs}ms${models.stderr.trim() ? `. Diagnostic: ${models.stderr.trim()}` : ""}`,
+          `Model catalogue discovery timed out via '${this.config.runtime.command} models' after ${this.config.policy.commandTimeoutMs}ms${modelsDiagnostic ? `. Diagnostic: ${modelsDiagnostic}` : ""}`,
         ),
       );
     }
     if (models.exitCode !== 0) {
       throw new Error(
         safeDiagnosticText(
-          `Failed to list models via '${this.config.runtime.command} models' (exit ${models.exitCode})${models.stderr.trim() ? `: ${models.stderr.trim()}` : "."}`,
+          `Failed to list models via '${this.config.runtime.command} models' (exit ${models.exitCode})${modelsDiagnostic ? `: ${modelsDiagnostic}` : "."}`,
         ),
       );
     }
@@ -513,7 +518,9 @@ export class CursorCliRuntime implements AgentRuntime {
         timeoutMs: this.config.policy.commandTimeoutMs,
       });
       const cliOk = version.exitCode === 0;
-      const versionText = version.stdout.trim() || version.stderr.trim();
+      const versionStdout = boundedTrimmedDiagnosticText(version.stdout);
+      const versionStderr = boundedTrimmedDiagnosticText(version.stderr);
+      const versionText = versionStdout || versionStderr;
       checks.push({
         name: "cursor-cli",
         ok: cliOk,
@@ -522,7 +529,7 @@ export class CursorCliRuntime implements AgentRuntime {
               `${this.config.runtime.command} is available${versionText ? `: ${versionText}` : "."}`,
             )
           : safeDiagnosticText(
-              `${this.config.runtime.command} returned exit code ${version.exitCode}${version.stderr.trim() ? `: ${version.stderr.trim()}` : "."}`,
+              `${this.config.runtime.command} returned exit code ${version.exitCode}${versionStderr ? `: ${versionStderr}` : "."}`,
             ),
       });
       checks.push({

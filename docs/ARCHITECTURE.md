@@ -364,7 +364,8 @@ and omitted attempt counts remain explicit. `FAIL.details.runtime` and retry
 `previousFailure.runtime` use the same bounded representation. Successful assistant artifacts
 retain the separate artifact-redaction contract. Persistence sanitization inspects no more than the
 first eight raw attempt slots, so malformed records cannot turn the eight-entry output limit into
-an unbounded scan.
+an unbounded scan. Event sanitization excludes raw runtime objects before cloning the remaining
+details, then attaches the reconstructed subset.
 
 `sanitizeDiagnostic()` bounds work before pattern application. It collects at most the output
 budget plus 4,096 Unicode code points of lookahead and never more than 12,288, normalizing controls
@@ -376,6 +377,9 @@ incomplete supported URI authorities fail-safely. The monotonic fixed-token-pref
 redacts a candidate that reaches an incomplete accepted-window end, preventing a recognizable
 token prefix from surviving final truncation. Quoted assignment scanning honors odd/even
 backslash escaping before delimiters and recognizes one JSON-encoded structural-quote layer.
+
+Cursor CLI adapters apply this bounded sanitizer directly to stderr before trimming or interpolating
+it into runtime, catalogue, or doctor summaries.
 
 ## 11. Trust boundaries
 

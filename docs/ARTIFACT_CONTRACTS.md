@@ -108,6 +108,8 @@ the same safeguard. `FAIL.details.runtime` and
 `RETRY_FROM_FAILED.details.previousFailure.runtime` use the same bounded durable subset. Loading an
 older record with no runtime object preserves the old shape; loading a record with the optional
 object reconstructs and sanitizes only the documented fields before status/inspection rendering.
+The existing schema-version-1 `failure.message` field keeps its historical unconstrained schema
+shape; migration and every new write enforce the current 8,192-code-point runtime policy.
 
 Cursor CLI runtime error results are not artifacts. Raw stderr, raw error metadata, and stderr
 digests are never part of the run or artifact contract. Safe runtime diagnostics expose a stable
@@ -279,7 +281,9 @@ Runtime fields are optional because not every adapter exposes them.
 
 For `FAIL`, details may also include the durable failure `code`, bounded safe `reason`, and optional
 bounded `runtime` summary. For `RETRY_FROM_FAILED`, `previousFailure` is the already-safe failure
-record and its message/runtime subset is re-sanitized at the store boundary.
+record and its message/runtime subset is re-sanitized at the store boundary. For both events, the
+raw runtime object is excluded before other detail fields are cloned; its bounded allowlisted
+replacement is attached afterward.
 
 ## Future schema hardening
 

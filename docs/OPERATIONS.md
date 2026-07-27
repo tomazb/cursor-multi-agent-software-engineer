@@ -290,6 +290,9 @@ Inspect:
 - Loading or migrating runtime metadata inspects only the first eight raw attempt slots. Invalid
   entries are dropped; the sanitizer does not scan an attacker-sized malformed array looking for
   later valid entries.
+- Historical schema-version-1 `failure.message` values may exceed the current 8,192-code-point
+  persistence policy. Loading migrates them through the sanitizer; the v1 JSON Schema deliberately
+  does not retroactively reject that formerly valid field.
 - Human `maswe status` prints the attempt count and structured operational fields. `--json` emits
   the same durable object. Model display values are single-line and delimiter-neutral; they do not
   change the exact model value used for execution.

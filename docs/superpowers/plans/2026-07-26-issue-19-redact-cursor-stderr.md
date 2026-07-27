@@ -120,7 +120,8 @@ The escaped structural-JSON and long-PEM review regressions brought the latest l
 342 passing, five opt-in skips, and zero failures. The final bounded durable-array inspection and integer
 schema-helper regressions brought the current total to 349 tests, 344 passing, five opt-in skips, and zero
 failures. The final fixed-prefix inspection-window regression brought the exact local total to 350 tests,
-345 passing, five opt-in skips, and zero failures without requiring a production-code change.
+345 passing, five opt-in skips, and zero failures. Delayed clone-order, stderr-order, and historical-schema
+regressions brought the current total to 354 tests, 349 passing, five opt-in skips, and zero failures.
 
 ---
 

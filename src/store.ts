@@ -100,6 +100,17 @@ function sanitizePersistedFailureMessage(message: string): string {
   ).text;
 }
 
+function cloneRecordWithout(
+  source: Record<string, unknown>,
+  omittedKey: string,
+): Record<string, unknown> {
+  const cloneable: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (key !== omittedKey) cloneable[key] = value;
+  }
+  return structuredClone(cloneable);
+}
+
 function sanitizeEventDetails(
   type: WorkflowEventType,
   details: Record<string, unknown> | undefined,
@@ -109,7 +120,7 @@ function sanitizeEventDetails(
     type === "FAIL" &&
     (typeof details.reason === "string" || "runtime" in details)
   ) {
-    const safe = structuredClone(details);
+    const safe = cloneRecordWithout(details, "runtime");
     if (typeof details.reason === "string") {
       safe.reason = sanitizePersistedFailureMessage(details.reason);
     }
@@ -124,19 +135,24 @@ function sanitizeEventDetails(
   if (
     type === "RETRY_FROM_FAILED" &&
     previousFailure &&
-    typeof previousFailure === "object" &&
-    typeof (previousFailure as Record<string, unknown>).message === "string"
+    typeof previousFailure === "object"
   ) {
-    const message = (previousFailure as Record<string, unknown>)
-      .message as string;
-    const safe = structuredClone(details);
-    const previous = safe.previousFailure as Record<string, unknown>;
-    previous.message = sanitizePersistedFailureMessage(message);
-    if ("runtime" in previous) {
-      const runtime = sanitizeDurableRuntimeFailureSummary(previous.runtime);
+    const rawPrevious = previousFailure as Record<string, unknown>;
+    const safe = cloneRecordWithout(details, "previousFailure");
+    const previous = cloneRecordWithout(rawPrevious, "runtime");
+    if (typeof rawPrevious.message === "string") {
+      previous.message = sanitizePersistedFailureMessage(
+        rawPrevious.message,
+      );
+    }
+    if ("runtime" in rawPrevious) {
+      const runtime = sanitizeDurableRuntimeFailureSummary(
+        rawPrevious.runtime,
+      );
       if (runtime) previous.runtime = runtime;
       else delete previous.runtime;
     }
+    safe.previousFailure = previous;
     return safe;
   }
   return details;

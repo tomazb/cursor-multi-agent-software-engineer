@@ -133,7 +133,8 @@ the digest fingerprint.
 - The orchestrator and file store re-sanitize failure messages, `FAIL.details.reason`, and retry
   `previousFailure.message` before persistence. They also reconstruct the allowlisted durable
   runtime-attempt subset rather than serializing arbitrary adapter metadata. CLI status rendering
-  applies the same focused safeguard.
+  applies the same focused safeguard. `FAIL` and retry event paths remove the raw runtime object
+  before cloning other details, then sanitize only the first eight runtime attempt slots.
 - Durable runtime failure state stores at most eight attempts. Attempt messages are capped at 512
   Unicode code points and model display fields at 256. Total and omitted attempt counts, aggregate
   truncation, stable code, exit/timeout/duration/transport fields, stderr presence, and truncation
@@ -145,6 +146,8 @@ the digest fingerprint.
   delimiters before formatting or persistence.
 - MASWE has no raw provider-debug artifact or log channel. It does not persist an encrypted copy or
   any digest or hash of raw stderr.
+- Cursor CLI failure adapters sanitize the bounded stderr window before trimming or composing
+  summaries; catalogue and doctor diagnostics use the same ordering.
 - Documentation instructs teams not to commit run artifacts by default.
 
 **Gaps and future work:**

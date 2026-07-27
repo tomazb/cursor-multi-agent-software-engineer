@@ -69,7 +69,10 @@ The project follows semantic versioning once a public release process is establi
   boundary, and Unicode line/paragraph and bidi framing controls are neutralized.
 - Runtime fallback metadata now survives into `run.failure.runtime`, applicable `FAIL` details,
   retry history, superseded runs, and human/JSON status output. Durable attempt messages are capped
-  at 512 code points, model display fields at 256, and arbitrary adapter metadata remains excluded.
+  at 512 code points, model display fields at 256, raw runtime arrays are sanitized before event
+  detail cloning, and arbitrary adapter metadata remains excluded.
+- Cursor stderr is bounded and redacted before trimming or summary interpolation. Historical
+  schema-version-1 failure messages remain schema-compatible and are bounded during migration.
 
 ### Planned
 

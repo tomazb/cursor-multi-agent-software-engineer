@@ -94,7 +94,7 @@
         "code": {
           "enum": ["runtime-models-exhausted", "workflow-failure"]
         },
-        "message": { "type": "string", "maxLength": 8192 },
+        "message": { "type": "string" },
         "at": { "type": "string" },
         "resumeState": { "type": "string" },
         "runtime": { "$ref": "#/$defs/durableRuntimeFailureSummary" }
