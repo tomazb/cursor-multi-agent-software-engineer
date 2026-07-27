@@ -221,7 +221,7 @@ constrained-heap test input. Neither historical `FAIL` is approval for a correct
   version, installs with the existing safe flags, runs `npm run check`, and runs `npm run pack:dry`.
 - [x] Document display-only successful identities, unchanged execution semantics, nested schema
   closure, exact-version CI, constrained-heap scope, and both historical verifier failures.
-- [ ] Commit CI and documentation without claiming readiness.
+- [x] Commit CI and documentation without claiming readiness.
 
 ### Task 16: Exact local validation, publication, and revalidation handoff
 
