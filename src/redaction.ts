@@ -30,33 +30,8 @@ const PRIVATE_KEY_BEGIN =
   /-----BEGIN [A-Z ]{0,64}PRIVATE KEY-----/g;
 const SENSITIVE_ASSIGNMENT_KEY =
   /(?:^|[_-])(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret|token|signature|sig|aws[_-]?secret[_-]?access[_-]?key)$/i;
-const FIXED_PREFIX_TOKENS = [
-  {
-    prefix: "github_pat_",
-    minimumValueLength: 20,
-    allows: isAsciiWordCharacter,
-  },
-  ...["ghp_", "gho_", "ghu_", "ghs_", "ghr_"].map((prefix) => ({
-    prefix,
-    minimumValueLength: 20,
-    allows: isAsciiWordCharacter,
-  })),
-  {
-    prefix: "sk-proj-",
-    minimumValueLength: 20,
-    allows: isApiTokenCharacter,
-  },
-  {
-    prefix: "sk-",
-    minimumValueLength: 20,
-    allows: isApiTokenCharacter,
-  },
-  ...["xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-"].map((prefix) => ({
-    prefix,
-    minimumValueLength: 10,
-    allows: isSlackTokenCharacter,
-  })),
-] as const;
+const FIXED_TOKEN_PREFIX =
+  /\b(?:github_pat_|gh[pousr]_|sk-(?:proj-)?|xox[baprs]-)/g;
 
 export interface SanitizedDiagnostic {
   text: string;
@@ -87,48 +62,41 @@ function redactFixedPrefixTokens(
   input: string,
   incompleteWindow: boolean,
 ): string {
-  const output: string[] = [];
+  let output = "";
   let cursor = 0;
-  let index = 0;
+  FIXED_TOKEN_PREFIX.lastIndex = 0;
 
-  while (index < input.length) {
-    if (index > 0 && isAsciiWordCharacter(input[index - 1]!)) {
-      index += 1;
-      continue;
-    }
-
-    const token = FIXED_PREFIX_TOKENS.find(({ prefix }) =>
-      input.startsWith(prefix, index)
-    );
-    if (!token) {
-      index += 1;
-      continue;
-    }
-
-    const valueStart = index + token.prefix.length;
+  for (const match of input.matchAll(FIXED_TOKEN_PREFIX)) {
+    const prefixStart = match.index;
+    if (prefixStart < cursor) continue;
+    const prefix = match[0];
+    const valueStart = prefixStart + prefix.length;
     let valueEnd = valueStart;
-    while (valueEnd < input.length && token.allows(input[valueEnd]!)) {
+    const allows = prefix.startsWith("gh")
+      ? isAsciiWordCharacter
+      : prefix.startsWith("xox")
+        ? isSlackTokenCharacter
+        : isApiTokenCharacter;
+    while (valueEnd < input.length && allows(input[valueEnd]!)) {
       valueEnd += 1;
     }
     const acceptedLength = valueEnd - valueStart;
+    const minimumValueLength = prefix.startsWith("xox") ? 10 : 20;
     const crossesInspectionBoundary =
       incompleteWindow && valueEnd === input.length;
     if (
-      acceptedLength < token.minimumValueLength &&
+      acceptedLength < minimumValueLength &&
       !crossesInspectionBoundary
     ) {
-      index += 1;
       continue;
     }
 
-    output.push(input.slice(cursor, index), "[REDACTED]");
+    output += input.slice(cursor, prefixStart);
+    output += "[REDACTED]";
     cursor = valueEnd;
-    index = valueEnd;
   }
 
-  if (output.length === 0) return input;
-  output.push(input.slice(cursor));
-  return output.join("");
+  return cursor === 0 ? input : `${output}${input.slice(cursor)}`;
 }
 
 function redactUriUserinfo(
