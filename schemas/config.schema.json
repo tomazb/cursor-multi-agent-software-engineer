@@ -69,6 +69,7 @@
         "promptTransport",
         "commandTimeoutMs",
         "roleTimeoutMs",
+        "doctorProbeTimeoutMs",
         "allowedPathGlobs"
       ],
       "properties": {

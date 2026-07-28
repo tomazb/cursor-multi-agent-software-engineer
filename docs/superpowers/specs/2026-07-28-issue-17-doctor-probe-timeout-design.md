@@ -2,16 +2,15 @@
 
 ## Status
 
-- **Design gate:** `DESIGN_APPROVED_FOR_IMPLEMENTATION_PLANNING`
-- **Owner approval of this design occurred before implementation-plan preparation.**
-  Implementation remained (and remains) **blocked** pending explicit owner approval of the
-  companion implementation plan
-  (`docs/superpowers/plans/2026-07-28-issue-17-doctor-probe-timeout.md`,
-  status `IMPLEMENTATION_PLAN_REVISED_READY_FOR_APPROVAL`). This document authorizes
-  implementation-plan preparation only; it does **not** authorize implementation.
-- This document is a design/specification only. No production code, tests, CI, or schema files
-  have been modified. The corrected commit that carries this revision is a documentation-only
-  plan-review commit.
+- **Historical design gate:** `DESIGN_APPROVED_FOR_IMPLEMENTATION_PLANNING`.
+- **Owner approval of this design occurred before implementation-plan preparation.** At that
+  design-time gate, implementation was blocked pending approval of the companion implementation
+  plan. Implementation and exact-head review correction subsequently occurred, as recorded in
+  `docs/superpowers/plans/2026-07-28-issue-17-doctor-probe-timeout.md`.
+- This document remains the design/specification artifact. The implemented draft PR now includes
+  the runtime/config/schema changes, `src/cli.ts` JSON behavior, and deterministic runtime/CLI
+  tests described below. Its current status is executed with exact-head draft-repair
+  revalidation in progress; merge remains unauthorized.
 - **Correction-pass revision (this pass):** A plan-review correction pass removed the residual
   semantic conflations that survived the earlier semantic-precision pass. Specifically: (a) a
   `model-{role}` check that did not execute because catalogue discovery failed is no longer
@@ -80,7 +79,7 @@
   - `test/rc-review-corrections.test.ts` — cleanup failure, exact-model probe selection
   - `test/ready-review-corrections.test.ts` — git-repository probe timeout propagation
 - **Validation commands run:**
-  ```
+  ```bash
   git rev-parse HEAD
   # → 277e14483c1d2ad280d67ee3262f3e8ef575e338
   git merge-base --is-ancestor 277e14483c1d2ad280d67ee3262f3e8ef575e338 HEAD
@@ -404,7 +403,7 @@ expires.
 | Bound | Value | Rationale |
 |---|---|---|
 | Minimum | 1 000 ms | Prevents trivially short budgets that would always time out |
-| Maximum | 300 000 ms (5 minutes) | Keeps the prompt-probe process deadline finite; the complete doctor command remains unbounded because probe-worktree creation and cleanup have no independent deadlines. |
+| Maximum | 300 000 ms (5 minutes) | Keeps the prompt-probe invocation deadline and promise settlement finite; descendant lifetime is not guaranteed, and the complete doctor command remains unbounded because probe-worktree creation and cleanup have no independent deadlines. |
 | Default | 60 000 ms | 4× margin over the 14-second upper bound observed in issue evidence |
 
 `assertConfig()` applies these as **hard validation constraints**. The following all constitute
@@ -470,18 +469,20 @@ consistent with the behavior of `commandTimeoutMs` and `roleTimeoutMs`.
 
 **TypeScript type:** `MasweConfig.policy.doctorProbeTimeoutMs` must be declared as `number`
 (non-optional) in `src/domain.ts`, because after `migrateConfig()` the field is always present.
-The field is optional in the JSON schema (`policy.required` does not include it) because users
-are not required to specify it in their config files.
+The normalized-config JSON schema also lists the field in `policy.required`, matching
+`assertConfig()`. User-authored partial policy objects receive the default during config merge
+before normalized validation.
 
 ### Deadline coverage
 
-The probe timeout is the wall-clock budget for the probe **process**; whatever the Cursor CLI
-does inside that window (any authentication handshake, any internal catalogue re-check, prompt
-transport of `maswe-stdin-probe`, model response round trip, and reading text output) all shares
-the single budget. Issue #17's probe does **not** parse or validate that output — it reads text
-and inspects only the exit code and timeout state. The budget therefore bounds the elapsed time
-of the invocation; it does **not** imply the probe verifies any of those internal steps
-succeeded (see "Misleading readiness risk").
+The probe timeout is the wall-clock deadline supplied to the probe invocation; whatever the
+Cursor CLI does before that deadline (any authentication handshake, any internal catalogue
+re-check, prompt transport of `maswe-stdin-probe`, model response round trip, and reading text
+output) shares the single budget. Deadline handling plus the settlement grace bounds promise
+settlement, but process-tree termination is best-effort and unobservable, so descendant lifetime
+is not strictly bounded. Issue #17's probe does **not** parse or validate the output — it reads
+text and inspects only the exit code and timeout state. The deadline therefore does **not** imply
+the probe verifies any of those internal steps succeeded (see "Misleading readiness risk").
 
 The probe timeout does **not** cover:
 - Worktree or branch creation (`resolveDoctorProbeCwd()`) — these use existing git operations
@@ -1088,7 +1089,7 @@ When the probe times out and cleanup also fails, both failures are preserved:
 
 The three distinct failure classes — the **primary probe failure** (`"probe-transport-timeout"`
 or `"probe-invocation-failure"`), a **process-termination failure** (reserved; not emitted by
-#17), and a **cleanup failure** (`"cleanup-failure"`) — must never overwrite one another. Each is
+Issue #17), and a **cleanup failure** (`"cleanup-failure"`) — must never overwrite one another. Each is
 a separate check with its own code. Issue #17 emits the primary probe failure and the cleanup
 failure independently; the termination failure remains reserved until the process-lifecycle
 follow-up makes it observable, at which point it must be added as a further independent check.
@@ -1209,7 +1210,7 @@ that explicitly verify message quality.**
 | `doctorProbeTimeoutMs: NaN` | `assertConfig` throws |
 | `doctorProbeTimeoutMs: Infinity` | `assertConfig` throws |
 | `doctorProbeTimeoutMs: 1.5` | `assertConfig` throws (non-integer) |
-| `doctorProbeTimeoutMs: "60000"` | Loaded via `migrateConfig` from JSON → schema or type rejection |
+| `doctorProbeTimeoutMs: "60000"` | Loaded via `migrateConfig` from JSON, then rejected by `assertConfig()` (or rejected by schema validation) |
 | `doctorProbeTimeoutMs: 1_000` | `assertConfig` passes (minimum accepted) |
 | `doctorProbeTimeoutMs: 300_000` | `assertConfig` passes (maximum accepted) |
 
@@ -1492,9 +1493,10 @@ Add to the `maswe doctor` section:
   `name`, `ok`, `message`, `code`, and optional `prerequisite`) with the exit status derived
   from `report.ok` in both human and JSON modes. Note that `--json` output is an in-process
   serialization with no persistence/schema guarantee.
-- State precisely what a passing probe proves (command started, stdin accepted, exited zero
-  within the timeout) and what it does not (auth classification, non-empty/valid output,
-  structured decoding, marker validity, descendant termination).
+- State precisely what a passing probe proves (command started with the configured stdin payload
+  wired to it and exited zero within the timeout) and what it does not (payload read or semantic
+  acceptance, auth classification, non-empty/valid output, structured decoding, marker validity,
+  descendant termination).
 - Note that process-tree termination on timeout is best-effort and not observable; a leaked
   descendant cannot be detected or reported by the current process abstraction.
 
@@ -1529,7 +1531,7 @@ process. The deadline applies **only to the prompt-transport invocation**. The *
 `maswe doctor` command duration remains unbounded**, because worktree creation
 (`resolveDoctorProbeCwd()`) and cleanup git operations
 (`cleanupDoctorProbeResources()` in the `finally` block) have no independent deadline. Issue
-#17 does not make `maswe doctor` globally bounded; bounding total doctor duration is deferred to
+Issue #17 does not make `maswe doctor` globally bounded; bounding total doctor duration is deferred to
 the cleanup-timeout follow-up.
 
 ### Orphaned-process risk
@@ -1702,8 +1704,9 @@ Criteria marked with `[NEW]` are additions or replacements from the original dra
     `git status --porcelain=v1` clean-tree assertion is mechanically achievable.
 35. **AC35 [NEW]:** Process-tree termination is documented as best-effort and **not** observable;
     the design and docs do not claim guaranteed termination. Probe-success semantics are not
-    overstated: a passing probe proves only that the command started, stdin was accepted, and the
-    process exited zero within the timeout.
+    overstated: a passing probe proves only that the command started with the configured stdin
+    payload wired to it and exited zero within the timeout; it does not prove the child read or
+    semantically accepted that payload.
 
 ---
 
@@ -1809,7 +1812,7 @@ command does not have a strict upper bound on its wall-clock duration. CI pipeli
 ### Validation gates
 
 - `npm run check` must pass after each step.
-- Tests added in step 6 must pass before the implementation is considered complete.
+- Tests added in step 7 must pass before the implementation is considered complete.
 - No existing tests may be weakened or deleted.
 - Authenticated validation is performed separately and recorded in the Issue #17 comment thread.
 

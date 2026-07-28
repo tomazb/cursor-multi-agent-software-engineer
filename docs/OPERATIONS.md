@@ -56,11 +56,11 @@ maswe doctor --json
 
 Doctor timeout policy is explicit and fail-closed:
 
-- `policy.doctorProbeTimeoutMs` controls only the stdin prompt-transport probe process timeout.
+- `policy.doctorProbeTimeoutMs` controls only the stdin prompt-transport invocation deadline.
 - Default: `60_000`; hard bounds: integer `1_000..300_000`.
 - Invalid explicit values fail at config validation (no clamping).
 - The probe timeout is independent of `commandTimeoutMs` and `roleTimeoutMs`.
-- Only the probe process is bounded. Full `maswe doctor` duration is still unbounded because probe worktree create/cleanup git operations have no timeout.
+- Only the probe invocation deadline and promise settlement are bounded. Process-tree termination is best-effort and unobservable, so descendant lifetimes are not strictly bounded. Full `maswe doctor` duration is also unbounded because probe worktree create/cleanup git operations have no timeout.
 
 MASWE stores local lock history under
 `.maswe/runs/<run-id>/.lock-journal-v3/`. The `data`, `admin`, and
@@ -155,7 +155,7 @@ Emitted doctor codes:
 
 Reserved but non-emitted in this release: `auth-failure`, `process-termination-failure`, `probe-malformed-output`, `probe-invalid-terminal-marker`.
 
-Probe success semantics are intentionally narrow: a passing stdin probe means the command started, accepted stdin, and exited zero inside `doctorProbeTimeoutMs`. It does not independently prove auth classification, output-shape validity, terminal-marker validity, or descendant termination. Process-tree termination remains best-effort and not observable.
+Probe success semantics are intentionally narrow: a passing stdin probe means the command started with the configured stdin payload wired to it and exited zero inside `doctorProbeTimeoutMs`. It does not independently prove that the child read or semantically accepted the payload, auth classification, output-shape validity, terminal-marker validity, or descendant termination. Process-tree termination remains best-effort and not observable.
 
 Cursor CLI assistant extraction and terminal markers:
 

@@ -372,9 +372,9 @@ throw from `resolveProjectModels()` is caught as a catalogue-discovery failure. 
 - Typed code semantics and emitted vs reserved distinction.
 - Skipped prerequisite behavior and `prerequisite` values (`cursor-cli`, `model-catalogue`, `model-brainstormer`).
 - `maswe doctor --json` surface: emits full `RuntimeDoctorResult`; exit from `report.ok` in both modes; no persistence/schema claim.
-- Corrected probe-success semantics: a passing probe proves only that the command started, stdin was accepted, and the process exited zero within the timeout — not auth classification, output validity, structured decoding, marker validity, or descendant termination.
+- Corrected probe-success semantics: a passing probe proves only that the command started with the configured stdin payload wired to it and exited zero within the timeout — not that the payload was read or semantically accepted, nor auth classification, output validity, structured decoding, marker validity, or descendant termination.
 - Process-tree termination is best-effort and not observable.
-- Explicit statement: only the prompt process is bounded (≤300s); the complete `maswe doctor` duration remains unbounded because worktree create/cleanup git operations have no deadline; cleanup timeout hardening remains follow-up.
+- Explicit statement: only the prompt invocation deadline and promise settlement are bounded (≤300s); descendant lifetime remains best-effort and unobservable, and the complete `maswe doctor` duration remains unbounded because worktree create/cleanup git operations have no deadline; cleanup timeout hardening remains follow-up.
 - Authenticated validation procedure (separate from deterministic tests) uses `maswe doctor --json` to record codes; evidence expectations documented.
 
 **Steps:**
@@ -452,6 +452,9 @@ iteration counts):
 
 **Files:** no committed code changes required; evidence captured in PR/issue comments.
 
+The checklist below is intentionally left pending until it is republished for the final pushed
+head; earlier authenticated runs are historical evidence and are not reused after a head change.
+
 **Required recorded fields:**
 - [ ] Implementation commit SHA (`git rev-parse HEAD`).
 - [ ] Cursor CLI version (`agent --version`).
@@ -475,10 +478,13 @@ iteration counts):
 
 **Files:** branch/PR metadata + review evidence; no unrelated source edits.
 
+Completed branch/PR setup steps are checked below. Exact-head CI, review, revalidation, and final
+handoff items remain intentionally pending until the last correction commit is pushed.
+
 **Steps:**
-- [ ] Create focused commits matching task boundaries and preserving test-first history.
-- [ ] Publish branch `issue/17-doctor-probe-timeout`.
-- [ ] Open draft PR referencing Issue #17 and approved design document.
+- [x] Create focused commits matching task boundaries and preserving test-first history.
+- [x] Publish branch `issue/17-doctor-probe-timeout`.
+- [x] Open draft PR referencing Issue #17 and approved design document.
 - [ ] Ensure CI runs against exact PR head SHA (no stale-run acceptance).
 - [ ] Request and address reviews from CodeRabbit, Copilot, Codex, and independent verifier per repository policy.
 - [ ] Re-run deterministic validation after every head-changing commit.
@@ -652,7 +658,13 @@ review correction that began from exact failed-review head
 - [x] Exact Node `22.22.2` / npm `10.9.7` parity validation passes on the final local
   correction tree.
 - [x] Package dry-run and temporary tarball inspection pass with no retained artifact.
-- [ ] Corrected commits are pushed normally and the new exact head is recorded.
+- [x] Correction commits through `b7d01b1` were pushed normally and that exact head was recorded;
+  subsequent final-head publication evidence belongs in the PR body because it cannot be
+  self-recorded inside its own commit.
+
+The remaining amendment items are intentionally pending final-head external validation and
+publication.
+
 - [ ] Authenticated validation is rerun against the corrected exact pushed head.
 - [ ] Copilot and CodeRabbit reach terminal exact-head dispositions; both original threads are
   replied to and resolved.
@@ -767,12 +779,12 @@ commits and current focused evidence without replacing original implementation h
 | AC2 | `4daf78c`, `766d5e0`; compile-time equality and runtime vocabulary regression pass for exact `DoctorCheckPrerequisite`. |
 | AC3 | `4daf78c`; persisted invalid-value regression passes and existing config validation remains fail closed. |
 | AC4 | `4daf78c`; historical omission normalizes to exactly `60_000`. |
-| AC5 | Schema tests passed in the final current-runtime and Node `22.22.2` full suites. |
+| AC5 | Schema tests passed in the final current-runtime and Node `22.22.2` full suites; `a54f169` adds an exact regression requiring `doctorProbeTimeoutMs` in the normalized schema. |
 | AC6 | `4daf78c`, `766d5e0`; Node and real-command probes receive exact configured timeout values. |
 | AC7 | `766d5e0`; typecheck and focused CLI/SDK/runtime tests pass with typed prerequisite vocabulary. |
 | AC8 | `4daf78c`; exact code assertions cover every new branch fixture. |
 | AC9 | Existing independent cleanup regression plus strengthened worktree lifecycle test pass. |
-| AC10 | Existing operations contract remains synchronized; artifact/design prerequisite typing updated in `766d5e0`. |
+| AC10 | Existing operations contract remains synchronized; artifact/design prerequisite typing updated in `766d5e0`, with the later review correction synchronizing the Node stand-in and deadline semantics. |
 | AC11 | Existing timeout message regression passes in the focused suite. |
 | AC12 | Existing timed-out probe regression passes with `probe-transport-timeout`. |
 | AC13 | No global doctor deadline or wall-clock assertion was added. |
@@ -793,11 +805,11 @@ commits and current focused evidence without replacing original implementation h
 | AC28 | `4daf78c`; one invalid non-brainstormer role leaves catalogue/brainstormer/probe successful. |
 | AC29 | Existing per-role resolution implementation remains unchanged and its focused tests pass. |
 | AC30 | `4daf78c`; post-version worktree-resolution throw keeps one successful `cursor-cli`, adds one `doctor`, and reports cleanup. |
-| AC31 | Focused JSON CLI tests pass using deterministic file-backed child capture. |
+| AC31 | Focused JSON CLI tests pass using deterministic file-backed child capture; `a54f169` requires every successful mock-runtime check code to equal `"ok"`. |
 | AC32 | Focused human/JSON CLI exit semantics pass. |
 | AC33 | Ready-review 1/1, allocation 25/25, and owner-recovery 100/100 CI-only gates passed. |
 | AC34 | Dry-run and temporary 83-file tarball inspection passed; temporary package/cache directories were removed. |
-| AC35 | Node success assertion remains transport-only; no auth/output/termination overclaim was added. |
+| AC35 | `1f312ad` adds a failing regression that rejects the probe-acceptance overclaim; the follow-up message/docs correction limits success to payload wiring plus exit zero and preserves best-effort termination semantics. |
 | AC36 | Focused Cursor SDK doctor tests pass unchanged. |
 | AC37 | `4daf78c`, `766d5e0`; explicit counters cover 0/0/0/0/1 resource gating, and isolated integration proves create/remove. |
 | AC38 | `4daf78c`; EMFILE, plain `Error`, and non-`Error` rejection fixtures all pass. |
@@ -825,3 +837,16 @@ implementation and correction sequences while:
 Because this documentation correction changes the PR head, deterministic validation,
 authenticated validation, exact-head CI, Copilot, CodeRabbit, and independent-verifier gates
 must all be repeated against the resulting pushed SHA before draft-stage repair handoff.
+
+The subsequent full GitHub CodeRabbit review and independent-verifier sweep found additional
+contract mismatches not covered by the first local audit. Test-first commits `a54f169` and
+`1f312ad` expose normalized-schema requiredness, exact successful JSON codes, and the remaining
+probe-message overclaim. The corresponding follow-up synchronizes:
+
+- normalized schema requiredness with `assertConfig()`;
+- the Node transport-only exception in architecture documentation;
+- successful probe wording across runtime, operations, design, and plan;
+- invocation-deadline/promise-settlement wording without claiming bounded descendant lifetime;
+- historical versus current design/plan status;
+- remaining markdown and design dependency-order defects; and
+- completed versus intentionally pending handoff checkboxes.

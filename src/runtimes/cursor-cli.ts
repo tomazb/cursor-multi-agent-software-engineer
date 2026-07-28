@@ -693,7 +693,7 @@ export class CursorCliRuntime implements AgentRuntime {
             name: "prompt-transport-probe",
             ok: probeOk,
             message: probeOk
-              ? `Configured stdin prompt execution path accepted a probe payload in cwd ${probeCwd}${managedProbe ? " (managed worktree)" : ""}${resolvedExactBrainstormer ? ` using exact model ${resolvedExactBrainstormer}` : ""}.`
+              ? `Configured stdin prompt execution path started with a probe payload and exited zero in cwd ${probeCwd}${managedProbe ? " (managed worktree)" : ""}${resolvedExactBrainstormer ? ` using exact model ${resolvedExactBrainstormer}` : ""}.`
               : probe.timedOut
                 ? `stdin prompt probe timed out after ${this.config.policy.doctorProbeTimeoutMs}ms in cwd ${probeCwd} (exit ${probe.exitCode}).`
                 : `stdin prompt probe failed in cwd ${probeCwd} (exit ${probe.exitCode}).`,
