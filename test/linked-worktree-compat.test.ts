@@ -46,6 +46,7 @@ test("deep-migrates v0.1 config snapshots missing policy hardening fields", () =
   assert.equal(migrated.policy.promptTransport, "stdin");
   assert.equal(typeof migrated.policy.commandTimeoutMs, "number");
   assert.equal(typeof migrated.policy.roleTimeoutMs, "number");
+  assert.equal(migrated.policy.doctorProbeTimeoutMs, 60_000);
   assert.deepEqual(migrated.policy.allowedPathGlobs, ["**"]);
 
   const run = migrateRunRecord({
@@ -66,6 +67,7 @@ test("deep-migrates v0.1 config snapshots missing policy hardening fields", () =
   assert.equal(run.config.policy.useIsolatedWorktree, true);
   assert.equal(run.config.policy.trustManagedWorktrees, true);
   assert.equal(run.config.policy.promptTransport, "stdin");
+  assert.equal(run.config.policy.doctorProbeTimeoutMs, 60_000);
 });
 
 test("ensureMasweGitExclude works when MASWE runs from a linked worktree", async () => {

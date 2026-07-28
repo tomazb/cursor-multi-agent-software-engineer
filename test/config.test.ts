@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { loadConfig } from "../src/config.ts";
+import { loadConfig, mergeConfigForTest, migrateConfig } from "../src/config.ts";
 
 const MASWE_ENV_KEYS = [
   "MASWE_RUNTIME",
@@ -93,5 +93,32 @@ test("host MASWE_MODEL_* env does not leak into file-backed defaults merge", asy
     assert.equal(isolated.roles.builder.model, "custom-builder");
   } finally {
     restoreMasweEnv(env);
+  }
+});
+
+test("doctorProbeTimeoutMs defaults to 60000 when omitted", () => {
+  const migrated = migrateConfig({
+    policy: { commandTimeoutMs: 2_000 },
+  });
+  assert.equal(migrated.policy.doctorProbeTimeoutMs, 60_000);
+});
+
+test("doctorProbeTimeoutMs accepts explicit bounds and rejects invalid values", () => {
+  assert.equal(
+    mergeConfigForTest({ policy: { doctorProbeTimeoutMs: 1_000 } }).policy.doctorProbeTimeoutMs,
+    1_000,
+  );
+  assert.equal(
+    mergeConfigForTest({ policy: { doctorProbeTimeoutMs: 300_000 } }).policy.doctorProbeTimeoutMs,
+    300_000,
+  );
+
+  const invalid = [0, -1, 999, 300_001, Number.NaN, Number.POSITIVE_INFINITY, 1.5];
+  for (const value of invalid) {
+    assert.throws(
+      () => mergeConfigForTest({ policy: { doctorProbeTimeoutMs: value } }),
+      /doctorProbeTimeoutMs/i,
+      String(value),
+    );
   }
 });

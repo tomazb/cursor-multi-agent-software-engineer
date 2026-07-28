@@ -511,3 +511,38 @@ test("config schema accepts stream-json outputFormat and rejects unknown values"
   bad.runtime.outputFormat = "yaml";
   assert.throws(() => assertMatches(schema, schema, bad, "config.bad-format"), /enum/);
 });
+
+test("config schema validates doctorProbeTimeoutMs bounds and integer type", async () => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/config.schema.json"), "utf8"),
+  ) as JsonSchema;
+
+  const min = structuredClone(DEFAULT_CONFIG);
+  (min.policy as Record<string, unknown>).doctorProbeTimeoutMs = 1_000;
+  assert.doesNotThrow(() => assertMatches(schema, schema, min, "config.doctorProbeTimeoutMs.min"));
+
+  const max = structuredClone(DEFAULT_CONFIG);
+  (max.policy as Record<string, unknown>).doctorProbeTimeoutMs = 300_000;
+  assert.doesNotThrow(() => assertMatches(schema, schema, max, "config.doctorProbeTimeoutMs.max"));
+
+  const tooLow = structuredClone(DEFAULT_CONFIG);
+  (tooLow.policy as Record<string, unknown>).doctorProbeTimeoutMs = 999;
+  assert.throws(
+    () => assertMatches(schema, schema, tooLow, "config.doctorProbeTimeoutMs.low"),
+    /config\.doctorProbeTimeoutMs\.low/,
+  );
+
+  const tooHigh = structuredClone(DEFAULT_CONFIG);
+  (tooHigh.policy as Record<string, unknown>).doctorProbeTimeoutMs = 300_001;
+  assert.throws(
+    () => assertMatches(schema, schema, tooHigh, "config.doctorProbeTimeoutMs.high"),
+    /config\.doctorProbeTimeoutMs\.high/,
+  );
+
+  const fractional = structuredClone(DEFAULT_CONFIG) as unknown as Record<string, unknown>;
+  (fractional.policy as Record<string, unknown>).doctorProbeTimeoutMs = 1.5;
+  assert.throws(
+    () => assertMatches(schema, schema, fractional, "config.doctorProbeTimeoutMs.fractional"),
+    /integer/,
+  );
+});
