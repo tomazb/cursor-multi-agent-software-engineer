@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to execute this plan task-by-task. Do not skip failing-test-first order. Keep commits focused and reviewable.
 
-**Status:** `IMPLEMENTATION_PLAN_FINAL_READY_FOR_APPROVAL`
+**Status:** `IMPLEMENTATION_PLAN_EXACT_READY_FOR_APPROVAL`
 
 **Goal:** Implement the approved Issue #17 design so `maswe doctor` uses a bounded, validated, configurable probe timeout (`policy.doctorProbeTimeoutMs`) and emits deterministic typed doctor-check codes without expanding scope.
 
@@ -67,6 +67,7 @@
 **Files:**
 - Create: `test/issue17-doctor-probe-timeout.test.ts`
 - Create: `test/issue17-doctor-cli-json.test.ts`
+- Create: `test/issue17-cursor-sdk-doctor.test.ts`
 - Modify: `test/config.test.ts`
 - Modify: `test/schema.test.ts`
 - Modify: `test/linked-worktree-compat.test.ts`
@@ -130,7 +131,7 @@
 - [ ] Add schema property as optional raw field (not in `policy.required`) with integer min/max.
 - [ ] Update example config to include explicit default field for operator discoverability.
 - [ ] Ensure partial policy objects keep all defaults (including `doctorProbeTimeoutMs`) after migration.
-- [ ] Add test for a historical raw `RunRecord` whose `config.policy` omits `doctorProbeTimeoutMs`: exercise `migrateRunRecord()` or `FileRunStore.load()` and assert: record remains loadable; `run.config.policy.doctorProbeTimeoutMs === 60_000`; `assertConfig()` passes; env overrides not applied during persisted-record migration; explicitly stored valid value is preserved; explicitly stored invalid value fails closed. Map to AC5/AC4.
+- [ ] Add tests in `test/compat-doctor.test.ts` (extend existing historical run-record loading coverage) covering: omitted `doctorProbeTimeoutMs` → `60_000`; explicit valid value preserved; explicit invalid value rejected by `assertConfig()`; process environment does not override persisted configuration during migration. Exercises `migrateRunRecord()` in `src/store.ts` and `migrateConfig()`/`assertConfig()` in `src/config.ts`. Map to AC39.
 - [ ] Re-run focused config/schema tests and keep failures only in unimplemented downstream tasks.
 
 ---
@@ -141,9 +142,10 @@
 - Modify: `src/domain.ts` — add `DoctorCheckCode`; add required `code` and optional `prerequisite` to `RuntimeDoctorResult.checks`.
 - Modify: `src/runtimes/cursor-cli.ts` — every constructed check literal gains a `code` (classification refactor is Task 4).
 - Modify: `src/runtimes/mock.ts` — the `mock-runtime` check literal gains `code: "ok"`.
-- Modify: `src/runtimes/cursor-sdk.ts` — the `cursor-api-key` and `cursor-sdk` check literals gain `code`.
+- Modify: `src/runtimes/cursor-sdk.ts` — the `cursor-api-key` and `cursor-sdk` check literals gain `code`; add `importFn` injection seam (see exact interface below).
 - Modify: `src/cli.ts` — add the `doctor --json` branch (exact behavior below).
 - Create: `test/issue17-doctor-cli-json.test.ts` — CLI human + `--json` coverage (Task 3 renderer + Task 5/exit semantics).
+- Create: `test/issue17-cursor-sdk-doctor.test.ts` — deterministic `CursorSdkRuntime.doctor()` tests using `importFn` injection; no `@cursor/sdk` installation required.
 - Modify: `test/issue17-doctor-probe-timeout.test.ts` — typed-code assertions.
 
 **Files (inspect only — must NOT be modified merely because they reference `RuntimeDoctorResult`):**
@@ -163,6 +165,32 @@ files that construct no non-empty doctor-check literal.
   - Reserved/non-emitted: `"auth-failure"`, `"process-termination-failure"`, `"probe-malformed-output"`, `"probe-invalid-terminal-marker"`
 - `RuntimeDoctorResult.checks[*]` gains required `code: DoctorCheckCode`.
 - `RuntimeDoctorResult.checks[*]` gains optional `prerequisite?: string`.
+- **Exact `CursorSdkRuntime` injection seam** (add to `src/runtimes/cursor-sdk.ts`):
+
+```typescript
+type CursorSdkImportFn = (
+  specifier: string,
+) => Promise<Record<string, any>>;
+
+export class CursorSdkRuntime implements AgentRuntime {
+  private readonly importFn: CursorSdkImportFn;
+
+  constructor(
+    options: { importFn?: CursorSdkImportFn } = {},
+  ) {
+    this.importFn = options.importFn ?? importOptional;
+  }
+
+  // execute() and doctor() both use:
+  // await this.importFn("@cursor/sdk")
+}
+```
+
+  Production construction remains compatible: `new CursorSdkRuntime()`. `createRuntime()` requires
+  no behavioral change. Both `execute()` and `doctor()` must use `this.importFn`; there must be
+  only one import path. The default remains the existing dynamic `importOptional`. Do not add
+  `@cursor/sdk` as a test dependency, manipulate `node_modules`, use global monkey-patching, or
+  rely on custom Node loaders.
 
 **Exact `src/cli.ts` `doctor --json` behavior:**
 - In the `doctor` case, after `const report = await runtime.doctor();`:
@@ -176,13 +204,17 @@ files that construct no non-empty doctor-check literal.
 **Steps:**
 - [ ] Add `DoctorCheckCode` union in `src/domain.ts` using existing kebab-case string-literal convention.
 - [ ] Extend `RuntimeDoctorResult` check shape with required `code` and optional `prerequisite`.
-- [ ] Update the runtime check constructors that build non-empty checks (`cursor-cli`, `mock`, `cursor-sdk`) to supply required `code`. For `cursor-sdk.ts` use the exact mapping: `cursor-api-key` + `CURSOR_API_KEY` present → `"ok"`; `cursor-api-key` + absent → `"cursor-sdk-credential-missing"`; `cursor-sdk` + import succeeds → `"ok"`; `cursor-sdk` + import throws → `"cursor-sdk-unavailable"`.
+- [ ] Update the runtime check constructors that build non-empty checks (`cursor-cli`, `mock`, `cursor-sdk`) to supply required `code`. For `cursor-sdk.ts` use the exact mapping: `cursor-api-key` + `CURSOR_API_KEY` present → `"ok"`; `cursor-api-key` + absent → `"cursor-sdk-credential-missing"`; `cursor-sdk` + import succeeds → `"ok"`; `cursor-sdk` + import throws → `"cursor-sdk-unavailable"`. Add the `importFn` injection seam (exact interface above) so both `execute()` and `doctor()` use `this.importFn("@cursor/sdk")`.
 - [ ] Add the `maswe doctor --json` branch to `src/cli.ts` exactly as specified above; keep human `PASS`/`FAIL` output in the exact `PASS|FAIL <name>: <message>` format (no code appended) and `report.ok`-derived exit status in both modes.
 - [ ] Create `test/issue17-doctor-cli-json.test.ts` with **two fixtures** as specified in the design:
   - **Passing fixture** (`MASWE_RUNTIME=mock`): assert human `PASS` lines in unchanged format; `--json` parseability; every check has `code`; mock check has `code: "ok"`; exit 0 in both modes.
   - **Failing/prerequisite fixture** (temp `cursor-cli` config + temp executable returning non-zero for `--version`): assert process exits non-zero in both modes; `cursor-cli` has `"cursor-version-check-failure"`; `prompt-transport-probe` has `ok: false`, `code: "skipped-prerequisite-failure"`, `prerequisite: "cursor-cli"`; actual probe command not invoked; JSON typed fields present; human line format unchanged.
   - Use existing child-process helpers and temporary executable patterns; do not add failure switches to production `MockRuntime`.
-- [ ] Add deterministic tests for `cursor-sdk.ts` both success and failure paths: `CURSOR_API_KEY` present → `cursor-api-key` `code: "ok"`; absent → `code: "cursor-sdk-credential-missing"`; import succeeds → `cursor-sdk` `code: "ok"`; import throws → `code: "cursor-sdk-unavailable"`.
+- [ ] Create `test/issue17-cursor-sdk-doctor.test.ts` exercising `CursorSdkRuntime.doctor()` via the `importFn` injection seam with three sub-contracts:
+  - **Import success** (inject `async () => ({ Agent: { prompt: async () => { throw new Error("execute() is not exercised by this doctor test"); } } })`): with `CURSOR_API_KEY` present assert `cursor-api-key` `ok:true`/`code:"ok"`, `cursor-sdk` `ok:true`/`code:"ok"`, `report.ok === true`.
+  - **Missing credential** (same successful importer, `CURSOR_API_KEY` absent): assert `cursor-api-key` `ok:false`/`code:"cursor-sdk-credential-missing"`, `cursor-sdk` `ok:true`/`code:"ok"`, `report.ok === false`.
+  - **Import failure** (inject `async () => { throw new Error("synthetic SDK import failure"); }`): assert `cursor-sdk` `ok:false`/`code:"cursor-sdk-unavailable"`; no reserved code emitted.
+  - Restore `CURSOR_API_KEY` in `finally` or equivalent teardown between tests; do not leak environment state.
 - [ ] Run `npm run typecheck`; for any non-required test file that fails to compile, add `code` only to the offending non-empty check literal.
 
 ---
@@ -367,7 +399,7 @@ iteration counts):
 
 **Focused runs (subset of the full suite; for fast iteration — not additional coverage):**
 - [ ] `node --experimental-strip-types --test test/config.test.ts test/schema.test.ts test/linked-worktree-compat.test.ts`
-- [ ] `node --experimental-strip-types --test test/issue17-doctor-probe-timeout.test.ts test/issue17-doctor-cli-json.test.ts test/compat-doctor.test.ts test/merge-blockers-round3.test.ts test/rc-review-corrections.test.ts test/ready-review-corrections.test.ts test/model-resolution.test.ts test/issue12-model-catalogue.test.ts test/issue19-runtime-failure.test.ts`
+- [ ] `node --experimental-strip-types --test test/issue17-doctor-probe-timeout.test.ts test/issue17-doctor-cli-json.test.ts test/issue17-cursor-sdk-doctor.test.ts test/compat-doctor.test.ts test/merge-blockers-round3.test.ts test/rc-review-corrections.test.ts test/ready-review-corrections.test.ts test/model-resolution.test.ts test/issue12-model-catalogue.test.ts test/issue19-runtime-failure.test.ts`
 
 **Additional CI-only gates (NOT part of `npm run check`; must be run explicitly to match CI):**
 - [ ] Focused ready-review regression (CI step "Ready-review regression tests"):
@@ -464,6 +496,7 @@ iteration counts):
    - `src/domain.ts`, `src/config.ts`, `schemas/config.schema.json`, example config.
 4. **Failing typed doctor-result/runtime tests**
    - Doctor classification + timeout + reserved-code non-emission tests.
+   - `test/issue17-cursor-sdk-doctor.test.ts` — failing cursor-sdk import-injection tests (written before Task 3 implementation).
 5. **Domain/runtime implementation**
    - `src/domain.ts`, `src/runtimes/cursor-cli.ts`, `src/runtimes/mock.ts`, `src/runtimes/cursor-sdk.ts`, `src/cli.ts`.
 6. **Documentation/contract updates**
@@ -485,7 +518,7 @@ Do not squash away test-first commits unless explicitly authorized later.
 | AC4 | Default `doctorProbeTimeoutMs: 60_000` in `DEFAULT_CONFIG`; migrate omission to 60_000 | Task 2 | `src/config.ts`, `src/domain.ts` | `test/config.test.ts`, `test/linked-worktree-compat.test.ts` | Focused config tests | Omitted raw config yields normalized `60_000` exactly |
 | AC5 | Schema property optional integer [1000, 300000] | Task 2 | `schemas/config.schema.json` | `test/schema.test.ts` | Focused schema tests | Schema accepts valid bound values and rejects out-of-range/wrong-type |
 | AC6 | Probe spawn uses exact `this.config.policy.doctorProbeTimeoutMs` (no fallback) | Task 5 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | Captured spawn options show exact normalized timeout |
-| AC7 | Every doctor check literal includes required `code`; `cursor-sdk.ts` uses exact cursor-sdk code mapping | Task 3 | `src/runtimes/cursor-cli.ts`, `src/runtimes/mock.ts`, `src/runtimes/cursor-sdk.ts` | Compatibility tests touching doctor checks, deterministic cursor-sdk tests | `npm run typecheck` + focused doctor tests | Compile-time + runtime assertions show code present on emitted checks; SDK success/failure paths both covered |
+| AC7 | Every doctor check literal includes required `code`; `cursor-sdk.ts` uses exact cursor-sdk code mapping and `importFn` injection seam | Task 3 | `src/runtimes/cursor-cli.ts`, `src/runtimes/mock.ts`, `src/runtimes/cursor-sdk.ts` | `test/issue17-cursor-sdk-doctor.test.ts`, compatibility tests touching doctor checks | `npm run typecheck` + focused doctor tests | Compile-time + runtime assertions show code present on emitted checks; SDK success/failure paths both covered without installing `@cursor/sdk` |
 | AC8 | Deterministic tests assert `code` values (message text only for message-quality tests) | Task 1, Task 3 | test suite | `test/issue17-doctor-probe-timeout.test.ts`, updated doctor tests | Focused doctor tests | Assertions primarily use `check.code`, with labeled message-only tests |
 | AC9 | Primary probe failure and cleanup failure both preserved independently | Task 6 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts`, `test/merge-blockers-round3.test.ts`, `test/rc-review-corrections.test.ts` | Focused doctor tests | Report contains separate failed checks with distinct codes |
 | AC10 | Operations doc covers new timeout field + semantics | Task 7 | `docs/OPERATIONS.md` | Doc review (no unit tests) | Full validation + review checklist | Docs include default/range/independence/limitations text |
@@ -514,10 +547,10 @@ Do not squash away test-first commits unless explicitly authorized later.
 | AC33 | Exact CI-only gates run and are distinguished from `npm run check` | Task 8 | `.github/workflows/ci.yml` parity (no repo edit) | `test/ready-review-corrections.test.ts`, `test/issue11-lock-contention.test.ts` | Ready-review run; Issue #11 25/100-iter env gates; Node 22 + 22.22.2 | Command transcripts for each gate |
 | AC34 | Packaging leaves no generated artifacts | Task 8 | n/a | n/a | `npm pack --json` in temp dir; artifact removed | Final `git status --porcelain=v1` clean; no `.tgz`/extraction dir |
 | AC35 | Termination not claimed observable; probe-success not overstated | Tasks 4, 7 | `src/runtimes/cursor-cli.ts`, docs | `test/issue17-doctor-probe-timeout.test.ts` | Focused tests + doc review | No test/doc asserts guaranteed termination or auth/output validity from a passing probe |
-| AC36 | `cursor-sdk.ts` uses exact code mapping: `cursor-sdk-credential-missing` for absent key; `cursor-sdk-unavailable` for failed import; neither is `auth-failure` or `cursor-executable-unavailable` | Task 3 | `src/runtimes/cursor-sdk.ts` | `test/issue17-doctor-probe-timeout.test.ts` or cursor-sdk dedicated tests | Focused doctor tests + `npm run typecheck` | SDK success and failure paths both have deterministic tests asserting exact codes |
+| AC36 | `cursor-sdk.ts` uses exact code mapping: `cursor-sdk-credential-missing` for absent key; `cursor-sdk-unavailable` for failed import; neither is `auth-failure` or `cursor-executable-unavailable`; testing does not depend on `@cursor/sdk` installation | Task 3 | `src/runtimes/cursor-sdk.ts` | `test/issue17-cursor-sdk-doctor.test.ts` | Focused cursor-sdk doctor tests + `npm run typecheck` | Import success, missing credential, and import failure paths all have deterministic tests asserting exact codes via `importFn` injection |
 | AC37 | `resolveDoctorProbeCwd()` gated before probe-resource creation: not called on version failure, catalogue failure, brainstormer failure, or argv transport; called exactly once for passing stdin probe; skipped probe cannot be replaced by worktree error | Task 4 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | Deterministic tests inject spy on `ensureProbeWorkspace`/`resolveDoctorProbeCwd` and assert call count for each scenario |
 | AC38 | Pre-version spawn rejection with non-executable-unavailability error → `doctor`/`doctor-unexpected-error`; no `cursor-cli` check emitted; downstream terminates | Task 4 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | EMFILE, plain Error, non-Error rejection → `doctor`/`doctor-unexpected-error`; no `cursor-cli` check present |
-| AC39 | Historical persisted `RunRecord` missing `doctorProbeTimeoutMs` loads successfully, normalizes to 60_000, passes `assertConfig()`, and env overrides are not applied during migration | Task 2 | `src/config.ts` | `test/config.test.ts` or `test/issue17-doctor-probe-timeout.test.ts` | Focused config tests | Loadable; `60_000`; `assertConfig()` passes; explicit valid value preserved; explicit invalid value fails closed |
+| AC39 | Historical persisted `RunRecord` missing `doctorProbeTimeoutMs` loads successfully, normalizes to 60_000, passes `assertConfig()`, and env overrides are not applied during migration | Task 2 | `src/store.ts` — `migrateRunRecord()`; `src/config.ts` — `migrateConfig()` and `assertConfig()` | `test/compat-doctor.test.ts` (extend existing historical run-record loading coverage) | Focused config + compat-doctor tests | Omitted field → `60_000`; explicit valid value preserved; explicit invalid value rejected; process environment does not override persisted configuration |
 | AC40 | Human CLI output is strictly `PASS\|FAIL <name>: <message>` in both modes; no code is appended to human lines | Task 3 | `src/cli.ts` | `test/issue17-doctor-cli-json.test.ts` (both fixtures) | Focused CLI tests | Human output lines match exact format; codes appear only in `--json` output |
 
 ---

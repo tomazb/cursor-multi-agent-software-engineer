@@ -404,7 +404,7 @@ expires.
 | Bound | Value | Rationale |
 |---|---|---|
 | Minimum | 1 000 ms | Prevents trivially short budgets that would always time out |
-| Maximum | 300 000 ms (5 minutes) | Keeps doctor finite; far exceeds observed provider latency |
+| Maximum | 300 000 ms (5 minutes) | Keeps the prompt-probe process deadline finite; the complete doctor command remains unbounded because probe-worktree creation and cleanup have no independent deadlines. |
 | Default | 60 000 ms | 4× margin over the 14-second upper bound observed in issue evidence |
 
 `assertConfig()` applies these as **hard validation constraints**. The following all constitute
@@ -908,20 +908,24 @@ persistence, schema, or wire-format stability claim for it beyond the CLI behavi
 
 CLI behavior is covered by a dedicated CLI test file, **`test/issue17-doctor-cli-json.test.ts`**
 (new; there is no existing CLI-entrypoint test for `doctor`). The exact test file is fixed here
-and must not be left to the builder. It exercises the CLI entry point deterministically with the
-`mock` runtime (`MASWE_RUNTIME=mock`, which requires no Cursor credentials) and asserts:
+and must not be left to the builder. It exercises the CLI entry point deterministically with
+**two fixtures**; both use the real CLI entry point with no live Cursor credentials.
 
-1. **Human output:** `maswe doctor` prints `PASS`/`FAIL <name>: <message>` lines and exits 0 on a
-   passing report.
-2. **JSON output parseability:** `maswe doctor --json` stdout is valid JSON that `JSON.parse()`
-   round-trips into an object with `ok` and a `checks` array.
-3. **Typed code + prerequisite visibility:** each parsed check has `name`, `ok`, `message`, and a
-   `code`; a skipped check (when present) carries a `prerequisite`.
-4. **Exit semantics match:** a report with `report.ok === false` yields a non-zero exit in **both**
-   human and JSON modes; a passing report yields exit 0 in both modes.
+**Passing fixture** (`MASWE_RUNTIME=mock`): exercises the mock runtime; asserts human
+`PASS <name>: <message>` format and `--json` output is parseable JSON with `ok: true` and every
+check carrying `code: "ok"`; both human and `--json` modes exit 0.
 
-The mock runtime's `doctor()` result must include the required `code` field so this test can
-assert typed codes without a live Cursor CLI.
+**Failing/prerequisite fixture** (temporary project configuration using `runtime.kind:
+"cursor-cli"` with a temporary executable that starts successfully and exits non-zero for
+`--version`): asserts that both human and `--json` modes exit non-zero; JSON contains
+`cursor-cli` / `"cursor-version-check-failure"` and `prompt-transport-probe` /
+`"skipped-prerequisite-failure"` / `prerequisite: "cursor-cli"`; the actual prompt probe is
+not invoked. This fixture covers the failed-report and skipped-prerequisite behaviors;
+**the mock fixture alone does not cover them.**
+
+Use existing child-process helpers and temporary executable patterns. Do not add failure
+switches to production `MockRuntime`. The mock runtime's `doctor()` result must include the
+required `code` field so tests can assert typed codes without a live Cursor CLI.
 
 ---
 
@@ -1337,6 +1341,91 @@ The probe command is never invoked. Test asserts in both human and `--json` mode
 Use existing child-process helpers and temporary executable patterns where possible. Do not add
 failure switches to production `MockRuntime`.
 
+### 11. CursorSdkRuntime deterministic tests (import injection seam)
+
+`CursorSdkRuntime.doctor()` currently uses the module-level `importOptional` function directly
+and exposes no injection seam, making it impossible to write deterministic tests for import
+success and failure paths without installing `@cursor/sdk`. Issue #17 adds an exact injection
+seam so tests can inject synthetic import outcomes.
+
+#### Injection seam contract
+
+```typescript
+type CursorSdkImportFn = (
+  specifier: string,
+) => Promise<Record<string, any>>;
+
+export class CursorSdkRuntime implements AgentRuntime {
+  private readonly importFn: CursorSdkImportFn;
+
+  constructor(
+    options: { importFn?: CursorSdkImportFn } = {},
+  ) {
+    this.importFn = options.importFn ?? importOptional;
+  }
+
+  // execute() and doctor() both use:
+  // await this.importFn("@cursor/sdk")
+}
+```
+
+Production construction remains compatible: `new CursorSdkRuntime()` uses the existing
+`importOptional` default. `createRuntime()` requires no behavioral change. Both `execute()`
+and `doctor()` use the injected importer, ensuring a single import path. The default remains
+the existing dynamic `importOptional`. The implementation must not add `@cursor/sdk` as a
+test dependency, manipulate `node_modules`, or use global monkey-patching or custom Node loaders.
+
+#### Test file: `test/issue17-cursor-sdk-doctor.test.ts` (new)
+
+Tests instantiate `CursorSdkRuntime` directly with injected import functions.
+
+**Import success** — inject:
+
+```typescript
+async () => ({
+  Agent: {
+    prompt: async () => {
+      throw new Error("execute() is not exercised by this doctor test");
+    },
+  },
+})
+```
+
+With `CURSOR_API_KEY` present, assert:
+
+| Check | `ok` | `code` |
+|---|---|---|
+| `cursor-api-key` | `true` | `"ok"` |
+| `cursor-sdk` | `true` | `"ok"` |
+
+Top-level `report.ok === true`.
+
+**Missing credential** — same successful importer, `CURSOR_API_KEY` absent. Assert:
+
+| Check | `ok` | `code` |
+|---|---|---|
+| `cursor-api-key` | `false` | `"cursor-sdk-credential-missing"` |
+| `cursor-sdk` | `true` | `"ok"` |
+
+Top-level `report.ok === false`.
+
+**Import failure** — inject:
+
+```typescript
+async () => {
+  throw new Error("synthetic SDK import failure");
+}
+```
+
+Assert:
+
+| Check | `ok` | `code` |
+|---|---|---|
+| `cursor-sdk` | `false` | `"cursor-sdk-unavailable"` |
+
+No reserved code is emitted. Tests must restore `CURSOR_API_KEY` in `finally` or equivalent
+teardown so environment state cannot leak between tests.
+
 ### Authenticated validation procedure (separate from deterministic tests)
 
 This procedure is not part of the automated test suite. It must be performed by a human operator
@@ -1681,11 +1770,12 @@ command does not have a strict upper bound on its wall-clock duration. CI pipeli
 | `src/config.ts` | Add `doctorProbeTimeoutMs: 60_000` to `DEFAULT_CONFIG.policy`; add hard bounds validation in `assertConfig()` (no `!== undefined` guard) |
 | `src/runtimes/cursor-cli.ts` | Isolate `listModels()` in a catalogue-only try/catch; resolve each role exactly once from that role's own attempt; capture the brainstormer's resolved exact ID from its own successful result; **remove the aggregate `resolveProjectModels()` call** from the doctor path. Replace `Math.min(5_000, commandTimeoutMs)` with `this.config.policy.doctorProbeTimeoutMs`; add a `code` to every check literal per the emitted mapping; classify the `--version` spawn rejection with ENOENT/EACCES/EPERM/ENOTDIR as `"cursor-executable-unavailable"` on `cursor-cli` (terminating downstream); classify any other pre-cursor-cli-check spawn rejection and any unexpected post-version exception as a **`doctor`** check with `"doctor-unexpected-error"` (never a duplicate `cursor-cli`); split `--version` non-zero/timeout into `"cursor-version-check-failure"`; emit skipped `model-{role}` (`prerequisite: "model-catalogue"`) on catalogue failure and skipped `prompt-transport-probe` with the correct `prerequisite` (`cursor-cli`/`model-catalogue`/`model-brainstormer`); gate `resolveDoctorProbeCwd()` so it is called only when the probe will actually execute (no blocking prerequisite and `promptTransport === "stdin"`). Must **not** construct any reserved code |
 | `src/runtimes/mock.ts` | Add `code: "ok"` to the hardcoded `mock-runtime` check object (currently a non-empty check literal) |
-| `src/runtimes/cursor-sdk.ts` | Add exact codes to the `cursor-api-key` and `cursor-sdk` check literals: `cursor-api-key` + `CURSOR_API_KEY` present → `"ok"`; `cursor-api-key` + absent → `"cursor-sdk-credential-missing"`; `cursor-sdk` + import succeeds → `"ok"`; `cursor-sdk` + import throws → `"cursor-sdk-unavailable"` |
+| `src/runtimes/cursor-sdk.ts` | Add exact codes to the `cursor-api-key` and `cursor-sdk` check literals: `cursor-api-key` + `CURSOR_API_KEY` present → `"ok"`; `cursor-api-key` + absent → `"cursor-sdk-credential-missing"`; `cursor-sdk` + import succeeds → `"ok"`; `cursor-sdk` + import throws → `"cursor-sdk-unavailable"`. Expose `importFn?: CursorSdkImportFn` injection seam in constructor (defaulting to `importOptional`) so `execute()` and `doctor()` share one import path and tests can inject synthetic outcomes without installing `@cursor/sdk`. |
 | `src/cli.ts` | Add the `maswe doctor --json` branch: `console.log(JSON.stringify(report, null, 2))` when `--json` is present, else keep the existing `PASS`/`FAIL` line loop unchanged; keep `process.exitCode = report.ok ? 0 : 1` in both modes. No argument-parser change needed (`positional()` already treats `--json` as a bare flag) |
 | `schemas/config.schema.json` | Add optional `doctorProbeTimeoutMs` field under `policy.properties` |
 | `test/issue17-doctor-probe-timeout.test.ts` (new) | All typed-code, timeout-selection, bounds, deadline, multiple-failure, classification, probe-resource-gating, and canonical-default tests |
 | `test/issue17-doctor-cli-json.test.ts` (new) | Two CLI fixtures: passing (mock runtime) + failing/prerequisite (cursor-cli with temp wrapper); human output, `--json` parseability, typed-code/prerequisite visibility, exit semantics |
+| `test/issue17-cursor-sdk-doctor.test.ts` (new) | Deterministic `CursorSdkRuntime.doctor()` tests for import success, missing credential, and import failure paths using the `importFn` injection seam; no `@cursor/sdk` installation required |
 | `docs/OPERATIONS.md` | Document new field and compatibility statement |
 | `docs/ARCHITECTURE.md` | Update `CursorCliRuntime` description |
 
