@@ -47,6 +47,7 @@ test("doctor --json emits structured result while human output keeps PASS|FAIL f
   assert.ok(report.checks.length > 0);
   for (const check of report.checks) {
     assert.equal(typeof check.code, "string");
+    assert.equal(check.code, "ok");
   }
 });
 

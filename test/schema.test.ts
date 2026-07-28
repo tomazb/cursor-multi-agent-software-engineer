@@ -117,6 +117,17 @@ test("DEFAULT_CONFIG satisfies config JSON schema required shape", async () => {
   assertMatches(schema, schema, DEFAULT_CONFIG, "config");
 });
 
+test("config schema requires the normalized doctor probe timeout", async () => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/config.schema.json"), "utf8"),
+  ) as JsonSchema;
+
+  assert.ok(
+    schema.properties?.policy?.required?.includes("doctorProbeTimeoutMs"),
+    "policy.doctorProbeTimeoutMs must be required by the normalized config schema",
+  );
+});
+
 test("persisted run records satisfy run-record schema required shape", async () => {
   const schema = JSON.parse(
     await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
