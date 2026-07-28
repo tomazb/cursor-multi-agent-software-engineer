@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to execute this plan task-by-task. Do not skip failing-test-first order. Keep commits focused and reviewable.
 
-**Status:** `IMPLEMENTATION_PLAN_READY_FOR_REVIEW`
+**Status:** `IMPLEMENTATION_PLAN_REVISED_READY_FOR_APPROVAL`
 
 **Goal:** Implement the approved Issue #17 design so `maswe doctor` uses a bounded, validated, configurable probe timeout (`policy.doctorProbeTimeoutMs`) and emits deterministic typed doctor-check codes without expanding scope.
 
@@ -13,7 +13,9 @@
 **Approved design inputs:**
 - Design: `docs/superpowers/specs/2026-07-28-issue-17-doctor-probe-timeout-design.md`
 - Approved baseline SHA: `277e14483c1d2ad280d67ee3262f3e8ef575e338`
-- Design status gate: `DESIGN_FINAL_READY_FOR_APPROVAL`
+- Design status gate: `DESIGN_APPROVED_FOR_IMPLEMENTATION_PLANNING` (owner approved the design
+  for implementation-plan preparation; implementation remains blocked pending explicit owner
+  approval of this revised plan).
 
 ---
 
@@ -32,6 +34,13 @@
 - No message-text authentication inference.
 - Reserved codes are type-only vocabulary in this issue; never emitted.
 - Cleanup remains a separate check; primary probe failures must not be overwritten.
+- Catalogue-discovery failure and role-resolution failure are distinct: `"model-resolution-failure"`
+  is emitted **only** when `resolveLogicalModelId()` actually ran for a role and threw; a role
+  check skipped because catalogue discovery failed uses `"skipped-prerequisite-failure"`.
+- Post-version unexpected errors use a stable generic `doctor` check (`"doctor-unexpected-error"`);
+  never emit a duplicate failed `cursor-cli` check after a successful `cursor-cli` check.
+- `maswe doctor --json` emits the full `RuntimeDoctorResult`; exit status derives from `report.ok`
+  in both human and JSON modes; no persistence/schema claim for `RuntimeDoctorResult`.
 - No production behavior changes outside approved Issue #17 contract.
 
 ## Scope boundaries
@@ -57,12 +66,14 @@
 
 **Files:**
 - Create: `test/issue17-doctor-probe-timeout.test.ts`
+- Create: `test/issue17-doctor-cli-json.test.ts`
 - Modify: `test/config.test.ts`
 - Modify: `test/schema.test.ts`
 - Modify: `test/linked-worktree-compat.test.ts`
 - Modify: `test/compat-doctor.test.ts`
 - Modify: `test/merge-blockers-round3.test.ts`
 - Modify: `test/rc-review-corrections.test.ts`
+- Modify: `test/ready-review-corrections.test.ts` (probe-timeout propagation now asserts `doctorProbeTimeoutMs`; also a CI gate)
 
 **Interfaces exercised:**
 - `migrateConfig()`, `assertConfig()`, `mergeConfigForTest()`
@@ -125,26 +136,25 @@
 
 ## Task 3 — Add typed doctor-result domain contract and wire consumers/renderers
 
-**Files:**
-- Modify: `src/domain.ts`
-- Modify: `src/runtimes/cursor-cli.ts`
-- Modify: `src/runtimes/mock.ts`
-- Modify: `src/runtimes/cursor-sdk.ts`
-- Modify: `src/cli.ts`
-- Modify: `test/issue17-doctor-probe-timeout.test.ts`
-- Modify: `test/compat-doctor.test.ts`
-- Modify: `test/linked-worktree-compat.test.ts`
-- Modify: `test/merge-blockers-round3.test.ts`
-- Modify: `test/rc-review-corrections.test.ts`
-- Modify: `test/issue19-runtime-failure.test.ts` (if needed to assert non-regression with added fields)
-- Modify: RuntimeDoctorResult type-consumer tests:
-  - `test/orchestrator.test.ts`
-  - `test/commit-provenance.test.ts`
-  - `test/failed-run-provenance.test.ts`
-  - `test/evidence-freshness.test.ts`
-  - `test/issue19-persistence.test.ts`
-  - `test/issue19-success-event-persistence.test.ts`
-  - `test/model-resolution.test.ts`
+**Files (required modifications — a concrete non-empty check literal or behavior requires change):**
+- Modify: `src/domain.ts` — add `DoctorCheckCode`; add required `code` and optional `prerequisite` to `RuntimeDoctorResult.checks`.
+- Modify: `src/runtimes/cursor-cli.ts` — every constructed check literal gains a `code` (classification refactor is Task 4).
+- Modify: `src/runtimes/mock.ts` — the `mock-runtime` check literal gains `code: "ok"`.
+- Modify: `src/runtimes/cursor-sdk.ts` — the `cursor-api-key` and `cursor-sdk` check literals gain `code`.
+- Modify: `src/cli.ts` — add the `doctor --json` branch (exact behavior below).
+- Create: `test/issue17-doctor-cli-json.test.ts` — CLI human + `--json` coverage (Task 3 renderer + Task 5/exit semantics).
+- Modify: `test/issue17-doctor-probe-timeout.test.ts` — typed-code assertions.
+
+**Files (inspect only — must NOT be modified merely because they reference `RuntimeDoctorResult`):**
+- `test/orchestrator.test.ts` — delegates `doctor()` to a `MockRuntime`/delegate; constructs no check literal → **inspected, unchanged**.
+- `test/commit-provenance.test.ts`, `test/failed-run-provenance.test.ts`, `test/evidence-freshness.test.ts` — return `new MockRuntime().doctor()`; construct no check literal → **inspected, unchanged**.
+- `test/model-resolution.test.ts`, `test/issue19-persistence.test.ts`, `test/issue19-success-event-persistence.test.ts`, `test/rc-review-corrections.test.ts` (line ~308 stub) — return `{ ok: true, checks: [] }` (empty array satisfies the required `code` type trivially) → **inspected, unchanged for the empty stub**. (`rc-review-corrections.test.ts` is also touched for behavior assertions in Tasks 2/4/6.)
+- `test/issue19-runtime-failure.test.ts` — inspect; change **only if** it constructs a non-empty doctor check literal that fails to compile.
+
+**Compile-driven rule:** For any test not listed as a required modification, the only permitted
+reason to edit it is an actual TypeScript compile failure caused by the new required `code`
+field. Inspect first; edit only if `npm run typecheck` fails on that file. Do not add `code` to
+files that construct no non-empty doctor-check literal.
 
 **Interfaces:**
 - New union type `DoctorCheckCode` in `src/domain.ts`:
@@ -153,13 +163,22 @@
 - `RuntimeDoctorResult.checks[*]` gains required `code: DoctorCheckCode`.
 - `RuntimeDoctorResult.checks[*]` gains optional `prerequisite?: string`.
 
+**Exact `src/cli.ts` `doctor --json` behavior:**
+- In the `doctor` case, after `const report = await runtime.doctor();`:
+  - if `has(args, "--json")`: `console.log(JSON.stringify(report, null, 2));`
+  - else: keep the existing `for (const check of report.checks) { console.log(`${check.ok ? "PASS" : "FAIL"} ${check.name}: ${check.message}`); }` loop.
+  - in both branches: `process.exitCode = report.ok ? 0 : 1;`
+- No argument-parser change required (`positional()` already treats `--json` as a bare flag).
+- The `--json` output is an in-process serialization of `RuntimeDoctorResult`; make **no**
+  persistence or JSON-Schema claim for it.
+
 **Steps:**
 - [ ] Add `DoctorCheckCode` union in `src/domain.ts` using existing kebab-case string-literal convention.
 - [ ] Extend `RuntimeDoctorResult` check shape with required `code` and optional `prerequisite`.
-- [ ] Update all runtime check constructors (`cursor-cli`, `mock`, `cursor-sdk`) to supply required `code`.
-- [ ] Update CLI doctor rendering path to remain compatible with the new required field (and include code display if adopted here).
-- [ ] Update tests and test-runtime stubs that construct non-empty doctor checks to include code fields.
-- [ ] Ensure exhaustive handling in tests/helpers where code switching is introduced.
+- [ ] Update the runtime check constructors that build non-empty checks (`cursor-cli`, `mock`, `cursor-sdk`) to supply required `code`.
+- [ ] Add the `maswe doctor --json` branch to `src/cli.ts` exactly as specified above; keep human `PASS`/`FAIL` output and `report.ok`-derived exit status in both modes.
+- [ ] Create `test/issue17-doctor-cli-json.test.ts` exercising the CLI entry point with the `mock` runtime (`MASWE_RUNTIME=mock`): assert human output lines, `--json` parseability, typed `code`/`prerequisite` visibility, and matching exit semantics (non-zero on failed report in both modes).
+- [ ] Run `npm run typecheck`; for any non-required test file that fails to compile, add `code` only to the offending non-empty check literal.
 
 ---
 
@@ -174,18 +193,46 @@
 
 **Interfaces and deterministic mappings:**
 - `cursor-cli` check:
-  - Spawn reject with `error.code ∈ { ENOENT, EACCES, EPERM, ENOTDIR }` → `"cursor-executable-unavailable"`
-  - Process started; non-zero or timed-out `--version` result → `"cursor-version-check-failure"`
-  - Other unexpected exception → `"doctor-unexpected-error"`
+  - `--version` **spawn rejected** with `error.code ∈ { ENOENT, EACCES, EPERM, ENOTDIR }` → `"cursor-executable-unavailable"`, then **terminate** the downstream check sequence (the thrown error propagates to the outer catch; no catalogue/model/probe checks are emitted).
+  - `--version` process started; non-zero or timed-out result → `"cursor-version-check-failure"` (`cliOk = false`).
+  - `--version` exit 0 → `"ok"` (`cliOk = true`).
+- `doctor` check (generic identity):
+  - An unexpected exception **after** the `cursor-cli` check was already recorded (e.g., a git error from `resolveDoctorProbeCwd()`) reaches the outer catch → emit a check named `doctor` with `"doctor-unexpected-error"`. **Never** emit a second `cursor-cli` check after a successful one.
 - `model-catalogue` check:
-  - Discovery operation ran and failed → `"catalogue-discovery-failure"`
+  - `listModels()` (catalogue-only try/catch) ran and threw → `"catalogue-discovery-failure"`.
 - `model-{role}` checks:
-  - Logical resolution attempt failed → `"model-resolution-failure"`
+  - `resolveLogicalModelId()` ran for this role and threw → `"model-resolution-failure"`.
+  - `model-catalogue` failed, so the role check did not execute → `"skipped-prerequisite-failure"`, `prerequisite: "model-catalogue"` (must **not** be `"model-resolution-failure"`).
 - `prompt-transport-probe` skipped:
-  - Code `"skipped-prerequisite-failure"`, `ok: false`, and stable prerequisite attribution
+  - Code `"skipped-prerequisite-failure"`, `ok: false`, and stable prerequisite attribution.
+
+**Exact `doctor()` classification refactor (removes the `resolveProjectModels()` trap):**
+
+The current code (base SHA) wraps `listModels()`, `resolveProjectModels(config, catalogueIds)`,
+and the per-role `resolveLogicalModelId()` loop in a **single** try/catch, so a role-resolution
+throw from `resolveProjectModels()` is caught as a catalogue-discovery failure. Refactor to:
+
+1. Isolate `listModels()` in a **catalogue-only** try/catch. On throw: emit `model-catalogue`
+   `"catalogue-discovery-failure"` and, for each retained `model-{role}` check, emit
+   `"skipped-prerequisite-failure"` with `prerequisite: "model-catalogue"`; do **not** attempt
+   any role resolution.
+2. After catalogue success, resolve **each role exactly once** via `resolveLogicalModelId(role.model, catalogueIds)`.
+   Construct each `model-{role}` result from that role's **own** resolution attempt (`"ok"` on
+   success, `"model-resolution-failure"` on that role's throw).
+3. Capture the brainstormer's resolved exact ID from the **brainstormer role's own successful
+   result** (not from an aggregate call).
+4. **Remove the aggregate `resolveProjectModels()` call from the doctor path.** A model-resolution
+   exception must never enter the catalogue-discovery catch. (If a separately justified use of
+   `resolveProjectModels()` is later identified, document that justification; the default is
+   removal.)
+5. Keep the outer catch strictly for the `--version` spawn rejection (→ `cursor-cli`
+   `"cursor-executable-unavailable"`) and for unexpected post-version exceptions (→ `doctor`
+   `"doctor-unexpected-error"`), distinguishing the two by whether a `cursor-cli` check was
+   already recorded.
 
 **Stable `prerequisite` values (exact):**
-- `"model-catalogue"` when probe did not run because catalogue discovery failed.
+- `"cursor-cli"` when the probe did not run because `--version` failed (non-zero/timed-out).
+- `"model-catalogue"` when a role check or the probe did not run because catalogue discovery failed.
 - `"model-brainstormer"` when catalogue exists but brainstormer exact-model resolution failed.
 
 **Process-abstraction note:**
@@ -193,11 +240,19 @@
 - Do **not** add `SpawnResult` fields or termination redesign in Issue #17.
 
 **Steps:**
-- [ ] Refactor `doctor()` to classify `--version` outcomes separately from outer unexpected failures.
-- [ ] Ensure non-zero `--version` is never misclassified as executable-unavailable.
-- [ ] Split catalogue-discovery failure from model-resolution failure in check generation.
-- [ ] Emit skipped-probe check only when probe was not executed; attach exact prerequisite value.
-- [ ] Add deterministic tests covering every mapping branch above.
+- [ ] Isolate `listModels()` in a catalogue-only try/catch and remove the aggregate `resolveProjectModels()` call from the doctor path.
+- [ ] Resolve each role exactly once from its own attempt; capture the brainstormer exact ID from the brainstormer role's successful result.
+- [ ] Classify `--version` spawn rejection as `cursor-cli` `"cursor-executable-unavailable"` (terminating downstream) and unexpected post-version exceptions as a `doctor` check `"doctor-unexpected-error"`; never emit a duplicate `cursor-cli` check after a successful one.
+- [ ] Ensure non-zero/timed-out `--version` is `"cursor-version-check-failure"`, never executable-unavailable; skip catalogue/model checks; emit `prompt-transport-probe` skipped with `prerequisite: "cursor-cli"` (probe not spawned).
+- [ ] Emit skipped `model-{role}` checks (`prerequisite: "model-catalogue"`) on catalogue failure instead of `"model-resolution-failure"`.
+- [ ] Emit skipped `prompt-transport-probe` only when the probe was not executed; attach the exact prerequisite value.
+- [ ] Add deterministic tests: catalogue failure (catalogue `"catalogue-discovery-failure"`; every retained role skipped with `prerequisite: "model-catalogue"`; no role reports resolution attempt; no `"model-resolution-failure"` emitted).
+- [ ] Add deterministic tests: valid catalogue + one invalid non-brainstormer role (catalogue `"ok"`; only that role `"model-resolution-failure"`).
+- [ ] Add deterministic tests: valid catalogue + invalid brainstormer (catalogue `"ok"`; brainstormer `"model-resolution-failure"`; probe skipped with `prerequisite: "model-brainstormer"`).
+- [ ] Add deterministic tests: `--version` non-zero and `--version` timed-out (both `"cursor-version-check-failure"`; probe skipped with `prerequisite: "cursor-cli"`; probe `spawnFn` not invoked; no false model/catalogue/auth/transport classification).
+- [ ] Add deterministic tests: `--version` spawn rejection ENOENT/EACCES (`"cursor-executable-unavailable"`; downstream terminated; only `cursor-cli` + `doctor-probe-cleanup` checks; no probe check).
+- [ ] Add deterministic test: unexpected post-version error (e.g. `resolveDoctorProbeCwd()` throws after a successful `cursor-cli` check) yields a `doctor` check `"doctor-unexpected-error"` and no duplicate `cursor-cli` check.
+- [ ] Add deterministic test: no `"model-resolution-failure"` code appears without an actual `resolveLogicalModelId()` attempt for that role.
 
 ---
 
@@ -207,6 +262,7 @@
 - Modify: `src/runtimes/cursor-cli.ts`
 - Modify: `test/issue17-doctor-probe-timeout.test.ts`
 - Modify: `test/compat-doctor.test.ts`
+- Modify: `test/ready-review-corrections.test.ts` (probe-timeout propagation asserts `doctorProbeTimeoutMs`)
 
 **Interfaces:**
 - Remove: `Math.min(5_000, this.config.policy.commandTimeoutMs)`
@@ -258,9 +314,12 @@
 - New `policy.doctorProbeTimeoutMs` field with default 60_000 and hard bounds 1_000..300_000.
 - Explicit behavior change: old implicit 5-second cap replaced by default 60-second probe timeout.
 - Typed code semantics and emitted vs reserved distinction.
-- Skipped prerequisite behavior and `prerequisite` values.
-- Explicit statement: no total doctor wall-clock bound yet; cleanup timeout hardening remains follow-up.
-- Authenticated validation procedure (separate from deterministic tests) and evidence expectations.
+- Skipped prerequisite behavior and `prerequisite` values (`cursor-cli`, `model-catalogue`, `model-brainstormer`).
+- `maswe doctor --json` surface: emits full `RuntimeDoctorResult`; exit from `report.ok` in both modes; no persistence/schema claim.
+- Corrected probe-success semantics: a passing probe proves only that the command started, stdin was accepted, and the process exited zero within the timeout — not auth classification, output validity, structured decoding, marker validity, or descendant termination.
+- Process-tree termination is best-effort and not observable.
+- Explicit statement: only the prompt process is bounded (≤300s); the complete `maswe doctor` duration remains unbounded because worktree create/cleanup git operations have no deadline; cleanup timeout hardening remains follow-up.
+- Authenticated validation procedure (separate from deterministic tests) uses `maswe doctor --json` to record codes; evidence expectations documented.
 
 **Steps:**
 - [ ] Update operator docs with configuration contract and runtime implications.
@@ -274,20 +333,53 @@
 
 **Files:** no new source files; command evidence only.
 
-**Focused command set (derived from existing scripts/tests):**
+**Commands already covered by `npm run check`** (`= npm run typecheck && npm test && npm run build`;
+`npm test` runs `node --experimental-strip-types --test test/*.test.ts`, which already includes
+`test/ready-review-corrections.test.ts` and the Issue #11 contention tests at their default
+iteration counts):
 - [ ] `npm ci --include=dev --ignore-scripts --no-audit --no-fund`
 - [ ] `npm run typecheck`
-- [ ] `node --experimental-strip-types --test test/config.test.ts test/schema.test.ts test/linked-worktree-compat.test.ts`
-- [ ] `node --experimental-strip-types --test test/issue17-doctor-probe-timeout.test.ts test/compat-doctor.test.ts test/merge-blockers-round3.test.ts test/rc-review-corrections.test.ts test/model-resolution.test.ts test/issue12-model-catalogue.test.ts test/issue19-runtime-failure.test.ts`
-- [ ] `node --experimental-strip-types --test test/orchestrator.test.ts test/commit-provenance.test.ts test/failed-run-provenance.test.ts test/evidence-freshness.test.ts test/issue19-persistence.test.ts test/issue19-success-event-persistence.test.ts`
 - [ ] `npm test`
-- [ ] `npm run check`
 - [ ] `npm run build`
-- [ ] `npm run pack:dry`
-- [ ] `npm pack --json`
-- [ ] Inspect produced tarball contents (e.g., `tar -tf <generated-tgz>` and verify expected `dist/`, `schemas/`, docs/package files)
+- [ ] `npm run check` (typecheck + full test suite + build; superset of the above)
+
+**Focused runs (subset of the full suite; for fast iteration — not additional coverage):**
+- [ ] `node --experimental-strip-types --test test/config.test.ts test/schema.test.ts test/linked-worktree-compat.test.ts`
+- [ ] `node --experimental-strip-types --test test/issue17-doctor-probe-timeout.test.ts test/issue17-doctor-cli-json.test.ts test/compat-doctor.test.ts test/merge-blockers-round3.test.ts test/rc-review-corrections.test.ts test/ready-review-corrections.test.ts test/model-resolution.test.ts test/issue12-model-catalogue.test.ts test/issue19-runtime-failure.test.ts`
+
+**Additional CI-only gates (NOT part of `npm run check`; must be run explicitly to match CI):**
+- [ ] Focused ready-review regression (CI step "Ready-review regression tests"):
+  ```bash
+  node --experimental-strip-types --test test/ready-review-corrections.test.ts
+  ```
+- [ ] Issue #11 allocation contention repetition (CI env-driven; 25 iterations):
+  ```bash
+  MASWE_ISSUE11_ALLOCATION_ITERATIONS=25 \
+  node --experimental-strip-types --test-name-pattern='allocation contention repetition' \
+    test/issue11-lock-contention.test.ts
+  ```
+- [ ] Issue #11 owner/recovery/successor repetition (CI env-driven; 100 iterations):
+  ```bash
+  MASWE_ISSUE11_RELEASE_ITERATIONS=100 \
+  node --experimental-strip-types --test-name-pattern='owner recovery successor repetition' \
+    test/issue11-lock-contention.test.ts
+  ```
+
+**Packaging validation (must leave no generated artifact in the worktree):**
+- [ ] `npm run pack:dry` (= `npm pack --dry-run`; lists contents without creating a tarball).
+- [ ] `npm pack --json` **executed in a temporary directory** so the tarball is created outside
+  the worktree, e.g.:
+  ```bash
+  tmp="$(mktemp -d)"; npm pack --json --pack-destination "$tmp"
+  tar -tf "$tmp"/*.tgz   # verify expected dist/, schemas/, docs/package files
+  rm -rf "$tmp"          # remove tarball + any extraction artifacts
+  ```
+  If `--pack-destination` is not used, remove the exact generated `.tgz` (and any extraction
+  directory) from the worktree immediately after inspection.
+- [ ] Confirm no `*.tgz`, extraction directory, or other temporary artifact remains in the worktree.
 - [ ] `git diff --check`
-- [ ] `git status --porcelain=v1`
+- [ ] `git status --porcelain=v1` — must be clean (mechanically achievable because packaging
+  artifacts were created outside the worktree or removed).
 
 **Node-version coverage:**
 - [ ] Run deterministic validation on current Node 22 runtime (`node --version` recorded).
@@ -310,8 +402,8 @@
 - [ ] Selected exact model ID used by doctor probe.
 - [ ] Effective `doctorProbeTimeoutMs` value.
 - [ ] Elapsed probe time observation.
-- [ ] Doctor check codes emitted for the run.
-- [ ] Cleanup outcome check code and message.
+- [ ] Doctor check codes emitted for the run, recorded from `maswe doctor --json` (typed codes read from JSON, never inferred from human output).
+- [ ] Cleanup outcome check code and message (from the same `--json` output).
 - [ ] Before/after worktree + `maswe/doctor-*` branch inventory.
 - [ ] Redacted command output excerpts.
 - [ ] Environment limitations and caveats (single-run latency is observational, not provider guarantee).
@@ -361,7 +453,7 @@ Do not squash away test-first commits unless explicitly authorized later.
 
 ---
 
-## Acceptance traceability matrix (design AC1–AC23)
+## Acceptance traceability matrix (design AC1–AC35)
 
 | AC | Requirement summary | Implementation task(s) | Source file(s) | Test file(s) | Validation command(s) | Expected evidence |
 |---|---|---|---|---|---|---|
@@ -388,6 +480,18 @@ Do not squash away test-first commits unless explicitly authorized later.
 | AC21 | No auth inference from message text; generic non-zero probe exit => invocation-failure | Task 4 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | Auth-like stderr still yields `probe-invocation-failure` |
 | AC22 | Probe failure + cleanup failure remain separate; no overwrite/suppression | Task 6 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts`, `test/rc-review-corrections.test.ts` | Focused doctor tests | Output contains both checks/codes in same report |
 | AC23 | Implementation plan/implementation do not claim reserved-code support | Tasks 3, 7, 10 | `src/domain.ts`, docs, PR notes | `test/issue17-doctor-probe-timeout.test.ts` | Focused tests + review checklist | Type includes reserved vocabulary; runtime/docs mark them non-emitted |
+| AC24 | Catalogue failure never masquerades as role-resolution failure | Task 4 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | On `listModels()` throw: `model-catalogue`=`catalogue-discovery-failure`; every retained `model-{role}`=`skipped-prerequisite-failure`/`model-catalogue`; no `model-resolution-failure` emitted |
+| AC25 | Skipped role/probe checks use `prerequisite` attribution | Task 4 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | Skipped checks carry `prerequisite ∈ {cursor-cli, model-catalogue, model-brainstormer}` and do not assert own-subject failure |
+| AC26 | `cursor-cli` is a supported `prerequisite` | Task 4 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | Non-zero/timed-out `--version`: no model/catalogue checks; probe skipped `prerequisite: cursor-cli`; probe not spawned |
+| AC27 | Spawn rejection terminates downstream | Task 4 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | ENOENT/EACCES on `--version`: `cursor-cli`=`cursor-executable-unavailable`; only `cursor-cli`+`doctor-probe-cleanup` emitted |
+| AC28 | Valid catalogue + one invalid role stays model-resolution failure | Task 4 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | `model-catalogue`=`ok`; only failing role=`model-resolution-failure`; brainstormer case skips probe with `prerequisite: model-brainstormer` |
+| AC29 | Aggregate `resolveProjectModels()` removed; no cross-catch leakage | Task 4 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests + code inspection | `listModels()` isolated; each role resolved once; role throw never becomes catalogue failure |
+| AC30 | Post-version unexpected error uses generic `doctor` identity | Task 4 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | `resolveDoctorProbeCwd()` throw after `cursor-cli` ok → `doctor`=`doctor-unexpected-error`; no duplicate `cursor-cli` |
+| AC31 | `maswe doctor --json` exposes full typed result | Task 3 | `src/cli.ts` | `test/issue17-doctor-cli-json.test.ts` | Focused CLI tests | JSON parses; each check has `name`/`ok`/`message`/`code`(+`prerequisite`); no schema/persistence claim |
+| AC32 | JSON and human exit semantics match | Task 3 | `src/cli.ts` | `test/issue17-doctor-cli-json.test.ts` | Focused CLI tests | Exit derived from `report.ok` in both modes; failed report exits non-zero in both |
+| AC33 | Exact CI-only gates run and are distinguished from `npm run check` | Task 8 | `.github/workflows/ci.yml` parity (no repo edit) | `test/ready-review-corrections.test.ts`, `test/issue11-lock-contention.test.ts` | Ready-review run; Issue #11 25/100-iter env gates; Node 22 + 22.22.2 | Command transcripts for each gate |
+| AC34 | Packaging leaves no generated artifacts | Task 8 | n/a | n/a | `npm pack --json` in temp dir; artifact removed | Final `git status --porcelain=v1` clean; no `.tgz`/extraction dir |
+| AC35 | Termination not claimed observable; probe-success not overstated | Tasks 4, 7 | `src/runtimes/cursor-cli.ts`, docs | `test/issue17-doctor-probe-timeout.test.ts` | Focused tests + doc review | No test/doc asserts guaranteed termination or auth/output validity from a passing probe |
 
 ---
 
