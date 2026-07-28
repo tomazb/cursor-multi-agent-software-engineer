@@ -254,6 +254,11 @@ test("Node stand-in catalogue failure does not weaken real-command model gating"
   const probe = report.checks.find((check) => check.name === "prompt-transport-probe");
   assert.equal(probe?.ok, true);
   assert.equal(probe?.code, "ok");
+  assert.match(
+    probe?.message ?? "",
+    /started with a probe payload and exited zero/,
+  );
+  assert.doesNotMatch(probe?.message ?? "", /\baccepted\b/i);
   assert.equal(probeInvocations, 1);
   assert.equal(probeTimeout, 19_000);
   assert.equal(probeInput, "maswe-stdin-probe");
