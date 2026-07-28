@@ -1,5 +1,6 @@
 import type {
   AgentRuntime,
+  DoctorCheckCode,
   MasweConfig,
   RuntimeDoctorResult,
   RuntimeErrorResult,
@@ -17,7 +18,6 @@ import {
 } from "../git-workspace.ts";
 import {
   resolveLogicalModelId,
-  resolveProjectModels,
   validatePersistedExactModel,
 } from "../model-resolution.ts";
 import { parseModelCatalogue, parseModelCatalogueIds } from "./cursor-model-catalogue.ts";
@@ -512,12 +512,40 @@ export class CursorCliRuntime implements AgentRuntime {
     let probeCwd = this.cwd;
     let managedProbe = false;
     const checks: RuntimeDoctorResult["checks"] = [];
+    const unavailableSpawnErrorCodes = new Set(["ENOENT", "EACCES", "EPERM", "ENOTDIR"]);
     try {
-      const version = await this.spawnFn(this.config.runtime.command, ["--version"], {
-        cwd: this.cwd,
-        timeoutMs: this.config.policy.commandTimeoutMs,
-      });
-      const cliOk = version.exitCode === 0;
+      let version: SpawnResult | undefined;
+      try {
+        version = await this.spawnFn(this.config.runtime.command, ["--version"], {
+          cwd: this.cwd,
+          timeoutMs: this.config.policy.commandTimeoutMs,
+        });
+      } catch (error) {
+        const code = error instanceof Error
+          ? (error as Error & { code?: string }).code
+          : undefined;
+        const message = safeDiagnosticText(
+          error instanceof Error ? error.message : String(error),
+        );
+        if (code && unavailableSpawnErrorCodes.has(code)) {
+          checks.push({
+            name: "cursor-cli",
+            ok: false,
+            message,
+            code: "cursor-executable-unavailable",
+          });
+        } else {
+          checks.push({
+            name: "doctor",
+            ok: false,
+            message,
+            code: "doctor-unexpected-error",
+          });
+        }
+        return { ok: checks.every((check) => check.ok), checks };
+      }
+
+      const cliOk = version.exitCode === 0 && !version.timedOut;
       const versionStdout = boundedTrimmedDiagnosticText(version.stdout);
       const versionStderr = boundedTrimmedDiagnosticText(version.stderr);
       const versionText = versionStdout || versionStderr;
@@ -528,27 +556,41 @@ export class CursorCliRuntime implements AgentRuntime {
           ? safeDiagnosticText(
               `${this.config.runtime.command} is available${versionText ? `: ${versionText}` : "."}`,
             )
+          : version.timedOut
+            ? safeDiagnosticText(
+                `${this.config.runtime.command} --version timed out after ${this.config.policy.commandTimeoutMs}ms${versionStderr ? `: ${versionStderr}` : "."}`,
+              )
           : safeDiagnosticText(
               `${this.config.runtime.command} returned exit code ${version.exitCode}${versionStderr ? `: ${versionStderr}` : "."}`,
             ),
+        code: cliOk ? "ok" : "cursor-version-check-failure",
       });
       checks.push({
         name: "prompt-transport",
         ok: true,
         message: `Configured prompt transport: ${this.config.policy.promptTransport}`,
+        code: "ok",
       });
 
-      // Catalogue discovery + project resolution before any model-using probe.
+      let catalogueOk = false;
       let resolvedExactBrainstormer: string | undefined;
       let catalogueIds: string[] = [];
       if (cliOk) {
         try {
           catalogueIds = await this.listModels();
-          const resolved = resolveProjectModels(this.config, catalogueIds);
-          resolvedExactBrainstormer = resolved.roles.brainstormer.model;
+          catalogueOk = true;
+          checks.push({
+            name: "model-catalogue",
+            ok: true,
+            message: "Model catalogue discovery succeeded.",
+            code: "ok",
+          });
           for (const [role, roleConfig] of Object.entries(this.config.roles)) {
             try {
               const exact = resolveLogicalModelId(roleConfig.model, catalogueIds);
+              if (role === "brainstormer") {
+                resolvedExactBrainstormer = exact;
+              }
               checks.push({
                 name: `model-${role}`,
                 ok: true,
@@ -556,6 +598,7 @@ export class CursorCliRuntime implements AgentRuntime {
                   exact === roleConfig.model.toLowerCase()
                     ? `${roleConfig.model} is present as an exact model catalogue ID.`
                     : `${roleConfig.model} resolves to catalogue ID ${exact}.`,
+                code: "ok",
               });
             } catch (error) {
               checks.push({
@@ -564,39 +607,55 @@ export class CursorCliRuntime implements AgentRuntime {
                 message: safeDiagnosticText(
                   error instanceof Error ? error.message : String(error),
                 ),
+                code: "model-resolution-failure",
               });
             }
           }
         } catch (error) {
+          catalogueOk = false;
           checks.push({
             name: "model-catalogue",
             ok: false,
             message: safeDiagnosticText(
               error instanceof Error ? error.message : String(error),
             ),
+            code: "catalogue-discovery-failure",
           });
           for (const [role, roleConfig] of Object.entries(this.config.roles)) {
             checks.push({
               name: `model-${role}`,
               ok: false,
-              message: `Could not resolve ${roleConfig.model}: model catalogue unavailable.`,
+              message: `Could not resolve ${roleConfig.model}: prerequisite check 'model-catalogue' failed.`,
+              code: "skipped-prerequisite-failure",
+              prerequisite: "model-catalogue",
             });
           }
         }
+      } else {
+        catalogueOk = false;
       }
 
-      probeCwd = await this.resolveDoctorProbeCwd();
-      managedProbe = probeCwd !== this.cwd;
-
       if (this.config.policy.promptTransport === "stdin") {
-        if (!looksLikeNode(this.config.runtime.command) && !resolvedExactBrainstormer) {
+        let blockingPrerequisite: string | undefined;
+        if (!cliOk) {
+          blockingPrerequisite = "cursor-cli";
+        } else if (!catalogueOk) {
+          blockingPrerequisite = "model-catalogue";
+        } else if (!looksLikeNode(this.config.runtime.command) && !resolvedExactBrainstormer) {
+          blockingPrerequisite = "model-brainstormer";
+        }
+        if (blockingPrerequisite) {
           checks.push({
             name: "prompt-transport-probe",
             ok: false,
             message:
-              "stdin prompt probe skipped: model resolution failed before catalogue-backed probe execution.",
+              `stdin prompt probe not executed: prerequisite check '${blockingPrerequisite}' failed.`,
+            code: "skipped-prerequisite-failure",
+            prerequisite: blockingPrerequisite,
           });
         } else {
+          probeCwd = await this.resolveDoctorProbeCwd();
+          managedProbe = probeCwd !== this.cwd;
           const probeArgs = looksLikeNode(this.config.runtime.command)
             ? [
                 "-e",
@@ -621,27 +680,41 @@ export class CursorCliRuntime implements AgentRuntime {
           const probe = await this.spawnFn(this.config.runtime.command, probeArgs, {
             cwd: probeCwd,
             input: "maswe-stdin-probe",
-            timeoutMs: Math.min(5_000, this.config.policy.commandTimeoutMs),
+            timeoutMs: this.config.policy.doctorProbeTimeoutMs,
           });
           const probeOk = probe.exitCode === 0 && !probe.timedOut;
+          const probeCode: DoctorCheckCode = probeOk
+            ? "ok"
+            : probe.timedOut
+              ? "probe-transport-timeout"
+              : "probe-invocation-failure";
           checks.push({
             name: "prompt-transport-probe",
             ok: probeOk,
             message: probeOk
               ? `Configured stdin prompt execution path accepted a probe payload in cwd ${probeCwd}${managedProbe ? " (managed worktree)" : ""}${resolvedExactBrainstormer ? ` using exact model ${resolvedExactBrainstormer}` : ""}.`
-              : `stdin prompt probe failed in cwd ${probeCwd} (exit ${probe.exitCode}${probe.timedOut ? ", timed out" : ""}).`,
+              : probe.timedOut
+                ? `stdin prompt probe timed out after ${this.config.policy.doctorProbeTimeoutMs}ms in cwd ${probeCwd} (exit ${probe.exitCode}).`
+                : `stdin prompt probe failed in cwd ${probeCwd} (exit ${probe.exitCode}).`,
+            code: probeCode,
           });
         }
       }
       void catalogueIds;
     } catch (error) {
-      checks.push({
-        name: "cursor-cli",
-        ok: false,
-        message: safeDiagnosticText(
-          error instanceof Error ? error.message : String(error),
-        ),
-      });
+      const hasDoctorUnexpected = checks.some(
+        (check) => check.name === "doctor" && check.code === "doctor-unexpected-error",
+      );
+      if (!hasDoctorUnexpected) {
+        checks.push({
+          name: "doctor",
+          ok: false,
+          message: safeDiagnosticText(
+            error instanceof Error ? error.message : String(error),
+          ),
+          code: "doctor-unexpected-error",
+        });
+      }
     } finally {
       const cleanup = await this.cleanupDoctorProbeSafe(probeCwd);
       checks.push(cleanup);
@@ -684,12 +757,13 @@ export class CursorCliRuntime implements AgentRuntime {
 
   private async cleanupDoctorProbeSafe(
     probeCwd: string,
-  ): Promise<{ name: string; ok: boolean; message: string }> {
+  ): Promise<{ name: string; ok: boolean; message: string; code: DoctorCheckCode }> {
     if (!this.doctorProbeRunId) {
       return {
         name: "doctor-probe-cleanup",
         ok: true,
         message: "No ephemeral doctor probe worktree was created.",
+        code: "ok",
       };
     }
     const probeId = this.doctorProbeRunId;
@@ -701,12 +775,14 @@ export class CursorCliRuntime implements AgentRuntime {
         name: "doctor-probe-cleanup",
         ok: true,
         message: `Removed doctor probe worktree and branch maswe/${probeId}.`,
+        code: "ok",
       };
     } catch (error) {
       return {
         name: "doctor-probe-cleanup",
         ok: false,
         message: error instanceof Error ? error.message : String(error),
+        code: "cleanup-failure",
       };
     } finally {
       this.doctorProbeRunId = undefined;

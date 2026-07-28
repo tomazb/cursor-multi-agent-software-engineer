@@ -257,12 +257,32 @@ export interface RuntimeErrorResult extends RuntimeResultBase {
 
 export type RuntimeResult = RuntimeFinishedResult | RuntimeErrorResult;
 
+export type DoctorCheckCode =
+  | "ok"
+  | "cursor-executable-unavailable"
+  | "cursor-version-check-failure"
+  | "catalogue-discovery-failure"
+  | "model-resolution-failure"
+  | "skipped-prerequisite-failure"
+  | "probe-invocation-failure"
+  | "probe-transport-timeout"
+  | "cleanup-failure"
+  | "doctor-unexpected-error"
+  | "cursor-sdk-credential-missing"
+  | "cursor-sdk-unavailable"
+  | "auth-failure"
+  | "process-termination-failure"
+  | "probe-malformed-output"
+  | "probe-invalid-terminal-marker";
+
 export interface RuntimeDoctorResult {
   ok: boolean;
   checks: Array<{
     name: string;
     ok: boolean;
     message: string;
+    code: DoctorCheckCode;
+    prerequisite?: string;
   }>;
 }
 

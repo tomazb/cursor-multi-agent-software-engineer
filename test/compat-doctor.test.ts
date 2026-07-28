@@ -49,5 +49,6 @@ test("doctor checks the configured stdin prompt transport path", async () => {
   assert.equal(transport.code, "ok");
   const probe = report.checks.find((c) => c.name === "prompt-transport-probe");
   assert.ok(probe, "doctor must probe configured stdin execution path");
-  assert.equal(probe.code, "ok");
+  assert.equal(probe.code, "skipped-prerequisite-failure");
+  assert.equal(probe.prerequisite, "model-catalogue");
 });

@@ -214,6 +214,6 @@ test("doctor probe timeout propagation uses doctorProbeTimeoutMs instead of comm
 
   const report = await runtime.doctor();
   const probe = report.checks.find((check) => check.name === "prompt-transport-probe");
-  assert.equal(probe?.ok, true, probe?.message);
+  assert.equal(probe?.ok, true, probe?.message ?? "missing prompt-transport-probe");
   assert.equal(probeTimeout, 25_000);
 });

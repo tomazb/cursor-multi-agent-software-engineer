@@ -245,7 +245,7 @@ test("existing-run Cursor execute uses persisted exact ID without substitution",
   const config = structuredClone(DEFAULT_CONFIG);
   config.runtime.command = process.execPath;
   config.roles.brainstormer.model = "cursor-grok-4.5-high";
-  config.policy.promptTransport = "argv";
+  config.policy.promptTransport = "stdin";
 
   let seenModel: string | undefined;
   const runtime = new CursorCliRuntime(config, {
@@ -531,7 +531,7 @@ test("doctor cleanup removes branch when worktree creation fails after branch ex
   const config = structuredClone(DEFAULT_CONFIG);
   config.runtime.kind = "cursor-cli";
   config.runtime.command = process.execPath;
-  config.policy.promptTransport = "argv";
+  config.policy.promptTransport = "stdin";
   config.policy.trustManagedWorktrees = true;
   config.policy.useIsolatedWorktree = true;
 

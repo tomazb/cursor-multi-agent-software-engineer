@@ -40,7 +40,7 @@ export class MockRuntime implements AgentRuntime {
   async doctor(): Promise<RuntimeDoctorResult> {
     return {
       ok: true,
-      checks: [{ name: "mock-runtime", ok: true, message: "Mock runtime is available." }],
+      checks: [{ name: "mock-runtime", ok: true, message: "Mock runtime is available.", code: "ok" }],
     };
   }
 }
