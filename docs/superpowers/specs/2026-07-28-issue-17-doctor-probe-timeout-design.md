@@ -158,7 +158,7 @@ would succeed in a real workflow run.
 
 ### Call flow (verified at base SHA `277e144`)
 
-```
+```text
 cli.ts: maswe doctor
   └─ createRuntime(config)            → CursorCliRuntime(config, { cwd })
   └─ runtime.doctor()
@@ -383,7 +383,7 @@ timeoutMs: Math.min(config.policy.doctorProbeCap ?? 60_000, commandTimeoutMs),
 
 ### Timeout precedence
 
-```
+```text
 Effective probe timeout =
     config.policy.doctorProbeTimeoutMs
     (always a validated integer in [1_000, 300_000], set to 60_000 by DEFAULT_CONFIG
@@ -426,7 +426,7 @@ explicitly supplies an invalid value. The operator must correct the configuratio
 tool can run.
 
 **Expected validation error:** `assertConfig()` throws a descriptive `Error` with the message:
-```
+```text
 policy.doctorProbeTimeoutMs must be an integer between 1000 and 300000
 ```
 
@@ -859,7 +859,7 @@ surfaced to operators and tests via a machine-readable JSON mode.
 `maswe doctor` (no `--json`) keeps its current human-readable output for backward compatibility.
 The current implementation (`src/cli.ts`) prints one line per check:
 
-```
+```text
 ${check.ok ? "PASS" : "FAIL"} ${check.name}: ${check.message}
 ```
 
@@ -941,7 +941,7 @@ required `code` field so tests can assert typed codes without a live Cursor CLI.
 The revised classification isolates each failure domain so no exception is misattributed. The
 implementation plan (Task 4) specifies the exact refactor; the design contract is:
 
-```
+```text
 doctor()
   ├─ TRY spawn agent --version
   │    ├─ spawn rejected (ENOENT/EACCES/EPERM/ENOTDIR)
@@ -1009,7 +1009,7 @@ Key invariants enforced by this structure:
 
 ### Normal execution path
 
-```
+```text
 doctor()
   ├─ agent --version (commandTimeoutMs)
   ├─ agent models    (commandTimeoutMs)
@@ -1026,7 +1026,7 @@ doctor()
 
 ### Timeout path
 
-```
+```text
 spawnFn(probe, { timeoutMs: effectiveProbeTimeout })
   ← deadline expires
   → spawnCaptured onTimeout():
@@ -1070,7 +1070,7 @@ check remains: `"probe-transport-timeout"` when `timedOut === true`, otherwise
 `cleanupDoctorProbeSafe()` is called in `finally` regardless of probe outcome. A timed-out probe
 does not bypass cleanup.
 
-```
+```text
 finally:
   cleanupDoctorProbeSafe(probeCwd)
     ├─ git worktree remove --force <worktreePath>  (no timeout — existing gap)
@@ -1298,7 +1298,7 @@ serialized before this field existed must remain loadable and usable.
 | Explicitly stored valid value is preserved | A persisted record with `doctorProbeTimeoutMs: 30_000` loads with that value intact |
 | Explicitly stored invalid value fails closed | A persisted record with `doctorProbeTimeoutMs: 0` causes `assertConfig()` to throw rather than silently clamping |
 
-This test maps to the configuration compatibility acceptance criterion (AC5 and AC4).
+This test maps to the persisted-configuration migration acceptance criterion (AC39).
 
 ### 10. CLI surface (`maswe doctor --json`)
 
@@ -1442,10 +1442,13 @@ acceptance tests.
    ```bash
    git rev-parse HEAD
    ```
-2. Confirm the effective `doctorProbeTimeoutMs`:
+2. Confirm the effective `doctorProbeTimeoutMs` from the normalized configuration separately:
    ```bash
-   maswe doctor 2>&1 | grep -E "prompt-transport-probe|timed out"
+   node --experimental-strip-types --input-type=module \
+     -e 'import { loadConfig } from "./src/config.ts"; const c = await loadConfig("/path/to/target-repo"); console.log(c.policy.doctorProbeTimeoutMs)'
    ```
+   Neither human doctor output nor `RuntimeDoctorResult` currently exposes the effective timeout
+   on a successful probe, so it must not be inferred from either output surface.
 3. Run `maswe doctor --json --cwd /path/to/target-repo` and record the parsed JSON. Because
    `--json` emits the complete `RuntimeDoctorResult`, the operator records directly from the
    JSON (no message-text scraping):
@@ -1453,7 +1456,7 @@ acceptance tests.
    - `report.ok`
    - for the `prompt-transport-probe` check: its `ok`, `code`, and (if present) `prerequisite`
    - the typed `code` of every other check
-   - the exact effective timeout value applied
+   - the exact effective timeout value recorded separately from the normalized configuration
    Authenticated validation **must** use `maswe doctor --json` to record codes; typed codes are
    read from the JSON, never inferred from human-readable output.
 4. Verify process and resource cleanup:
@@ -1518,13 +1521,16 @@ The existing ADR structure (0001–0007) covers the relevant architectural princ
 ### Denial-of-service / excessive-wait risk
 
 Without a maximum bound, an operator could set `doctorProbeTimeoutMs` to an arbitrary large
-value. The 300 000 ms maximum **bounds the prompt-transport probe process to at most 5 minutes**;
-with a 60 000 ms default, the probe process hang is bounded even without operator configuration.
-This bound applies **only to the prompt-transport invocation**. The **complete `maswe doctor`
-command duration remains unbounded**, because worktree creation (`resolveDoctorProbeCwd()`) and
-the cleanup git operations (`cleanupDoctorProbeResources()` in the `finally` block) have no
-independent deadline. Issue #17 does not make `maswe doctor` globally bounded; bounding total
-doctor duration is deferred to the cleanup-timeout follow-up.
+value. The 300 000 ms maximum caps the prompt-transport invocation deadline and subsequent
+promise settlement; the 60 000 ms default supplies that deadline without operator
+configuration. Process-tree termination after timeout remains best-effort, is not guaranteed,
+and is not observable, so this policy does not strictly bound the lifetime of every descendant
+process. The deadline applies **only to the prompt-transport invocation**. The **complete
+`maswe doctor` command duration remains unbounded**, because worktree creation
+(`resolveDoctorProbeCwd()`) and cleanup git operations
+(`cleanupDoctorProbeResources()` in the `finally` block) have no independent deadline. Issue
+#17 does not make `maswe doctor` globally bounded; bounding total doctor duration is deferred to
+the cleanup-timeout follow-up.
 
 ### Orphaned-process risk
 
@@ -1549,10 +1555,13 @@ is preserved unchanged.
 Issue #17's probe uses `--output-format text` and checks only the process exit and timeout
 state. A passing `prompt-transport-probe` check therefore proves **only**:
 1. The configured `agent` command **started**.
-2. The selected invocation path **accepted the stdin payload**.
-3. The process **exited zero within `doctorProbeTimeoutMs`** (`exitCode === 0 && !timedOut`).
+2. The invocation was started with the configured stdin payload wired to the child process.
+3. The child process **exited zero within `doctorProbeTimeoutMs`**
+   (`exitCode === 0 && !timedOut`).
 
 A passing check does **not** independently prove any of the following:
+- That the child read, parsed, or semantically accepted the stdin payload (there is no
+  acknowledgement protocol).
 - A machine-readable authentication classification (auth success is not decoded; a non-zero exit
   is classified as `"probe-invocation-failure"`, never `"auth-failure"`).
 - Non-empty or semantically valid model output (the probe does not inspect stdout content).

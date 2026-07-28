@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to execute this plan task-by-task. Do not skip failing-test-first order. Keep commits focused and reviewable.
 
-**Status:** `IMPLEMENTATION_PLAN_EXACT_READY_FOR_APPROVAL`
+**Status:** `IMPLEMENTATION_EXECUTED_DRAFT_REPAIR_REVALIDATION_PENDING`
 
 **Goal:** Implement the approved Issue #17 design so `maswe doctor` uses a bounded, validated, configurable probe timeout (`policy.doctorProbeTimeoutMs`) and emits deterministic typed doctor-check codes without expanding scope.
 
@@ -10,12 +10,12 @@
 
 **Tech Stack:** TypeScript ESM, Node `node:test` (`--experimental-strip-types`), JSON Schema 2020-12, npm scripts/CI defined in `package.json` and `.github/workflows/ci.yml`.
 
-**Approved design inputs:**
+**Approved design inputs at implementation start:**
 - Design: `docs/superpowers/specs/2026-07-28-issue-17-doctor-probe-timeout-design.md`
 - Approved baseline SHA: `277e14483c1d2ad280d67ee3262f3e8ef575e338`
-- Design status gate: `DESIGN_APPROVED_FOR_IMPLEMENTATION_PLANNING` (owner approved the design
-  for implementation-plan preparation; implementation remains blocked pending explicit owner
-  approval of this revised plan).
+- Historical design status gate: `DESIGN_APPROVED_FOR_IMPLEMENTATION_PLANNING`. That gate
+  preceded the implementation and exact-head repair records retained later in this document;
+  it is not the current execution status.
 
 ---
 
@@ -400,8 +400,8 @@ iteration counts):
 - [x] `npm run check` (typecheck + full test suite + build; superset of the above)
 
 **Focused runs (subset of the full suite; for fast iteration — not additional coverage):**
-- [ ] `node --experimental-strip-types --test test/config.test.ts test/schema.test.ts test/linked-worktree-compat.test.ts`
-- [ ] `node --experimental-strip-types --test test/issue17-doctor-probe-timeout.test.ts test/issue17-doctor-cli-json.test.ts test/issue17-cursor-sdk-doctor.test.ts test/compat-doctor.test.ts test/merge-blockers-round3.test.ts test/rc-review-corrections.test.ts test/ready-review-corrections.test.ts test/model-resolution.test.ts test/issue12-model-catalogue.test.ts test/issue19-runtime-failure.test.ts`
+- [x] `node --experimental-strip-types --test test/config.test.ts test/schema.test.ts test/linked-worktree-compat.test.ts`
+- [x] `node --experimental-strip-types --test test/issue17-doctor-probe-timeout.test.ts test/issue17-doctor-cli-json.test.ts test/issue17-cursor-sdk-doctor.test.ts test/compat-doctor.test.ts test/merge-blockers-round3.test.ts test/rc-review-corrections.test.ts test/ready-review-corrections.test.ts test/model-resolution.test.ts test/issue12-model-catalogue.test.ts test/issue19-runtime-failure.test.ts`
 
 **Additional CI-only gates (NOT part of `npm run check`; must be run explicitly to match CI):**
 - [x] Focused ready-review regression (CI step "Ready-review regression tests"):
@@ -433,12 +433,12 @@ iteration counts):
   If `--pack-destination` is not used, remove the exact generated `.tgz` (and any extraction
   directory) from the worktree immediately after inspection.
 - [x] Confirm no `*.tgz`, extraction directory, or other temporary artifact remains in the worktree.
-- [ ] `git diff --check`
-- [ ] `git status --porcelain=v1` — must be clean (mechanically achievable because packaging
+- [x] `git diff --check`
+- [x] `git status --porcelain=v1` — clean at recorded validation heads because packaging
   artifacts were created outside the worktree or removed).
 
 **Node-version coverage:**
-- [ ] Run deterministic validation on current Node 22 runtime (`node --version` recorded).
+- [x] Run deterministic validation on the active runtime (Node `v24.18.0` recorded).
 - [x] Run CI-parity compatibility validation on exact Node `22.22.2`:
   - `export PATH="$HOME/.nvm/versions/node/v22.22.2/bin:$PATH"`
   - `node --version && npm --version`
@@ -803,3 +803,25 @@ commits and current focused evidence without replacing original implementation h
 | AC38 | `4daf78c`; EMFILE, plain `Error`, and non-`Error` rejection fixtures all pass. |
 | AC39 | `4daf78c`; four exact persisted migration cases pass through `migrateRunRecord()`. |
 | AC40 | Focused human CLI formatting tests pass; codes remain JSON-only. |
+
+### Post-correction documentation audit
+
+After the initial correction head `1c0f8021d0c709b32f2c874440b20f9f2e645f95` was pushed
+and validated, authenticated CodeRabbit CLI `0.7.1` reviewed the committed base-to-head range
+and reported seven documentation-consistency findings. This follow-up preserves the original
+implementation and correction sequences while:
+
+- marking every design-document fence with an explicit language;
+- mapping persisted-run migration evidence to AC39;
+- recording the effective timeout from normalized configuration rather than claiming successful
+  human or JSON doctor output exposes it;
+- distinguishing the bounded invocation deadline/promise settlement from best-effort,
+  unobservable process-tree termination;
+- removing the overclaim that exit zero proves the child accepted the stdin payload;
+- updating the plan status from its historical pre-implementation gate to the executed draft
+  repair state; and
+- synchronizing focused, repository-state, and active-runtime checkboxes with recorded evidence.
+
+Because this documentation correction changes the PR head, deterministic validation,
+authenticated validation, exact-head CI, Copilot, CodeRabbit, and independent-verifier gates
+must all be repeated against the resulting pushed SHA before draft-stage repair handoff.
