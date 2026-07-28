@@ -117,6 +117,8 @@ test("doctor probes configured stdin path using CLI --cwd target", async () => {
   const report = await runtime.doctor();
   const probe = report.checks.find((c) => c.name === "prompt-transport-probe");
   assert.ok(probe);
-  assert.equal(probe.ok, true);
+  assert.equal(probe.ok, false);
+  assert.equal(probe.code, "skipped-prerequisite-failure");
+  assert.equal(probe.prerequisite, "model-catalogue");
   assert.match(probe.message, /stdin|cwd/i);
 });
