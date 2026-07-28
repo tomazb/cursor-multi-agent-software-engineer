@@ -339,8 +339,8 @@ contract" for the final specification.
 - The field name makes its purpose unambiguous in config and documentation.
 - Adds one field to `MasweConfig`, `domain.ts`, `config.ts` (`DEFAULT_CONFIG`, `assertConfig`),
   and `schemas/config.schema.json`.
-- Field is optional in raw user config (not in `policy.required`); existing configs without it
-  receive the default via `DEFAULT_CONFIG` merge.
+- The normalized schema requires the field in `policy.required`; existing raw configs may omit it
+  because `DEFAULT_CONFIG` merge supplies the default before normalized validation.
 - **Risk:** Operators must discover a third timeout field. However, `OPERATIONS.md` can direct
   them to it clearly.
 - The default of 60 000 ms safely covers observed 7–14 second latencies with a 4× margin,
@@ -1102,7 +1102,7 @@ follow-up makes it observable, at which point it must be added as a further inde
 
 | Attribute | Value |
 |---|---|
-| Type | `integer` (non-optional in TypeScript after `migrateConfig`; optional in raw user config) |
+| Type | `integer` (required in normalized TypeScript/schema config after `migrateConfig`; omission remains compatible for historical raw config) |
 | In `DEFAULT_CONFIG` | yes — `doctorProbeTimeoutMs: 60_000` |
 | Default | `60_000` ms (provided by `DEFAULT_CONFIG`, not by a call-site fallback) |
 | Minimum | `1_000` ms |
@@ -1127,8 +1127,9 @@ config at `60_000` unless the user explicitly overrides it. Runtime code uses
 `this.config.policy.doctorProbeTimeoutMs` directly — no `?? 60_000` fallback.
 
 The field is declared as `doctorProbeTimeoutMs: number` (non-optional) in `MasweConfig.policy`
-because it is always populated through the defaults path before validation. The JSON schema
-does **not** add it to `policy.required` (users need not provide it in their config files).
+because it is always populated through the defaults path before validation. The normalized JSON
+schema adds it to `policy.required`, matching `assertConfig()`; users and historical persisted
+records may omit it only before merge/migration supplies the default.
 
 **Test:** A config loaded with `migrateConfig({})` must produce exactly
 `policy.doctorProbeTimeoutMs === 60_000`.
@@ -1176,8 +1177,10 @@ In `schemas/config.schema.json`, under `policy.properties`:
 "doctorProbeTimeoutMs": { "type": "integer", "minimum": 1000, "maximum": 300000 }
 ```
 
-The field is not added to `policy.required`; it is optional in raw user config. The schema
-`minimum` and `maximum` constraints align with `assertConfig()` hard bounds.
+The field is added to `policy.required` because this schema describes normalized config.
+Backward compatibility with raw and historical configs is preserved by merge/migration adding
+the default before validation. The schema `minimum` and `maximum` constraints align with
+`assertConfig()` hard bounds.
 
 ---
 
@@ -1604,8 +1607,9 @@ Criteria marked with `[NEW]` are additions or replacements from the original dra
    No advisory warning; always throws.
 4. **AC4 [NEW]:** `src/config.ts` `DEFAULT_CONFIG` **includes** `doctorProbeTimeoutMs: 60_000`
    in `policy`. A call to `migrateConfig({})` produces exactly `policy.doctorProbeTimeoutMs === 60_000`.
-5. **AC5:** `schemas/config.schema.json` includes `doctorProbeTimeoutMs` as an optional integer
-   (not in `policy.required`) with `minimum: 1000, maximum: 300000`.
+5. **AC5:** `schemas/config.schema.json` includes `doctorProbeTimeoutMs` as a required normalized
+   integer in `policy.required`, with `minimum: 1000, maximum: 300000`; merge/migration supplies
+   the default for raw or historical omissions before validation.
 6. **AC6 [NEW]:** The probe spawn call uses `timeoutMs: this.config.policy.doctorProbeTimeoutMs`
    directly — no `?? 60_000` or other call-site fallback.
 7. **AC7 [NEW]:** `RuntimeDoctorResult.checks` elements include a required `code: DoctorCheckCode`
@@ -1791,7 +1795,7 @@ command does not have a strict upper bound on its wall-clock duration. CI pipeli
 | `src/runtimes/mock.ts` | Add `code: "ok"` to the hardcoded `mock-runtime` check object (currently a non-empty check literal) |
 | `src/runtimes/cursor-sdk.ts` | Add exact codes to the `cursor-api-key` and `cursor-sdk` check literals: `cursor-api-key` + `CURSOR_API_KEY` present → `"ok"`; `cursor-api-key` + absent → `"cursor-sdk-credential-missing"`; `cursor-sdk` + import succeeds → `"ok"`; `cursor-sdk` + import throws → `"cursor-sdk-unavailable"`. Expose `importFn?: CursorSdkImportFn` injection seam in constructor (defaulting to `importOptional`) so `execute()` and `doctor()` share one import path and tests can inject synthetic outcomes without installing `@cursor/sdk`. |
 | `src/cli.ts` | Add the `maswe doctor --json` branch: `console.log(JSON.stringify(report, null, 2))` when `--json` is present, else keep the existing `PASS`/`FAIL` line loop unchanged; keep `process.exitCode = report.ok ? 0 : 1` in both modes. No argument-parser change needed (`positional()` already treats `--json` as a bare flag) |
-| `schemas/config.schema.json` | Add optional `doctorProbeTimeoutMs` field under `policy.properties` |
+| `schemas/config.schema.json` | Add required normalized `doctorProbeTimeoutMs` under `policy.properties` and `policy.required`; migration supplies historical/raw omissions before validation |
 | `test/issue17-doctor-probe-timeout.test.ts` (new) | All typed-code, timeout-selection, bounds, deadline, multiple-failure, classification, probe-resource-gating, and canonical-default tests |
 | `test/issue17-doctor-cli-json.test.ts` (new) | Two CLI fixtures: passing (mock runtime) + failing/prerequisite (cursor-cli with temp wrapper); human output, `--json` parseability, typed-code/prerequisite visibility, exit semantics |
 | `test/issue17-cursor-sdk-doctor.test.ts` (new) | Deterministic `CursorSdkRuntime.doctor()` tests for import success, missing credential, and import failure paths using the `importFn` injection seam; no `@cursor/sdk` installation required |
