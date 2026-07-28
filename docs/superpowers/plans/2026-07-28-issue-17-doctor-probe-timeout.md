@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to execute this plan task-by-task. Do not skip failing-test-first order. Keep commits focused and reviewable.
 
-**Status:** `IMPLEMENTATION_PLAN_REVISED_READY_FOR_APPROVAL`
+**Status:** `IMPLEMENTATION_PLAN_FINAL_READY_FOR_APPROVAL`
 
 **Goal:** Implement the approved Issue #17 design so `maswe doctor` uses a bounded, validated, configurable probe timeout (`policy.doctorProbeTimeoutMs`) and emits deterministic typed doctor-check codes without expanding scope.
 
@@ -130,6 +130,7 @@
 - [ ] Add schema property as optional raw field (not in `policy.required`) with integer min/max.
 - [ ] Update example config to include explicit default field for operator discoverability.
 - [ ] Ensure partial policy objects keep all defaults (including `doctorProbeTimeoutMs`) after migration.
+- [ ] Add test for a historical raw `RunRecord` whose `config.policy` omits `doctorProbeTimeoutMs`: exercise `migrateRunRecord()` or `FileRunStore.load()` and assert: record remains loadable; `run.config.policy.doctorProbeTimeoutMs === 60_000`; `assertConfig()` passes; env overrides not applied during persisted-record migration; explicitly stored valid value is preserved; explicitly stored invalid value fails closed. Map to AC5/AC4.
 - [ ] Re-run focused config/schema tests and keep failures only in unimplemented downstream tasks.
 
 ---
@@ -158,7 +159,7 @@ files that construct no non-empty doctor-check literal.
 
 **Interfaces:**
 - New union type `DoctorCheckCode` in `src/domain.ts`:
-  - Emitted: `"ok"`, `"cursor-executable-unavailable"`, `"cursor-version-check-failure"`, `"catalogue-discovery-failure"`, `"model-resolution-failure"`, `"skipped-prerequisite-failure"`, `"probe-invocation-failure"`, `"probe-transport-timeout"`, `"cleanup-failure"`, `"doctor-unexpected-error"`
+  - Emitted: `"ok"`, `"cursor-executable-unavailable"`, `"cursor-version-check-failure"`, `"catalogue-discovery-failure"`, `"model-resolution-failure"`, `"skipped-prerequisite-failure"`, `"probe-invocation-failure"`, `"probe-transport-timeout"`, `"cleanup-failure"`, `"doctor-unexpected-error"`, `"cursor-sdk-credential-missing"`, `"cursor-sdk-unavailable"`
   - Reserved/non-emitted: `"auth-failure"`, `"process-termination-failure"`, `"probe-malformed-output"`, `"probe-invalid-terminal-marker"`
 - `RuntimeDoctorResult.checks[*]` gains required `code: DoctorCheckCode`.
 - `RuntimeDoctorResult.checks[*]` gains optional `prerequisite?: string`.
@@ -175,9 +176,13 @@ files that construct no non-empty doctor-check literal.
 **Steps:**
 - [ ] Add `DoctorCheckCode` union in `src/domain.ts` using existing kebab-case string-literal convention.
 - [ ] Extend `RuntimeDoctorResult` check shape with required `code` and optional `prerequisite`.
-- [ ] Update the runtime check constructors that build non-empty checks (`cursor-cli`, `mock`, `cursor-sdk`) to supply required `code`.
-- [ ] Add the `maswe doctor --json` branch to `src/cli.ts` exactly as specified above; keep human `PASS`/`FAIL` output and `report.ok`-derived exit status in both modes.
-- [ ] Create `test/issue17-doctor-cli-json.test.ts` exercising the CLI entry point with the `mock` runtime (`MASWE_RUNTIME=mock`): assert human output lines, `--json` parseability, typed `code`/`prerequisite` visibility, and matching exit semantics (non-zero on failed report in both modes).
+- [ ] Update the runtime check constructors that build non-empty checks (`cursor-cli`, `mock`, `cursor-sdk`) to supply required `code`. For `cursor-sdk.ts` use the exact mapping: `cursor-api-key` + `CURSOR_API_KEY` present → `"ok"`; `cursor-api-key` + absent → `"cursor-sdk-credential-missing"`; `cursor-sdk` + import succeeds → `"ok"`; `cursor-sdk` + import throws → `"cursor-sdk-unavailable"`.
+- [ ] Add the `maswe doctor --json` branch to `src/cli.ts` exactly as specified above; keep human `PASS`/`FAIL` output in the exact `PASS|FAIL <name>: <message>` format (no code appended) and `report.ok`-derived exit status in both modes.
+- [ ] Create `test/issue17-doctor-cli-json.test.ts` with **two fixtures** as specified in the design:
+  - **Passing fixture** (`MASWE_RUNTIME=mock`): assert human `PASS` lines in unchanged format; `--json` parseability; every check has `code`; mock check has `code: "ok"`; exit 0 in both modes.
+  - **Failing/prerequisite fixture** (temp `cursor-cli` config + temp executable returning non-zero for `--version`): assert process exits non-zero in both modes; `cursor-cli` has `"cursor-version-check-failure"`; `prompt-transport-probe` has `ok: false`, `code: "skipped-prerequisite-failure"`, `prerequisite: "cursor-cli"`; actual probe command not invoked; JSON typed fields present; human line format unchanged.
+  - Use existing child-process helpers and temporary executable patterns; do not add failure switches to production `MockRuntime`.
+- [ ] Add deterministic tests for `cursor-sdk.ts` both success and failure paths: `CURSOR_API_KEY` present → `cursor-api-key` `code: "ok"`; absent → `code: "cursor-sdk-credential-missing"`; import succeeds → `cursor-sdk` `code: "ok"`; import throws → `code: "cursor-sdk-unavailable"`.
 - [ ] Run `npm run typecheck`; for any non-required test file that fails to compile, add `code` only to the offending non-empty check literal.
 
 ---
@@ -194,9 +199,11 @@ files that construct no non-empty doctor-check literal.
 **Interfaces and deterministic mappings:**
 - `cursor-cli` check:
   - `--version` **spawn rejected** with `error.code ∈ { ENOENT, EACCES, EPERM, ENOTDIR }` → `"cursor-executable-unavailable"`, then **terminate** the downstream check sequence (the thrown error propagates to the outer catch; no catalogue/model/probe checks are emitted).
+  - `--version` **spawn rejected** with any other thrown value (unknown `error.code`, `EMFILE`, `ENOMEM`, plain `Error` without `code`, non-`Error` rejection) → emit a **`doctor`** check with `"doctor-unexpected-error"`; **no** `cursor-cli` check is emitted; terminate downstream.
   - `--version` process started; non-zero or timed-out result → `"cursor-version-check-failure"` (`cliOk = false`).
   - `--version` exit 0 → `"ok"` (`cliOk = true`).
 - `doctor` check (generic identity):
+  - A pre-version spawn rejection whose `error.code` is not in the executable-unavailability set reaches the outer catch before any `cursor-cli` check exists → emit a `doctor` check with `"doctor-unexpected-error"`; never emit a `cursor-cli` check.
   - An unexpected exception **after** the `cursor-cli` check was already recorded (e.g., a git error from `resolveDoctorProbeCwd()`) reaches the outer catch → emit a check named `doctor` with `"doctor-unexpected-error"`. **Never** emit a second `cursor-cli` check after a successful one.
 - `model-catalogue` check:
   - `listModels()` (catalogue-only try/catch) ran and threw → `"catalogue-discovery-failure"`.
@@ -226,9 +233,15 @@ throw from `resolveProjectModels()` is caught as a catalogue-discovery failure. 
    `resolveProjectModels()` is later identified, document that justification; the default is
    removal.)
 5. Keep the outer catch strictly for the `--version` spawn rejection (→ `cursor-cli`
-   `"cursor-executable-unavailable"`) and for unexpected post-version exceptions (→ `doctor`
-   `"doctor-unexpected-error"`), distinguishing the two by whether a `cursor-cli` check was
-   already recorded.
+   `"cursor-executable-unavailable"` for ENOENT/EACCES/EPERM/ENOTDIR; `doctor`
+   `"doctor-unexpected-error"` for all other thrown values before `cursor-cli` check is recorded)
+   and for unexpected post-version exceptions (→ `doctor` `"doctor-unexpected-error"`),
+   distinguishing the cases by whether a `cursor-cli` check was already recorded.
+6. Gate `resolveDoctorProbeCwd()` so it is called **only when the stdin probe will actually
+   execute**: confirm no blocking prerequisite exists and `promptTransport === "stdin"` before
+   calling it. When `promptTransport !== "stdin"`, no probe-resource creation occurs. When a
+   blocking prerequisite exists, emit the skipped `prompt-transport-probe` check and do **not**
+   call `resolveDoctorProbeCwd()`.
 
 **Stable `prerequisite` values (exact):**
 - `"cursor-cli"` when the probe did not run because `--version` failed (non-zero/timed-out).
@@ -252,7 +265,16 @@ throw from `resolveProjectModels()` is caught as a catalogue-discovery failure. 
 - [ ] Add deterministic tests: `--version` non-zero and `--version` timed-out (both `"cursor-version-check-failure"`; probe skipped with `prerequisite: "cursor-cli"`; probe `spawnFn` not invoked; no false model/catalogue/auth/transport classification).
 - [ ] Add deterministic tests: `--version` spawn rejection ENOENT/EACCES (`"cursor-executable-unavailable"`; downstream terminated; only `cursor-cli` + `doctor-probe-cleanup` checks; no probe check).
 - [ ] Add deterministic test: unexpected post-version error (e.g. `resolveDoctorProbeCwd()` throws after a successful `cursor-cli` check) yields a `doctor` check `"doctor-unexpected-error"` and no duplicate `cursor-cli` check.
+- [ ] Add deterministic test: `spawnFn` rejects with an unknown error code (e.g. `EMFILE`) before `cursor-cli` check exists → `doctor` check with `"doctor-unexpected-error"`; no `cursor-cli` check emitted; downstream terminates.
+- [ ] Add deterministic test: `spawnFn` rejects with a plain `Error` (no `code`) before `cursor-cli` check exists → `doctor`/`"doctor-unexpected-error"`; no `cursor-cli` check.
+- [ ] Add deterministic test: `spawnFn` rejects with a non-`Error` value → `doctor`/`"doctor-unexpected-error"`; no `cursor-cli` check.
 - [ ] Add deterministic test: no `"model-resolution-failure"` code appears without an actual `resolveLogicalModelId()` attempt for that role.
+- [ ] Add deterministic test: non-zero version → `ensureProbeWorkspace` / `resolveDoctorProbeCwd()` is **not** called (no worktree or branch created).
+- [ ] Add deterministic test: catalogue failure → `resolveDoctorProbeCwd()` not called.
+- [ ] Add deterministic test: brainstormer resolution failure → `resolveDoctorProbeCwd()` not called.
+- [ ] Add deterministic test: `promptTransport !== "stdin"` (argv transport) → `resolveDoctorProbeCwd()` not called; no probe-resource creation.
+- [ ] Add deterministic test: all prerequisites pass and `promptTransport === "stdin"` → `resolveDoctorProbeCwd()` called exactly once when isolation requires it.
+- [ ] Add deterministic test: a skipped probe has `"skipped-prerequisite-failure"` and is not replaced by any worktree-creation error (because creation is never attempted for a skipped probe).
 
 ---
 
@@ -458,12 +480,12 @@ Do not squash away test-first commits unless explicitly authorized later.
 | AC | Requirement summary | Implementation task(s) | Source file(s) | Test file(s) | Validation command(s) | Expected evidence |
 |---|---|---|---|---|---|---|
 | AC1 | Remove hard-coded `Math.min(5_000, ...)` probe timeout path | Task 5 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | No `Math.min(5_000` in probe path; tests assert exact propagated timeout |
-| AC2 | Add `doctorProbeTimeoutMs` + `DoctorCheckCode` + required `code` + optional `prerequisite` | Tasks 2, 3 | `src/domain.ts` | `test/issue17-doctor-probe-timeout.test.ts`, compatibility tests | `npm run typecheck` + focused tests | Type errors gone only after field/union/shape updates are complete |
+| AC2 | Add `doctorProbeTimeoutMs` + `DoctorCheckCode` (16-value: 12 emitted + 4 reserved) + required `code` + optional `prerequisite` | Tasks 2, 3 | `src/domain.ts` | `test/issue17-doctor-probe-timeout.test.ts`, compatibility tests | `npm run typecheck` + focused tests | Type errors gone only after field/union/shape updates are complete |
 | AC3 | Hard reject invalid timeout values in `assertConfig()` | Task 2 | `src/config.ts` | `test/config.test.ts`, `test/rc-review-corrections.test.ts` | Focused config tests | Invalid values throw with `doctorProbeTimeoutMs` validation error |
 | AC4 | Default `doctorProbeTimeoutMs: 60_000` in `DEFAULT_CONFIG`; migrate omission to 60_000 | Task 2 | `src/config.ts`, `src/domain.ts` | `test/config.test.ts`, `test/linked-worktree-compat.test.ts` | Focused config tests | Omitted raw config yields normalized `60_000` exactly |
 | AC5 | Schema property optional integer [1000, 300000] | Task 2 | `schemas/config.schema.json` | `test/schema.test.ts` | Focused schema tests | Schema accepts valid bound values and rejects out-of-range/wrong-type |
 | AC6 | Probe spawn uses exact `this.config.policy.doctorProbeTimeoutMs` (no fallback) | Task 5 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | Captured spawn options show exact normalized timeout |
-| AC7 | Every doctor check literal includes required `code` | Task 3 | `src/runtimes/cursor-cli.ts`, `src/runtimes/mock.ts`, `src/runtimes/cursor-sdk.ts` | Compatibility tests touching doctor checks | `npm run typecheck` + focused doctor tests | Compile-time + runtime assertions show code present on emitted checks |
+| AC7 | Every doctor check literal includes required `code`; `cursor-sdk.ts` uses exact cursor-sdk code mapping | Task 3 | `src/runtimes/cursor-cli.ts`, `src/runtimes/mock.ts`, `src/runtimes/cursor-sdk.ts` | Compatibility tests touching doctor checks, deterministic cursor-sdk tests | `npm run typecheck` + focused doctor tests | Compile-time + runtime assertions show code present on emitted checks; SDK success/failure paths both covered |
 | AC8 | Deterministic tests assert `code` values (message text only for message-quality tests) | Task 1, Task 3 | test suite | `test/issue17-doctor-probe-timeout.test.ts`, updated doctor tests | Focused doctor tests | Assertions primarily use `check.code`, with labeled message-only tests |
 | AC9 | Primary probe failure and cleanup failure both preserved independently | Task 6 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts`, `test/merge-blockers-round3.test.ts`, `test/rc-review-corrections.test.ts` | Focused doctor tests | Report contains separate failed checks with distinct codes |
 | AC10 | Operations doc covers new timeout field + semantics | Task 7 | `docs/OPERATIONS.md` | Doc review (no unit tests) | Full validation + review checklist | Docs include default/range/independence/limitations text |
@@ -473,7 +495,7 @@ Do not squash away test-first commits unless explicitly authorized later.
 | AC14 | Cleanup-timeout hardening remains explicit follow-up only | Task 7 | `docs/OPERATIONS.md`, `docs/ARCHITECTURE.md`, `CHANGELOG.md` | Doc review | Full validation + review checklist | Docs explicitly defer cleanup timeout changes |
 | AC15 | Repository check pipeline passes | Task 8 | n/a | n/a | `npm run check` | Recorded command output for exact head |
 | AC16 | Cleanup still always attempted via `finally` | Task 6 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts`, `test/merge-blockers-round3.test.ts` | Focused doctor tests | Cleanup check present after success/failure/timeout paths |
-| AC17 | Skipped probe emits `skipped-prerequisite-failure`, `ok:false`, and stable `prerequisite`; not mislabeled model/auth/transport failure | Task 4 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | Skipped probe has exact code + prerequisite (`model-catalogue` or `model-brainstormer`) |
+| AC17 | Skipped probe emits `skipped-prerequisite-failure`, `ok:false`, and stable `prerequisite` (`cursor-cli`, `model-catalogue`, or `model-brainstormer`); not mislabeled model/auth/transport failure | Task 4 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | Skipped probe has exact code + prerequisite from stable vocabulary |
 | AC18 | Executable unavailable distinct from started-but-failing version check | Task 4 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | ENOENT/EACCES/EPERM/ENOTDIR map to unavailable; started non-zero/timeouts map to version-check-failure |
 | AC19 | Emitted code predicates are deterministic and mutually exclusive | Task 4 | `src/runtimes/cursor-cli.ts`, `src/domain.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | Branch coverage verifies one code per concrete condition |
 | AC20 | Reserved codes remain non-emitted | Task 3, Task 4 | `src/domain.ts`, `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | Reserved-code set is never observed in emitted checks |
@@ -492,6 +514,11 @@ Do not squash away test-first commits unless explicitly authorized later.
 | AC33 | Exact CI-only gates run and are distinguished from `npm run check` | Task 8 | `.github/workflows/ci.yml` parity (no repo edit) | `test/ready-review-corrections.test.ts`, `test/issue11-lock-contention.test.ts` | Ready-review run; Issue #11 25/100-iter env gates; Node 22 + 22.22.2 | Command transcripts for each gate |
 | AC34 | Packaging leaves no generated artifacts | Task 8 | n/a | n/a | `npm pack --json` in temp dir; artifact removed | Final `git status --porcelain=v1` clean; no `.tgz`/extraction dir |
 | AC35 | Termination not claimed observable; probe-success not overstated | Tasks 4, 7 | `src/runtimes/cursor-cli.ts`, docs | `test/issue17-doctor-probe-timeout.test.ts` | Focused tests + doc review | No test/doc asserts guaranteed termination or auth/output validity from a passing probe |
+| AC36 | `cursor-sdk.ts` uses exact code mapping: `cursor-sdk-credential-missing` for absent key; `cursor-sdk-unavailable` for failed import; neither is `auth-failure` or `cursor-executable-unavailable` | Task 3 | `src/runtimes/cursor-sdk.ts` | `test/issue17-doctor-probe-timeout.test.ts` or cursor-sdk dedicated tests | Focused doctor tests + `npm run typecheck` | SDK success and failure paths both have deterministic tests asserting exact codes |
+| AC37 | `resolveDoctorProbeCwd()` gated before probe-resource creation: not called on version failure, catalogue failure, brainstormer failure, or argv transport; called exactly once for passing stdin probe; skipped probe cannot be replaced by worktree error | Task 4 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | Deterministic tests inject spy on `ensureProbeWorkspace`/`resolveDoctorProbeCwd` and assert call count for each scenario |
+| AC38 | Pre-version spawn rejection with non-executable-unavailability error → `doctor`/`doctor-unexpected-error`; no `cursor-cli` check emitted; downstream terminates | Task 4 | `src/runtimes/cursor-cli.ts` | `test/issue17-doctor-probe-timeout.test.ts` | Focused doctor tests | EMFILE, plain Error, non-Error rejection → `doctor`/`doctor-unexpected-error`; no `cursor-cli` check present |
+| AC39 | Historical persisted `RunRecord` missing `doctorProbeTimeoutMs` loads successfully, normalizes to 60_000, passes `assertConfig()`, and env overrides are not applied during migration | Task 2 | `src/config.ts` | `test/config.test.ts` or `test/issue17-doctor-probe-timeout.test.ts` | Focused config tests | Loadable; `60_000`; `assertConfig()` passes; explicit valid value preserved; explicit invalid value fails closed |
+| AC40 | Human CLI output is strictly `PASS\|FAIL <name>: <message>` in both modes; no code is appended to human lines | Task 3 | `src/cli.ts` | `test/issue17-doctor-cli-json.test.ts` (both fixtures) | Focused CLI tests | Human output lines match exact format; codes appear only in `--json` output |
 
 ---
 
