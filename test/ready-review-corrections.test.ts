@@ -34,9 +34,9 @@ const args = process.argv.slice(2);
 const mode = process.env.MASWE_FAKE_GIT_MODE;
 if (args[0] === "rev-parse" && args[1] === "--is-inside-work-tree") {
   if (mode === "hang") setTimeout(() => {}, 10_000);
-  else { console.log("true"); process.exit(0); }
+  else { require("node:fs").writeSync(1, "true\\n"); process.exit(0); }
 } else if (args[0] === "status" && mode === "status-failure") {
-  console.error("synthetic git status failure");
+  require("node:fs").writeSync(2, "synthetic git status failure\\n");
   process.exit(7);
 } else {
   process.exit(0);

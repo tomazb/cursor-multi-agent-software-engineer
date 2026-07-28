@@ -12,7 +12,9 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
 - Model output cannot authorize a transition unless the orchestrator recognizes the required terminal marker after structured response decoding: exactly one bare marker token on the final logical line of the authoritative assistant text (no backticks, quotes, earlier mentions, duplicates, or conflicting markers).
 - For Cursor CLI `json` / `stream-json` modes, marker validation runs only on the decoded authoritative `result` string. Transport JSON quoting is not treated as embedded model content. Malformed envelopes, unsupported shapes, and missing `result` fields fail closed before marker validation.
 - Operator-visible marker diagnostics distinguish quoted examples, embedded tokens, duplicates, conflicts, non-final markers, and content after a marker, without echoing the full model output.
-- Common secrets are redacted before persistence.
+- Common secrets are redacted before persistence. Successful model output follows the artifact
+  redaction contract; its URI-authority scanner advances once forwards without rescanning prior
+  content. Failure diagnostics additionally follow the bounded failure contract below.
 - JSON schemas live under `schemas/` for configuration and run records.
 - Persisted `run.config.roles.*.model` values are exact executable catalogue IDs after `start`. Loading a run migrates defaults then runs the same config assertions as project load (without applying process environment overrides).
 
@@ -60,6 +62,64 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
 Build, quality, and verification events include the evaluated `headSha`. When `headSha` changes, prior quality/verification evidence is invalidated and merge-ready fails closed until CI and verification are re-run.
 
 The run's configuration is a snapshot. Changing `.maswe/config.json` affects only later runs unless a future migration command explicitly updates a run.
+
+### Failure record
+
+New failures may include `failure.code`, currently `runtime-models-exhausted` or `workflow-failure`,
+alongside the existing message, timestamp, and optional resume state. The code is optional for
+backward compatibility with existing schema-version-1 records. They may also include the optional
+schema-version-1-compatible object:
+
+```json
+{
+  "runtime": {
+    "attempts": [
+      {
+        "model": "cursor-grok-4.5-high",
+        "code": "cursor-cli-non-zero",
+        "message": "Cursor CLI exited non-zero.",
+        "requestedModel": "cursor-grok-4.5-high",
+        "configuredModel": "cursor-grok-4.5-high",
+        "exitCode": 7,
+        "timedOut": false,
+        "durationMs": 42,
+        "promptTransport": "stdin",
+        "stderrPresent": true,
+        "truncated": false
+      }
+    ],
+    "totalAttempts": 1,
+    "omittedAttempts": 0,
+    "aggregateTruncated": false
+  }
+}
+```
+
+`attempts` stores at most eight entries. `totalAttempts` counts every executed fallback;
+`omittedAttempts` is the difference between the total and stored entries. Attempt messages are
+bounded to 512 Unicode code points and `model`, `requestedModel`, and `configuredModel` display
+fields to 256. All fields except `model`, `code`, `message`, `stderrPresent`, and `truncated` are
+optional per attempt. Arbitrary runtime metadata is not part of this contract. The
+`durableRuntimeFailureAttempt` and `durableRuntimeFailureSummary` schema definitions both set
+`additionalProperties: false`, so nested raw stderr, adapter metadata, and unknown summary fields
+are rejected.
+Store and migration safeguards inspect only the first eight raw attempt slots and discard invalid
+entries, keeping sanitization work bounded even for malformed historical input.
+
+Failure messages and `FAIL.details.reason` are normalized, redacted, and bounded to 8,192 Unicode
+code points including `… [truncated]`. `RETRY_FROM_FAILED.details.previousFailure.message` receives
+the same safeguard. `FAIL.details.runtime` and
+`RETRY_FROM_FAILED.details.previousFailure.runtime` use the same bounded durable subset. Loading an
+older record with no runtime object preserves the old shape; loading a record with the optional
+object reconstructs and sanitizes only the documented fields before status/inspection rendering.
+The existing schema-version-1 `failure.message` field keeps its historical unconstrained schema
+shape; migration and every new write enforce the current 8,192-code-point runtime policy.
+
+Cursor CLI runtime error results are not artifacts. Raw stderr, raw error metadata, and stderr
+digests are never part of the run or artifact contract. Safe runtime diagnostics expose a stable
+code plus applicable exit code, timeout, duration, requested/configured model, prompt transport,
+`stderrPresent`, and `truncated`. Individual diagnostics are capped at 2,048 Unicode code points
+before the 8,192-code-point fallback aggregate is built.
 
 ## `02-brainstorm.md`
 
@@ -133,6 +193,10 @@ For every command it contains:
 - stderr.
 
 The report's overall result is `PASS` only when every configured command ran and returned zero. With an empty command list, the result is pass; production repositories should configure meaningful commands.
+
+This stderr is output from trusted project quality commands and is redacted through the existing
+artifact contract. It is distinct from provider/Cursor runtime stderr, which never becomes an
+artifact.
 
 ## `06-verification-report.md`
 
@@ -218,6 +282,19 @@ Each transition event includes:
 ```
 
 Runtime fields are optional because not every adapter exposes them.
+
+For runtime-backed successful transitions, `requestedModel` and `actualModel` are display-only
+copies normalized with the same single-line, aggregate-delimiter-neutral, 256-code-point policy as
+durable failure model fields. Optional `agentId` and `runtimeRunId` use a separately named bounded
+identifier-display policy. Runtime invocation, catalogue selection, fallback ordering, and
+requested-versus-actual comparison use the original values and are not changed by event
+persistence.
+
+For `FAIL`, details may also include the durable failure `code`, bounded safe `reason`, and optional
+bounded `runtime` summary. For `RETRY_FROM_FAILED`, `previousFailure` is the already-safe failure
+record and its message/runtime subset is re-sanitized at the store boundary. For both events, the
+raw runtime object is excluded before other detail fields are cloned; its bounded allowlisted
+replacement is attached afterward.
 
 ## Future schema hardening
 

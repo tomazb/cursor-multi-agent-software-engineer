@@ -118,15 +118,90 @@ the digest fingerprint.
 - `.env*` is ignored except the example file.
 - SDK API key is passed through process environment/options, not persisted in run config.
 - Persisted workspace `remote` provenance is sanitized at capture time: HTTP(S)/`ssh://` userinfo is stripped; malformed credential-like remotes are omitted rather than stored raw.
+- Raw Cursor CLI stderr is transient process-adapter data. Non-zero exits return only a structured
+  failure code, process metadata, and a normalized/redacted/bounded operator diagnostic. Runtime
+  metadata records `stderrPresent` rather than stderr content.
+- Failure diagnostics normalize unsafe controls, redact, and then truncate. Individual diagnostics
+  are at most 2,048 Unicode code points and all-model aggregates at most 8,192, including the
+  `… [truncated]` marker.
+- Diagnostic work is bounded before redaction. The sanitizer accepts at most the requested output
+  budget plus 4,096 Unicode code points of lookahead, with an absolute 12,288-code-point inspection
+  ceiling. The ordinary 2,048-code-point diagnostic therefore inspects at most 6,144 code points;
+  the 8,192-code-point aggregate inspects at most 12,288. Long assignments and incomplete private
+  key blocks are treated as secret through the accepted-window boundary, so truncation cannot
+  expose a recognized secret prefix.
+- The orchestrator and file store re-sanitize failure messages, `FAIL.details.reason`, and retry
+  `previousFailure.message` before persistence. They also reconstruct the allowlisted durable
+  runtime-attempt subset rather than serializing arbitrary adapter metadata. CLI status rendering
+  applies the same focused safeguard. `FAIL` and retry event paths remove the raw runtime object
+  before cloning other details, then sanitize only the first eight runtime attempt slots.
+- Durable runtime failure state stores at most eight attempts. Attempt messages are capped at 512
+  Unicode code points and model display fields at 256. Total and omitted attempt counts, aggregate
+  truncation, stable code, exit/timeout/duration/transport fields, stderr presence, and truncation
+  are retained where applicable. Re-sanitizing a loaded or tampered record inspects only its first
+  eight raw attempt slots; invalid entries are discarded rather than triggering an unbounded search
+  for later valid-looking data.
+- Model identifiers used for execution remain unchanged. Their diagnostic display copies are
+  separately redacted, capped, collapsed to one line, and stripped of aggregate framing
+  delimiters before formatting or persistence.
+- Successful runtime-backed workflow events apply that same 256-code-point model-display policy to
+  `requestedModel` and `actualModel`. Optional `agentId` and `runtimeRunId` values use a separately
+  named 256-code-point identifier-display policy at the same persistence boundary. These display
+  copies do not alter runtime invocation, exact-model comparison, catalogue selection, or fallback
+  ordering.
+- The JSON Schema closes the nested durable runtime attempt and summary allowlists with
+  `additionalProperties: false`. Historical schema-version-1 parent objects remain open where
+  required for compatibility, and failures without runtime metadata remain valid.
+- MASWE has no raw provider-debug artifact or log channel. It does not persist an encrypted copy or
+  any digest or hash of raw stderr.
+- Cursor CLI failure adapters sanitize the bounded stderr window before trimming or composing
+  summaries; catalogue and doctor diagnostics use the same ordering.
 - Documentation instructs teams not to commit run artifacts by default.
+- The normal constrained-heap regression uses an 8,000,000-character one-byte input, a 48 MiB V8
+  old-space limit, and an exact 128-code-point output assertion. It guards against sanitizer
+  overhead proportional to every input code point; it is not an absolute bound on total process
+  memory or the input representation itself.
 
 **Gaps and future work:**
 
-- Automatic secret redaction covers common token/PEM/Authorization patterns; it is best-effort, not a DLP product.
+- Automatic secret redaction covers tested classic GitHub tokens, modern `github_pat_` fine-grained
+  PAT shapes, OpenAI/Slack tokens, authorization and standalone bearer forms, URI userinfo, common
+  API-key/token/AWS-secret assignments, private-key blocks, and sensitive query parameters.
+  URI-userinfo recognition requires an explicit `http`, `https`, `ssh`, `git`, `git+https`,
+  `git+ssh`, `sftp`, or `ftp` `scheme://` prefix; it redacts username-only and username/password
+  forms while preserving the remaining URI. If a supported URI authority reaches a truncated
+  inspection-window boundary before `@` or another authority delimiter, the incomplete authority
+  is redacted fail-closed. SCP-like `user@host:path`, ordinary email, arbitrary schemes, and
+  percent-decoded semantic interpretation are intentionally not inferred.
+- The accepted grammar is deliberately narrow: classic GitHub prefixes and `github_pat_` require at
+  least 20 token characters; authorization forms require an `Authorization: Bearer|Basic` header
+  or standalone `Bearer`; assignment keys are ASCII identifier names ending in a tested
+  API-key/token/secret/signature/AWS-secret suffix followed by `:` or `=` and a quoted or
+  delimiter-terminated value (quoted values honor odd/even backslash escaping before a quote, and
+  one JSON-encoded structural-quote layer is recognized); sensitive query values require a tested
+  `?`/`&` parameter name; and private-key blocks require a `BEGIN … PRIVATE KEY` marker (an absent
+  end marker redacts through the accepted window). The fixed-token-prefix scanner consumes only
+  each prefix's documented ASCII token alphabet and redacts fail-closed if that candidate reaches
+  the truncated accepted-window end, even before the complete-token minimum is observable.
+- The fixed-token-prefix, assignment, URI-authority, and private-key scanners advance
+  monotonically. The URI scanner records the last `@` during its forward authority pass; it does
+  not search the already-consumed prefix again for each URI. That property also keeps the separate,
+  potentially larger successful-artifact `redactSecrets()` path linear in the accepted text.
+  Remaining regular expressions use non-overlapping grammars and failure diagnostics run them only
+  on the bounded diagnostic window; none contains the former nested ambiguous provider-prefix
+  repetition. Benchmarks guard scaling, but are supporting evidence rather than a formal
+  complexity proof.
+- Recognition remains pattern-based, best-effort protection, not a DLP product or a guarantee that
+  arbitrary credentials can be recognized.
+- Diagnostic framing replaces C0/C1 controls, Unicode line/paragraph separators, bidi overrides,
+  and bidi isolates; CR/LF normalization and tab/newline preservation otherwise remain as
+  documented.
 - Default Cursor CLI prompt transport is stdin; argv remains available via `policy.promptTransport`.
 - No provider-specific privacy controls beyond local redaction.
 
-A near-term change should pass large prompts through stdin or SDK calls rather than command-line arguments where supported.
+Authentication-like stderr prose remains visible only after sanitization under the structured
+non-zero classification. It does not drive control flow because Cursor CLI does not expose a typed
+authentication field.
 
 ### T8 — Artifact tampering
 

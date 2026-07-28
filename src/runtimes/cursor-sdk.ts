@@ -1,9 +1,25 @@
 import type { AgentRuntime, RuntimeDoctorResult, RuntimeRequest, RuntimeResult } from "../domain.ts";
 import { gitWorkspaceFingerprint } from "../git-snapshot.ts";
+import { sanitizeDiagnostic } from "../redaction.ts";
 
 const importOptional = new Function("specifier", "return import(specifier)") as (
   specifier: string,
 ) => Promise<Record<string, any>>;
+
+export function serializeCursorSdkResult(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    const serialized = JSON.stringify(value, null, 2);
+    if (typeof serialized === "string") return serialized;
+  } catch {
+    // Fall through to a string representation for non-JSON values such as BigInt.
+  }
+  try {
+    return String(value ?? "");
+  } catch {
+    return "[unserializable Cursor SDK result]";
+  }
+}
 
 export class CursorSdkRuntime implements AgentRuntime {
   async listModels(): Promise<string[]> {
@@ -27,9 +43,28 @@ export class CursorSdkRuntime implements AgentRuntime {
         `${request.role} changed the workspace despite read-only policy. Review and revert the changes before continuing.`,
       );
     }
-    const output = typeof result.result === "string" ? result.result : JSON.stringify(result.result, null, 2);
+    const output = serializeCursorSdkResult(result.result);
+    if (result.status !== "finished") {
+      const diagnostic = sanitizeDiagnostic(output || `Cursor SDK returned status ${String(result.status)}`);
+      return {
+        status: "error",
+        output: diagnostic.text,
+        requestedModel: request.roleConfig.model,
+        actualModel: result.model?.id,
+        agentId: result.agentId,
+        runId: result.id,
+        failure: {
+          code: "cursor-sdk-error",
+          message: diagnostic.text,
+          requestedModel: request.roleConfig.model,
+          stderrPresent: false,
+          truncated: diagnostic.truncated,
+        },
+        metadata: { status: result.status, diagnosticTruncated: diagnostic.truncated },
+      };
+    }
     return {
-      status: result.status === "finished" ? "finished" : "error",
+      status: "finished",
       output,
       requestedModel: request.roleConfig.model,
       actualModel: result.model?.id,

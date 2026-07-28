@@ -20,7 +20,12 @@ import {
   type PublishClaimOptions,
   type PublishedClaimHandle,
 } from "./lock-journal.ts";
-import { redactSecrets } from "./redaction.ts";
+import {
+  FAILURE_AGGREGATE_MAX_CODE_POINTS,
+  redactSecrets,
+  sanitizeDiagnostic,
+} from "./redaction.ts";
+import { sanitizeDurableRuntimeFailureSummary } from "./failure-diagnostics.ts";
 import { transition } from "./state-machine.ts";
 
 function now(): string {
@@ -88,6 +93,90 @@ export interface RunStore {
   readArtifact(run: RunRecord, name: string): Promise<string | undefined>;
 }
 
+function sanitizePersistedFailureMessage(message: string): string {
+  return sanitizeDiagnostic(
+    message,
+    FAILURE_AGGREGATE_MAX_CODE_POINTS,
+  ).text;
+}
+
+function cloneRecordWithout(
+  source: Record<string, unknown>,
+  omittedKey: string,
+): Record<string, unknown> {
+  const cloneable: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (key !== omittedKey) cloneable[key] = value;
+  }
+  return structuredClone(cloneable);
+}
+
+function sanitizeEventDetails(
+  type: WorkflowEventType,
+  details: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!details) return undefined;
+  if (
+    type === "FAIL" &&
+    (typeof details.reason === "string" || "runtime" in details)
+  ) {
+    const safe = cloneRecordWithout(details, "runtime");
+    if (typeof details.reason === "string") {
+      safe.reason = sanitizePersistedFailureMessage(details.reason);
+    }
+    if ("runtime" in details) {
+      const runtime = sanitizeDurableRuntimeFailureSummary(details.runtime);
+      if (runtime) safe.runtime = runtime;
+      else delete safe.runtime;
+    }
+    return safe;
+  }
+  const previousFailure = details.previousFailure;
+  if (
+    type === "RETRY_FROM_FAILED" &&
+    previousFailure &&
+    typeof previousFailure === "object"
+  ) {
+    const rawPrevious = previousFailure as Record<string, unknown>;
+    const safe = cloneRecordWithout(details, "previousFailure");
+    const previous = cloneRecordWithout(rawPrevious, "runtime");
+    if (typeof rawPrevious.message === "string") {
+      previous.message = sanitizePersistedFailureMessage(
+        rawPrevious.message,
+      );
+    }
+    if ("runtime" in rawPrevious) {
+      const runtime = sanitizeDurableRuntimeFailureSummary(
+        rawPrevious.runtime,
+      );
+      if (runtime) previous.runtime = runtime;
+      else delete previous.runtime;
+    }
+    safe.previousFailure = previous;
+    return safe;
+  }
+  return details;
+}
+
+function sanitizeRunFailureState(run: RunRecord): RunRecord {
+  if (run.failure) {
+    run.failure.message = sanitizePersistedFailureMessage(run.failure.message);
+    if ("runtime" in run.failure) {
+      const runtime = sanitizeDurableRuntimeFailureSummary(
+        run.failure.runtime,
+      );
+      if (runtime) run.failure.runtime = runtime;
+      else delete run.failure.runtime;
+    }
+  }
+  for (const event of run.events) {
+    const safeDetails = sanitizeEventDetails(event.type, event.details);
+    if (safeDetails) event.details = safeDetails;
+    else delete event.details;
+  }
+  return run;
+}
+
 export function migrateRunRecord(raw: unknown): RunRecord {
   if (!raw || typeof raw !== "object") {
     throw new Error("Run record is not a JSON object");
@@ -122,26 +211,26 @@ export function migrateRunRecord(raw: unknown): RunRecord {
   assertConfig(migratedConfig);
 
   if (candidate.version === undefined) {
-    return {
+    return sanitizeRunFailureState({
       ...(candidate as unknown as RunRecord),
       version: 1,
       artifacts,
       config: migratedConfig,
-    };
+    });
   }
 
   if (typeof candidate.version !== "number" || candidate.version < 1) {
     throw new Error("Run record version is missing or invalid (fail-closed)");
   }
 
-  return {
+  return sanitizeRunFailureState({
     ...(candidate as unknown as RunRecord),
     config: migratedConfig,
     artifacts:
       artifacts.length > 0
         ? artifacts
         : ((candidate as unknown as RunRecord).artifacts ?? []),
-  };
+  });
 }
 
 export class FileRunStore implements RunStore {
@@ -448,6 +537,7 @@ export class FileRunStore implements RunStore {
   }
 
   async save(run: RunRecord): Promise<void> {
+    sanitizeRunFailureState(run);
     await this.withLock(run.id, async () => {
       const onDisk = await this.readRunFile(run.id);
       if (onDisk.version !== run.version) {
@@ -487,7 +577,12 @@ export class FileRunStore implements RunStore {
     details?: Record<string, unknown>,
   ): Promise<RunRecord> {
     const from = run.state;
-    const to = transition(from, type, details?.resumeState as WorkflowState | undefined);
+    const safeDetails = sanitizeEventDetails(type, details);
+    const to = transition(
+      from,
+      type,
+      safeDetails?.resumeState as WorkflowState | undefined,
+    );
     run.state = to;
     run.events.push({
       id: randomUUID(),
@@ -496,7 +591,7 @@ export class FileRunStore implements RunStore {
       actor,
       from,
       to,
-      ...(details ? { details } : {}),
+      ...(safeDetails ? { details: safeDetails } : {}),
     });
     await this.save(run);
     return run;

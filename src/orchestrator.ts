@@ -1,4 +1,13 @@
-import type { AgentRuntime, RoleId, RunRecord, RuntimeResult, WorkflowState } from "./domain.ts";
+import type {
+  AgentRuntime,
+  DurableRuntimeFailureAttempt,
+  DurableRuntimeFailureSummary,
+  RoleId,
+  RunFailureCode,
+  RunRecord,
+  RuntimeFinishedResult,
+  WorkflowState,
+} from "./domain.ts";
 import { buildCommentClassifierPrompt, buildRolePrompt } from "./prompt-builder.ts";
 import { gitRevParse, isGitWorkspaceClean } from "./git-snapshot.ts";
 import {
@@ -19,13 +28,23 @@ import { renderQualityReport, runQualityChecks } from "./quality.ts";
 import { isHumanGate, isTerminal } from "./state-machine.ts";
 import { FileRunStore, type RunStore } from "./store.ts";
 import type { MasweConfig } from "./domain.ts";
+import {
+  appendFailureAggregate,
+  assertRuntimeIdentity,
+  DURABLE_RUNTIME_FAILURE_ATTEMPT_LIMIT,
+  ensureRuntimeSuccess,
+  makeDurableRuntimeFailureSummary,
+  reportOmittedFailureAttempts,
+  runFailureCode,
+  runFailureDetails,
+  runFailureMessage,
+  runFailureRuntime,
+  RuntimeModelsExhaustedError,
+  runtimeEventIdentityDetails,
+  runtimeAttemptFailure,
+  safeFailureMessage,
+} from "./failure-diagnostics.ts";
 import path from "node:path";
-
-function ensureSuccess(result: RuntimeResult, role: RoleId): void {
-  if (result.status !== "finished") {
-    throw new Error(`${role} failed: ${result.output || "No output was produced."}`);
-  }
-}
 
 export function extractVerifierDefects(report: string): string {
   const lines = report.split(/\r?\n/);
@@ -284,10 +303,7 @@ export class Orchestrator {
             {
               passed,
               required: run.config.gates.requireVerifierPass,
-              requestedModel: result.requestedModel,
-              actualModel: result.actualModel,
-              agentId: result.agentId,
-              runtimeRunId: result.runId,
+              ...runtimeEventIdentityDetails(result),
               headSha: evaluatedSha,
               marker: markers.marker,
             },
@@ -324,8 +340,12 @@ export class Orchestrator {
           throw new Error(`State ${run.state} requires a user or integration event.`);
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return this.failRun(run, message);
+      return this.failRun(
+        run,
+        runFailureMessage(error),
+        runFailureCode(error),
+        runFailureRuntime(error),
+      );
     }
   }
 
@@ -371,10 +391,7 @@ export class Orchestrator {
     }
 
     return this.store.applyEvent(run, "BUILD_COMPLETED", "builder", {
-      requestedModel: result.requestedModel,
-      actualModel: result.actualModel,
-      agentId: result.agentId,
-      runtimeRunId: result.runId,
+      ...runtimeEventIdentityDetails(result),
       marker: markers.marker,
       ...(beforeSha ? { inputHeadSha: beforeSha, headSha: beforeSha } : {}),
       ...(outputHeadSha ? { outputHeadSha } : {}),
@@ -420,27 +437,32 @@ export class Orchestrator {
     }
 
     return this.store.applyEvent(run, "RESOLUTION_COMPLETED", "prResolver", {
-      requestedModel: result.requestedModel,
-      actualModel: result.actualModel,
-      agentId: result.agentId,
-      runtimeRunId: result.runId,
+      ...runtimeEventIdentityDetails(result),
       marker: markers.marker,
       ...(beforeSha ? { inputHeadSha: beforeSha, headSha: beforeSha } : {}),
       ...(outputHeadSha ? { outputHeadSha } : {}),
     });
   }
 
-  private async failRun(run: RunRecord, message: string): Promise<RunRecord> {
+  private async failRun(
+    run: RunRecord,
+    message: string,
+    code: RunFailureCode = "workflow-failure",
+    runtime?: DurableRuntimeFailureSummary,
+  ): Promise<RunRecord> {
     const resumeState = isTerminal(run.state) ? undefined : run.state;
+    const safeMessage = safeFailureMessage(message);
     run.failure = {
-      message,
+      code,
+      message: safeMessage,
       at: new Date().toISOString(),
       ...(resumeState ? { resumeState } : {}),
+      ...(runtime ? { runtime } : {}),
     };
     await this.store.save(run);
     if (!isTerminal(run.state)) {
       const failed = await this.store.applyEvent(run, "FAIL", "orchestrator", {
-        reason: message,
+        ...runFailureDetails(code, safeMessage, runtime),
         ...(resumeState ? { resumeState } : {}),
       });
       return this.finalizeTerminal(failed);
@@ -462,10 +484,7 @@ export class Orchestrator {
     await this.store.writeArtifact(run, artifactName, result.output);
     const evaluatedSha = headSha ?? run.workspace?.headSha;
     return this.store.applyEvent(run, successEvent, role, {
-      requestedModel: result.requestedModel,
-      actualModel: result.actualModel,
-      agentId: result.agentId,
-      runtimeRunId: result.runId,
+      ...runtimeEventIdentityDetails(result),
       marker: markers.marker,
       ...(evaluatedSha ? { headSha: evaluatedSha } : {}),
     });
@@ -476,12 +495,17 @@ export class Orchestrator {
     role: RoleId,
     prompt: string,
     roleOverride?: RunRecord["config"]["roles"][RoleId],
-  ): Promise<RuntimeResult> {
+  ): Promise<RuntimeFinishedResult> {
     const configured = roleOverride ?? run.config.roles[role];
     const candidates = run.config.policy.rejectModelFallback
       ? [configured.model]
       : [configured.model, ...(configured.fallbackModels ?? [])];
-    const failures: string[] = [];
+    let aggregate = `${role} failed for all configured models: `;
+    let aggregateHasEntries = false;
+    let aggregateFull = false;
+    let aggregateOmittedAttempts = 0;
+    let totalFailureAttempts = 0;
+    const durableAttempts: DurableRuntimeFailureAttempt[] = [];
     const workdir = workingDirectoryFor(run);
 
     for (const model of candidates) {
@@ -497,22 +521,50 @@ export class Orchestrator {
             run.workspace?.worktreePath && path.resolve(workdir) === path.resolve(run.workspace.worktreePath),
           ),
         });
-        ensureSuccess(result, role);
+        ensureRuntimeSuccess(result, role);
         if (
           run.config.policy.rejectModelFallback &&
           result.actualModel &&
           result.actualModel !== result.requestedModel
         ) {
-          throw new Error(
-            `${role} requested ${result.requestedModel}, but runtime reported ${result.actualModel}.`,
-          );
+          assertRuntimeIdentity(result, role);
         }
         return result;
       } catch (error) {
-        failures.push(`${model}: ${error instanceof Error ? error.message : String(error)}`);
+        totalFailureAttempts += 1;
+        const failure = runtimeAttemptFailure(model, error);
+        if (
+          durableAttempts.length <
+          DURABLE_RUNTIME_FAILURE_ATTEMPT_LIMIT
+        ) {
+          durableAttempts.push(failure.durable);
+        }
+        if (aggregateFull) {
+          aggregateOmittedAttempts += 1;
+        } else {
+          const appended = appendFailureAggregate(
+            aggregate,
+            failure.rendered,
+            aggregateHasEntries,
+          );
+          aggregate = appended.text;
+          aggregateFull = appended.full;
+          aggregateHasEntries = true;
+        }
       }
     }
-    throw new Error(`${role} failed for all configured models: ${failures.join(" | ")}`);
+    const message = reportOmittedFailureAttempts(
+      aggregate,
+      aggregateOmittedAttempts,
+    );
+    throw new RuntimeModelsExhaustedError(
+      message,
+      makeDurableRuntimeFailureSummary(
+        durableAttempts,
+        totalFailureAttempts,
+        aggregateFull,
+      ),
+    );
   }
 
   async markPrOpened(runId: string): Promise<RunRecord> {

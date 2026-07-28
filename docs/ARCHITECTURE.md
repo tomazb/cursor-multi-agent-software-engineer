@@ -144,10 +144,29 @@ doctor(): Promise<RuntimeDoctorResult>
 Implemented adapters:
 
 - `MockRuntime`: deterministic outputs for tests and workflow development.
-- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode. **New runs** resolve logical model names via `resolveProjectModels` against a fail-closed structured catalogue parse; **existing-run stages** call `validatePersistedExactModel` and never substitute. Unwraps JSON/`stream-json` stdout by decoding the transport envelope once and reading only the authoritative string `result` field (text mode keeps raw stdout); never treats stderr as successful assistant content; structured modes never fall back to raw envelope text. Terminal markers are validated only on that decoded logical text. Adds `--mode ask` for read-only roles and `--force` only for write roles; adds `--trust` when `policy.trustManagedWorktrees` is set for MASWE-managed worktrees. Doctor discovers the catalogue before the stdin probe and cleans probe branch/worktree by recorded probe identity in `finally`.
+- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode. **New runs** resolve logical model names via `resolveProjectModels` against a fail-closed structured catalogue parse; **existing-run stages** call `validatePersistedExactModel` and never substitute. Unwraps JSON/`stream-json` stdout by decoding the transport envelope once and reading only the authoritative string `result` field (text mode keeps raw stdout); never treats stderr as successful assistant content; structured modes never fall back to raw envelope text. Terminal markers are validated only on that decoded logical text. Non-zero process stderr stays inside the adapter: the returned error contains a structured failure code, safe execution metadata, and a redacted bounded diagnostic; metadata stores `stderrPresent`, never raw stderr. Adds `--mode ask` for read-only roles and `--force` only for write roles; adds `--trust` when `policy.trustManagedWorktrees` is set for MASWE-managed worktrees. Doctor discovers the catalogue before the stdin probe and cleans probe branch/worktree by recorded probe identity in `finally`.
 - `CursorSdkRuntime`: dynamically imports `@cursor/sdk` and runs a local one-shot `Agent.prompt` call (no catalogue capability; empty-catalogue pass-through stays SDK-only).
 
 The optional SDK import means the CLI can build and run without installing the beta SDK.
+
+`RuntimeResult` is discriminated by `status`. Finished results carry assistant output. Error results
+also require a `RuntimeFailureDiagnostic` with a stable code, safe message, requested/configured
+model where known, stderr-presence flag, truncation flag, and applicable exit/timeout/duration/
+transport fields. The core never parses human-readable error prose to make policy decisions.
+
+When fallback candidates fail, the core converts each typed diagnostic into an explicit durable
+subset. `RunRecord.failure.runtime` is optional for schema-version-1 compatibility and contains at
+most eight attempts plus total/omitted counts and an aggregate-truncation flag. Each attempt keeps
+the attempted model display, code, a 512-code-point safe message, requested/configured model
+displays where supplied, exit/timeout/duration/transport fields where supplied, `stderrPresent`,
+and `truncated`. Model displays are single-line, delimiter-neutral, and capped at 256 code points;
+the actual configured model passed to the runtime is not rewritten.
+
+Successful runtime-backed transition events cross the same untrusted runtime-to-persistence
+boundary. `runtimeEventIdentityDetails()` creates display-only copies of `requestedModel` and
+`actualModel` with the model-display policy, and optional `agentId` and `runtimeRunId` with a
+separately named bounded identifier policy. Runtime invocation and exact-model enforcement consume
+the original values before those copies are constructed.
 
 ### 3.9 Read-only enforcement
 
@@ -329,7 +348,10 @@ The hosted design adds:
 Failures fall into categories:
 
 1. **Startup/configuration:** missing CLI, key, SDK, model, or invalid config. The run fails immediately.
-2. **Agent run failure:** nonzero CLI exit or SDK error. The configured fallback policy applies.
+2. **Agent run failure:** nonzero CLI exit, timeout, process-spawn failure, exit-zero structured
+   decode failure, or SDK error. The configured fallback policy applies to typed, individually
+   bounded failures. The final all-model aggregate is bounded independently and reports the count
+   of later model failures omitted after its diagnostic budget is exhausted.
 3. **Quality failure:** routes to `BUILDING` while under cycle limit.
 4. **Verification failure:** routes to `BUILDING` while under cycle limit.
 5. **Scope failure:** routes to `WAITING_FOR_HUMAN` without edits.
@@ -337,6 +359,48 @@ Failures fall into categories:
 7. **Policy exhaustion:** cycle limit produces `FAILED`.
 
 The orchestrator never retries indefinitely.
+
+Failure persistence is defense in depth. Runtime adapters must return safe diagnostics;
+`src/failure-diagnostics.ts` re-sanitizes each runtime failure before fallback aggregation;
+`failRun()` sanitizes the aggregate before assigning `run.failure` and `FAIL` details; and the file
+store sanitizes failure/retry fields and reconstructs the allowlisted attempt subset again before
+serialization. The exact limits are 2,048 Unicode code points per diagnostic, 8,192 per aggregate,
+512 per durable attempt message, 256 per durable model display, and eight stored attempts. Total
+and omitted attempt counts remain explicit. `FAIL.details.runtime` and retry
+`previousFailure.runtime` use the same bounded representation. Successful assistant artifacts
+retain the separate artifact-redaction contract. Persistence sanitization inspects no more than the
+first eight raw attempt slots, so malformed records cannot turn the eight-entry output limit into
+an unbounded scan. Event sanitization excludes raw runtime objects before cloning the remaining
+details, then attaches the reconstructed subset.
+
+The run-record JSON Schema enforces the same nested contract:
+`durableRuntimeFailureAttempt` and `durableRuntimeFailureSummary` reject additional properties.
+Historical schema-version-1 failures without runtime metadata and historical parent extensions
+remain compatible.
+
+`sanitizeDiagnostic()` bounds work before pattern application. It collects at most the output
+budget plus 4,096 Unicode code points of lookahead and never more than 12,288, normalizing controls
+during that bounded scan. Purpose-specific URI-userinfo, assignment, and private-key scanners
+advance monotonically; the remaining fixed recognition expressions run on only that accepted
+window. The lookahead lets scanners consume recognized values that cross the retained output
+boundary, while reaching the accepted-window end closes long assignment/private-key values and
+incomplete supported URI authorities fail-safely. The monotonic fixed-token-prefix scanner also
+redacts a candidate that reaches an incomplete accepted-window end, preventing a recognizable
+token prefix from surviving final truncation. Quoted assignment scanning honors odd/even
+backslash escaping before delimiters and recognizes one JSON-encoded structural-quote layer.
+The shared URI scanner records `@` positions during its single forward authority pass rather than
+repeatedly searching the preceding string. This keeps both bounded failure diagnostics and the
+separately unbounded successful-artifact redaction path proportional to accepted input size.
+
+Cursor CLI adapters apply this bounded sanitizer directly to stderr before trimming or interpolating
+it into runtime, catalogue, or doctor summaries.
+
+CI runs the full deterministic check on both the current Node 22 release and exact Node `22.22.2`.
+Test-only child programs use synchronous compact-result writes or unique file-backed descriptors
+where buffered JavaScript pipe output is version-sensitive; production CLI output is unchanged.
+The constrained-heap sanitizer test uses an 8,000,000-character one-byte input under a 48 MiB V8
+old-space limit and asserts an exact 128-code-point result. It tests incremental sanitizer overhead,
+not an absolute total-process memory ceiling.
 
 ## 11. Trust boundaries
 
@@ -361,6 +425,10 @@ GitHub input (future)
 
 - No structured telemetry exporter.
 - SDK adapter uses a one-shot local prompt and does not yet exploit durable SDK agents.
+- SDK import or `Agent.prompt` rejection can still reach the orchestrator as a generic caught
+  `runtime-error` instead of an adapter-produced `cursor-sdk-error`. It is sanitized and bounded
+  before persistence, but typed SDK-specific metadata requires a separate adapter lifecycle/test
+  seam change.
 - Reasoning effort is stored but not translated into provider-specific SDK parameters.
 - GitHub App check runs and authenticated PR automation remain v0.3+.
 

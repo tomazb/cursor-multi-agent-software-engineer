@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { redactSecrets } from "../src/redaction.ts";
+import * as redactionModule from "../src/redaction.ts";
 
 test("redacts common API tokens and authorization headers", () => {
   const input = [
@@ -15,6 +17,15 @@ test("redacts common API tokens and authorization headers", () => {
   assert.match(redacted, /\[REDACTED\]/);
 });
 
+test("redacts synthetic modern GitHub fine-grained PAT shapes", () => {
+  const token =
+    "github_pat_11SYNTHETICREDACTIONONLY_abcdefghijklmnopqrstuvwxyz0123456789";
+  const redacted = redactSecrets(`provider rejected ${token}`);
+
+  assert.equal(redacted.includes(token), false);
+  assert.equal(redacted, "provider rejected [REDACTED]");
+});
+
 test("redacts PEM private key blocks", () => {
   const input = `-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7
@@ -25,7 +36,527 @@ MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7
   assert.match(redacted, /\[REDACTED\]/);
 });
 
+test("redacts a private-key block that crosses the inspection window", () => {
+  const result = redactionModule.sanitizeDiagnostic(
+    `-----BEGIN PRIVATE KEY-----\nPEM-WINDOW-CANARY-${"x".repeat(7_000)}\n-----END PRIVATE KEY-----`,
+  );
+
+  assert.equal(result.truncated, true);
+  assert.equal(result.text.includes("PEM-WINDOW-CANARY"), false);
+  assert.match(result.text, /BEGIN PRIVATE KEY-----\n\[REDACTED\]/);
+  assert.ok([...result.text].length <= 2_048);
+});
+
 test("leaves ordinary text unchanged", () => {
   const input = "Build passed. See docs/SECURITY.md for policy.";
   assert.equal(redactSecrets(input), input);
+});
+
+test("redacts standalone bearer tokens, URL credentials, and assignments", () => {
+  const input = [
+    "Bearer standalone-secret-value",
+    "request failed at https://alice:super-secret@example.invalid/private",
+    "api_key=synthetic-secret-value",
+    "token: synthetic-secret-value",
+    "endpoint=https://service.internal.invalid/run?access_token=synthetic-secret-value&safe=yes",
+  ].join("\n");
+
+  const redacted = redactSecrets(input);
+
+  for (const secret of [
+    "standalone-secret-value",
+    "super-secret",
+    "synthetic-secret-value",
+  ]) {
+    assert.equal(redacted.includes(secret), false, `leaked ${secret}`);
+  }
+  assert.match(redacted, /Bearer \[REDACTED\]/);
+  assert.match(redacted, /https:\/\/\[REDACTED\]@example\.invalid\/private/);
+  assert.match(redacted, /safe=yes/);
+});
+
+test("redacts HTTP username-only URI userinfo", () => {
+  const redacted = redactSecrets(
+    "https://opaque-http-credential@example.invalid/repo",
+  );
+  assert.equal(redacted.includes("opaque-http-credential"), false);
+  assert.match(
+    redacted,
+    /https:\/\/\[REDACTED\]@example\.invalid\/repo/,
+  );
+});
+
+test("redacts SSH and git+https username-only URI userinfo without changing ordinary email text", () => {
+  const input = [
+    "ssh://opaque-ssh-credential@example.invalid:2222/repo?ref=main#readme",
+    "git+https://opaque-git-credential@example.invalid/org/repo.git",
+    "contact release-engineering@example.invalid for help",
+  ].join("\n");
+  const redacted = redactSecrets(input);
+
+  assert.equal(redacted.includes("opaque-ssh-credential"), false);
+  assert.equal(redacted.includes("opaque-git-credential"), false);
+  assert.match(
+    redacted,
+    /ssh:\/\/\[REDACTED\]@example\.invalid:2222\/repo\?ref=main#readme/,
+  );
+  assert.match(
+    redacted,
+    /git\+https:\/\/\[REDACTED\]@example\.invalid\/org\/repo\.git/,
+  );
+  assert.match(redacted, /release-engineering@example\.invalid/);
+});
+
+test("redacts malformed credential-like URI authorities fail-safely", () => {
+  const input = [
+    "https://opaque-missing-host@",
+    "ssh://first:second:opaque@example.invalid/repo",
+  ].join("\n");
+
+  const redacted = redactSecrets(input);
+
+  assert.equal(redacted.includes("opaque-missing-host"), false);
+  assert.equal(redacted.includes("first:second:opaque"), false);
+  assert.equal(
+    redacted,
+    [
+      "https://[REDACTED]@",
+      "ssh://[REDACTED]@example.invalid/repo",
+    ].join("\n"),
+  );
+});
+
+test("redacts URI userinfo that crosses the bounded inspection window", () => {
+  const secret = "URI-WINDOW-CANARY-" + "x".repeat(7_000);
+  const passwordResult = redactionModule.sanitizeDiagnostic(
+    `https://user:${secret}@example.invalid/repo`,
+    2_048,
+  );
+  const usernameResult = redactionModule.sanitizeDiagnostic(
+    `ssh://${secret}@example.invalid/repo`,
+    2_048,
+  );
+
+  for (const result of [passwordResult, usernameResult]) {
+    assert.equal(result.truncated, true);
+    assert.equal(result.text.includes("URI-WINDOW-CANARY"), false);
+    assert.ok([...result.text].length <= 2_048);
+  }
+  assert.equal(passwordResult.text.includes("https://user:"), false);
+  assert.match(passwordResult.text, /^https:\/\/\[REDACTED\]/);
+  assert.match(usernameResult.text, /^ssh:\/\/\[REDACTED\]/);
+});
+
+test("redacts provider-prefixed API key assignments", () => {
+  const input = [
+    "CURSOR_API_KEY=cursor-prefixed-synthetic-value",
+    "OPENAI_API_KEY: openai-prefixed-synthetic-value",
+    'ANTHROPIC_API_KEY="anthropic-prefixed-synthetic-value"',
+  ].join("\n");
+
+  const redacted = redactSecrets(input);
+
+  assert.equal(redacted.includes("cursor-prefixed-synthetic-value"), false);
+  assert.equal(redacted.includes("openai-prefixed-synthetic-value"), false);
+  assert.equal(redacted.includes("anthropic-prefixed-synthetic-value"), false);
+  assert.equal(redacted.match(/\[REDACTED\]/g)?.length, 3);
+  assert.equal(
+    redacted,
+    [
+      "CURSOR_API_KEY=[REDACTED]",
+      "OPENAI_API_KEY: [REDACTED]",
+      'ANTHROPIC_API_KEY="[REDACTED]"',
+    ].join("\n"),
+  );
+});
+
+test("redacts JSON-quoted secret, token, and signature assignments", () => {
+  const input =
+    '{"access_token":"json-access-value","secret":"json-secret-value","signature":"json-signature-value","sig":"json-sig-value"}';
+
+  const redacted = redactSecrets(input);
+
+  for (const secret of [
+    "json-access-value",
+    "json-secret-value",
+    "json-signature-value",
+    "json-sig-value",
+  ]) {
+    assert.equal(redacted.includes(secret), false, `leaked ${secret}`);
+  }
+  assert.equal(
+    redacted,
+    '{"access_token":"[REDACTED]","secret":"[REDACTED]","signature":"[REDACTED]","sig":"[REDACTED]"}',
+  );
+});
+
+test("quoted assignment scanning honors odd and even escaped delimiters", () => {
+  const oddBackslashInput = String.raw`{"client_secret":"prefix\"ESCAPED-QUOTE-CANARY","safe":"preserved"}`;
+  const evenBackslashInput = String.raw`{"client_secret":"prefix\\","safe":"preserved"}`;
+
+  const oddBackslashRedacted = redactSecrets(oddBackslashInput);
+  const evenBackslashRedacted = redactSecrets(evenBackslashInput);
+
+  assert.equal(oddBackslashRedacted.includes("ESCAPED-QUOTE-CANARY"), false);
+  assert.equal(
+    oddBackslashRedacted,
+    '{"client_secret":"[REDACTED]","safe":"preserved"}',
+  );
+  assert.equal(
+    evenBackslashRedacted,
+    '{"client_secret":"[REDACTED]","safe":"preserved"}',
+  );
+});
+
+test("redacts assignments with escaped JSON structural quotes", () => {
+  const input = String.raw`payload={\"token\":\"ESCAPED-JSON-CANARY\"}`;
+  const escapedContentQuote = String.raw`payload={\"token\":\"prefix\\\"ESCAPED-INNER-QUOTE-CANARY\"}`;
+  const redacted = redactSecrets(input);
+  const escapedContentRedacted = redactSecrets(escapedContentQuote);
+
+  assert.equal(redacted.includes("ESCAPED-JSON-CANARY"), false);
+  assert.equal(redacted, String.raw`payload={\"token\":\"[REDACTED]\"}`);
+  assert.equal(
+    escapedContentRedacted.includes("ESCAPED-INNER-QUOTE-CANARY"),
+    false,
+  );
+  assert.equal(
+    escapedContentRedacted,
+    String.raw`payload={\"token\":\"[REDACTED]\"}`,
+  );
+});
+
+test("redacts multiple synthetic secret forms at the start, middle, and end", () => {
+  const input = [
+    "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA starts the line",
+    "middle sk-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB value",
+    "Authorization: Bearer bearer-secret-value",
+    "xoxb-CCCCCCCCCCCCCCCCCCCC",
+    "aws_secret_access_key=AWS-SYNTHETIC-SECRET",
+    "ends with token=synthetic-secret-value",
+  ].join("\n");
+
+  const redacted = redactSecrets(input);
+
+  assert.equal(redacted.includes("ghp_AAAAAAAAA"), false);
+  assert.equal(redacted.includes("sk-BBBBBBBBB"), false);
+  assert.equal(redacted.includes("bearer-secret-value"), false);
+  assert.equal(redacted.includes("CCCCCCCCCCCC"), false);
+  assert.equal(redacted.includes("AWS-SYNTHETIC-SECRET"), false);
+  assert.equal(redacted.includes("synthetic-secret-value"), false);
+  assert.match(redacted, /starts the line/);
+  assert.match(redacted, /middle/);
+  assert.match(redacted, /ends with/);
+});
+
+test("sanitizes controls and bounds diagnostics by Unicode code points", () => {
+  const sanitizeDiagnostic = (
+    redactionModule as Record<string, unknown>
+  ).sanitizeDiagnostic;
+  assert.equal(typeof sanitizeDiagnostic, "function");
+  if (typeof sanitizeDiagnostic !== "function") return;
+
+  const result = sanitizeDiagnostic(
+    `safe\u0000text\u001b[31m ${"😀".repeat(20)}\nnext\tline`,
+    32,
+  ) as { text: string; truncated: boolean };
+
+  assert.equal(result.truncated, true);
+  assert.ok([...result.text].length <= 32);
+  assert.match(result.text, /… \[truncated\]$/);
+  assert.doesNotMatch(result.text, /[\u0000\u001b]/);
+});
+
+test("neutralizes Unicode line separators and bidi framing controls", () => {
+  const input = "safe\u2028line\u2029paragraph\u202Ereversed\u2066isolated\u2069";
+  const result = redactionModule.sanitizeDiagnostic(input);
+
+  assert.equal(result.truncated, false);
+  assert.doesNotMatch(result.text, /[\u2028\u2029\u202A-\u202E\u2066-\u2069]/);
+  assert.equal(result.text, "safe\uFFFDline\uFFFDparagraph\uFFFDreversed\uFFFDisolated\uFFFD");
+});
+
+test("redacts before truncating near a secret boundary", () => {
+  const sanitizeDiagnostic = (
+    redactionModule as Record<string, unknown>
+  ).sanitizeDiagnostic;
+  assert.equal(typeof sanitizeDiagnostic, "function");
+  if (typeof sanitizeDiagnostic !== "function") return;
+
+  const result = sanitizeDiagnostic(
+    `${"safe-".repeat(8)}token=synthetic-secret-value trailing context`,
+    56,
+  ) as { text: string; truncated: boolean };
+
+  assert.equal(result.truncated, true);
+  assert.equal(result.text.includes("synthetic-secret-value"), false);
+  assert.equal(result.text.includes("synthetic-"), false);
+  assert.ok([...result.text].length <= 56);
+});
+
+test("redacts prefixed tokens that cross the bounded inspection window", () => {
+  const filler = `${"f".repeat(2_029)} `;
+  const inspectionLimit =
+    redactionModule.FAILURE_DIAGNOSTIC_MAX_CODE_POINTS +
+    redactionModule.DIAGNOSTIC_REDACTION_LOOKAHEAD_CODE_POINTS;
+  const crossingToken = (prefix: string, boundary: string): string => {
+    const canary = "TOKENWINDOWCANARY";
+    const paddingLength =
+      inspectionLimit - filler.length - prefix.length - canary.length - 1;
+    return `${prefix}${canary}${"A".repeat(paddingLength)}${boundary}${"B".repeat(3_000)}`;
+  };
+  const hyphenOnlyAcceptedPrefix = (prefix: string): string => {
+    const paddingLength = inspectionLimit - filler.length - prefix.length;
+    return `${prefix}${"-".repeat(paddingLength)}${"B".repeat(3_000)}`;
+  };
+  const tokens = [
+    `ghp_TOKENWINDOWCANARY${"A".repeat(7_000)}`,
+    crossingToken("sk-", "-"),
+    crossingToken("xoxb-", "-"),
+  ];
+
+  for (const token of tokens) {
+    const result = redactionModule.sanitizeDiagnostic(`${filler}${token}`);
+
+    assert.equal(result.truncated, true);
+    assert.equal(result.text.includes("TOKENWINDOWCANARY"), false);
+    assert.doesNotMatch(result.text, /(?:ghp_|sk-|xoxb-)TOKEN/);
+    assert.ok([...result.text].length <= 2_048);
+  }
+
+  for (const prefix of ["sk-", "xoxb-"]) {
+    const result = redactionModule.sanitizeDiagnostic(
+      `${filler}${hyphenOnlyAcceptedPrefix(prefix)}`,
+    );
+
+    assert.equal(result.truncated, true);
+    assert.equal(result.text.includes(prefix), false);
+  }
+});
+
+test("redacts a long assignment crossing the retained diagnostic boundary", () => {
+  const prefix = "safe ".repeat(403);
+  const secret = "boundary-secret-prefix-" + "z".repeat(32_000);
+  const result = redactionModule.sanitizeDiagnostic(
+    `${prefix}token=${secret}`,
+    2_048,
+  );
+
+  assert.equal(result.truncated, true);
+  assert.equal(result.text.includes("boundary-secret-prefix"), false);
+  assert.equal(result.text.includes("token=boundary"), false);
+  assert.match(result.text, /token=\[REDACTED\]/);
+  assert.ok([...result.text].length <= 2_048);
+});
+
+test("assignment sanitizer work scales below the former quadratic curve", () => {
+  const moduleUrl = new URL("../src/redaction.ts", import.meta.url).href;
+  const script = `
+    import { writeSync } from "node:fs";
+    import { performance } from "node:perf_hooks";
+    import { sanitizeDiagnostic } from ${JSON.stringify(moduleUrl)};
+
+    function median(values) {
+      const sorted = [...values].sort((a, b) => a - b);
+      return sorted[Math.floor(sorted.length / 2)];
+    }
+
+    function measure(size) {
+      const input = "A-".repeat(size / 2);
+      const samples = [];
+      const callsPerSample = 100;
+      for (let index = 0; index < 5; index += 1) {
+        sanitizeDiagnostic(input, 2_048);
+      }
+      for (let sample = 0; sample < 7; sample += 1) {
+        const started = performance.now();
+        for (let call = 0; call < callsPerSample; call += 1) {
+          sanitizeDiagnostic(input, 2_048);
+        }
+        samples.push((performance.now() - started) / callsPerSample);
+      }
+      return median(samples);
+    }
+
+    const smallMs = measure(20_000);
+    const largeMs = measure(40_000);
+    writeSync(1, JSON.stringify({ smallMs, largeMs, ratio: largeMs / smallMs }));
+  `;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      script,
+    ],
+    { encoding: "utf8", timeout: 15_000 },
+  );
+
+  assert.equal(
+    result.status,
+    0,
+    `sanitizer scaling probe failed: ${result.stderr}`,
+  );
+  const measured = JSON.parse(result.stdout) as {
+    smallMs: number;
+    largeMs: number;
+    ratio: number;
+  };
+  assert.ok(
+    measured.ratio < 3,
+    `doubling adversarial input scaled ${measured.ratio.toFixed(2)}x (${measured.smallMs.toFixed(2)}ms -> ${measured.largeMs.toFixed(2)}ms)`,
+  );
+});
+
+test("assignment sanitizer handles large match-heavy input within a hard bound", () => {
+  const moduleUrl = new URL("../src/redaction.ts", import.meta.url).href;
+  const script = `
+    import { sanitizeDiagnostic } from ${JSON.stringify(moduleUrl)};
+    const input = Array.from(
+      { length: 20_000 },
+      (_, index) => "TOKEN=synthetic-match-" + index,
+    ).join("\\n");
+    const result = sanitizeDiagnostic(input, 2_048);
+    if (!result.truncated || result.text.includes("synthetic-match-")) process.exit(2);
+  `;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      script,
+    ],
+    { encoding: "utf8", timeout: 10_000 },
+  );
+
+  assert.equal(
+    result.status,
+    0,
+    `match-heavy sanitizer probe failed: ${result.stderr}`,
+  );
+});
+
+test("URI userinfo scanning scales below the reviewed quadratic curve", () => {
+  const moduleUrl = new URL("../src/redaction.ts", import.meta.url).href;
+  const script = `
+    import { writeSync } from "node:fs";
+    import { performance } from "node:perf_hooks";
+    import { redactSecrets } from ${JSON.stringify(moduleUrl)};
+
+    function median(values) {
+      const sorted = [...values].sort((a, b) => a - b);
+      return sorted[Math.floor(sorted.length / 2)];
+    }
+
+    function measure(uriCount) {
+      const input = "https://host.invalid/repository\\n".repeat(uriCount);
+      const samples = [];
+      redactSecrets(input);
+      for (let sample = 0; sample < 3; sample += 1) {
+        const started = performance.now();
+        redactSecrets(input);
+        samples.push(performance.now() - started);
+      }
+      return median(samples);
+    }
+
+    const smallMs = measure(4_000);
+    const largeMs = measure(8_000);
+    writeSync(1, JSON.stringify({ smallMs, largeMs, ratio: largeMs / smallMs }));
+  `;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      script,
+    ],
+    { encoding: "utf8", timeout: 10_000 },
+  );
+
+  assert.equal(
+    result.status,
+    0,
+    `URI scanner scaling probe failed: ${result.stderr}`,
+  );
+  const measured = JSON.parse(result.stdout) as {
+    smallMs: number;
+    largeMs: number;
+    ratio: number;
+  };
+  assert.ok(
+    measured.ratio < 3,
+    `doubling credential-free URI input scaled ${measured.ratio.toFixed(2)}x (${measured.smallMs.toFixed(2)}ms -> ${measured.largeMs.toFixed(2)}ms)`,
+  );
+});
+
+test("diagnostic sanitization is deterministic for multiline mixed content", () => {
+  const sanitizeDiagnostic = (
+    redactionModule as Record<string, unknown>
+  ).sanitizeDiagnostic;
+  assert.equal(typeof sanitizeDiagnostic, "function");
+  if (typeof sanitizeDiagnostic !== "function") return;
+
+  const input = [
+    "request failed safely",
+    "Authorization: Bearer bearer-secret-value",
+    "details remain useful",
+    "-----BEGIN PRIVATE KEY-----",
+    "synthetic-private-key",
+    "-----END PRIVATE KEY-----",
+  ].join("\n");
+  const first = sanitizeDiagnostic(input, 2_048);
+  const second = sanitizeDiagnostic(input, 2_048);
+
+  assert.deepEqual(first, second);
+  assert.equal(
+    JSON.stringify(first).includes("bearer-secret-value"),
+    false,
+  );
+  assert.equal(
+    JSON.stringify(first).includes("synthetic-private-key"),
+    false,
+  );
+  assert.match(JSON.stringify(first), /details remain useful/);
+});
+
+test("diagnostic bound includes the marker and has exact Unicode edge behavior", () => {
+  const sanitizeDiagnostic = redactionModule.sanitizeDiagnostic;
+  const exact = `${"a".repeat(15)}😀`;
+  const within = sanitizeDiagnostic(exact, 16);
+  const over = sanitizeDiagnostic(`${exact}b`, 16);
+
+  assert.deepEqual(within, { text: exact, truncated: false });
+  assert.equal(over.truncated, true);
+  assert.equal([...over.text].length, 16);
+  assert.match(over.text, /… \[truncated\]$/);
+});
+
+test("bounds very large diagnostics without materializing every code point", () => {
+  const moduleUrl = new URL("../src/redaction.ts", import.meta.url).href;
+  const script = `
+    import { sanitizeDiagnostic } from ${JSON.stringify(moduleUrl)};
+    const result = sanitizeDiagnostic("x".repeat(8_000_000), 128);
+    if (!result.truncated || [...result.text].length !== 128) process.exit(2);
+  `;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--max-old-space-size=48",
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      script,
+    ],
+    { encoding: "utf8", timeout: 20_000 },
+  );
+
+  assert.equal(
+    result.status,
+    0,
+    `constrained-heap sanitizer failed: ${result.stderr}`,
+  );
 });

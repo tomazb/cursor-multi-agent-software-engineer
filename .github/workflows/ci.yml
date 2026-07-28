@@ -41,6 +41,11 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
+      - name: Print Node.js version
+        run: |
+          node --version
+          npm --version
+
       - name: Install dependencies
         run: npm ci --include=dev --ignore-scripts --no-audit --no-fund
 
@@ -65,6 +70,45 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Verify package contents
+        run: npm run pack:dry
+
+  node-22-22-2-compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Verify checked-out revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "Expected SHA: ${EXPECTED_SHA}"
+          echo "Actual SHA:   ${actual}"
+          test "${actual}" = "${EXPECTED_SHA}"
+
+      - name: Set up Node.js 22.22.2
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.22.2
+
+      - name: Print Node.js version
+        run: |
+          node --version
+          npm --version
+
+      - name: Install dependencies
+        run: npm ci --include=dev --ignore-scripts --no-audit --no-fund
+
+      - name: Check
+        run: npm run check
 
       - name: Verify package contents
         run: npm run pack:dry
