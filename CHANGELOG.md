@@ -8,6 +8,12 @@ The project follows semantic versioning once a public release process is establi
 
 ### Added
 
+- `policy.doctorProbeTimeoutMs` configuration contract (default `60_000`, integer bounds
+  `1_000..300_000`) with fail-closed validation and schema coverage.
+- Typed doctor check codes across runtimes plus CLI `maswe doctor --json` output of full
+  `RuntimeDoctorResult` (`code` and optional `prerequisite` per check).
+- Deterministic Issue #17 doctor/runtime/CLI/SDK regressions including typed prerequisite skips,
+  timeout propagation, and Cursor SDK import-seam coverage.
 - Version-3 per-run immutable ticket journals for data, administrative, and administrative-recovery
   locking. Claims and exact-target releases use canonical digest-bound records and atomic
   no-clobber hard-link publication.
@@ -31,6 +37,13 @@ The project follows semantic versioning once a public release process is establi
 
 ### Changed
 
+- Cursor CLI doctor probe timeout now uses `policy.doctorProbeTimeoutMs` instead of the former
+  implicit 5-second cap (`Math.min(5_000, commandTimeoutMs)`).
+- Cursor CLI doctor classification now separates executable-unavailable, version-check failures,
+  catalogue failures, role-resolution failures, skipped-prerequisite failures, probe invocation
+  failures, probe transport timeouts, cleanup failures, and doctor unexpected errors.
+- Doctor probe resource creation is now gated to real stdin-probe execution paths only; skipped
+  probes and argv transport do not create probe worktrees/branches.
 - `maswe unlock` and `maswe unlock-admin` now publish an exact immutable release rather than
   deleting a reusable owner pathname. Force remains an explicit operator-quiescence assertion,
   not process fencing.
