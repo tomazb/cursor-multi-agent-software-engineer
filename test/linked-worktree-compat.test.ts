@@ -6,6 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { DEFAULT_CONFIG, mergeConfigForTest } from "../src/config.ts";
+import { spawnCaptured } from "../src/process.ts";
 import { migrateRunRecord } from "../src/store.ts";
 import { ensureMasweGitExclude } from "../src/git-workspace.ts";
 import { CursorCliRuntime } from "../src/runtimes/cursor-cli.ts";
@@ -112,13 +113,26 @@ test("doctor probes configured stdin path using CLI --cwd target", async () => {
   config.runtime.kind = "cursor-cli";
   config.runtime.command = process.execPath;
   config.policy.promptTransport = "stdin";
+  config.policy.doctorProbeTimeoutMs = 24_000;
 
-  const runtime = new CursorCliRuntime(config, { cwd });
+  let probeInvocations = 0;
+  const runtime = new CursorCliRuntime(config, {
+    cwd,
+    spawnFn: async (command, args, options) => {
+      if (args[0] === "-e") {
+        probeInvocations += 1;
+        assert.equal(options.cwd, cwd);
+        assert.equal(options.input, "maswe-stdin-probe");
+        assert.equal(options.timeoutMs, 24_000);
+      }
+      return spawnCaptured(command, args, options);
+    },
+  });
   const report = await runtime.doctor();
   const probe = report.checks.find((c) => c.name === "prompt-transport-probe");
   assert.ok(probe);
-  assert.equal(probe.ok, false);
-  assert.equal(probe.code, "skipped-prerequisite-failure");
-  assert.equal(probe.prerequisite, "model-catalogue");
+  assert.equal(probe.ok, true);
+  assert.equal(probe.code, "ok");
+  assert.equal(probeInvocations, 1);
   assert.match(probe.message, /stdin|cwd/i);
 });
