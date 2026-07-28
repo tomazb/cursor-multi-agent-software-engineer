@@ -636,12 +636,13 @@ export class CursorCliRuntime implements AgentRuntime {
       }
 
       if (this.config.policy.promptTransport === "stdin") {
-        let blockingPrerequisite: string | undefined;
+        const nodeStandIn = looksLikeNode(this.config.runtime.command);
+        let blockingPrerequisite: RuntimeDoctorResult["checks"][number]["prerequisite"];
         if (!cliOk) {
           blockingPrerequisite = "cursor-cli";
-        } else if (!catalogueOk) {
+        } else if (!nodeStandIn && !catalogueOk) {
           blockingPrerequisite = "model-catalogue";
-        } else if (!looksLikeNode(this.config.runtime.command) && !resolvedExactBrainstormer) {
+        } else if (!nodeStandIn && !resolvedExactBrainstormer) {
           blockingPrerequisite = "model-brainstormer";
         }
         if (blockingPrerequisite) {
@@ -656,7 +657,7 @@ export class CursorCliRuntime implements AgentRuntime {
         } else {
           probeCwd = await this.resolveDoctorProbeCwd();
           managedProbe = probeCwd !== this.cwd;
-          const probeArgs = looksLikeNode(this.config.runtime.command)
+          const probeArgs = nodeStandIn
             ? [
                 "-e",
                 'const d=require("node:fs").readFileSync(0,"utf8");process.exit(d==="maswe-stdin-probe"?0:1)',
@@ -671,7 +672,7 @@ export class CursorCliRuntime implements AgentRuntime {
                 "ask",
               ];
           if (
-            !looksLikeNode(this.config.runtime.command) &&
+            !nodeStandIn &&
             this.config.policy.trustManagedWorktrees &&
             managedProbe
           ) {

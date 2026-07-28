@@ -17,7 +17,7 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
   content. Failure diagnostics additionally follow the bounded failure contract below.
 - JSON schemas live under `schemas/` for configuration and run records.
 - Persisted `run.config.roles.*.model` values are exact executable catalogue IDs after `start`. Loading a run migrates defaults then runs the same config assertions as project load (without applying process environment overrides).
-- `RuntimeDoctorResult` (including `maswe doctor --json` output) is not a persisted artifact and is not governed by run-record schemas. It is an in-process report surface with typed doctor `code` values and optional skipped-check `prerequisite`.
+- `RuntimeDoctorResult` (including `maswe doctor --json` output) is not a persisted artifact and is not governed by run-record schemas. It is an in-process report surface with typed doctor `code` values and optional skipped-check `prerequisite` constrained by `DoctorCheckPrerequisite` to `cursor-cli`, `model-catalogue`, or `model-brainstormer`.
 
 ## Run record
 

@@ -180,6 +180,7 @@ test("persisted config migration ignores conflicting MASWE environment overrides
 });
 
 test("doctor checks the configured stdin prompt transport path", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-node-stand-in-"));
   const config = structuredClone(DEFAULT_CONFIG);
   config.runtime.kind = "cursor-cli";
   config.runtime.command = process.execPath;
@@ -188,6 +189,7 @@ test("doctor checks the configured stdin prompt transport path", async () => {
   let probeInvocations = 0;
   let observedProbeTimeout = -1;
   const runtime = new CursorCliRuntime(config, {
+    cwd,
     spawnFn: async (command, args, options) => {
       if (args[0] === "-e") {
         probeInvocations += 1;

@@ -275,6 +275,11 @@ export type DoctorCheckCode =
   | "probe-malformed-output"
   | "probe-invalid-terminal-marker";
 
+export type DoctorCheckPrerequisite =
+  | "cursor-cli"
+  | "model-catalogue"
+  | "model-brainstormer";
+
 export interface RuntimeDoctorResult {
   ok: boolean;
   checks: Array<{
@@ -282,7 +287,7 @@ export interface RuntimeDoctorResult {
     ok: boolean;
     message: string;
     code: DoctorCheckCode;
-    prerequisite?: string;
+    prerequisite?: DoctorCheckPrerequisite;
   }>;
 }
 

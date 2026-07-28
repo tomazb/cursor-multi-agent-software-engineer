@@ -565,6 +565,11 @@ stable if check names change.
 ### Updated `RuntimeDoctorResult`
 
 ```typescript
+export type DoctorCheckPrerequisite =
+  | "cursor-cli"
+  | "model-catalogue"
+  | "model-brainstormer";
+
 export interface RuntimeDoctorResult {
   ok: boolean;
   checks: Array<{
@@ -578,7 +583,7 @@ export interface RuntimeDoctorResult {
      * skip (one of "cursor-cli", "model-catalogue", or "model-brainstormer").
      * Absent on every check that actually executed.
      */
-    prerequisite?: string;
+    prerequisite?: DoctorCheckPrerequisite;
   }>;
 }
 ```
@@ -600,7 +605,7 @@ before it. Each skipped check is represented as follows:
   from "ran and failed". No separate boolean `executed`/`ran` field is added. The `code` field
   already carries the execution state precisely, so **the smallest correct model change is to
   reuse `code` rather than introduce a parallel execution-state flag.**
-- `prerequisite?: string` — an optional, additive field naming the prerequisite check that
+- `prerequisite?: DoctorCheckPrerequisite` — an optional field naming the prerequisite check that
   caused the skip, retaining enough structured information for machine consumers to attribute the
   skip without message parsing. It is optional, so existing check literals that always execute
   are unaffected and no consumer is forced to read it.
@@ -1580,7 +1585,9 @@ Criteria marked with `[NEW]` are additions or replacements from the original dra
 2. **AC2 [NEW]:** `src/domain.ts` declares `doctorProbeTimeoutMs: number` (non-optional) in
    `MasweConfig.policy` and exports `DoctorCheckCode` as a string literal union type with the
    full 16-value vocabulary (12 emitted + 4 reserved), and `RuntimeDoctorResult.checks` gains a
-   required `code: DoctorCheckCode` field and an optional `prerequisite?: string` field.
+   required `code: DoctorCheckCode` field and an optional
+   `prerequisite?: DoctorCheckPrerequisite` field, where `DoctorCheckPrerequisite` is exactly
+   `"cursor-cli" | "model-catalogue" | "model-brainstormer"`.
 3. **AC3 [NEW]:** `src/config.ts` `assertConfig()` rejects any `doctorProbeTimeoutMs` value
    that is: below 1 000 ms, above 300 000 ms, zero, negative, non-integer, or non-finite.
    No advisory warning; always throws.
@@ -1766,7 +1773,7 @@ command does not have a strict upper bound on its wall-clock duration. CI pipeli
 
 | File | Change |
 |---|---|
-| `src/domain.ts` | Add `doctorProbeTimeoutMs: number` to `MasweConfig.policy`; export `DoctorCheckCode` 16-value union (12 emitted + 4 reserved); add required `code: DoctorCheckCode` and optional `prerequisite?: string` to `RuntimeDoctorResult.checks` |
+| `src/domain.ts` | Add `doctorProbeTimeoutMs: number` to `MasweConfig.policy`; export `DoctorCheckCode` 16-value union (12 emitted + 4 reserved) and exact three-value `DoctorCheckPrerequisite`; add required `code: DoctorCheckCode` and optional `prerequisite?: DoctorCheckPrerequisite` to `RuntimeDoctorResult.checks` |
 | `src/config.ts` | Add `doctorProbeTimeoutMs: 60_000` to `DEFAULT_CONFIG.policy`; add hard bounds validation in `assertConfig()` (no `!== undefined` guard) |
 | `src/runtimes/cursor-cli.ts` | Isolate `listModels()` in a catalogue-only try/catch; resolve each role exactly once from that role's own attempt; capture the brainstormer's resolved exact ID from its own successful result; **remove the aggregate `resolveProjectModels()` call** from the doctor path. Replace `Math.min(5_000, commandTimeoutMs)` with `this.config.policy.doctorProbeTimeoutMs`; add a `code` to every check literal per the emitted mapping; classify the `--version` spawn rejection with ENOENT/EACCES/EPERM/ENOTDIR as `"cursor-executable-unavailable"` on `cursor-cli` (terminating downstream); classify any other pre-cursor-cli-check spawn rejection and any unexpected post-version exception as a **`doctor`** check with `"doctor-unexpected-error"` (never a duplicate `cursor-cli`); split `--version` non-zero/timeout into `"cursor-version-check-failure"`; emit skipped `model-{role}` (`prerequisite: "model-catalogue"`) on catalogue failure and skipped `prompt-transport-probe` with the correct `prerequisite` (`cursor-cli`/`model-catalogue`/`model-brainstormer`); gate `resolveDoctorProbeCwd()` so it is called only when the probe will actually execute (no blocking prerequisite and `promptTransport === "stdin"`). Must **not** construct any reserved code |
 | `src/runtimes/mock.ts` | Add `code: "ok"` to the hardcoded `mock-runtime` check object (currently a non-empty check literal) |

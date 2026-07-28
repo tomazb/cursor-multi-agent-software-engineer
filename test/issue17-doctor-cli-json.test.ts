@@ -1,32 +1,21 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { promisify } from "node:util";
 import { DEFAULT_CONFIG } from "../src/config.ts";
-
-const execFileAsync = promisify(execFile);
+import type { DoctorCheckPrerequisite } from "../src/domain.ts";
+import { spawnFileCaptured } from "./helpers/child-process.ts";
 
 async function runDoctor(cwd: string, args: string[] = [], env: Record<string, string> = {}) {
-  try {
-    const result = await execFileAsync(
-      process.execPath,
-      ["--experimental-strip-types", "src/cli.ts", "doctor", "--cwd", cwd, ...args],
-      {
-        cwd: process.cwd(),
-        env: { ...process.env, ...env },
-      },
-    );
-    return { code: 0, stdout: result.stdout, stderr: result.stderr };
-  } catch (error: unknown) {
-    if (error && typeof error === "object" && "code" in error) {
-      const failed = error as { code: number; stdout?: string; stderr?: string };
-      return { code: failed.code, stdout: failed.stdout ?? "", stderr: failed.stderr ?? "" };
-    }
-    throw error;
-  }
+  return spawnFileCaptured(
+    process.execPath,
+    ["--experimental-strip-types", "src/cli.ts", "doctor", "--cwd", cwd, ...args],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, ...env },
+    },
+  );
 }
 
 async function writeConfig(cwd: string, config: unknown): Promise<void> {
@@ -101,7 +90,7 @@ process.exit(0);
       ok: boolean;
       message: string;
       code: string;
-      prerequisite?: string;
+      prerequisite?: DoctorCheckPrerequisite;
     }>;
   };
   assert.equal(report.ok, false);
