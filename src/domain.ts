@@ -47,6 +47,7 @@ export interface MasweConfig {
     promptTransport: PromptTransport;
     commandTimeoutMs: number;
     roleTimeoutMs: number;
+    doctorProbeTimeoutMs: number;
     maxRunDurationMs?: number;
     allowedPathGlobs: string[];
   };
