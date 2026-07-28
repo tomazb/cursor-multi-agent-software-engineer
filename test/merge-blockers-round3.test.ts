@@ -178,6 +178,7 @@ test("doctor cleanup removes probe worktree and branch; failures are visible che
   const cleanup = report.checks.find((c) => c.name === "doctor-probe-cleanup");
   assert.ok(cleanup, "doctor must report probe cleanup check");
   assert.equal(cleanup.ok, true, cleanup.message);
+  assert.equal(cleanup.code, "ok");
   assert.match(cleanup.message, /Removed doctor probe|No ephemeral/);
 
   const afterWorktrees = (await execFileAsync("git", ["worktree", "list", "--porcelain"], { cwd }))

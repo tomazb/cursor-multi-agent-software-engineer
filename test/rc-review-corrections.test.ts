@@ -629,6 +629,7 @@ test("doctor cleanup removes branch when worktree creation fails after branch ex
   const cleanup = report.checks.find((c) => c.name === "doctor-probe-cleanup");
   assert.ok(cleanup);
   assert.equal(cleanup.ok, true, cleanup.message);
+  assert.equal(cleanup.code, "ok");
   assert.ok(
     report.checks.some((c) => !c.ok && /injected worktree|cursor-cli/i.test(c.message)),
     "original doctor failure must remain visible",

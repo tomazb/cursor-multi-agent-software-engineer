@@ -46,6 +46,8 @@ test("doctor checks the configured stdin prompt transport path", async () => {
   const transport = report.checks.find((c) => c.name === "prompt-transport");
   assert.ok(transport);
   assert.match(transport.message, /stdin/i);
+  assert.equal(transport.code, "ok");
   const probe = report.checks.find((c) => c.name === "prompt-transport-probe");
   assert.ok(probe, "doctor must probe configured stdin execution path");
+  assert.equal(probe.code, "ok");
 });
