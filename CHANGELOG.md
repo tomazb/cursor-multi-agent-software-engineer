@@ -33,10 +33,20 @@ The project follows semantic versioning once a public release process is establi
 - Successful-event identity framing regressions covering brainstorm, design, build, verifier
   success/failure, post-review verification, resolution, retry/supersede state, and human/JSON
   rendering.
-- Exact Node `22.22.2` CI compatibility coverage alongside the current Node 22 job.
+- Governed Node runtime support with exact `.nvmrc` baseline `24.18.0`, bounded Node 22/24 package
+  engines, strict npm engine policy, dependency-free install/script and CLI guards, zero-side-effect
+  unsupported-runtime rejection tests, and same-runtime child-process selection proof.
+- Exact Node `22.22.2` compatibility coverage and exact unsupported Node `25.9.0` negative CI
+  alongside the canonical Node `24.18.0` job.
 
 ### Changed
 
+- The primary blocking CI runtime is now exact Node `24.18.0` from `.nvmrc`; exact Node `22.22.2`
+  remains the blocking compatibility floor. Floating blocking Node aliases are removed.
+- Repository npm entry points and direct CLI execution now reject unsupported Node versions before
+  substantive validation, package creation, configuration/state access, worktree creation, provider
+  invocation, or target quality commands. Failures use `MASWE_UNSUPPORTED_NODE_VERSION` and report
+  the active version, supported range, canonical baseline, and an optional NVM recovery command.
 - Cursor CLI doctor probe timeout now uses `policy.doctorProbeTimeoutMs` instead of the former
   implicit 5-second cap (`Math.min(5_000, commandTimeoutMs)`).
 - Cursor CLI doctor classification now separates executable-unavailable, version-check failures,
