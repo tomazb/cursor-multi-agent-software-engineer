@@ -8,12 +8,18 @@ export const UNSUPPORTED_NODE_VERSION_CODE = "MASWE_UNSUPPORTED_NODE_VERSION";
 
 const VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
+function displayNodeVersion(input) {
+  if (typeof input === "string") return input.length > 0 ? input : "<unavailable>";
+  if (input === null || input === undefined) return "<unavailable>";
+  return String(input);
+}
+
 export function parseNodeVersion(input) {
   if (typeof input !== "string") {
-    throw new TypeError(`Invalid Node.js version: ${String(input)}`);
+    throw new TypeError(`Invalid Node.js version: ${displayNodeVersion(input)}`);
   }
   const match = VERSION_PATTERN.exec(input);
-  if (!match) throw new TypeError(`Invalid Node.js version: ${input || "<empty>"}`);
+  if (!match) throw new TypeError(`Invalid Node.js version: ${displayNodeVersion(input)}`);
   const parts = match.slice(1).map(Number);
   if (parts.some((part) => !Number.isSafeInteger(part))) {
     throw new TypeError(`Invalid Node.js version: ${input}`);
@@ -43,9 +49,7 @@ export function isSupportedNodeVersion(input) {
 }
 
 export function unsupportedNodeVersionMessage(actualVersion) {
-  const actual = typeof actualVersion === "string" && actualVersion.length > 0
-    ? actualVersion
-    : "<unavailable>";
+  const actual = displayNodeVersion(actualVersion);
   return `${UNSUPPORTED_NODE_VERSION_CODE}: Node.js ${actual} is unsupported. `
     + `Supported range: ${SUPPORTED_NODE_RANGE}. `
     + `Canonical baseline: ${CANONICAL_NODE_VERSION} from .nvmrc. `
@@ -61,7 +65,8 @@ export class UnsupportedNodeVersionError extends Error {
   }
 }
 
-export function assertSupportedNodeVersion(actualVersion = process.versions.node) {
+export function assertSupportedNodeVersion(...args) {
+  const actualVersion = args.length === 0 ? process.versions.node : args[0];
   if (!isSupportedNodeVersion(actualVersion)) {
     throw new UnsupportedNodeVersionError(actualVersion);
   }
