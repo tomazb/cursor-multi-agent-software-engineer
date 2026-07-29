@@ -1,0 +1,66 @@
+export const CANONICAL_NODE_VERSION = "24.18.0";
+export const NODE_COMPATIBILITY_FLOOR = "22.22.2";
+export const SUPPORTED_NODE_RANGE = ">=22.22.2 <23 || >=24.18.0 <25";
+export const UNSUPPORTED_NODE_VERSION_CODE = "MASWE_UNSUPPORTED_NODE_VERSION";
+
+export type NodeVersion = readonly [major: number, minor: number, patch: number];
+
+const VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+
+export function parseNodeVersion(input: string): NodeVersion {
+  const match = VERSION_PATTERN.exec(input);
+  if (!match) throw new TypeError(`Invalid Node.js version: ${input || "<empty>"}`);
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const patch = Number(match[3]);
+  if (![major, minor, patch].every(Number.isSafeInteger)) {
+    throw new TypeError(`Invalid Node.js version: ${input}`);
+  }
+  return [major, minor, patch];
+}
+
+function atLeast(parts: NodeVersion, minimum: NodeVersion): boolean {
+  for (let index = 0; index < parts.length; index += 1) {
+    const value = parts[index];
+    const floor = minimum[index];
+    if (value > floor) return true;
+    if (value < floor) return false;
+  }
+  return true;
+}
+
+export function isSupportedNodeVersion(input: string): boolean {
+  try {
+    const parts = parseNodeVersion(input);
+    if (parts[0] === 22) return atLeast(parts, [22, 22, 2]);
+    if (parts[0] === 24) return atLeast(parts, [24, 18, 0]);
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+export function unsupportedNodeVersionMessage(actualVersion: string): string {
+  const actual = actualVersion.length > 0 ? actualVersion : "<unavailable>";
+  return `${UNSUPPORTED_NODE_VERSION_CODE}: Node.js ${actual} is unsupported. `
+    + `Supported range: ${SUPPORTED_NODE_RANGE}. `
+    + `Canonical baseline: ${CANONICAL_NODE_VERSION} from .nvmrc. `
+    + "Select a supported runtime before retrying (optional NVM example: nvm install && nvm use).";
+}
+
+export class UnsupportedNodeVersionError extends Error {
+  readonly code = UNSUPPORTED_NODE_VERSION_CODE;
+  readonly actualVersion: string;
+
+  constructor(actualVersion: string) {
+    super(unsupportedNodeVersionMessage(actualVersion));
+    this.name = "UnsupportedNodeVersionError";
+    this.actualVersion = actualVersion;
+  }
+}
+
+export function assertSupportedNodeVersion(actualVersion = process.versions.node): void {
+  if (!isSupportedNodeVersion(actualVersion)) {
+    throw new UnsupportedNodeVersionError(actualVersion);
+  }
+}
