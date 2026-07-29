@@ -78,7 +78,7 @@ test("standalone assertion seam rejects unsupported Node with stable diagnostics
   assert.match(result.stderr, /25\.9\.0/);
   assert.match(result.stderr, />=22\.22\.2 <23 \|\| >=24\.18\.0 <25/);
   assert.match(result.stderr, /24\.18\.0/);
-  assert.match(result.stderr, /nvm install && nvm use/);
+  assert.match(result.stderr, /nvm install 24\.18\.0 && nvm use 24\.18\.0/);
 });
 
 test("project npm policy enables strict engine rejection", async () => {
