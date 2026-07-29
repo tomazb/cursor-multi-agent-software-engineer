@@ -36,7 +36,7 @@ flowchart TB
 
 ### 3.1 CLI entry point
 
-`src/cli.ts` validates the active Node runtime, parses commands, resolves the target repository and configuration, creates a runtime, invokes the orchestrator, and renders run state.
+`src/cli.ts` is the unconditional shebang entrypoint and safe failure renderer. It delegates to the testable `runCli()` command runner in `src/cli-runner.ts`, which validates the active Node runtime, parses commands, resolves the target repository and configuration, creates a runtime, invokes the orchestrator, and renders run state.
 
 The Node assertion is the first action inside the testable `runCli()` entry function. Unsupported runtimes fail with `MASWE_UNSUPPORTED_NODE_VERSION` before target-path resolution, configuration or run-store access, starter-config writes, worktree/branch creation, provider invocation, or target quality commands. The installed `#!/usr/bin/env node` shebang intentionally selects the user's active PATH runtime; the guard then validates that selected binary.
 
