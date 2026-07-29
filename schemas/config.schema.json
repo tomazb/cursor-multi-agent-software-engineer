@@ -69,6 +69,7 @@
         "promptTransport",
         "commandTimeoutMs",
         "roleTimeoutMs",
+        "doctorProbeTimeoutMs",
         "allowedPathGlobs"
       ],
       "properties": {
@@ -81,6 +82,7 @@
         "promptTransport": { "enum": ["stdin", "argv"] },
         "commandTimeoutMs": { "type": "integer", "minimum": 1 },
         "roleTimeoutMs": { "type": "integer", "minimum": 1 },
+        "doctorProbeTimeoutMs": { "type": "integer", "minimum": 1000, "maximum": 300000 },
         "maxRunDurationMs": { "type": "integer", "minimum": 1 },
         "allowedPathGlobs": {
           "type": "array",

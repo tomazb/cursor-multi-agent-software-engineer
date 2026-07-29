@@ -6,6 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { DEFAULT_CONFIG, mergeConfigForTest } from "../src/config.ts";
+import { spawnCaptured } from "../src/process.ts";
 import { migrateRunRecord } from "../src/store.ts";
 import { ensureMasweGitExclude } from "../src/git-workspace.ts";
 import { CursorCliRuntime } from "../src/runtimes/cursor-cli.ts";
@@ -46,6 +47,7 @@ test("deep-migrates v0.1 config snapshots missing policy hardening fields", () =
   assert.equal(migrated.policy.promptTransport, "stdin");
   assert.equal(typeof migrated.policy.commandTimeoutMs, "number");
   assert.equal(typeof migrated.policy.roleTimeoutMs, "number");
+  assert.equal(migrated.policy.doctorProbeTimeoutMs, 60_000);
   assert.deepEqual(migrated.policy.allowedPathGlobs, ["**"]);
 
   const run = migrateRunRecord({
@@ -66,6 +68,7 @@ test("deep-migrates v0.1 config snapshots missing policy hardening fields", () =
   assert.equal(run.config.policy.useIsolatedWorktree, true);
   assert.equal(run.config.policy.trustManagedWorktrees, true);
   assert.equal(run.config.policy.promptTransport, "stdin");
+  assert.equal(run.config.policy.doctorProbeTimeoutMs, 60_000);
 });
 
 test("ensureMasweGitExclude works when MASWE runs from a linked worktree", async () => {
@@ -110,11 +113,26 @@ test("doctor probes configured stdin path using CLI --cwd target", async () => {
   config.runtime.kind = "cursor-cli";
   config.runtime.command = process.execPath;
   config.policy.promptTransport = "stdin";
+  config.policy.doctorProbeTimeoutMs = 24_000;
 
-  const runtime = new CursorCliRuntime(config, { cwd });
+  let probeInvocations = 0;
+  const runtime = new CursorCliRuntime(config, {
+    cwd,
+    spawnFn: async (command, args, options) => {
+      if (args[0] === "-e") {
+        probeInvocations += 1;
+        assert.equal(options.cwd, cwd);
+        assert.equal(options.input, "maswe-stdin-probe");
+        assert.equal(options.timeoutMs, 24_000);
+      }
+      return spawnCaptured(command, args, options);
+    },
+  });
   const report = await runtime.doctor();
   const probe = report.checks.find((c) => c.name === "prompt-transport-probe");
   assert.ok(probe);
   assert.equal(probe.ok, true);
+  assert.equal(probe.code, "ok");
+  assert.equal(probeInvocations, 1);
   assert.match(probe.message, /stdin|cwd/i);
 });

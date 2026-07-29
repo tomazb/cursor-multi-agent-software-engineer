@@ -177,3 +177,43 @@ test("text output preserves Markdown containing standalone JSON", async () => {
   assert.equal(result.status, "finished");
   assert.equal(result.output, textOutput);
 });
+
+test("doctor probe timeout propagation uses doctorProbeTimeoutMs instead of commandTimeoutMs cap", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-issue17-timeout-propagation-"));
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.runtime.command = "agent";
+  config.policy.promptTransport = "stdin";
+  config.policy.useIsolatedWorktree = false;
+  config.policy.trustManagedWorktrees = false;
+  config.policy.commandTimeoutMs = 2_000;
+  config.policy.doctorProbeTimeoutMs = 25_000;
+
+  let probeTimeout = -1;
+  const runtime = new CursorCliRuntime(config, {
+    cwd,
+    spawnFn: async (_command, args, options) => {
+      if (args[0] === "--version") return { exitCode: 0, stdout: "agent 1.0", stderr: "", durationMs: 1 };
+      if (args[0] === "models") {
+        return {
+          exitCode: 0,
+          stdout: [
+            "cursor-grok-4.5-high",
+            "cursor-claude-fable-5-high",
+            "cursor-claude-opus-4.8-high",
+            "gpt-5.6-sol-high",
+            "",
+          ].join("\n"),
+          stderr: "",
+          durationMs: 1,
+        };
+      }
+      probeTimeout = options.timeoutMs;
+      return { exitCode: 0, stdout: "ok", stderr: "", durationMs: 1 };
+    },
+  });
+
+  const report = await runtime.doctor();
+  const probe = report.checks.find((check) => check.name === "prompt-transport-probe");
+  assert.equal(probe?.ok, true, probe?.message ?? "missing prompt-transport-probe");
+  assert.equal(probeTimeout, 25_000);
+});

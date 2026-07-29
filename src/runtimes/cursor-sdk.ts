@@ -6,6 +6,10 @@ const importOptional = new Function("specifier", "return import(specifier)") as 
   specifier: string,
 ) => Promise<Record<string, any>>;
 
+type CursorSdkImportFn = (
+  specifier: string,
+) => Promise<Record<string, any>>;
+
 export function serializeCursorSdkResult(value: unknown): string {
   if (typeof value === "string") return value;
   try {
@@ -22,6 +26,14 @@ export function serializeCursorSdkResult(value: unknown): string {
 }
 
 export class CursorSdkRuntime implements AgentRuntime {
+  private readonly importFn: CursorSdkImportFn;
+
+  constructor(
+    options: { importFn?: CursorSdkImportFn } = {},
+  ) {
+    this.importFn = options.importFn ?? importOptional;
+  }
+
   async listModels(): Promise<string[]> {
     // SDK catalogue discovery is not available here; require exact IDs in config.
     return [];
@@ -31,7 +43,7 @@ export class CursorSdkRuntime implements AgentRuntime {
     const apiKey = process.env.CURSOR_API_KEY;
     if (!apiKey) throw new Error("CURSOR_API_KEY is required for the cursor-sdk runtime.");
     const before = await gitWorkspaceFingerprint(request.cwd);
-    const sdk = await importOptional("@cursor/sdk");
+    const sdk = await this.importFn("@cursor/sdk");
     const result = await sdk.Agent.prompt(request.prompt, {
       apiKey,
       model: { id: request.roleConfig.model },
@@ -75,21 +87,23 @@ export class CursorSdkRuntime implements AgentRuntime {
   }
 
   async doctor(): Promise<RuntimeDoctorResult> {
-    const checks = [];
+    const checks: RuntimeDoctorResult["checks"] = [];
     const hasKey = Boolean(process.env.CURSOR_API_KEY);
     checks.push({
       name: "cursor-api-key",
       ok: hasKey,
       message: hasKey ? "CURSOR_API_KEY is set." : "CURSOR_API_KEY is not set.",
+      code: hasKey ? "ok" : "cursor-sdk-credential-missing",
     });
     try {
-      await importOptional("@cursor/sdk");
-      checks.push({ name: "cursor-sdk", ok: true, message: "@cursor/sdk can be imported." });
+      await this.importFn("@cursor/sdk");
+      checks.push({ name: "cursor-sdk", ok: true, message: "@cursor/sdk can be imported.", code: "ok" });
     } catch (error) {
       checks.push({
         name: "cursor-sdk",
         ok: false,
         message: error instanceof Error ? error.message : String(error),
+        code: "cursor-sdk-unavailable",
       });
     }
     return { ok: checks.every((check) => check.ok), checks };

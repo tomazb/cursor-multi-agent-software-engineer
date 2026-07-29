@@ -56,6 +56,7 @@ export const DEFAULT_CONFIG: MasweConfig = {
     promptTransport: "stdin",
     commandTimeoutMs: 600_000,
     roleTimeoutMs: 1_800_000,
+    doctorProbeTimeoutMs: 60_000,
     allowedPathGlobs: ["**"],
   },
 };
@@ -206,6 +207,13 @@ export function assertConfig(config: MasweConfig): void {
   }
   if (!Number.isFinite(config.policy.roleTimeoutMs) || config.policy.roleTimeoutMs < 1) {
     throw new Error("policy.roleTimeoutMs must be at least 1");
+  }
+  if (
+    !Number.isInteger(config.policy.doctorProbeTimeoutMs) ||
+    config.policy.doctorProbeTimeoutMs < 1_000 ||
+    config.policy.doctorProbeTimeoutMs > 300_000
+  ) {
+    throw new Error("policy.doctorProbeTimeoutMs must be an integer between 1000 and 300000");
   }
   if (
     config.policy.maxRunDurationMs !== undefined &&

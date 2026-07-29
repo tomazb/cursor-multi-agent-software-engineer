@@ -49,9 +49,18 @@ Run diagnostics:
 ```bash
 maswe doctor
 maswe doctor --cwd /path/to/repo
+maswe doctor --json
 ```
 
 `doctor` probes the Cursor CLI from a MASWE-managed worktree when `trustManagedWorktrees` is enabled (passing `--trust`), then removes that ephemeral worktree **and** its `maswe/doctor-*` branch. Cleanup outcome is reported as a doctor check.
+
+Doctor timeout policy is explicit and fail-closed:
+
+- `policy.doctorProbeTimeoutMs` controls only the stdin prompt-transport invocation deadline.
+- Default: `60_000`; hard bounds: integer `1_000..300_000`.
+- Invalid explicit values fail at config validation (no clamping).
+- The probe timeout is independent of `commandTimeoutMs` and `roleTimeoutMs`.
+- Only the probe invocation deadline and promise settlement are bounded. Process-tree termination is best-effort and unobservable, so descendant lifetimes are not strictly bounded. Full `maswe doctor` duration is also unbounded because probe worktree create/cleanup git operations have no timeout.
 
 MASWE stores local lock history under
 `.maswe/runs/<run-id>/.lock-journal-v3/`. The `data`, `admin`, and
@@ -122,6 +131,31 @@ Fail-closed catalogue discovery and logical→exact resolution apply to runtimes
 Treat a Cursor CLI doctor catalogue failure as a reason to inspect `agent models` output format and authentication, not as proof the provider is unavailable and not as permission to select from surviving rows.
 
 Doctor probe cleanup is based on recorded probe identity: once a `doctor-*` probe ID is assigned, final cleanup removes the probe worktree (if present) and `maswe/doctor-*` branch even when worktree creation failed after the branch was created. Cleanup is idempotent; cleanup failures surface as a `doctor-probe-cleanup` check without erasing the original doctor failure.
+
+Doctor checks include typed `code` values in JSON output (`maswe doctor --json`) and keep human output unchanged:
+
+- Human mode: `PASS|FAIL <name>: <message>`
+- JSON mode: full `RuntimeDoctorResult` object (`ok`, `checks[]` with `name`, `ok`, `message`, `code`, and optional `prerequisite`)
+- Both modes set exit code from `report.ok`.
+
+Emitted doctor codes:
+
+- `ok`
+- `cursor-executable-unavailable`
+- `cursor-version-check-failure`
+- `catalogue-discovery-failure`
+- `model-resolution-failure`
+- `skipped-prerequisite-failure` (`prerequisite` is one of `cursor-cli`, `model-catalogue`, `model-brainstormer`)
+- `probe-invocation-failure`
+- `probe-transport-timeout`
+- `cleanup-failure`
+- `doctor-unexpected-error`
+- `cursor-sdk-credential-missing`
+- `cursor-sdk-unavailable`
+
+Reserved but non-emitted in this release: `auth-failure`, `process-termination-failure`, `probe-malformed-output`, `probe-invalid-terminal-marker`.
+
+Probe success semantics are intentionally narrow: a passing stdin probe means the command started with the configured stdin payload wired to it and exited zero inside `doctorProbeTimeoutMs`. It does not independently prove that the child read or semantically accepted the payload, auth classification, output-shape validity, terminal-marker validity, or descendant termination. Process-tree termination remains best-effort and not observable.
 
 Cursor CLI assistant extraction and terminal markers:
 

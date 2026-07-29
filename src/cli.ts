@@ -115,8 +115,12 @@ async function main(): Promise<void> {
     case "doctor": {
       const runtime = createRuntime(projectConfig!, cwd);
       const report = await runtime.doctor();
-      for (const check of report.checks) {
-        console.log(`${check.ok ? "PASS" : "FAIL"} ${check.name}: ${check.message}`);
+      if (has(args, "--json")) {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        for (const check of report.checks) {
+          console.log(`${check.ok ? "PASS" : "FAIL"} ${check.name}: ${check.message}`);
+        }
       }
       process.exitCode = report.ok ? 0 : 1;
       return;

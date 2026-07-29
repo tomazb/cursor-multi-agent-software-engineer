@@ -172,21 +172,61 @@ test("doctor cleanup removes probe worktree and branch; failures are visible che
 
   const beforeWorktrees = (await execFileAsync("git", ["worktree", "list", "--porcelain"], { cwd }))
     .stdout;
+  const beforeBranches = (
+    await execFileAsync("git", ["branch", "--list", "maswe/doctor-*"], { cwd })
+  ).stdout;
+  const { ensureRunWorkspace, cleanupDoctorProbeResources } = await import("../src/git-workspace.ts");
 
   const runtime = new CursorCliRuntime(config, { cwd });
+  let ensureProbeCalls = 0;
+  let createdProbeId: string | undefined;
+  let createdProbePath: string | undefined;
+  let worktreeObservedDuringProbe = false;
+  let branchObservedDuringProbe = false;
+  runtime.ensureProbeWorkspace = async (repositoryPath, run) => {
+    ensureProbeCalls += 1;
+    createdProbeId = run.id;
+    const workspace = await ensureRunWorkspace(repositoryPath, run);
+    createdProbePath = workspace.worktreePath;
+    assert.ok(createdProbePath);
+    await access(createdProbePath);
+    worktreeObservedDuringProbe = true;
+    const branchSha = (
+      await execFileAsync("git", ["rev-parse", "--verify", `maswe/${run.id}`], { cwd })
+    ).stdout.trim();
+    branchObservedDuringProbe = /^[0-9a-f]{40}$/.test(branchSha);
+    return workspace;
+  };
   const report = await runtime.doctor();
+  const probe = report.checks.find((c) => c.name === "prompt-transport-probe");
+  assert.ok(probe);
+  assert.equal(probe.ok, true, probe.message);
+  assert.equal(probe.code, "ok");
   const cleanup = report.checks.find((c) => c.name === "doctor-probe-cleanup");
   assert.ok(cleanup, "doctor must report probe cleanup check");
   assert.equal(cleanup.ok, true, cleanup.message);
-  assert.match(cleanup.message, /Removed doctor probe|No ephemeral/);
+  assert.equal(cleanup.code, "ok");
+  assert.match(cleanup.message, /Removed doctor probe worktree and branch/);
+  assert.equal(ensureProbeCalls, 1);
+  assert.ok(createdProbeId);
+  assert.ok(createdProbePath);
+  assert.equal(worktreeObservedDuringProbe, true);
+  assert.equal(branchObservedDuringProbe, true);
 
   const afterWorktrees = (await execFileAsync("git", ["worktree", "list", "--porcelain"], { cwd }))
     .stdout;
+  const afterBranches = (
+    await execFileAsync("git", ["branch", "--list", "maswe/doctor-*"], { cwd })
+  ).stdout;
   assert.equal(afterWorktrees, beforeWorktrees);
+  assert.equal(afterBranches, beforeBranches);
+  await assert.rejects(access(createdProbePath), /ENOENT/);
+  await assert.rejects(
+    execFileAsync("git", ["rev-parse", "--verify", `maswe/${createdProbeId}`], { cwd }),
+  );
 
   // Planted probe cleanup deletes both worktree and branch.
   const probeId = `doctor-${Date.now().toString(36)}`;
-  const { ensureRunWorkspace, cleanupDoctorProbeResources } = await import("../src/git-workspace.ts");
   const planted = await ensureRunWorkspace(cwd, {
     schemaVersion: 1,
     version: 1,
