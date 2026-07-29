@@ -45,7 +45,7 @@ export function unsupportedNodeVersionMessage(actualVersion: string): string {
   return `${UNSUPPORTED_NODE_VERSION_CODE}: Node.js ${actual} is unsupported. `
     + `Supported range: ${SUPPORTED_NODE_RANGE}. `
     + `Canonical baseline: ${CANONICAL_NODE_VERSION} from .nvmrc. `
-    + "Select a supported runtime before retrying (optional NVM example: nvm install && nvm use).";
+    + `Select a supported runtime before retrying (optional NVM example: nvm install ${CANONICAL_NODE_VERSION} && nvm use ${CANONICAL_NODE_VERSION}).`;
 }
 
 export class UnsupportedNodeVersionError extends Error {
