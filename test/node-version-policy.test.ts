@@ -82,7 +82,7 @@ test("Node runtime policy accepts only the approved Node 22 and Node 24 ranges",
         assert.match(error.message, new RegExp(version.replaceAll(".", "\\.")));
         assert.match(error.message, />=22\.22\.2 <23 \|\| >=24\.18\.0 <25/);
         assert.match(error.message, /24\.18\.0/);
-        assert.match(error.message, /nvm install && nvm use/);
+        assert.match(error.message, /nvm install 24\.18\.0 && nvm use 24\.18\.0/);
         assert.match(error.message, /optional/i);
         return true;
       },
