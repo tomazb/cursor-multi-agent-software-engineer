@@ -12,6 +12,7 @@ import {
   assertSupportedNodeVersion,
   isSupportedNodeVersion,
   parseNodeVersion,
+  unsupportedNodeVersionMessage,
 } from "../src/node-version.ts";
 
 const repositoryRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -56,6 +57,8 @@ const malformedCases = [
   "22.22.2 ",
   "01.2.3",
 ];
+
+const nonStringCases: unknown[] = [null, undefined, 25, true, {}, []];
 
 test("Node runtime constants match the approved contract", () => {
   assert.equal(CANONICAL_NODE_VERSION, "24.18.0");
@@ -104,6 +107,28 @@ test("malformed Node versions fail closed", () => {
       version,
     );
   }
+});
+
+test("non-string injected Node versions keep the stable unsupported-version contract", () => {
+  for (const version of nonStringCases) {
+    assert.throws(() => parseNodeVersion(version), /invalid Node\.js version/i);
+    assert.equal(isSupportedNodeVersion(version), false);
+    assert.throws(
+      () => assertSupportedNodeVersion(version),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.name, "UnsupportedNodeVersionError");
+        assert.equal((error as Error & { code?: string }).code, UNSUPPORTED_NODE_VERSION_CODE);
+        assert.match(error.message, /MASWE_UNSUPPORTED_NODE_VERSION/);
+        assert.doesNotMatch(error.message, /Cannot read properties|TypeError/);
+        return true;
+      },
+    );
+  }
+
+  assert.match(unsupportedNodeVersionMessage(null), /Node\.js <unavailable> is unsupported/);
+  assert.match(unsupportedNodeVersionMessage(undefined), /Node\.js <unavailable> is unsupported/);
+  assert.match(unsupportedNodeVersionMessage(25), /Node\.js 25 is unsupported/);
 });
 
 test("repository metadata is synchronized with the approved Node policy", async () => {
