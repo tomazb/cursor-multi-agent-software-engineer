@@ -66,7 +66,7 @@ test("standalone assertion seam rejects unsupported Node with stable diagnostics
          assertSupportedNodeVersion("25.9.0");
          process.exitCode = 9;
        } catch (error) {
-         process.stderr.write(String(error.code) + "\n" + String(error.message));
+         process.stderr.write(String(error.code) + "\\n" + String(error.message));
          process.exitCode = 1;
        }`,
     ],
