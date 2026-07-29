@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readdir, symlink } from "node:fs/promises";
+import { access, mkdtemp, readdir, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -20,23 +20,27 @@ async function assertPathAbsent(target: string): Promise<void> {
 
 async function assertUnsupportedWithoutMasweState(argv: string[]): Promise<void> {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-node-guard-"));
-  const command = [...argv, "--cwd", cwd];
-  await assert.rejects(
-    () => runCli({ argv: command, observedNodeVersion: "25.9.0" }),
-    (error: unknown) => {
-      assert.ok(error instanceof Error);
-      assert.equal((error as Error & { code?: string }).code, UNSUPPORTED_NODE_VERSION_CODE);
-      assert.match(error.message, /MASWE_UNSUPPORTED_NODE_VERSION/);
-      assert.match(error.message, /25\.9\.0/);
-      assert.match(
-        error.message,
-        new RegExp(`nvm install ${canonicalVersionPattern} && nvm use ${canonicalVersionPattern}`),
-      );
-      return true;
-    },
-  );
-  await assertPathAbsent(path.join(cwd, ".maswe"));
-  assert.deepEqual(await readdir(cwd), []);
+  try {
+    const command = [...argv, "--cwd", cwd];
+    await assert.rejects(
+      () => runCli({ argv: command, observedNodeVersion: "25.9.0" }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal((error as Error & { code?: string }).code, UNSUPPORTED_NODE_VERSION_CODE);
+        assert.match(error.message, /MASWE_UNSUPPORTED_NODE_VERSION/);
+        assert.match(error.message, /25\.9\.0/);
+        assert.match(
+          error.message,
+          new RegExp(`nvm install ${canonicalVersionPattern} && nvm use ${canonicalVersionPattern}`),
+        );
+        return true;
+      },
+    );
+    await assertPathAbsent(path.join(cwd, ".maswe"));
+    assert.deepEqual(await readdir(cwd), []);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 }
 
 test("unsupported Node rejects init before starter configuration is written", async () => {
@@ -65,31 +69,35 @@ test("supported Node preserves help behavior without creating state", async () =
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-node-supported-"));
   const output: string[] = [];
   const originalLog = console.log;
-  console.log = (...values: unknown[]) => output.push(values.map(String).join(" "));
   try {
+    console.log = (...values: unknown[]) => output.push(values.map(String).join(" "));
     await runCli({ argv: ["help", "--cwd", cwd], observedNodeVersion: CANONICAL_NODE_VERSION });
+    assert.match(output.join("\n"), /Cursor Multi-Agent Software Engineer/);
+    await assertPathAbsent(path.join(cwd, ".maswe"));
+    assert.deepEqual(await readdir(cwd), []);
   } finally {
     console.log = originalLog;
+    await rm(cwd, { recursive: true, force: true });
   }
-
-  assert.match(output.join("\n"), /Cursor Multi-Agent Software Engineer/);
-  await assertPathAbsent(path.join(cwd, ".maswe"));
-  assert.deepEqual(await readdir(cwd), []);
 });
 
 test("symlinked CLI entrypoint executes instead of being mistaken for an import", async () => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-node-symlink-"));
-  const linkedCli = path.join(cwd, "maswe-linked.ts");
-  await symlink(cliPath, linkedCli);
+  try {
+    const linkedCli = path.join(cwd, "maswe-linked.ts");
+    await symlink(cliPath, linkedCli);
 
-  const result = await spawnFileCaptured(
-    process.execPath,
-    ["--experimental-strip-types", linkedCli, "help"],
-    { cwd, timeoutMs: 5_000 },
-  );
+    const result = await spawnFileCaptured(
+      process.execPath,
+      ["--experimental-strip-types", linkedCli, "help"],
+      { cwd, timeoutMs: 5_000 },
+    );
 
-  assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /Cursor Multi-Agent Software Engineer/);
-  await assertPathAbsent(path.join(cwd, ".maswe"));
-  assert.deepEqual(await readdir(cwd), ["maswe-linked.ts"]);
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /Cursor Multi-Agent Software Engineer/);
+    await assertPathAbsent(path.join(cwd, ".maswe"));
+    assert.deepEqual(await readdir(cwd), ["maswe-linked.ts"]);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
