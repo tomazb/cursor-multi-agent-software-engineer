@@ -205,6 +205,32 @@ test("standalone and TypeScript guards expose the same constants and decisions",
   }
 });
 
+test("standalone guard distinguishes an omitted version from explicit undefined", () => {
+  const scriptUrl = pathToFileURL(standaloneGuardPath).href;
+  const probe = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `import { assertSupportedNodeVersion } from ${JSON.stringify(scriptUrl)};
+       try {
+         assertSupportedNodeVersion(undefined);
+         process.exitCode = 9;
+       } catch (error) {
+         process.stdout.write(JSON.stringify({ name: error.name, code: error.code, message: error.message }));
+         process.exitCode = 1;
+       }`,
+    ],
+    { cwd: repositoryRoot, encoding: "utf8", timeout: 5_000 },
+  );
+
+  assert.equal(probe.status, 1, probe.stderr);
+  const result = JSON.parse(probe.stdout) as { name: string; code: string; message: string };
+  assert.equal(result.name, "UnsupportedNodeVersionError");
+  assert.equal(result.code, UNSUPPORTED_NODE_VERSION_CODE);
+  assert.match(result.message, /Node\.js <unavailable> is unsupported/);
+});
+
 test("standalone guard is dependency-free and does not mutate or switch runtimes", async () => {
   const source = await readFile(standaloneGuardPath, "utf8");
   const imports = [...source.matchAll(/from\s+["']([^"']+)["']/g)].map((match) => match[1]);
