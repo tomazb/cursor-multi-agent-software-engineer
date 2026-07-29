@@ -4,10 +4,12 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { CANONICAL_NODE_VERSION } from "../src/node-version.ts";
 
 const repositoryRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const packageJsonPath = path.join(repositoryRoot, "package.json");
 const guardPath = path.join(repositoryRoot, "scripts", "verify-node-version.mjs");
+const canonicalVersionPattern = CANONICAL_NODE_VERSION.replaceAll(".", "\\.");
 
 interface PackageJson {
   scripts?: Record<string, string>;
@@ -77,8 +79,11 @@ test("standalone assertion seam rejects unsupported Node with stable diagnostics
   assert.match(result.stderr, /^MASWE_UNSUPPORTED_NODE_VERSION\n/);
   assert.match(result.stderr, /25\.9\.0/);
   assert.match(result.stderr, />=22\.22\.2 <23 \|\| >=24\.18\.0 <25/);
-  assert.match(result.stderr, /24\.18\.0/);
-  assert.match(result.stderr, /nvm install 24\.18\.0 && nvm use 24\.18\.0/);
+  assert.match(result.stderr, new RegExp(canonicalVersionPattern));
+  assert.match(
+    result.stderr,
+    new RegExp(`nvm install ${canonicalVersionPattern} && nvm use ${canonicalVersionPattern}`),
+  );
 });
 
 test("project npm policy enables strict engine rejection", async () => {
