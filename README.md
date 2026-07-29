@@ -4,7 +4,7 @@ A durable, model-configurable software delivery orchestrator for Cursor and the 
 
 The system separates product discovery, specification, implementation, independent verification, and pull-request comment resolution into distinct roles. A deterministic state machine owns stage transitions and file-based artifacts preserve every handoff.
 
-> Project status: **v0.2 local hardening**. The local CLI now includes atomic run storage, git worktree isolation, deterministic commits/scope checks, marker enforcement, secret redaction, stdin prompt transport, budgets/timeouts, and retry/supersede recovery. Native GitHub App automation and a hosted control plane remain scheduled for later milestones.
+> Project status: **v0.2 local hardening**. The local CLI now includes atomic run storage, git worktree isolation, deterministic commits/scope checks, marker enforcement, secret redaction, stdin prompt transport, budgets/timeouts, retry/supersede recovery, and a governed Node runtime contract. Native GitHub App automation and a hosted control plane remain scheduled for later milestones.
 
 ## Why this exists
 
@@ -63,22 +63,32 @@ The architecture deliberately keeps the Cursor plugin thin. The standalone orche
 
 ### Prerequisites
 
-- Node.js 22.15 or newer.
+- A Node.js runtime in the supported range `>=22.22.2 <23 || >=24.18.0 <25`.
+  - Canonical contributor and primary-CI baseline: exact Node `24.18.0` from `.nvmrc`.
+  - Blocking compatibility floor: exact Node `22.22.2`.
 - Git.
 - Cursor CLI installed and authenticated when using the default runtime.
 - Superpowers installed in Cursor with `/add-plugin superpowers`.
 - A clean target repository, unless `policy.allowDirtyWorkspace` is explicitly enabled.
 
+Node 23, Node 25, Node 26+, Node 22 below `22.22.2`, and Node 24 below `24.18.0` are unsupported. Passing an ad hoc command on an unsupported runtime is exploratory evidence, not a supported configuration.
+
 ### Install and build
+
+NVM is optional and is not a MASWE product dependency. When NVM is available, `.nvmrc` provides the canonical version:
 
 ```bash
 git clone https://github.com/tomazb/cursor-multi-agent-software-engineer.git
 cd cursor-multi-agent-software-engineer
+nvm install
+nvm use
 npm install
 npm run check
 npm run build
 npm link
 ```
+
+With another version manager, container image, or system package, select any runtime inside the supported range before running npm commands. Normal installation, repository scripts, and the CLI fail early with `MASWE_UNSUPPORTED_NODE_VERSION` when the active runtime is outside the contract. The diagnostic reports the selected version, supported range, canonical `.nvmrc` baseline, and an optional NVM recovery example.
 
 `npm link` makes the `maswe` command available globally for local development. A packaged release can replace this later.
 
@@ -166,6 +176,7 @@ The current implementation provides:
 - Configurable retry ceilings for build/verify and review-resolution loops.
 - Scope classification before any PR comment is automatically resolved.
 - Re-running quality checks and a fresh verifier after every resolver edit.
+- Layered Node-runtime rejection through bounded package engines, strict npm engine policy, guarded repository scripts, and the CLI entry boundary before repository or durable-state actions.
 
 The v0.2 verifier and quality gates bind evidence to the current git **head SHA**. Read-only roles still use workspace fingerprinting to detect unauthorized edits. Remote GitHub check-run automation remains a later milestone.
 
@@ -199,6 +210,7 @@ These are deliberate boundaries rather than hidden behavior. See [the roadmap](d
 
 ```text
 src/                 Orchestrator, state machine, store, runtimes, CLI
+scripts/             Dependency-free repository policy guards
 prompts/             Versioned role prompts and output contracts
 test/                Node test-runner unit and workflow tests
 skills/maswe/         Cursor plugin skill and references
@@ -212,13 +224,15 @@ examples/             Starter request and configuration examples
 ## Development
 
 ```bash
+nvm install   # optional version-manager flow; reads .nvmrc
+nvm use
 npm install
 npm run typecheck
 npm test
 npm run build
 ```
 
-The test suite uses Node's built-in TypeScript stripping and test runner; the production build uses TypeScript.
+The test suite uses Node's built-in TypeScript stripping and test runner; the production build uses TypeScript. Exact-head evidence must record the Node binary path, `process.execPath`, Node version, and npm version, with Node 24 canonical and Node 22 compatibility results reported separately.
 
 ## License
 
