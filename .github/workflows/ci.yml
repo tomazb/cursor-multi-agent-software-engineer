@@ -210,3 +210,39 @@ jobs:
           grep -F '25.9.0' <<<"${output}"
           grep -F -- '>=22.22.2 <23 || >=24.18.0 <25' <<<"${output}"
           test ! -d node_modules
+
+      - name: Require guarded npm entry points to reject before work
+        shell: bash
+        run: |
+          set -euo pipefail
+          for script in check build pack:dry; do
+            set +e
+            output="$(npm run "${script}" 2>&1)"
+            status=$?
+            set -e
+            printf '%s\n' "${output}"
+            test "${status}" -ne 0
+            grep -F 'MASWE_UNSUPPORTED_NODE_VERSION' <<<"${output}"
+            grep -F '25.9.0' <<<"${output}"
+          done
+          test ! -d node_modules
+          test ! -d dist
+          test -z "$(find . -maxdepth 1 -name '*.tgz' -print -quit)"
+
+      - name: Require direct CLI rejection before target side effects
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$(mktemp -d)"
+          trap 'rm -rf "${target}"' EXIT
+          set +e
+          output="$(node --experimental-strip-types src/cli.ts init --cwd "${target}" 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "${output}"
+          test "${status}" -ne 0
+          grep -F 'MASWE_UNSUPPORTED_NODE_VERSION' <<<"${output}"
+          grep -F '25.9.0' <<<"${output}"
+          test ! -e "${target}/.maswe"
+          test -z "$(find "${target}" -mindepth 1 -maxdepth 1 -print -quit)"
+          test ! -d node_modules
