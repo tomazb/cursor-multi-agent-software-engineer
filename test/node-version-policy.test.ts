@@ -110,16 +110,27 @@ test("repository metadata is synchronized with the approved Node policy", async 
   const nvmrc = await readFile(path.join(repositoryRoot, ".nvmrc"), "utf8");
   const npmrc = await readFile(path.join(repositoryRoot, ".npmrc"), "utf8");
   const packageJson = JSON.parse(await readFile(path.join(repositoryRoot, "package.json"), "utf8")) as {
+    name?: string;
+    version?: string;
     engines?: { node?: string };
   };
   const packageLock = JSON.parse(
     await readFile(path.join(repositoryRoot, "package-lock.json"), "utf8"),
-  ) as { packages?: Record<string, { engines?: { node?: string } }> };
+  ) as {
+    name?: string;
+    version?: string;
+    packages?: Record<string, { name?: string; version?: string; engines?: { node?: string } }>;
+  };
+  const lockRoot = packageLock.packages?.[""];
 
   assert.equal(nvmrc, `${CANONICAL_NODE_VERSION}\n`);
   assert.equal(npmrc, "engine-strict=true\n");
   assert.equal(packageJson.engines?.node, SUPPORTED_NODE_RANGE);
-  assert.equal(packageLock.packages?.[""]?.engines?.node, SUPPORTED_NODE_RANGE);
+  assert.equal(packageLock.name, packageJson.name);
+  assert.equal(packageLock.version, packageJson.version);
+  assert.equal(lockRoot?.name, packageJson.name);
+  assert.equal(lockRoot?.version, packageJson.version);
+  assert.equal(lockRoot?.engines?.node, SUPPORTED_NODE_RANGE);
 });
 
 test("standalone and TypeScript guards expose the same constants and decisions", () => {
