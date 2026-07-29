@@ -21,8 +21,8 @@ export function parseNodeVersion(input: string): NodeVersion {
 
 function atLeast(parts: NodeVersion, minimum: NodeVersion): boolean {
   for (let index = 0; index < parts.length; index += 1) {
-    const value = parts[index];
-    const floor = minimum[index];
+    const value = parts[index]!;
+    const floor = minimum[index]!;
     if (value > floor) return true;
     if (value < floor) return false;
   }
