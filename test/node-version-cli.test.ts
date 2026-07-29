@@ -5,10 +5,14 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { runCli } from "../src/cli-runner.ts";
-import { UNSUPPORTED_NODE_VERSION_CODE } from "../src/node-version.ts";
+import {
+  CANONICAL_NODE_VERSION,
+  UNSUPPORTED_NODE_VERSION_CODE,
+} from "../src/node-version.ts";
 import { spawnFileCaptured } from "./helpers/child-process.ts";
 
 const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+const canonicalVersionPattern = CANONICAL_NODE_VERSION.replaceAll(".", "\\.");
 
 async function assertPathAbsent(target: string): Promise<void> {
   await assert.rejects(() => access(target), { code: "ENOENT" });
@@ -24,7 +28,10 @@ async function assertUnsupportedWithoutMasweState(argv: string[]): Promise<void>
       assert.equal((error as Error & { code?: string }).code, UNSUPPORTED_NODE_VERSION_CODE);
       assert.match(error.message, /MASWE_UNSUPPORTED_NODE_VERSION/);
       assert.match(error.message, /25\.9\.0/);
-      assert.match(error.message, /nvm install 24\.18\.0 && nvm use 24\.18\.0/);
+      assert.match(
+        error.message,
+        new RegExp(`nvm install ${canonicalVersionPattern} && nvm use ${canonicalVersionPattern}`),
+      );
       return true;
     },
   );
@@ -60,7 +67,7 @@ test("supported Node preserves help behavior without creating state", async () =
   const originalLog = console.log;
   console.log = (...values: unknown[]) => output.push(values.map(String).join(" "));
   try {
-    await runCli({ argv: ["help", "--cwd", cwd], observedNodeVersion: "24.18.0" });
+    await runCli({ argv: ["help", "--cwd", cwd], observedNodeVersion: CANONICAL_NODE_VERSION });
   } finally {
     console.log = originalLog;
   }
