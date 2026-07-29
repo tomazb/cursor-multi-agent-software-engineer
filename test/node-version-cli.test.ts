@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readdir } from "node:fs/promises";
+import { access, mkdtemp, readdir, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { runCli } from "../src/cli.ts";
+import { fileURLToPath } from "node:url";
+import { runCli } from "../src/cli-runner.ts";
 import { UNSUPPORTED_NODE_VERSION_CODE } from "../src/node-version.ts";
+import { spawnFileCaptured } from "./helpers/child-process.ts";
+
+const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
 
 async function assertPathAbsent(target: string): Promise<void> {
   await assert.rejects(() => access(target), { code: "ENOENT" });
@@ -64,4 +68,21 @@ test("supported Node preserves help behavior without creating state", async () =
   assert.match(output.join("\n"), /Cursor Multi-Agent Software Engineer/);
   await assertPathAbsent(path.join(cwd, ".maswe"));
   assert.deepEqual(await readdir(cwd), []);
+});
+
+test("symlinked CLI entrypoint executes instead of being mistaken for an import", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-node-symlink-"));
+  const linkedCli = path.join(cwd, "maswe-linked.ts");
+  await symlink(cliPath, linkedCli);
+
+  const result = await spawnFileCaptured(
+    process.execPath,
+    ["--experimental-strip-types", linkedCli, "help"],
+    { cwd, timeoutMs: 5_000 },
+  );
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /Cursor Multi-Agent Software Engineer/);
+  await assertPathAbsent(path.join(cwd, ".maswe"));
+  assert.deepEqual(await readdir(cwd), ["maswe-linked.ts"]);
 });
