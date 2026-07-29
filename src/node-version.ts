@@ -68,7 +68,8 @@ export class UnsupportedNodeVersionError extends Error {
   }
 }
 
-export function assertSupportedNodeVersion(actualVersion: unknown = process.versions.node): void {
+export function assertSupportedNodeVersion(...args: [] | [unknown]): void {
+  const actualVersion = args.length === 0 ? process.versions.node : args[0];
   if (!isSupportedNodeVersion(actualVersion)) {
     throw new UnsupportedNodeVersionError(actualVersion);
   }
