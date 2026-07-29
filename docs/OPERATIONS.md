@@ -2,14 +2,42 @@
 
 ## 1. Installation
 
+The active Node runtime must satisfy `>=22.22.2 <23 || >=24.18.0 <25` before normal npm or MASWE execution. Exact Node `24.18.0` from `.nvmrc` is the canonical local/primary-CI baseline; exact Node `22.22.2` is the blocking compatibility floor. NVM is optional and is not a MASWE runtime dependency.
+
+With NVM:
+
 ```bash
 git clone https://github.com/tomazb/cursor-multi-agent-software-engineer.git
 cd cursor-multi-agent-software-engineer
+nvm install
+nvm use
 npm install
 npm run check
 npm run build
 npm link
 ```
+
+With another environment manager, select a supported Node binary and run the same npm commands. Normal installation and repository scripts reject unsupported versions through package engines, `engine-strict`, and the dependency-free guard. Direct CLI execution applies the same policy before repository or durable-state actions.
+
+An unsupported runtime fails with `MASWE_UNSUPPORTED_NODE_VERSION` and reports:
+
+- the selected Node version;
+- the supported range;
+- canonical version `24.18.0`;
+- an optional `nvm install && nvm use` recovery example.
+
+The guard does not install or switch Node. Node 23, Node 25, Node 26+, Node 22 below `22.22.2`, and Node 24 below `24.18.0` are unsupported. A passing exploratory command outside the range is not support evidence.
+
+For each exact-head validation target, capture separately:
+
+```bash
+command -v node
+node --version
+node -p 'process.execPath'
+npm --version
+```
+
+When NVM is used, also capture `nvm current` and `nvm which current`. Do not combine Node 24 canonical and Node 22 compatibility commands into one unlabeled validation record.
 
 Install Cursor CLI according to Cursor's current documentation and authenticate it. Install Superpowers in Cursor:
 
@@ -33,6 +61,8 @@ maswe init
 ```
 
 This creates `.maswe/config.json`. The directory `.maswe/runs/` is ignored by the starter `.gitignore` in this project, but target repositories should make the same choice explicitly. Some teams may want to commit approved design artifacts while keeping raw model logs private.
+
+The Node guard runs before `init` writes starter configuration. Under an unsupported runtime, no `.maswe` state is created.
 
 ## 3. Configure models
 
@@ -301,6 +331,12 @@ These commands record workflow status only; they do not merge a PR.
 
 ## 7. Recovery
 
+### Unsupported Node runtime
+
+Select a runtime inside the supported range and retry the same command. No run migration is required solely because of the runtime policy. A persisted run created earlier cannot resume under an unsupported runtime because the CLI guard executes before loading the run or constructing its runtime.
+
+Do not use `--force` to turn an unsupported runtime into validation evidence. npm's strict-engine behavior is an early convenience layer; the standalone and CLI guards remain authoritative for normal execution.
+
 ### Process interrupted
 
 All completed transitions and artifacts are on disk. Re-run:
@@ -387,39 +423,15 @@ A basic CI job can build and test MASWE itself. Using MASWE to alter a target re
 
 Do not let a model push or merge directly in production CI. Let it edit the checkout, then use scripted git and GitHub steps after policy gates pass.
 
-MASWE's own CI retains a current Node 22 job and an exact Node `22.22.2` compatibility job. Both
-verify the checked-out SHA and run the full deterministic check; the exact-version job also runs
-the package dry run. Test-only child-process result capture uses explicit synchronous or unique
-file-backed channels to avoid Node-version-sensitive buffered pipe output without changing CLI
-rendering.
+MASWE's own blocking CI uses:
+
+1. exact Node `24.18.0` from `.nvmrc` as the canonical baseline, with exact-head verification, binary/version evidence, install, guard, typecheck, focused regressions, contention gates, full tests, build, built-CLI guard seam, and package dry run;
+2. exact Node `22.22.2` as the compatibility floor, with exact-head verification, install, guard, full check, focused Node-policy/child-runtime regressions, and package dry run;
+3. exact unsupported Node `25.9.0` as a short negative job that succeeds only when normal `npm ci` and the standalone guard reject before dependency installation or substantive validation.
+
+No blocking job uses a floating major or LTS alias. The Node 25 job is rejection evidence, not product-validation evidence. Test-only child-process result capture uses explicit synchronous or unique file-backed channels, and same-runtime Node children use `process.execPath`, avoiding PATH drift without changing production CLI rendering.
 
 The normal constrained-heap sanitizer regression runs an 8,000,000-character one-byte input with a
 48 MiB V8 old-space limit, an exact 128-code-point output assertion, and a hard timeout. This
 detects the historical full-code-point-array overhead while keeping the initial input feasible on
 supported Node 22 releases; it does not establish an absolute process-memory bound.
-
-## 10. Upgrades
-
-Before pulling a new version:
-
-1. Back up `.maswe/runs/` for active projects.
-2. Read `CHANGELOG.md` for state or artifact contract changes.
-3. Run `npm install` and `npm run check`.
-4. Rebuild and re-link the CLI.
-5. Run `maswe doctor` in target repositories.
-
-For the v3 lock-journal upgrade:
-
-1. Stop every MASWE process using the target `.maswe/runs/` tree.
-2. Back up the tree and inspect legacy `.lock`, `.admin.lock`, and
-   `.admin.lock.recovering` objects.
-3. Start only the new binary. It represents an existing PR #10 lock as virtual ticket zero and
-   publishes a digest-bound compatibility release only through `maswe unlock <run-id> --force`
-   or `maswe unlock-admin <run-id> --force`; it never deletes the legacy path. An empty legacy
-   `.admin.lock.recovering` directory is bound to stable filesystem identity and fails closed if
-   replaced or if that identity is unavailable.
-4. Do not run old and new binaries concurrently. Old binaries cannot see v3 claims.
-
-After the first v3 claim, rollback to an old binary is unsupported without a separately designed
-quiescent migration/archival operation. Stop and restore the backup rather than deleting claims or
-journal directories. There is no general run-schema migration tool in v0.1.
