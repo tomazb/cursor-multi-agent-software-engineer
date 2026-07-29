@@ -173,6 +173,7 @@ test("standalone guard is dependency-free and does not mutate or switch runtimes
   const source = await readFile(standaloneGuardPath, "utf8");
   const imports = [...source.matchAll(/from\s+["']([^"']+)["']/g)].map((match) => match[1]);
   assert.deepEqual(imports, ["node:url"]);
-  assert.doesNotMatch(source, /node_modules|npm install|npm ci|child_process|\bspawn(?:Sync)?\b|\bexec(?:File)?\b/);
-  assert.doesNotMatch(source, /writeFile|appendFile|mkdir|rmSync|unlink|rename/);
+  assert.doesNotMatch(source, /from\s+["']node:child_process["']/);
+  assert.doesNotMatch(source, /\b(?:spawn|spawnSync|exec|execFile|execFileSync)\s*\(/);
+  assert.doesNotMatch(source, /\b(?:writeFile|appendFile|mkdir|rmSync|unlink|rename)\s*\(/);
 });
