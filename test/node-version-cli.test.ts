@@ -20,7 +20,7 @@ async function assertUnsupportedWithoutMasweState(argv: string[]): Promise<void>
       assert.equal((error as Error & { code?: string }).code, UNSUPPORTED_NODE_VERSION_CODE);
       assert.match(error.message, /MASWE_UNSUPPORTED_NODE_VERSION/);
       assert.match(error.message, /25\.9\.0/);
-      assert.match(error.message, /nvm install && nvm use/);
+      assert.match(error.message, /nvm install 24\.18\.0 && nvm use 24\.18\.0/);
       return true;
     },
   );
