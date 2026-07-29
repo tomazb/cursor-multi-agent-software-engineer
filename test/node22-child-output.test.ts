@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { access, chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -71,31 +71,35 @@ test("file-backed child capture handles early stdin closure deterministically", 
 
 test("same-runtime child Node ignores a hostile PATH-selected node", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-hostile-node-path-"));
-  const bin = path.join(root, "bin");
-  const marker = path.join(root, "hostile-node-executed");
-  await mkdir(bin, { recursive: true });
-  const fakeNode = path.join(bin, "node");
-  await writeFile(
-    fakeNode,
-    `#!/bin/sh\nprintf hostile > ${JSON.stringify(marker)}\nexit 97\n`,
-    "utf8",
-  );
-  await chmod(fakeNode, 0o755);
+  try {
+    const bin = path.join(root, "bin");
+    const marker = path.join(root, "hostile-node-executed");
+    await mkdir(bin, { recursive: true });
+    const fakeNode = path.join(bin, "node");
+    await writeFile(
+      fakeNode,
+      `#!/bin/sh\nprintf hostile > ${JSON.stringify(marker)}\nexit 97\n`,
+      "utf8",
+    );
+    await chmod(fakeNode, 0o755);
 
-  const child = await spawnFileCaptured(
-    process.execPath,
-    ["--input-type=module", "--eval", "process.stdout.write(process.execPath)"],
-    {
-      cwd: root,
-      env: {
-        ...process.env,
-        PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+    const child = await spawnFileCaptured(
+      process.execPath,
+      ["--input-type=module", "--eval", "process.stdout.write(process.execPath)"],
+      {
+        cwd: root,
+        env: {
+          ...process.env,
+          PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+        },
+        timeoutMs: 5_000,
       },
-      timeoutMs: 5_000,
-    },
-  );
+    );
 
-  assert.equal(child.code, 0, child.stderr);
-  assert.equal(child.stdout, process.execPath);
-  await assert.rejects(() => access(marker), { code: "ENOENT" });
+    assert.equal(child.code, 0, child.stderr);
+    assert.equal(child.stdout, process.execPath);
+    await assert.rejects(() => access(marker), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
