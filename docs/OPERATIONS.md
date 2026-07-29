@@ -24,7 +24,7 @@ An unsupported runtime fails with `MASWE_UNSUPPORTED_NODE_VERSION` and reports:
 - the selected Node version;
 - the supported range;
 - canonical version `24.18.0`;
-- an optional `nvm install && nvm use` recovery example.
+- an optional `nvm install 24.18.0 && nvm use 24.18.0` recovery example.
 
 The guard does not install or switch Node. Node 23, Node 25, Node 26+, Node 22 below `22.22.2`, and Node 24 below `24.18.0` are unsupported. A passing exploratory command outside the range is not support evidence.
 
@@ -207,7 +207,7 @@ Cursor CLI assistant extraction and terminal markers:
   diagnostics are capped at 2,048 code points and the all-model fallback message at 8,192; both
   bounds include `… [truncated]`. If later fallback diagnostics cannot fit, the message reports
   their omitted-attempt count while the configured attempts still execute.
-- Before redaction, diagnostic inspection is capped at the output budget plus 4,096 code points
+- Before redaction, diagnostic inspection is capped at the output budget plus 4,096 Unicode code points
   and never exceeds 12,288. The lookahead closes recognized assignments/private-key blocks that
   cross the retained output boundary, and an incomplete supported URI authority that reaches the
   inspection boundary is redacted fail-closed. URI userinfo is recognized for `http`, `https`, `ssh`,
@@ -435,3 +435,30 @@ The normal constrained-heap sanitizer regression runs an 8,000,000-character one
 48 MiB V8 old-space limit, an exact 128-code-point output assertion, and a hard timeout. This
 detects the historical full-code-point-array overhead while keeping the initial input feasible on
 supported Node 22 releases; it does not establish an absolute process-memory bound.
+
+## 10. Upgrades
+
+Before pulling a new version:
+
+1. Back up `.maswe/runs/` for active projects.
+2. Read `CHANGELOG.md` for state, artifact, or runtime-support contract changes.
+3. Select a Node runtime inside `>=22.22.2 <23 || >=24.18.0 <25`; for the canonical NVM flow run `nvm install 24.18.0 && nvm use 24.18.0`.
+4. Run `npm install` and `npm run check`.
+5. Rebuild and re-link the CLI.
+6. Run `maswe doctor` in target repositories.
+
+For the v3 lock-journal upgrade:
+
+1. Stop every MASWE process using the target `.maswe/runs/` tree.
+2. Back up the tree and inspect legacy `.lock`, `.admin.lock`, and
+   `.admin.lock.recovering` objects.
+3. Start only the new binary. It represents an existing PR #10 lock as virtual ticket zero and
+   publishes a digest-bound compatibility release only through `maswe unlock <run-id> --force`
+   or `maswe unlock-admin <run-id> --force`; it never deletes the legacy path. An empty legacy
+   `.admin.lock.recovering` directory is bound to stable filesystem identity and fails closed if
+   replaced or if that identity is unavailable.
+4. Do not run old and new binaries concurrently. Old binaries cannot see v3 claims.
+
+After the first v3 claim, rollback to an old binary is unsupported without a separately designed
+quiescent migration/archival operation. Stop and restore the backup rather than deleting claims or
+journal directories. There is no general run-schema migration tool in v0.1.
