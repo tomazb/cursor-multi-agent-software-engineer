@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { loadConfig, writeStarterConfig } from "./config.ts";
 import type { MasweConfig, RunRecord } from "./domain.ts";
+import { assertSupportedNodeVersion } from "./node-version.ts";
 import { Orchestrator } from "./orchestrator.ts";
 import { createRuntime } from "./runtime.ts";
 import { FileRunStore } from "./store.ts";
@@ -83,8 +85,15 @@ async function orchestratorForRun(
 
 const PROJECT_CONFIG_COMMANDS = new Set(["doctor", "start"]);
 
-async function main(): Promise<void> {
-  const rawArgs = process.argv.slice(2);
+export interface RunCliOptions {
+  argv?: string[];
+  observedNodeVersion?: string;
+}
+
+export async function runCli(options: RunCliOptions = {}): Promise<void> {
+  assertSupportedNodeVersion(options.observedNodeVersion ?? process.versions.node);
+
+  const rawArgs = options.argv ?? process.argv.slice(2);
   const command = rawArgs[0] ?? "help";
   const args = rawArgs.slice(1);
   const cwd = path.resolve(option(rawArgs, "--cwd") ?? process.cwd());
@@ -242,7 +251,7 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error) => {
+function reportCliFailure(error: unknown): void {
   console.error(
     sanitizeDiagnostic(
       error instanceof Error ? error.message : String(error),
@@ -250,4 +259,12 @@ main().catch((error) => {
     ).text,
   );
   process.exitCode = 1;
-});
+}
+
+const invokedAsProgram = process.argv[1]
+  ? import.meta.url === pathToFileURL(process.argv[1]).href
+  : false;
+
+if (invokedAsProgram) {
+  runCli().catch(reportCliFailure);
+}
