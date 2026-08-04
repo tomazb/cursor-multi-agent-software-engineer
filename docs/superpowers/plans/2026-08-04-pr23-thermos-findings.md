@@ -368,4 +368,3 @@ git log --oneline --decorate -n 8
 ```
 
 Expected: separate design, guard, deterministic-test, and documentation commits are visible. Do not mark the PR ready, merge, enable auto-merge, or infer repository-owner merge authorization.
-

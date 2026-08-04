@@ -64,4 +64,3 @@ Final verification runs `npm run check`, `npm run pack:dry`, the focused Node-po
 - `docs/PRD.md`
 - `docs/DEVELOPMENT.md`
 - `docs/superpowers/specs/2026-08-04-pr23-thermos-findings-design.md`
-
