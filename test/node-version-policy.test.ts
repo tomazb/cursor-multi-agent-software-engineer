@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { spawnFileCaptured } from "./helpers/child-process.ts";
 import {
   CANONICAL_NODE_VERSION,
   NODE_COMPATIBILITY_FLOOR,
@@ -233,10 +235,56 @@ test("standalone guard distinguishes an omitted version from explicit undefined"
   assert.match(result.message, /Node\.js <unavailable> is unsupported/);
 });
 
+test("standalone guard rejects an unsupported runtime through a symlinked entry path", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-node-guard-symlink-"));
+  try {
+    const linkedGuard = path.join(root, "verify-node-version.mjs");
+    await symlink(standaloneGuardPath, linkedGuard);
+    const injectedVersionUrl = `data:text/javascript,${encodeURIComponent(
+      'Object.defineProperty(process.versions, "node", { value: "25.9.0" });',
+    )}`;
+
+    const result = await spawnFileCaptured(
+      process.execPath,
+      ["--import", injectedVersionUrl, linkedGuard],
+      { cwd: root, timeoutMs: 5_000 },
+    );
+
+    assert.equal(result.code, 1, result.stderr);
+    assert.match(result.stderr, /MASWE_UNSUPPORTED_NODE_VERSION/);
+    assert.match(result.stderr, /25\.9\.0/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("standalone guard fails closed when its executable entry cannot be canonicalized", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-node-guard-entry-"));
+  try {
+    const missingEntry = path.join(root, "missing-entry.mjs");
+    const guardUrl = pathToFileURL(standaloneGuardPath).href;
+    const probe = `process.argv[1] = ${JSON.stringify(missingEntry)}; await import(${JSON.stringify(guardUrl)});`;
+
+    const result = await spawnFileCaptured(
+      process.execPath,
+      ["--input-type=module", "--eval", probe],
+      { cwd: root, timeoutMs: 5_000 },
+    );
+
+    assert.equal(result.code, 1);
+    assert.equal(
+      result.stderr,
+      "MASWE_NODE_GUARD_ENTRY_RESOLUTION_FAILED: unable to canonicalize Node guard entry path.\n",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("standalone guard is dependency-free and does not mutate or switch runtimes", async () => {
   const source = await readFile(standaloneGuardPath, "utf8");
   const imports = [...source.matchAll(/from\s+["']([^"']+)["']/g)].map((match) => match[1]);
-  assert.deepEqual(imports, ["node:url"]);
+  assert.deepEqual(imports, ["node:fs", "node:url"]);
   assert.doesNotMatch(source, /from\s+["']node:child_process["']/);
   assert.doesNotMatch(source, /\b(?:spawn|spawnSync|execFile|execFileSync)\s*\(/);
   assert.doesNotMatch(source, /\b(?:writeFile|appendFile|mkdir|rmSync|unlink|rename)\s*\(/);

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { pathToFileURL } from "node:url";
+import { realpathSync, writeSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 export const CANONICAL_NODE_VERSION = "24.18.0";
 export const NODE_COMPATIBILITY_FLOOR = "22.22.2";
@@ -7,6 +8,7 @@ export const SUPPORTED_NODE_RANGE = ">=22.22.2 <23 || >=24.18.0 <25";
 export const UNSUPPORTED_NODE_VERSION_CODE = "MASWE_UNSUPPORTED_NODE_VERSION";
 
 const VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+const ENTRY_RESOLUTION_FAILURE_CODE = "MASWE_NODE_GUARD_ENTRY_RESOLUTION_FAILED";
 
 function displayNodeVersion(input) {
   if (typeof input === "string") return input.length > 0 ? input : "<unavailable>";
@@ -72,16 +74,29 @@ export function assertSupportedNodeVersion(...args) {
   }
 }
 
-const invokedAsProgram = process.argv[1]
-  ? import.meta.url === pathToFileURL(process.argv[1]).href
-  : false;
+function isInvokedAsProgram() {
+  const entryPath = process.argv[1];
+  if (!entryPath) return false;
+  try {
+    return realpathSync(entryPath) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    writeSync(
+      2,
+      `${ENTRY_RESOLUTION_FAILURE_CODE}: unable to canonicalize Node guard entry path.\n`,
+    );
+    process.exitCode = 1;
+    return false;
+  }
+}
+
+const invokedAsProgram = isInvokedAsProgram();
 
 if (invokedAsProgram) {
   try {
     assertSupportedNodeVersion();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`${message}\n`);
+    writeSync(2, `${message}\n`);
     process.exitCode = 1;
   }
 }
