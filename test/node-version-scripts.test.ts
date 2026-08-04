@@ -63,12 +63,13 @@ test("standalone assertion seam rejects unsupported Node with stable diagnostics
     [
       "--input-type=module",
       "--eval",
-      `import { assertSupportedNodeVersion } from ${JSON.stringify(guardUrl)};
+      `import { writeSync } from "node:fs";
+       import { assertSupportedNodeVersion } from ${JSON.stringify(guardUrl)};
        try {
          assertSupportedNodeVersion("25.9.0");
          process.exitCode = 9;
        } catch (error) {
-         process.stderr.write(String(error.code) + "\\n" + String(error.message));
+         writeSync(2, String(error.code) + "\\n" + String(error.message));
          process.exitCode = 1;
        }`,
     ],

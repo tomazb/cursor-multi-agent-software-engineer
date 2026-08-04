@@ -165,9 +165,10 @@ test("standalone and TypeScript guards expose the same constants and decisions",
     [
       "--input-type=module",
       "--eval",
-      `import * as p from ${JSON.stringify(scriptUrl)};
+      `import { writeSync } from "node:fs";
+       import * as p from ${JSON.stringify(scriptUrl)};
        const versions = ${JSON.stringify([...supportedCases, ...unsupportedCases, ...malformedCases])};
-       process.stdout.write(JSON.stringify({
+       writeSync(1, JSON.stringify({
          canonical: p.CANONICAL_NODE_VERSION,
          floor: p.NODE_COMPATIBILITY_FLOOR,
          range: p.SUPPORTED_NODE_RANGE,
@@ -212,12 +213,13 @@ test("standalone guard distinguishes an omitted version from explicit undefined"
     [
       "--input-type=module",
       "--eval",
-      `import { assertSupportedNodeVersion } from ${JSON.stringify(scriptUrl)};
+      `import { writeSync } from "node:fs";
+       import { assertSupportedNodeVersion } from ${JSON.stringify(scriptUrl)};
        try {
          assertSupportedNodeVersion(undefined);
          process.exitCode = 9;
        } catch (error) {
-         process.stdout.write(JSON.stringify({ name: error.name, code: error.code, message: error.message }));
+         writeSync(1, JSON.stringify({ name: error.name, code: error.code, message: error.message }));
          process.exitCode = 1;
        }`,
     ],
