@@ -2,28 +2,59 @@
 
 ## Toolchain
 
-- Node.js 22.15+
-- TypeScript 5.8+
+- Canonical Node.js baseline: exact `24.18.0` from `.nvmrc`
+- Supported Node.js range: `>=22.22.2 <23 || >=24.18.0 <25`
+- Blocking compatibility floor: exact `22.22.2`
+- TypeScript 7.0+
 - Node built-in test runner
 - No required runtime dependencies
 - Optional `@cursor/sdk` peer dependency
 
+NVM is an optional contributor selection mechanism, not a MASWE product dependency. Other version managers, containers, and system packages are supported when they provide a Node binary inside the bounded range. Node 23, Node 25, Node 26+, Node 22 below `22.22.2`, and Node 24 below `24.18.0` are unsupported exploratory runtimes.
+
 ## Setup
 
+With NVM:
+
 ```bash
+nvm install
+nvm use
 npm install
 npm run check
 ```
 
+Without NVM, select a supported Node binary using your environment manager, then run the same npm commands. `.npmrc`, package engines, repository scripts, and the CLI entry boundary reject unsupported versions with `MASWE_UNSUPPORTED_NODE_VERSION`. The guard does not install or switch Node automatically.
+
 Useful commands:
 
 ```bash
+npm run verify:node
 npm run typecheck
 npm test
 npm run build
 npm run dev -- help
 npm run dev -- status --cwd /path/to/target
 ```
+
+Public npm scripts validate the active Node runtime before substantive work. `npm run check` performs one explicit guard and then the raw typecheck, test, and build phases without recursively repeating the guard.
+
+For exact-head evidence, record and label each runtime separately:
+
+```bash
+command -v node
+node --version
+node -p 'process.execPath'
+npm --version
+```
+
+When NVM is used, also record:
+
+```bash
+nvm current
+nvm which current
+```
+
+Do not combine Node 24 canonical-baseline commands and Node 22 compatibility-floor commands into one unlabeled result. A successful command on an unsupported runtime is not support evidence.
 
 Issue #11 lock-journal checks use real child processes and parent-controlled IPC barriers:
 
@@ -57,13 +88,28 @@ src/git-workspace.ts      worktree/branch/commit/scope management
 src/markers.ts            terminal marker validation
 src/redaction.ts          secret masking for artifacts and logs
 src/process.ts            process capture with timeouts
+src/node-version.ts       pure bounded Node policy and CLI assertion
 src/runtime.ts            adapter factory
 src/runtimes/*            provider/runtime-specific implementation
-src/cli.ts                user interface only
+src/cli.ts                guarded user interface entry point
+scripts/verify-node-version.mjs dependency-free install/script guard
 schemas/*                 JSON schemas for config and run records
 ```
 
 Do not import Cursor SDK from the core. Do not move transition decisions into prompts or runtime adapters.
+
+## Node runtime policy changes
+
+Changes to `.nvmrc`, the supported range, compatibility floor, or guard behavior are governed support-contract changes. Update together:
+
+1. `.nvmrc` canonical exact version.
+2. `package.json` and lockfile root `engines.node`.
+3. Standalone and TypeScript policy constants and boundary tests.
+4. Canonical, compatibility, and unsupported-negative CI jobs.
+5. PRD portability requirements, README, development, operations, architecture, agent guidance, and changelog.
+6. Exact-head validation under every supported blocking target.
+
+Adding a later Node major requires explicit qualification; it must not become supported merely because a shell, runner image, or floating CI alias changes.
 
 ## Testing strategy
 
@@ -74,6 +120,7 @@ Do not import Cursor SDK from the core. Do not move transition decisions into pr
 - Output marker parsing.
 - Artifact hashing and replacement.
 - Workspace fingerprint behavior.
+- Node runtime boundary parsing, metadata synchronization, script order, and zero-side-effect CLI rejection.
 
 ### Workflow tests
 
@@ -90,6 +137,10 @@ Use `MockRuntime` and temporary directories to cover:
 ### Adapter tests
 
 Provider adapters should use contract tests and fake executables/SDK modules. Live provider tests belong in an opt-in integration suite and must not run on untrusted forks with credentials.
+
+### Child Node processes
+
+A child that must use the same runtime as its parent must be launched through `process.execPath`, not a literal PATH-selected `node`. The installed CLI shebang remains `#!/usr/bin/env node` because PATH selection is the intended launch contract; the entry guard then validates the selected runtime. Intentional PATH/shebang fixtures and user-configured external commands must remain explicitly classified.
 
 ## Adding a runtime
 
@@ -142,17 +193,19 @@ Until automated releases exist:
 
 1. Update PRD/architecture/ADRs for behavioral changes.
 2. Update `CHANGELOG.md`.
-3. Run `npm run check` on supported platforms.
-4. Review generated `dist/` locally but do not commit it unless distribution strategy changes.
-5. Tag `vX.Y.Z` after merge.
-6. Publish a GitHub release with migration and known-limitations notes.
-7. Add npm or plugin marketplace publishing only after package naming and signing policy are decided.
+3. Run `npm run check` separately on exact Node `24.18.0` and `22.22.2`.
+4. Run the exact unsupported Node `25.9.0` rejection check without classifying it as product validation.
+5. Review generated `dist/` locally but do not commit it unless distribution strategy changes.
+6. Tag `vX.Y.Z` after merge.
+7. Publish a GitHub release with migration and known-limitations notes.
+8. Add npm or plugin marketplace publishing only after package naming and signing policy are decided.
 
 ## Definition of done
 
 - Acceptance criteria are explicit.
 - Code and tests are implemented.
-- Type check, tests, and build pass.
+- Type check, tests, and build pass on both blocking supported Node targets.
+- Unsupported-runtime fail-fast behavior is proven before side effects.
 - Security and failure behavior are reviewed.
 - User and operations documentation is current.
 - No model claims are accepted without deterministic or verifier evidence.

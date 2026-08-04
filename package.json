@@ -10,6 +10,7 @@
   "files": [
     "dist",
     "prompts",
+    "scripts",
     "skills",
     "schemas",
     ".cursor-plugin",
@@ -17,16 +18,21 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=22.15"
+    "node": ">=22.22.2 <23 || >=24.18.0 <25"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --experimental-strip-types --test test/*.test.ts",
-    "check": "npm run typecheck && npm test && npm run build",
-    "pack:dry": "npm pack --dry-run",
-    "dev": "node --experimental-strip-types src/cli.ts",
-    "start": "node dist/cli.js"
+    "verify:node": "node scripts/verify-node-version.mjs",
+    "preinstall": "node scripts/verify-node-version.mjs",
+    "_build": "tsc -p tsconfig.build.json",
+    "_typecheck": "tsc -p tsconfig.json --noEmit",
+    "_test": "node --experimental-strip-types --test test/*.test.ts",
+    "build": "npm run verify:node && npm run _build",
+    "typecheck": "npm run verify:node && npm run _typecheck",
+    "test": "npm run verify:node && npm run _test",
+    "check": "npm run verify:node && npm run _typecheck && npm run _test && npm run _build",
+    "pack:dry": "npm run verify:node && npm pack --dry-run",
+    "dev": "npm run verify:node && node --experimental-strip-types src/cli.ts",
+    "start": "npm run verify:node && node dist/cli.js"
   },
   "peerDependencies": {
     "@cursor/sdk": "*"

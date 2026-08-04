@@ -36,9 +36,21 @@ flowchart TB
 
 ### 3.1 CLI entry point
 
-`src/cli.ts` parses commands, resolves the target repository and configuration, creates a runtime, invokes the orchestrator, and renders run state.
+`src/cli.ts` is the unconditional shebang entrypoint and safe failure renderer. It delegates to the testable `runCli()` command runner in `src/cli-runner.ts`, which validates the active Node runtime, parses commands, resolves the target repository and configuration, creates a runtime, invokes the orchestrator, and renders run state.
 
-It contains no transition logic beyond selecting a public orchestrator operation.
+The Node assertion is the first action inside the testable `runCli()` entry function. Unsupported runtimes fail with `MASWE_UNSUPPORTED_NODE_VERSION` before target-path resolution, configuration or run-store access, starter-config writes, worktree/branch creation, provider invocation, or target quality commands. The installed `#!/usr/bin/env node` shebang intentionally selects the user's active PATH runtime; the guard then validates that selected binary.
+
+The governed runtime contract is split across synchronized surfaces:
+
+- `.nvmrc` selects exact Node `24.18.0` as the canonical contributor and primary-CI baseline;
+- `package.json` and lockfile root metadata bound support to `>=22.22.2 <23 || >=24.18.0 <25`;
+- `.npmrc`, `scripts/verify-node-version.mjs`, guarded npm entry points, and `src/node-version.ts` provide layered rejection;
+- exact Node `22.22.2` remains a blocking compatibility floor;
+- same-runtime Node child processes use `process.execPath`, while intentional shebang/PATH fixtures and user-configured external commands remain explicit exceptions.
+
+NVM is optional contributor tooling, not a product dependency. Adding another supported major requires an explicit contract change and exact CI qualification rather than a floating environment update.
+
+The CLI contains no transition logic beyond selecting a public orchestrator operation.
 
 ### 3.2 Configuration loader
 
@@ -263,11 +275,11 @@ MASWE does not fork or embed Superpowers. This keeps methodology upgrades indepe
 
 ### 7.1 Local CLI — implemented
 
-One process operates on one checkout. State lives under `.maswe/`. This is the v0.1 reference deployment.
+One process operates on one checkout. State lives under `.maswe/`. The process must start under a supported Node runtime; unsupported execution is rejected before local state access.
 
 ### 7.2 CI runner — partially supported
 
-The CLI can run in CI against an existing checkout. Approval and GitHub event wiring must currently be supplied by workflow steps or manual commands.
+The CLI can run in CI against an existing checkout. Approval and GitHub event wiring must currently be supplied by workflow steps or manual commands. MASWE's own blocking CI uses exact Node `24.18.0` for the canonical baseline and exact `22.22.2` for compatibility, plus an exact Node `25.9.0` negative job that succeeds only when installation and the standalone guard reject the unsupported runtime.
 
 ### 7.3 Hosted control plane — planned
 
@@ -347,7 +359,7 @@ The hosted design adds:
 
 Failures fall into categories:
 
-1. **Startup/configuration:** missing CLI, key, SDK, model, or invalid config. The run fails immediately.
+1. **Startup/runtime contract:** an unsupported Node runtime is rejected before repository or durable-state side effects. Other missing CLI, key, SDK, model, or invalid-config failures stop immediately.
 2. **Agent run failure:** nonzero CLI exit, timeout, process-spawn failure, exit-zero structured
    decode failure, or SDK error. The configured fallback policy applies to typed, individually
    bounded failures. The final all-model aggregate is bounded independently and reports the count
@@ -395,9 +407,8 @@ separately unbounded successful-artifact redaction path proportional to accepted
 Cursor CLI adapters apply this bounded sanitizer directly to stderr before trimming or interpolating
 it into runtime, catalogue, or doctor summaries.
 
-CI runs the full deterministic check on both the current Node 22 release and exact Node `22.22.2`.
-Test-only child programs use synchronous compact-result writes or unique file-backed descriptors
-where buffered JavaScript pipe output is version-sensitive; production CLI output is unchanged.
+CI runs the full deterministic check on exact Node `24.18.0` and exact Node `22.22.2`. Test-only child programs use synchronous compact-result writes or unique file-backed descriptors where buffered JavaScript pipe output is version-sensitive; same-runtime Node children use `process.execPath`; production CLI output is unchanged. The exact Node `25.9.0` negative job runs no product suite and is rejection evidence, not product-validation evidence.
+
 The constrained-heap sanitizer test uses an 8,000,000-character one-byte input under a 48 MiB V8
 old-space limit and asserts an exact 128-code-point result. It tests incremental sanitizer overhead,
 not an absolute total-process memory ceiling.
@@ -407,6 +418,10 @@ not an absolute total-process memory ceiling.
 ```text
 trusted configuration
   -> may define shell quality commands and runtime command
+
+selected Node runtime
+  -> must satisfy the bounded support contract before repository/state actions
+  -> source may be NVM, setup-node, another manager, container, or system package
 
 untrusted request / model output / PR comments
   -> may influence prompts and artifacts
@@ -432,7 +447,7 @@ GitHub input (future)
 - Reasoning effort is stored but not translated into provider-specific SDK parameters.
 - GitHub App check runs and authenticated PR automation remain v0.3+.
 
-Closed in v0.2: branch/worktree manager, git SHA persistence on the run record, atomic file-store writes with optimistic versioning, artifact digest revalidation, attempt history, secret redaction, stdin prompt transport, budgets/timeouts, and retry/supersede recovery.
+Closed in v0.2: branch/worktree manager, git SHA persistence on the run record, atomic file-store writes with optimistic versioning, artifact digest revalidation, attempt history, secret redaction, stdin prompt transport, budgets/timeouts, retry/supersede recovery, and governed Node runtime enforcement.
 
 ## 13. Extension points
 

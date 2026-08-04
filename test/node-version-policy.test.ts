@@ -1,0 +1,291 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { spawnFileCaptured } from "./helpers/child-process.ts";
+import {
+  CANONICAL_NODE_VERSION,
+  NODE_COMPATIBILITY_FLOOR,
+  SUPPORTED_NODE_RANGE,
+  UNSUPPORTED_NODE_VERSION_CODE,
+  assertSupportedNodeVersion,
+  isSupportedNodeVersion,
+  parseNodeVersion,
+  unsupportedNodeVersionMessage,
+} from "../src/node-version.ts";
+
+const repositoryRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+const standaloneGuardPath = path.join(repositoryRoot, "scripts", "verify-node-version.mjs");
+
+const supportedCases = [
+  "22.22.2",
+  "22.22.3",
+  "22.23.1",
+  "22.99.99",
+  "24.18.0",
+  "24.18.1",
+  "24.99.99",
+];
+
+const unsupportedCases = [
+  "0.0.0",
+  "21.99.99",
+  "22.0.0",
+  "22.22.1",
+  "23.0.0",
+  "23.99.99",
+  "24.0.0",
+  "24.17.99",
+  "25.0.0",
+  "25.9.0",
+  "26.0.0",
+  "99.0.0",
+];
+
+const malformedCases = [
+  "",
+  "22",
+  "22.22",
+  "22.22.2.0",
+  "v22.22.2",
+  "22.22.2-rc.1",
+  "22.22.2+build",
+  "22.-1.2",
+  "22.a.2",
+  " 22.22.2",
+  "22.22.2 ",
+  "01.2.3",
+];
+
+const nonStringCases: unknown[] = [null, undefined, 25, true, {}, []];
+
+test("Node runtime constants match the approved contract", () => {
+  assert.equal(CANONICAL_NODE_VERSION, "24.18.0");
+  assert.equal(NODE_COMPATIBILITY_FLOOR, "22.22.2");
+  assert.equal(SUPPORTED_NODE_RANGE, ">=22.22.2 <23 || >=24.18.0 <25");
+  assert.equal(UNSUPPORTED_NODE_VERSION_CODE, "MASWE_UNSUPPORTED_NODE_VERSION");
+});
+
+test("Node runtime policy accepts only the approved Node 22 and Node 24 ranges", () => {
+  for (const version of supportedCases) {
+    assert.equal(isSupportedNodeVersion(version), true, `expected ${version} to be supported`);
+    assert.deepEqual(parseNodeVersion(version), version.split(".").map(Number));
+    assert.doesNotThrow(() => assertSupportedNodeVersion(version));
+  }
+
+  for (const version of unsupportedCases) {
+    assert.equal(isSupportedNodeVersion(version), false, `expected ${version} to be unsupported`);
+    assert.throws(
+      () => assertSupportedNodeVersion(version),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal((error as Error & { code?: string }).code, UNSUPPORTED_NODE_VERSION_CODE);
+        assert.match(error.message, new RegExp(UNSUPPORTED_NODE_VERSION_CODE));
+        assert.match(error.message, new RegExp(version.replaceAll(".", "\\.")));
+        assert.match(error.message, />=22\.22\.2 <23 \|\| >=24\.18\.0 <25/);
+        assert.match(error.message, /24\.18\.0/);
+        assert.match(error.message, /nvm install 24\.18\.0 && nvm use 24\.18\.0/);
+        assert.match(error.message, /optional/i);
+        return true;
+      },
+    );
+  }
+});
+
+test("malformed Node versions fail closed", () => {
+  for (const version of malformedCases) {
+    assert.throws(() => parseNodeVersion(version), /invalid Node\.js version/i, version);
+    assert.equal(isSupportedNodeVersion(version), false, version);
+    assert.throws(
+      () => assertSupportedNodeVersion(version),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal((error as Error & { code?: string }).code, UNSUPPORTED_NODE_VERSION_CODE);
+        return true;
+      },
+      version,
+    );
+  }
+});
+
+test("non-string injected Node versions keep the stable unsupported-version contract", () => {
+  for (const version of nonStringCases) {
+    assert.throws(() => parseNodeVersion(version), /invalid Node\.js version/i);
+    assert.equal(isSupportedNodeVersion(version), false);
+    assert.throws(
+      () => assertSupportedNodeVersion(version),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.name, "UnsupportedNodeVersionError");
+        assert.equal((error as Error & { code?: string }).code, UNSUPPORTED_NODE_VERSION_CODE);
+        assert.match(error.message, /MASWE_UNSUPPORTED_NODE_VERSION/);
+        assert.doesNotMatch(error.message, /Cannot read properties|TypeError/);
+        return true;
+      },
+    );
+  }
+
+  assert.match(unsupportedNodeVersionMessage(null), /Node\.js <unavailable> is unsupported/);
+  assert.match(unsupportedNodeVersionMessage(undefined), /Node\.js <unavailable> is unsupported/);
+  assert.match(unsupportedNodeVersionMessage(25), /Node\.js 25 is unsupported/);
+});
+
+test("repository metadata is synchronized with the approved Node policy", async () => {
+  const nvmrc = await readFile(path.join(repositoryRoot, ".nvmrc"), "utf8");
+  const npmrc = await readFile(path.join(repositoryRoot, ".npmrc"), "utf8");
+  const packageJson = JSON.parse(await readFile(path.join(repositoryRoot, "package.json"), "utf8")) as {
+    name?: string;
+    version?: string;
+    engines?: { node?: string };
+  };
+  const packageLock = JSON.parse(
+    await readFile(path.join(repositoryRoot, "package-lock.json"), "utf8"),
+  ) as {
+    name?: string;
+    version?: string;
+    packages?: Record<string, { name?: string; version?: string; engines?: { node?: string } }>;
+  };
+  const lockRoot = packageLock.packages?.[""];
+
+  assert.equal(nvmrc, `${CANONICAL_NODE_VERSION}\n`);
+  assert.equal(npmrc, "engine-strict=true\n");
+  assert.equal(packageJson.engines?.node, SUPPORTED_NODE_RANGE);
+  assert.equal(packageLock.name, packageJson.name);
+  assert.equal(packageLock.version, packageJson.version);
+  assert.equal(lockRoot?.name, packageJson.name);
+  assert.equal(lockRoot?.version, packageJson.version);
+  assert.equal(lockRoot?.engines?.node, SUPPORTED_NODE_RANGE);
+});
+
+test("standalone and TypeScript guards expose the same constants and decisions", () => {
+  const scriptUrl = pathToFileURL(standaloneGuardPath).href;
+  const probe = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `import { writeSync } from "node:fs";
+       import * as p from ${JSON.stringify(scriptUrl)};
+       const versions = ${JSON.stringify([...supportedCases, ...unsupportedCases, ...malformedCases])};
+       writeSync(1, JSON.stringify({
+         canonical: p.CANONICAL_NODE_VERSION,
+         floor: p.NODE_COMPATIBILITY_FLOOR,
+         range: p.SUPPORTED_NODE_RANGE,
+         code: p.UNSUPPORTED_NODE_VERSION_CODE,
+         decisions: versions.map((version) => [version, p.isSupportedNodeVersion(version)]),
+       }));`,
+    ],
+    { cwd: repositoryRoot, encoding: "utf8", timeout: 5_000 },
+  );
+
+  assert.equal(probe.status, 0, probe.stderr);
+  const result = JSON.parse(probe.stdout) as {
+    canonical: string;
+    floor: string;
+    range: string;
+    code: string;
+    decisions: Array<[string, boolean]>;
+  };
+  assert.deepEqual(
+    {
+      canonical: result.canonical,
+      floor: result.floor,
+      range: result.range,
+      code: result.code,
+    },
+    {
+      canonical: CANONICAL_NODE_VERSION,
+      floor: NODE_COMPATIBILITY_FLOOR,
+      range: SUPPORTED_NODE_RANGE,
+      code: UNSUPPORTED_NODE_VERSION_CODE,
+    },
+  );
+  for (const [version, supported] of result.decisions) {
+    assert.equal(supported, isSupportedNodeVersion(version), version);
+  }
+});
+
+test("standalone guard distinguishes an omitted version from explicit undefined", () => {
+  const scriptUrl = pathToFileURL(standaloneGuardPath).href;
+  const probe = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `import { writeSync } from "node:fs";
+       import { assertSupportedNodeVersion } from ${JSON.stringify(scriptUrl)};
+       try {
+         assertSupportedNodeVersion(undefined);
+         process.exitCode = 9;
+       } catch (error) {
+         writeSync(1, JSON.stringify({ name: error.name, code: error.code, message: error.message }));
+         process.exitCode = 1;
+       }`,
+    ],
+    { cwd: repositoryRoot, encoding: "utf8", timeout: 5_000 },
+  );
+
+  assert.equal(probe.status, 1, probe.stderr);
+  const result = JSON.parse(probe.stdout) as { name: string; code: string; message: string };
+  assert.equal(result.name, "UnsupportedNodeVersionError");
+  assert.equal(result.code, UNSUPPORTED_NODE_VERSION_CODE);
+  assert.match(result.message, /Node\.js <unavailable> is unsupported/);
+});
+
+test("standalone guard rejects an unsupported runtime through a symlinked entry path", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-node-guard-symlink-"));
+  try {
+    const linkedGuard = path.join(root, "verify-node-version.mjs");
+    await symlink(standaloneGuardPath, linkedGuard);
+    const injectedVersionUrl = `data:text/javascript,${encodeURIComponent(
+      'Object.defineProperty(process.versions, "node", { value: "25.9.0" });',
+    )}`;
+
+    const result = await spawnFileCaptured(
+      process.execPath,
+      ["--import", injectedVersionUrl, linkedGuard],
+      { cwd: root, timeoutMs: 5_000 },
+    );
+
+    assert.equal(result.code, 1, result.stderr);
+    assert.match(result.stderr, /MASWE_UNSUPPORTED_NODE_VERSION/);
+    assert.match(result.stderr, /25\.9\.0/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("standalone guard fails closed when its executable entry cannot be canonicalized", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-node-guard-entry-"));
+  try {
+    const missingEntry = path.join(root, "missing-entry.mjs");
+    const guardUrl = pathToFileURL(standaloneGuardPath).href;
+    const probe = `process.argv[1] = ${JSON.stringify(missingEntry)}; await import(${JSON.stringify(guardUrl)});`;
+
+    const result = await spawnFileCaptured(
+      process.execPath,
+      ["--input-type=module", "--eval", probe],
+      { cwd: root, timeoutMs: 5_000 },
+    );
+
+    assert.equal(result.code, 1);
+    assert.equal(
+      result.stderr,
+      "MASWE_NODE_GUARD_ENTRY_RESOLUTION_FAILED: unable to canonicalize Node guard entry path.\n",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("standalone guard is dependency-free and does not mutate or switch runtimes", async () => {
+  const source = await readFile(standaloneGuardPath, "utf8");
+  const imports = [...source.matchAll(/from\s+["']([^"']+)["']/g)].map((match) => match[1]);
+  assert.deepEqual(imports, ["node:fs", "node:url"]);
+  assert.doesNotMatch(source, /from\s+["']node:child_process["']/);
+  assert.doesNotMatch(source, /\b(?:spawn|spawnSync|execFile|execFileSync)\s*\(/);
+  assert.doesNotMatch(source, /\b(?:writeFile|appendFile|mkdir|rmSync|unlink|rename)\s*\(/);
+});
