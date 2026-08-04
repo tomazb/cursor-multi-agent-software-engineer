@@ -218,7 +218,7 @@ Every transition shall record event type, actor, source and destination state, t
 
 ### NFR-4 — Portability
 
-The local product shall run on Node.js 22.15+ on macOS, Linux, and Windows where the configured Cursor CLI command and project commands are available.
+The local product shall run on macOS, Linux, and Windows with Node.js in the supported range `>=22.22.2 <23 || >=24.18.0 <25`, where the configured Cursor CLI command and project commands are available. Exact Node `24.18.0` is the canonical contributor and primary-CI baseline; exact Node `22.22.2` is the blocking compatibility floor.
 
 ### NFR-5 — Maintainability
 

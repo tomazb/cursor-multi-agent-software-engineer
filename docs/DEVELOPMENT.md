@@ -106,7 +106,7 @@ Changes to `.nvmrc`, the supported range, compatibility floor, or guard behavior
 2. `package.json` and lockfile root `engines.node`.
 3. Standalone and TypeScript policy constants and boundary tests.
 4. Canonical, compatibility, and unsupported-negative CI jobs.
-5. README, development, operations, architecture, agent guidance, and changelog.
+5. PRD portability requirements, README, development, operations, architecture, agent guidance, and changelog.
 6. Exact-head validation under every supported blocking target.
 
 Adding a later Node major requires explicit qualification; it must not become supported merely because a shell, runner image, or floating CI alias changes.
