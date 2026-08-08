@@ -256,17 +256,20 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
         config,
         store,
         http,
-        tokenProvider: async (installationId) => {
+        tokenProvider: async (installationId, repository) => {
           const appId = process.env[config.githubApp!.appIdEnv];
           const privateKey = process.env[config.githubApp!.privateKeyEnv];
           if (!appId || !privateKey) {
             throw new Error("GitHub App id or private key environment variables are missing");
           }
+          const repoName = repository.split("/")[1];
           return createInstallationAccessToken({
             appId,
             privateKeyPem: privateKey,
             installationId,
             http,
+            ...(repoName ? { repository: repoName } : {}),
+            readOnlyChecks: config.githubApp!.readOnlyChecks,
           });
         },
       });
@@ -291,17 +294,20 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
         config,
         store,
         http,
-        tokenProvider: async (installationId) => {
+        tokenProvider: async (installationId, repository) => {
           const appId = process.env[config.githubApp!.appIdEnv];
           const privateKey = process.env[config.githubApp!.privateKeyEnv];
           if (!appId || !privateKey) {
             throw new Error("GitHub App id or private key environment variables are missing");
           }
+          const repoName = repository.split("/")[1];
           return createInstallationAccessToken({
             appId,
             privateKeyPem: privateKey,
             installationId,
             http,
+            ...(repoName ? { repository: repoName } : {}),
+            readOnlyChecks: config.githubApp!.readOnlyChecks,
           });
         },
       });

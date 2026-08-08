@@ -37,12 +37,26 @@ function isRepoAllowed(config: GitHubAppConfig, repository: string | undefined):
   return config.allowedRepositories.includes(repository);
 }
 
+function remoteMatchesRepository(remote: string | undefined, repository: string): boolean {
+  if (!remote) return false;
+  const normalized = remote.replace(/\.git$/i, "").replace(/\/$/, "");
+  return (
+    normalized.endsWith(`/${repository}`) ||
+    normalized.endsWith(`:${repository}`) ||
+    normalized.includes(`github.com/${repository}`) ||
+    normalized.includes(`github.com:${repository}`)
+  );
+}
+
 export class GitHubAppAdapter {
   private readonly cwd: string;
   private readonly config: MasweConfig;
   private readonly store: RunStore;
   private readonly http: GitHubHttpClient;
-  private readonly tokenProvider: (installationId: number) => Promise<string>;
+  private readonly tokenProvider: (
+    installationId: number,
+    repository: string,
+  ) => Promise<string>;
   private readonly deliveries: GitHubDeliveryStore;
   private readonly sideEffects: GitHubSideEffectStore;
   private readonly associations: GitHubAssociationIndex;
@@ -52,7 +66,7 @@ export class GitHubAppAdapter {
     config: MasweConfig;
     store: RunStore;
     http: GitHubHttpClient;
-    tokenProvider: (installationId: number) => Promise<string>;
+    tokenProvider: (installationId: number, repository: string) => Promise<string>;
   }) {
     this.cwd = options.cwd;
     this.config = options.config;
@@ -94,21 +108,31 @@ export class GitHubAppAdapter {
       return { status: 200, body: { ok: true, duplicate: true } };
     }
 
-    let payload: Record<string, unknown>;
     try {
-      payload = JSON.parse(request.rawBody) as Record<string, unknown>;
-    } catch {
-      return { status: 400, body: { ok: false, message: "invalid JSON body" } };
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(request.rawBody) as Record<string, unknown>;
+      } catch {
+        await this.deliveries.fail(request.deliveryId, "invalid JSON body");
+        return { status: 400, body: { ok: false, message: "invalid JSON body" } };
+      }
+
+      const event = normalizeGitHubWebhook({
+        deliveryId: request.deliveryId,
+        eventName: request.eventName,
+        payload,
+      });
+
+      await this.dispatch(event, app);
+      await this.deliveries.complete(request.deliveryId);
+      return { status: 200, body: { ok: true } };
+    } catch (error) {
+      await this.deliveries.fail(
+        request.deliveryId,
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error;
     }
-
-    const event = normalizeGitHubWebhook({
-      deliveryId: request.deliveryId,
-      eventName: request.eventName,
-      payload,
-    });
-
-    await this.dispatch(event, app);
-    return { status: 200, body: { ok: true } };
   }
 
   async publishChecksForRun(runId: string): Promise<RunRecord> {
@@ -125,15 +149,35 @@ export class GitHubAppAdapter {
     }
     const headSha = run.github.headSha || run.workspace?.headSha;
     if (!headSha) throw new Error(`Run ${runId} has no head SHA for checks`);
-    await this.publishChecks(run, run.github.repository, run.github.pullRequestNumber, headSha);
+    await this.publishChecks(
+      run,
+      run.github.repository,
+      run.github.pullRequestNumber,
+      headSha,
+      run.github.installationId,
+    );
     return run;
   }
 
   private async dispatch(event: GitHubInternalEvent, app: GitHubAppConfig): Promise<void> {
     if (event.type === "installation.deleted") {
       if (event.installationId !== undefined) {
-        await this.associations.suspendInstallation(event.installationId);
+        const suspended = await this.associations.suspendInstallation(event.installationId);
+        await this.suspendRunRecords(suspended.map((record) => record.runId));
       }
+      return;
+    }
+
+    if (event.type === "installation_repositories.removed") {
+      if (event.installationId !== undefined && event.repository) {
+        const suspended = await this.associations.suspendRepository(
+          event.installationId,
+          event.repository,
+        );
+        await this.suspendRunRecords(suspended.map((record) => record.runId));
+      }
+      // Also suspend any allowlisted repos carried only in the raw event via association scan:
+      // normalize currently does not expand repositories_removed; handle via repository when present.
       return;
     }
 
@@ -151,29 +195,101 @@ export class GitHubAppAdapter {
       event.pullRequestNumber !== undefined &&
       event.headSha
     ) {
-      await this.handlePullRequestEvent(event, app);
+      await this.handlePullRequestEvent(event);
+      return;
+    }
+
+    if (event.type === "push" && event.repository && event.branch && event.headSha) {
+      await this.handlePushEvent(event);
     }
   }
 
-  private async handlePullRequestEvent(
-    event: GitHubInternalEvent,
-    app: GitHubAppConfig,
-  ): Promise<void> {
+  private async suspendRunRecords(runIds: string[]): Promise<void> {
+    for (const runId of runIds) {
+      try {
+        const run = await this.store.load(runId);
+        if (!run.github || run.github.suspended) continue;
+        run.github = { ...run.github, suspended: true };
+        await this.store.save(run);
+      } catch {
+        // Run may have been deleted; index suspension still holds.
+      }
+    }
+  }
+
+  private async handlePushEvent(event: GitHubInternalEvent): Promise<void> {
+    const repository = event.repository!;
+    const branch = event.branch!;
+    const headSha = event.headSha!;
+    const association = await this.associations.findByRepositoryBranch(repository, branch);
+    if (!association || association.suspended) return;
+
+    const synthetic: GitHubInternalEvent = {
+      ...event,
+      type: "pull_request.synchronize",
+      pullRequestNumber: association.pullRequestNumber,
+      headSha,
+      branch,
+      repository,
+      installationId: association.installationId,
+    };
+    await this.handlePullRequestEvent(synthetic);
+  }
+
+  private async currentPullRequestHead(
+    repository: string,
+    pullRequestNumber: number,
+    installationId: number,
+  ): Promise<string | undefined> {
+    const { owner, repo } = parseOwnerRepo(repository);
+    const token = await this.tokenProvider(installationId, repository);
+    const response = await this.http.request(
+      "GET",
+      `https://api.github.com/repos/${owner}/${repo}/pulls/${pullRequestNumber}`,
+      {
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/vnd.github+json",
+          "user-agent": "maswe-github-app",
+        },
+      },
+    );
+    if (response.status < 200 || response.status >= 300) return undefined;
+    const head = (response.body as { head?: { sha?: string } }).head;
+    return typeof head?.sha === "string" ? head.sha : undefined;
+  }
+
+  private async handlePullRequestEvent(event: GitHubInternalEvent): Promise<void> {
     const repository = event.repository!;
     const pullRequestNumber = event.pullRequestNumber!;
     const headSha = event.headSha!;
-    const installationId = event.installationId ?? 0;
+    const installationId = event.installationId;
+    if (installationId === undefined || installationId <= 0) {
+      throw new Error("pull_request event missing installation id");
+    }
 
     let association = await this.associations.find(repository, pullRequestNumber);
     if (association?.suspended) {
       return;
     }
 
+    if (association?.headSha && association.headSha !== headSha) {
+      const liveHead = await this.currentPullRequestHead(
+        repository,
+        pullRequestNumber,
+        installationId,
+      );
+      if (liveHead && liveHead !== headSha) {
+        // Stale out-of-order delivery: current PR head has already moved on.
+        return;
+      }
+    }
+
     let run: RunRecord | undefined;
     if (association) {
       run = await this.store.load(association.runId);
     } else {
-      run = await this.findMatchingRun(repository, event.branch);
+      run = await this.findMatchingRun(repository, pullRequestNumber, event.branch);
       if (run) {
         association = await this.associations.bind({
           runId: run.id,
@@ -188,10 +304,9 @@ export class GitHubAppAdapter {
     }
 
     if (run) {
+      if (run.github?.suspended) return;
       const previousHeadSha = run.github?.headSha ?? association?.headSha;
-      if (invalidateStaleEvidence(run, headSha)) {
-        // Evidence cleared for the new event SHA.
-      }
+      invalidateStaleEvidence(run, headSha);
       run.github = {
         installationId,
         repository,
@@ -202,30 +317,34 @@ export class GitHubAppAdapter {
         suspended: false,
       };
       await this.store.save(run);
-      if (association) {
-        await this.associations.bind({
-          runId: run.id,
-          installationId,
-          repository,
-          pullRequestNumber,
-          baseSha: run.github.baseSha,
-          headSha,
-          branch: run.github.branch,
-        });
-      }
-      await this.publishChecks(run, repository, pullRequestNumber, headSha, previousHeadSha);
+      await this.associations.bind({
+        runId: run.id,
+        installationId,
+        repository,
+        pullRequestNumber,
+        baseSha: run.github.baseSha,
+        headSha,
+        branch: run.github.branch,
+      });
+      await this.publishChecks(
+        run,
+        repository,
+        pullRequestNumber,
+        headSha,
+        installationId,
+        previousHeadSha,
+      );
       return;
     }
 
-    // Unassociated PR: still publish neutral checks so plumbing is visible.
-    const synthetic = {
-      schemaVersion: 1 as const,
+    const synthetic: RunRecord = {
+      schemaVersion: 1,
       version: 1,
       id: "unassociated",
       title: "unassociated",
       request: "",
       repositoryPath: this.cwd,
-      state: "PR_REVIEW" as const,
+      state: "PR_REVIEW",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       approvals: { brainstorm: false, design: false },
@@ -233,28 +352,51 @@ export class GitHubAppAdapter {
       config: this.config,
       artifacts: [],
       events: [],
+      github: {
+        installationId,
+        repository,
+        pullRequestNumber,
+        baseSha: event.baseSha ?? headSha,
+        headSha,
+        branch: event.branch ?? "unknown",
+        suspended: false,
+      },
     };
-    void app;
-    await this.publishChecks(synthetic, repository, pullRequestNumber, headSha);
+    await this.publishChecks(synthetic, repository, pullRequestNumber, headSha, installationId);
   }
 
   private async findMatchingRun(
     repository: string,
+    pullRequestNumber: number,
     branch: string | undefined,
   ): Promise<RunRecord | undefined> {
     const runs = await this.store.list();
     const terminal = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+
+    // Exact PR association on the run record wins.
     for (const run of runs) {
-      if (terminal.has(run.state)) continue;
-      if (run.github?.repository === repository && !run.github.suspended) {
+      if (terminal.has(run.state) || run.github?.suspended) continue;
+      if (
+        run.github?.repository === repository &&
+        run.github.pullRequestNumber === pullRequestNumber
+      ) {
         return run;
       }
-      if (branch && run.workspace?.branch === branch) {
-        return run;
+    }
+
+    // Otherwise require exact remote + branch match (never repository-only).
+    if (!branch) return undefined;
+    for (const run of runs) {
+      if (terminal.has(run.state) || run.github?.suspended) continue;
+      if (run.github && run.github.repository === repository) {
+        // Already associated to a different PR — do not steal.
+        if (run.github.pullRequestNumber !== pullRequestNumber) continue;
       }
-      const remote = run.workspace?.remote ?? "";
-      if (remote.includes(repository) || remote.endsWith(`${repository}.git`)) {
-        if (!branch || run.workspace?.branch === branch) return run;
+      if (
+        remoteMatchesRepository(run.workspace?.remote, repository) &&
+        run.workspace?.branch === branch
+      ) {
+        return run;
       }
     }
     return undefined;
@@ -265,15 +407,12 @@ export class GitHubAppAdapter {
     repository: string,
     pullRequestNumber: number,
     headSha: string,
+    installationId: number,
     previousHeadSha?: string,
   ): Promise<void> {
     const app = this.githubApp();
     const { owner, repo } = parseOwnerRepo(repository);
-    const installationId = run.github?.installationId;
-    const token =
-      installationId !== undefined && installationId > 0
-        ? await this.tokenProvider(installationId)
-        : "unassociated-token";
+    const token = await this.tokenProvider(installationId, repository);
     const publisher = new CheckPublisher({
       http: this.http,
       sideEffects: this.sideEffects,

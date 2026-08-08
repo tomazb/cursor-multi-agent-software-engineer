@@ -121,6 +121,12 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
     if (action !== "added" && action !== "removed") {
       throw new Error(`Unsupported installation_repositories action: ${String(action)}`);
     }
+    const removed = Array.isArray(payload.repositories_removed)
+      ? payload.repositories_removed
+      : [];
+    const firstRemoved = asRecord(removed[0]);
+    const removedFullName =
+      typeof firstRemoved?.full_name === "string" ? firstRemoved.full_name : undefined;
     return withOptional(
       {
         eventId: input.deliveryId,
@@ -132,6 +138,7 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
       },
       {
         installationId: installationId(payload),
+        repository: removedFullName ?? repositoryFullName(payload),
         rawAction: action,
       },
     );

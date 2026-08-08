@@ -16,6 +16,10 @@ The project follows semantic versioning once a public release process is establi
   association fields with schema and artifact-contract updates.
 - Integration coverage for forged signatures, delivery replay, stale SHA invalidation, rate limits,
   and installation removal.
+- Review hardening for Phase A: canonical `03-specification-and-design.md` check binding, real
+  installation tokens for unassociated PRs, delivery complete-after-success, exact PR association
+  matching, scoped checks tokens, PATCH without `head_sha`, webhook body limits, rate-limit
+  backoff, push invalidation, out-of-order SHA rejection, and association index locking.
 - `policy.doctorProbeTimeoutMs` configuration contract (default `60_000`, integer bounds
   `1_000..300_000`) with fail-closed validation and schema coverage.
 - Typed doctor check codes across runtimes plus CLI `maswe doctor --json` output of full

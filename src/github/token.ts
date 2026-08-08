@@ -33,9 +33,23 @@ export async function createInstallationAccessToken(options: {
   privateKeyPem: string;
   installationId: number;
   http: GitHubTokenHttp;
+  /** Repository name only (without owner), per GitHub Apps API. */
+  repository?: string;
+  /** When true (Phase A), request checks write + metadata read only. */
+  readOnlyChecks?: boolean;
   nowMs?: number;
 }): Promise<string> {
   const jwt = createGitHubAppJwt(options.appId, options.privateKeyPem, options.nowMs);
+  const body: Record<string, unknown> = {};
+  if (options.repository) {
+    body.repositories = [options.repository];
+  }
+  if (options.readOnlyChecks) {
+    body.permissions = {
+      checks: "write",
+      metadata: "read",
+    };
+  }
   const response = await options.http.request(
     "POST",
     `https://api.github.com/app/installations/${options.installationId}/access_tokens`,
@@ -45,15 +59,15 @@ export async function createInstallationAccessToken(options: {
         accept: "application/vnd.github+json",
         "user-agent": "maswe-github-app",
       },
-      body: {},
+      body,
     },
   );
   if (response.status < 200 || response.status >= 300) {
     throw new Error(`Failed to create installation token: HTTP ${response.status}`);
   }
-  const body = response.body as { token?: string };
-  if (typeof body.token !== "string" || !body.token) {
+  const tokenBody = response.body as { token?: string };
+  if (typeof tokenBody.token !== "string" || !tokenBody.token) {
     throw new Error("Installation token response missing token");
   }
-  return body.token;
+  return tokenBody.token;
 }

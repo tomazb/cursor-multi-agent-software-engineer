@@ -53,8 +53,8 @@ test("buildCheckConclusions binds success only to matching evidence SHA", () => 
         createdAt: "",
       },
       {
-        name: "03-design.md",
-        logicalName: "03-design.md",
+        name: "03-specification-and-design.md",
+        logicalName: "03-specification-and-design.md",
         attempt: 1,
         path: "x",
         sha256: "b".repeat(64),
@@ -79,6 +79,94 @@ test("buildCheckConclusions binds success only to matching evidence SHA", () => 
   assert.equal(stale["MASWE / independent verification"].conclusion, "neutral");
 });
 
+test("buildCheckConclusions rejects the non-canonical 03-design.md name", () => {
+  const run = {
+    schemaVersion: 1,
+    version: 1,
+    id: "run-1",
+    title: "t",
+    request: "r",
+    repositoryPath: "/tmp",
+    state: "PR_REVIEW",
+    createdAt: "",
+    updatedAt: "",
+    approvals: { brainstorm: true, design: true },
+    counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
+    config: DEFAULT_CONFIG,
+    artifacts: [
+      {
+        name: "02-brainstorm.md",
+        logicalName: "02-brainstorm.md",
+        attempt: 1,
+        path: "x",
+        sha256: "a".repeat(64),
+        createdAt: "",
+      },
+      {
+        name: "03-design.md",
+        logicalName: "03-design.md",
+        attempt: 1,
+        path: "x",
+        sha256: "b".repeat(64),
+        createdAt: "",
+      },
+    ],
+    events: [],
+  } as RunRecord;
+  assert.equal(
+    buildCheckConclusions(run, "sha")["MASWE / specification compliance"].conclusion,
+    "action_required",
+  );
+});
+
+test("CheckPublisher PATCH bodies omit head_sha", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-patch-"));
+  const sideEffects = new GitHubSideEffectStore(root);
+  const patches: unknown[] = [];
+  const http: GitHubHttpClient = {
+    async request(method, url, options) {
+      if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
+      if (method === "POST") return { status: 201, headers: {}, body: { id: 1 } };
+      if (method === "PATCH") {
+        patches.push(options?.body);
+        return { status: 200, headers: {}, body: { id: 1 } };
+      }
+      return { status: 200, headers: {}, body: {} };
+    },
+  };
+  const publisher = new CheckPublisher({
+    http,
+    sideEffects,
+    readOnlyChecks: true,
+    owner: "owner",
+    repo: "repo",
+    pullRequestNumber: 1,
+    token: "token",
+  });
+  const run = {
+    schemaVersion: 1,
+    version: 1,
+    id: "run-1",
+    title: "t",
+    request: "r",
+    repositoryPath: "/tmp",
+    state: "PR_REVIEW",
+    createdAt: "",
+    updatedAt: "",
+    approvals: { brainstorm: false, design: false },
+    counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
+    config: DEFAULT_CONFIG,
+    artifacts: [],
+    events: [],
+  } as RunRecord;
+  await publisher.publishForHeadSha(run, "sha1");
+  await publisher.publishForHeadSha(run, "sha1");
+  assert.ok(patches.length >= 4);
+  for (const body of patches) {
+    assert.equal(Object.hasOwn(body as object, "head_sha"), false);
+  }
+});
+
 test("CheckPublisher creates checks idempotently and invalidates prior SHA success", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-checks-"));
   const sideEffects = new GitHubSideEffectStore(root);
@@ -87,6 +175,9 @@ test("CheckPublisher creates checks idempotently and invalidates prior SHA succe
   const http: GitHubHttpClient = {
     async request(method, url, options) {
       calls.push({ method, url, body: options?.body });
+      if (method === "GET") {
+        return { status: 200, headers: {}, body: { check_runs: [] } };
+      }
       if (method === "POST" && url.includes("/check-runs")) {
         const id = nextId++;
         return { status: 201, headers: {}, body: { id } };
@@ -151,8 +242,10 @@ test("CheckPublisher creates checks idempotently and invalidates prior SHA succe
 test("CheckPublisher surfaces rate limits without recording success", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-rl-"));
   const sideEffects = new GitHubSideEffectStore(root);
+  let calls = 0;
   const http: GitHubHttpClient = {
     async request() {
+      calls += 1;
       return {
         status: 403,
         headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "9999999999" },
@@ -168,6 +261,8 @@ test("CheckPublisher surfaces rate limits without recording success", async () =
     repo: "repo",
     pullRequestNumber: 1,
     token: "token",
+    maxRateLimitRetries: 2,
+    sleepFn: async () => {},
   });
   const run = {
     schemaVersion: 1,
@@ -187,5 +282,6 @@ test("CheckPublisher surfaces rate limits without recording success", async () =
   } as RunRecord;
 
   await assert.rejects(() => publisher.publishForHeadSha(run, "sha"), /rate limit/i);
+  assert.ok(calls > 1);
   assert.equal(await sideEffects.get("check-run:owner/repo/1/sha/MASWE / specification compliance/1"), undefined);
 });

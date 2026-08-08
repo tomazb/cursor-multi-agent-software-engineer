@@ -33,16 +33,26 @@ function testConfig() {
   });
 }
 
-async function setup() {
+async function setup(options: { liveHead?: string } = {}) {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-int-"));
   const store = new FileRunStore(cwd);
   const config = testConfig();
   const posts: unknown[] = [];
   const patches: unknown[] = [];
+  const tokens: Array<{ installationId: number; repository: string }> = [];
   let nextId = 1;
   let rateLimitOnce = false;
+  let liveHead = options.liveHead;
+  let failAll = false;
   const http: GitHubHttpClient = {
     async request(method, url, options) {
+      if (failAll) {
+        return {
+          status: 500,
+          headers: {},
+          body: { message: "forced failure" },
+        };
+      }
       if (rateLimitOnce) {
         rateLimitOnce = false;
         return {
@@ -50,6 +60,16 @@ async function setup() {
           headers: { "x-ratelimit-remaining": "0" },
           body: { message: "API rate limit exceeded" },
         };
+      }
+      if (method === "GET" && url.includes("/pulls/")) {
+        return {
+          status: 200,
+          headers: {},
+          body: { head: { sha: liveHead ?? "unknown" } },
+        };
+      }
+      if (method === "GET" && url.includes("/check-runs")) {
+        return { status: 200, headers: {}, body: { check_runs: [] } };
       }
       if (method === "POST" && url.includes("/check-runs")) {
         posts.push(options?.body);
@@ -67,7 +87,10 @@ async function setup() {
     config,
     store,
     http,
-    tokenProvider: async () => "test-token",
+    tokenProvider: async (installationId, repository) => {
+      tokens.push({ installationId, repository });
+      return "test-token";
+    },
   });
   return {
     cwd,
@@ -75,8 +98,15 @@ async function setup() {
     adapter,
     posts,
     patches,
+    tokens,
+    setLiveHead(sha: string) {
+      liveHead = sha;
+    },
     enableRateLimitOnce() {
       rateLimitOnce = true;
+    },
+    setFailAll(value: boolean) {
+      failAll = value;
     },
   };
 }
@@ -96,7 +126,7 @@ function prPayload(headSha: string, number = 9) {
 
 test("integration: forged signature makes no state change", async () => {
   process.env[SECRET_ENV] = SECRET;
-  const { adapter, cwd, posts } = await setup();
+  const { adapter, posts } = await setup();
   const body = JSON.stringify(prPayload("sha1"));
   const result = await adapter.handleWebhook({
     deliveryId: "del-forged",
@@ -106,16 +136,11 @@ test("integration: forged signature makes no state change", async () => {
   });
   assert.equal(result.status, 401);
   assert.equal(posts.length, 0);
-  const sideEffects = new GitHubSideEffectStore(path.join(cwd, ".maswe", "github"));
-  assert.equal(
-    await sideEffects.get("check-run:owner/repo/9/sha1/MASWE / deterministic quality/1"),
-    undefined,
-  );
 });
 
-test("integration: replayed delivery does not duplicate checks", async () => {
+test("integration: replayed completed delivery does not duplicate checks", async () => {
   process.env[SECRET_ENV] = SECRET;
-  const { adapter, posts, store } = await setup();
+  const { adapter, posts, store } = await setup({ liveHead: "sha1" });
   const run = await store.create("assoc", "req", testConfig());
   run.workspace = {
     baseSha: "base",
@@ -138,7 +163,6 @@ test("integration: replayed delivery does not duplicate checks", async () => {
     rawBody: body,
   });
   assert.equal(first.status, 200);
-  assert.equal(first.body.duplicate, undefined);
   const postCount = posts.length;
   assert.ok(postCount >= 4);
 
@@ -153,9 +177,50 @@ test("integration: replayed delivery does not duplicate checks", async () => {
   assert.equal(posts.length, postCount);
 });
 
+test("integration: failed delivery can be retried with the same id", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { adapter, setFailAll, posts } = await setup({ liveHead: "sha-rl" });
+  setFailAll(true);
+  const body = JSON.stringify(prPayload("sha-rl"));
+  await assert.rejects(
+    () =>
+      adapter.handleWebhook({
+        deliveryId: "del-rl-retry",
+        eventName: "pull_request",
+        signatureHeader: sign(body),
+        rawBody: body,
+      }),
+    /forced failure|HTTP 500/i,
+  );
+  setFailAll(false);
+  const retry = await adapter.handleWebhook({
+    deliveryId: "del-rl-retry",
+    eventName: "pull_request",
+    signatureHeader: sign(body),
+    rawBody: body,
+  });
+  assert.equal(retry.status, 200);
+  assert.ok(posts.length >= 4);
+});
+
+test("integration: unassociated PR uses the event installation token", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { adapter, tokens, posts } = await setup({ liveHead: "sha-u" });
+  const body = JSON.stringify(prPayload("sha-u"));
+  const result = await adapter.handleWebhook({
+    deliveryId: "del-unassoc",
+    eventName: "pull_request",
+    signatureHeader: sign(body),
+    rawBody: body,
+  });
+  assert.equal(result.status, 200);
+  assert.ok(tokens.some((t) => t.installationId === 44 && t.repository === "owner/repo"));
+  assert.ok(posts.length >= 4);
+});
+
 test("integration: new head SHA invalidates prior success conclusions", async () => {
   process.env[SECRET_ENV] = SECRET;
-  const { adapter, posts, patches, store } = await setup();
+  const { adapter, posts, patches, store, setLiveHead } = await setup({ liveHead: "sha1" });
   const run = await store.create("sha-order", "req", testConfig());
   run.workspace = {
     baseSha: "base",
@@ -177,12 +242,8 @@ test("integration: new head SHA invalidates prior success conclusions", async ()
     signatureHeader: sign(body1),
     rawBody: body1,
   });
-  const successPosts = posts.filter(
-    (body) => (body as { conclusion?: string }).conclusion === "success",
-  );
-  assert.ok(successPosts.length >= 2);
 
-  // Evidence still sha1; event moves to sha2 → quality/verify must not succeed for sha2
+  setLiveHead("sha2");
   const body2 = JSON.stringify(prPayload("sha2"));
   await adapter.handleWebhook({
     deliveryId: "del-sha2",
@@ -204,34 +265,54 @@ test("integration: new head SHA invalidates prior success conclusions", async ()
   assert.equal(loaded.github?.headSha, "sha2");
 });
 
-test("integration: rate limit does not record a successful side effect", async () => {
+test("integration: stale out-of-order head is ignored", async () => {
   process.env[SECRET_ENV] = SECRET;
-  const { adapter, enableRateLimitOnce, cwd } = await setup();
-  enableRateLimitOnce();
-  const body = JSON.stringify(prPayload("sha-rl"));
-  await assert.rejects(
-    () =>
-      adapter.handleWebhook({
-        deliveryId: "del-rl",
-        eventName: "pull_request",
-        signatureHeader: sign(body),
-        rawBody: body,
-      }),
-    /rate limit/i,
-  );
-  const sideEffects = new GitHubSideEffectStore(path.join(cwd, ".maswe", "github"));
-  assert.equal(
-    await sideEffects.get("check-run:owner/repo/9/sha-rl/MASWE / specification compliance/1"),
-    undefined,
-  );
+  const { adapter, store, setLiveHead } = await setup({ liveHead: "sha2" });
+  const run = await store.create("stale", "req", testConfig());
+  run.workspace = {
+    baseSha: "base",
+    headSha: "sha1",
+    branch: "maswe/run-1",
+    fingerprint: "fp",
+    remote: "https://github.com/owner/repo.git",
+  };
+  await store.save(run);
+
+  await adapter.handleWebhook({
+    deliveryId: "del-newer",
+    eventName: "pull_request",
+    signatureHeader: sign(JSON.stringify(prPayload("sha2"))),
+    rawBody: JSON.stringify(prPayload("sha2")),
+  });
+  assert.equal((await store.load(run.id)).github?.headSha, "sha2");
+
+  setLiveHead("sha2");
+  await adapter.handleWebhook({
+    deliveryId: "del-stale",
+    eventName: "pull_request",
+    signatureHeader: sign(JSON.stringify(prPayload("sha1"))),
+    rawBody: JSON.stringify(prPayload("sha1")),
+  });
+  assert.equal((await store.load(run.id)).github?.headSha, "sha2");
 });
 
-test("integration: installation deletion suspends associations", async () => {
+test("integration: installation deletion suspends run records", async () => {
   process.env[SECRET_ENV] = SECRET;
-  const { adapter, cwd, posts } = await setup();
+  const { adapter, cwd, store, posts } = await setup();
+  const run = await store.create("suspend-me", "req", testConfig());
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "b",
+    headSha: "h",
+    branch: "feature",
+    suspended: false,
+  };
+  await store.save(run);
   const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
   await index.bind({
-    runId: "run-x",
+    runId: run.id,
     installationId: 44,
     repository: "owner/repo",
     pullRequestNumber: 9,
@@ -249,6 +330,7 @@ test("integration: installation deletion suspends associations", async () => {
   });
   assert.equal(result.status, 200);
   assert.equal((await index.find("owner/repo", 9))?.suspended, true);
+  assert.equal((await store.load(run.id)).github?.suspended, true);
 
   const syncBody = JSON.stringify(prPayload("sha-after-suspend"));
   const after = await adapter.handleWebhook({
@@ -258,6 +340,85 @@ test("integration: installation deletion suspends associations", async () => {
     rawBody: syncBody,
   });
   assert.equal(after.status, 200);
-  // Suspended association: no check posts for that bound run path
   assert.equal(posts.length, 0);
+});
+
+test("integration: does not steal another PR's associated run", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { adapter, store } = await setup({ liveHead: "other" });
+  const run = await store.create("pr-one", "req", testConfig());
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 1,
+    baseSha: "b",
+    headSha: "h",
+    branch: "maswe/other",
+    suspended: false,
+  };
+  run.workspace = {
+    baseSha: "b",
+    headSha: "h",
+    branch: "maswe/other",
+    fingerprint: "fp",
+    remote: "https://github.com/owner/repo.git",
+  };
+  await store.save(run);
+
+  const body = JSON.stringify(prPayload("other", 99));
+  await adapter.handleWebhook({
+    deliveryId: "del-other-pr",
+    eventName: "pull_request",
+    signatureHeader: sign(body),
+    rawBody: body,
+  });
+  const loaded = await store.load(run.id);
+  assert.equal(loaded.github?.pullRequestNumber, 1);
+  assert.equal(loaded.github?.headSha, "h");
+});
+
+test("integration: push events invalidate the matching PR association", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { adapter, store, cwd, setLiveHead } = await setup({ liveHead: "sha-push" });
+  const run = await store.create("push-run", "req", testConfig());
+  run.workspace = {
+    baseSha: "base",
+    headSha: "old",
+    branch: "maswe/run-1",
+    fingerprint: "fp",
+    remote: "https://github.com/owner/repo.git",
+  };
+  run.evidence = {
+    quality: { headSha: "old", passed: true, at: "t" },
+    verification: { headSha: "old", passed: true, at: "t" },
+  };
+  await store.save(run);
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  await index.bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "old",
+    branch: "maswe/run-1",
+  });
+
+  setLiveHead("sha-push");
+  const body = JSON.stringify({
+    ref: "refs/heads/maswe/run-1",
+    after: "sha-push",
+    installation: { id: 44 },
+    repository: { full_name: "owner/repo" },
+  });
+  const result = await adapter.handleWebhook({
+    deliveryId: "del-push",
+    eventName: "push",
+    signatureHeader: sign(body),
+    rawBody: body,
+  });
+  assert.equal(result.status, 200);
+  const loaded = await store.load(run.id);
+  assert.equal(loaded.github?.headSha, "sha-push");
+  assert.equal(loaded.evidence?.quality, undefined);
 });

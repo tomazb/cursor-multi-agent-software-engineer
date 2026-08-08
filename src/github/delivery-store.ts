@@ -1,9 +1,21 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+
+export type DeliveryStatus = "processing" | "completed";
 
 export interface DeliveryClaimResult {
   claimed: boolean;
   duplicate: boolean;
+  status?: DeliveryStatus;
+}
+
+export interface DeliveryRecord {
+  deliveryId: string;
+  status: DeliveryStatus;
+  claimedAt: string;
+  completedAt?: string;
+  lastError?: string;
 }
 
 function assertSafeDeliveryId(deliveryId: string): void {
@@ -15,9 +27,18 @@ function assertSafeDeliveryId(deliveryId: string): void {
   }
 }
 
+async function writeAtomic(filePath: string, content: string): Promise<void> {
+  const directory = path.dirname(filePath);
+  await mkdir(directory, { recursive: true });
+  const tempPath = path.join(directory, `.${path.basename(filePath)}.${randomUUID()}.tmp`);
+  await writeFile(tempPath, content, "utf8");
+  await rename(tempPath, filePath);
+}
+
 /**
- * File-backed unique claim store for `X-GitHub-Delivery` ids.
- * Root is typically `<cwd>/.maswe/github`.
+ * File-backed delivery ledger for `X-GitHub-Delivery` ids.
+ * Claims start as `processing`; only `completed` deliveries are treated as terminal duplicates.
+ * Failed processing releases the claim so GitHub redelivery can retry.
  */
 export class GitHubDeliveryStore {
   private readonly deliveriesDir: string;
@@ -26,23 +47,80 @@ export class GitHubDeliveryStore {
     this.deliveriesDir = path.join(githubRoot, "deliveries");
   }
 
+  private filePath(deliveryId: string): string {
+    return path.join(this.deliveriesDir, `${deliveryId}.json`);
+  }
+
+  private async read(deliveryId: string): Promise<DeliveryRecord | undefined> {
+    try {
+      const raw = await readFile(this.filePath(deliveryId), "utf8");
+      return JSON.parse(raw) as DeliveryRecord;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
   async claim(deliveryId: string): Promise<DeliveryClaimResult> {
     assertSafeDeliveryId(deliveryId);
     await mkdir(this.deliveriesDir, { recursive: true });
-    const filePath = path.join(this.deliveriesDir, `${deliveryId}.json`);
-    const payload = `${JSON.stringify({
+    const existing = await this.read(deliveryId);
+    if (existing?.status === "completed") {
+      return { claimed: false, duplicate: true, status: "completed" };
+    }
+    if (existing?.status === "processing") {
+      // Another in-flight attempt owns this delivery; treat as duplicate until it completes or fails.
+      return { claimed: false, duplicate: true, status: "processing" };
+    }
+
+    const record: DeliveryRecord = {
       deliveryId,
+      status: "processing",
       claimedAt: new Date().toISOString(),
-    })}\n`;
+    };
     try {
-      await writeFile(filePath, payload, { encoding: "utf8", flag: "wx" });
-      return { claimed: true, duplicate: false };
+      await writeFile(this.filePath(deliveryId), `${JSON.stringify(record)}\n`, {
+        encoding: "utf8",
+        flag: "wx",
+      });
+      return { claimed: true, duplicate: false, status: "processing" };
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === "EEXIST") {
-        return { claimed: false, duplicate: true };
+        const raced = await this.read(deliveryId);
+        return {
+          claimed: false,
+          duplicate: true,
+          ...(raced?.status ? { status: raced.status } : {}),
+        };
       }
       throw error;
     }
+  }
+
+  async complete(deliveryId: string): Promise<void> {
+    assertSafeDeliveryId(deliveryId);
+    const existing = await this.read(deliveryId);
+    if (!existing) {
+      throw new Error(`Cannot complete unknown delivery ${deliveryId}`);
+    }
+    const record: DeliveryRecord = {
+      ...existing,
+      status: "completed",
+      completedAt: new Date().toISOString(),
+    };
+    delete record.lastError;
+    await writeAtomic(this.filePath(deliveryId), `${JSON.stringify(record)}\n`);
+  }
+
+  async fail(deliveryId: string, errorMessage: string): Promise<void> {
+    assertSafeDeliveryId(deliveryId);
+    // Release the claim so a redelivery with the same ID can retry.
+    try {
+      await unlink(this.filePath(deliveryId));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    void errorMessage;
   }
 }

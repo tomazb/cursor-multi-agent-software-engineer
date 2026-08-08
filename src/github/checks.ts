@@ -40,7 +40,9 @@ export interface GitHubHttpClient {
 function hasApprovedSpecArtifacts(run: RunRecord): boolean {
   if (!run.approvals.brainstorm || !run.approvals.design) return false;
   const logical = new Set(run.artifacts.map((a) => a.logicalName));
-  return logical.has("02-brainstorm.md") && logical.has("03-design.md");
+  return (
+    logical.has("02-brainstorm.md") && logical.has("03-specification-and-design.md")
+  );
 }
 
 export function buildCheckConclusions(
@@ -111,7 +113,16 @@ function idempotencyKey(
   return `check-run:${owner}/${repo}/${pullRequestNumber}/${headSha}/${checkName}/${attempt}`;
 }
 
-function isRateLimited(status: number, headers: Record<string, string>, body: unknown): boolean {
+function externalIdFor(key: string): string {
+  // GitHub external_id is free-form; keep it stable and filesystem-safe length.
+  return key.length <= 64 ? key : key.slice(0, 64);
+}
+
+export function isRateLimited(
+  status: number,
+  headers: Record<string, string>,
+  body: unknown,
+): boolean {
   if (status === 429) return true;
   if (status !== 403) return false;
   const remaining = headers["x-ratelimit-remaining"] ?? headers["X-RateLimit-Remaining"];
@@ -123,6 +134,23 @@ function isRateLimited(status: number, headers: Record<string, string>, body: un
   return /rate limit/i.test(message);
 }
 
+function rateLimitDelayMs(headers: Record<string, string>, attempt: number): number {
+  const retryAfter = headers["retry-after"] ?? headers["Retry-After"];
+  if (retryAfter && /^\d+$/.test(retryAfter)) {
+    return Math.min(Number(retryAfter) * 1000, 30_000);
+  }
+  const reset = headers["x-ratelimit-reset"] ?? headers["X-RateLimit-Reset"];
+  if (reset && /^\d+$/.test(reset)) {
+    const until = Number(reset) * 1000 - Date.now();
+    if (until > 0) return Math.min(until, 30_000);
+  }
+  return Math.min(250 * 2 ** attempt, 5_000);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export class CheckPublisher {
   private readonly http: GitHubHttpClient;
   private readonly sideEffects: GitHubSideEffectStore;
@@ -132,6 +160,8 @@ export class CheckPublisher {
   private readonly pullRequestNumber: number;
   private readonly token: string;
   private readonly attempt: number;
+  private readonly maxRateLimitRetries: number;
+  private readonly sleepFn: (ms: number) => Promise<void>;
 
   constructor(options: {
     http: GitHubHttpClient;
@@ -142,6 +172,8 @@ export class CheckPublisher {
     pullRequestNumber: number;
     token: string;
     attempt?: number;
+    maxRateLimitRetries?: number;
+    sleepFn?: (ms: number) => Promise<void>;
   }) {
     this.http = options.http;
     this.sideEffects = options.sideEffects;
@@ -151,6 +183,8 @@ export class CheckPublisher {
     this.pullRequestNumber = options.pullRequestNumber;
     this.token = options.token;
     this.attempt = options.attempt ?? 1;
+    this.maxRateLimitRetries = options.maxRateLimitRetries ?? 4;
+    this.sleepFn = options.sleepFn ?? sleep;
   }
 
   async publishForHeadSha(
@@ -184,7 +218,7 @@ export class CheckPublisher {
       );
       const existing = await this.sideEffects.get(key);
       if (!existing) continue;
-      await this.patchCheck(existing.resourceId, previousHeadSha, {
+      await this.patchCheck(existing.resourceId, {
         conclusion: "cancelled",
         title: "Superseded by newer head SHA",
         summary: `Invalidated because a newer head SHA was evaluated for PR #${this.pullRequestNumber}.`,
@@ -205,53 +239,99 @@ export class CheckPublisher {
       name,
       this.attempt,
     );
+    const externalId = externalIdFor(key);
     const existing = await this.sideEffects.get(key);
     if (existing) {
-      await this.patchCheck(existing.resourceId, headSha, outcome);
+      await this.patchCheck(existing.resourceId, outcome);
       return;
     }
 
-    const response = await this.http.request(
+    const reconciled = await this.reconcileExistingCheck(name, headSha, externalId);
+    if (reconciled !== undefined) {
+      await this.sideEffects.put(key, { resourceId: reconciled, kind: "check-run" });
+      await this.patchCheck(reconciled, outcome);
+      return;
+    }
+
+    const response = await this.requestWithRateLimitRetry(
       "POST",
       `https://api.github.com/repos/${this.owner}/${this.repo}/check-runs`,
       {
-        headers: this.headers(),
-        body: {
-          name,
-          head_sha: headSha,
-          status: "completed",
-          conclusion: outcome.conclusion,
-          output: { title: outcome.title, summary: outcome.summary },
-        },
+        name,
+        head_sha: headSha,
+        external_id: externalId,
+        status: "completed",
+        conclusion: outcome.conclusion,
+        output: { title: outcome.title, summary: outcome.summary },
       },
     );
-    this.assertOk(response.status, response.headers, response.body);
     const id = (response.body as { id?: number }).id;
     if (typeof id !== "number") {
-      throw new Error("GitHub check-run response missing id");
+      // POST may have succeeded server-side; try reconcile before failing closed.
+      const recovered = await this.reconcileExistingCheck(name, headSha, externalId);
+      if (recovered === undefined) {
+        throw new Error("GitHub check-run response missing id");
+      }
+      await this.sideEffects.put(key, { resourceId: recovered, kind: "check-run" });
+      return;
     }
     await this.sideEffects.put(key, { resourceId: id, kind: "check-run" });
   }
 
-  private async patchCheck(
-    checkRunId: number,
+  private async reconcileExistingCheck(
+    name: MasweCheckName,
     headSha: string,
-    outcome: CheckOutcome,
-  ): Promise<void> {
-    const response = await this.http.request(
+    externalId: string,
+  ): Promise<number | undefined> {
+    const response = await this.requestWithRateLimitRetry(
+      "GET",
+      `https://api.github.com/repos/${this.owner}/${this.repo}/commits/${encodeURIComponent(headSha)}/check-runs?check_name=${encodeURIComponent(name)}&filter=latest`,
+    );
+    const checkRuns = (response.body as { check_runs?: Array<{ id?: number; external_id?: string }> })
+      .check_runs;
+    if (!Array.isArray(checkRuns)) return undefined;
+    const match = checkRuns.find((run) => run.external_id === externalId && typeof run.id === "number");
+    return match?.id;
+  }
+
+  private async patchCheck(checkRunId: number, outcome: CheckOutcome): Promise<void> {
+    await this.requestWithRateLimitRetry(
       "PATCH",
       `https://api.github.com/repos/${this.owner}/${this.repo}/check-runs/${checkRunId}`,
       {
-        headers: this.headers(),
-        body: {
-          head_sha: headSha,
-          status: "completed",
-          conclusion: outcome.conclusion,
-          output: { title: outcome.title, summary: outcome.summary },
-        },
+        status: "completed",
+        conclusion: outcome.conclusion,
+        output: { title: outcome.title, summary: outcome.summary },
       },
     );
-    this.assertOk(response.status, response.headers, response.body);
+  }
+
+  private async requestWithRateLimitRetry(
+    method: string,
+    url: string,
+    body?: unknown,
+  ): Promise<{ status: number; headers: Record<string, string>; body: unknown }> {
+    let lastHeaders: Record<string, string> = {};
+    let lastBody: unknown;
+    for (let attempt = 0; attempt <= this.maxRateLimitRetries; attempt += 1) {
+      const response = await this.http.request(method, url, {
+        headers: this.headers(),
+        ...(body !== undefined ? { body } : {}),
+      });
+      if (!isRateLimited(response.status, response.headers, response.body)) {
+        if (response.status < 200 || response.status >= 300) {
+          throw new Error(`GitHub Checks API request failed: HTTP ${response.status}`);
+        }
+        return response;
+      }
+      lastHeaders = response.headers;
+      lastBody = response.body;
+      if (attempt === this.maxRateLimitRetries) break;
+      await this.sleepFn(rateLimitDelayMs(response.headers, attempt));
+    }
+    void lastBody;
+    void lastHeaders;
+    throw new Error("GitHub API rate limit exceeded");
   }
 
   private headers(): Record<string, string> {
@@ -261,18 +341,5 @@ export class CheckPublisher {
       "user-agent": "maswe-github-app",
       "content-type": "application/json",
     };
-  }
-
-  private assertOk(
-    status: number,
-    headers: Record<string, string>,
-    body: unknown,
-  ): void {
-    if (isRateLimited(status, headers, body)) {
-      throw new Error("GitHub API rate limit exceeded");
-    }
-    if (status < 200 || status >= 300) {
-      throw new Error(`GitHub Checks API request failed: HTTP ${status}`);
-    }
   }
 }
