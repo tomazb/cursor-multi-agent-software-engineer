@@ -4,11 +4,10 @@ import type { GitHubHttpClient } from "./checks.ts";
 export function createFetchGitHubHttpClient(): GitHubHttpClient {
   return {
     async request(method, url, options) {
-      const response = await fetch(url, {
-        method,
-        headers: options?.headers,
-        body: options?.body === undefined ? undefined : JSON.stringify(options.body),
-      });
+      const init: RequestInit = { method };
+      if (options?.headers) init.headers = options.headers;
+      if (options?.body !== undefined) init.body = JSON.stringify(options.body);
+      const response = await fetch(url, init);
       const headers: Record<string, string> = {};
       response.headers.forEach((value, key) => {
         headers[key] = value;
