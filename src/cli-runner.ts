@@ -2,6 +2,10 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { loadConfig, writeStarterConfig } from "./config.ts";
 import type { AgentRuntime, MasweConfig, RunRecord } from "./domain.ts";
+import { GitHubAppAdapter } from "./github/adapter.ts";
+import { createFetchGitHubHttpClient } from "./github/http.ts";
+import { createInstallationAccessToken } from "./github/token.ts";
+import { listenWebhookServer } from "./github/webhook-server.ts";
 import { assertSupportedNodeVersion } from "./node-version.ts";
 import { Orchestrator } from "./orchestrator.ts";
 import { createRuntime } from "./runtime.ts";
@@ -28,6 +32,8 @@ Usage:
   maswe supersede <run-id>
   maswe unlock <run-id> [--force]
   maswe unlock-admin <run-id> [--force]
+  maswe github-webhook
+  maswe github-publish-checks <run-id>
 
 Options:
   --config <path>  Use a specific config file.
@@ -76,7 +82,7 @@ async function orchestratorForRun(
   return { orchestrator, runtime, run };
 }
 
-const PROJECT_CONFIG_COMMANDS = new Set(["doctor", "start"]);
+const PROJECT_CONFIG_COMMANDS = new Set(["doctor", "start", "github-webhook", "github-publish-checks"]);
 
 export interface RunCliOptions {
   argv?: string[];
@@ -237,6 +243,70 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
       if (!runId) throw new Error("unlock-admin requires <run-id>");
       await store.unlockAdmin(runId, { force: has(args, "--force") });
       console.log(`Published an exact admin-lock release for run ${runId}`);
+      return;
+    }
+    case "github-webhook": {
+      const config = projectConfig!;
+      if (!config.githubApp?.enabled) {
+        throw new Error("githubApp.enabled must be true to start the webhook server");
+      }
+      const http = createFetchGitHubHttpClient();
+      const adapter = new GitHubAppAdapter({
+        cwd,
+        config,
+        store,
+        http,
+        tokenProvider: async (installationId) => {
+          const appId = process.env[config.githubApp!.appIdEnv];
+          const privateKey = process.env[config.githubApp!.privateKeyEnv];
+          if (!appId || !privateKey) {
+            throw new Error("GitHub App id or private key environment variables are missing");
+          }
+          return createInstallationAccessToken({
+            appId,
+            privateKeyPem: privateKey,
+            installationId,
+            http,
+          });
+        },
+      });
+      const { url } = await listenWebhookServer({
+        adapter,
+        host: config.githubApp.webhookHost ?? "127.0.0.1",
+        port: config.githubApp.webhookPort ?? 8787,
+      });
+      console.log(`Listening for GitHub webhooks at ${url}`);
+      return;
+    }
+    case "github-publish-checks": {
+      const runId = values[0];
+      if (!runId) throw new Error("github-publish-checks requires <run-id>");
+      const config = projectConfig!;
+      if (!config.githubApp?.enabled) {
+        throw new Error("githubApp.enabled must be true to publish checks");
+      }
+      const http = createFetchGitHubHttpClient();
+      const adapter = new GitHubAppAdapter({
+        cwd,
+        config,
+        store,
+        http,
+        tokenProvider: async (installationId) => {
+          const appId = process.env[config.githubApp!.appIdEnv];
+          const privateKey = process.env[config.githubApp!.privateKeyEnv];
+          if (!appId || !privateKey) {
+            throw new Error("GitHub App id or private key environment variables are missing");
+          }
+          return createInstallationAccessToken({
+            appId,
+            privateKeyPem: privateKey,
+            installationId,
+            http,
+          });
+        },
+      });
+      const run = await adapter.publishChecksForRun(runId);
+      console.log(has(args, "--json") ? JSON.stringify(run, null, 2) : renderRun(run));
       return;
     }
     default:
