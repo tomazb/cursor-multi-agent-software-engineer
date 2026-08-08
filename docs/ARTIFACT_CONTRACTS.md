@@ -54,6 +54,15 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
     "quality": { "headSha": "abc...", "passed": true, "at": "..." },
     "verification": { "headSha": "abc...", "passed": true, "at": "..." }
   },
+  "github": {
+    "installationId": 12345,
+    "repository": "owner/repo",
+    "pullRequestNumber": 42,
+    "baseSha": "abc...",
+    "headSha": "def...",
+    "branch": "maswe/20260722120000-1a2b3c4d",
+    "suspended": false
+  },
   "config": {},
   "artifacts": [],
   "events": []
@@ -61,6 +70,8 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
 ```
 
 Build, quality, and verification events include the evaluated `headSha`. When `headSha` changes, prior quality/verification evidence is invalidated and merge-ready fails closed until CI and verification are re-run.
+
+Optional `github` association binds a run to a GitHub App installation, repository, and pull request for check-run mirroring. `suspended` is set when the installation loses access; Phase A does not auto-start runs from webhooks.
 
 The run's configuration is a snapshot. Changing `.maswe/config.json` affects only later runs unless a future migration command explicitly updates a run.
 

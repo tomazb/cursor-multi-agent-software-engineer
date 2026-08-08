@@ -122,3 +122,67 @@ test("doctorProbeTimeoutMs accepts explicit bounds and rejects invalid values", 
     );
   }
 });
+
+test("githubApp is optional and omitted by default", () => {
+  const config = mergeConfigForTest({});
+  assert.equal(config.githubApp, undefined);
+});
+
+test("githubApp accepts enabled read-only pilot config", () => {
+  const config = mergeConfigForTest({
+    githubApp: {
+      enabled: true,
+      readOnlyChecks: true,
+      webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+      appIdEnv: "MASWE_GITHUB_APP_ID",
+      privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+      allowedRepositories: ["owner/repo"],
+      webhookHost: "127.0.0.1",
+      webhookPort: 8787,
+    },
+  });
+  assert.deepEqual(config.githubApp, {
+    enabled: true,
+    readOnlyChecks: true,
+    webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+    appIdEnv: "MASWE_GITHUB_APP_ID",
+    privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+    allowedRepositories: ["owner/repo"],
+    webhookHost: "127.0.0.1",
+    webhookPort: 8787,
+  });
+});
+
+test("githubApp rejects write mode when enabled in Phase A pilot", () => {
+  assert.throws(
+    () =>
+      mergeConfigForTest({
+        githubApp: {
+          enabled: true,
+          readOnlyChecks: false,
+          webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+          appIdEnv: "MASWE_GITHUB_APP_ID",
+          privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+          allowedRepositories: ["owner/repo"],
+        },
+      }),
+    /readOnlyChecks/,
+  );
+});
+
+test("githubApp rejects empty allowlist when enabled", () => {
+  assert.throws(
+    () =>
+      mergeConfigForTest({
+        githubApp: {
+          enabled: true,
+          readOnlyChecks: true,
+          webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+          appIdEnv: "MASWE_GITHUB_APP_ID",
+          privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+          allowedRepositories: [],
+        },
+      }),
+    /allowedRepositories/,
+  );
+});

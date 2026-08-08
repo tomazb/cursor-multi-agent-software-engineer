@@ -85,6 +85,30 @@
         "mergeReady": { "$ref": "#/$defs/evidenceBinding" }
       }
     },
+    "github": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "installationId",
+        "repository",
+        "pullRequestNumber",
+        "baseSha",
+        "headSha",
+        "branch"
+      ],
+      "properties": {
+        "installationId": { "type": "integer" },
+        "repository": {
+          "type": "string",
+          "pattern": "^[^/\\s]+/[^/\\s]+$"
+        },
+        "pullRequestNumber": { "type": "integer", "minimum": 1 },
+        "baseSha": { "type": "string", "minLength": 1 },
+        "headSha": { "type": "string", "minLength": 1 },
+        "branch": { "type": "string", "minLength": 1 },
+        "suspended": { "type": "boolean" }
+      }
+    },
     "supersedes": { "type": "string" },
     "supersededBy": { "type": "string" },
     "failure": {

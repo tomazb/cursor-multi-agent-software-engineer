@@ -59,5 +59,15 @@
     "roleTimeoutMs": 1800000,
     "doctorProbeTimeoutMs": 60000,
     "allowedPathGlobs": ["**"]
+  },
+  "githubApp": {
+    "enabled": false,
+    "readOnlyChecks": true,
+    "webhookSecretEnv": "MASWE_GITHUB_WEBHOOK_SECRET",
+    "appIdEnv": "MASWE_GITHUB_APP_ID",
+    "privateKeyEnv": "MASWE_GITHUB_APP_PRIVATE_KEY",
+    "allowedRepositories": ["owner/repo"],
+    "webhookHost": "127.0.0.1",
+    "webhookPort": 8787
   }
 }

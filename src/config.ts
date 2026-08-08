@@ -90,7 +90,7 @@ export function migrateConfig(raw: unknown): MasweConfig {
   if (!raw || typeof raw !== "object") return base;
   const value = raw as Partial<MasweConfig>;
 
-  return {
+  const migrated: MasweConfig = {
     ...base,
     ...value,
     version: 1,
@@ -106,6 +106,12 @@ export function migrateConfig(raw: unknown): MasweConfig {
     quality: { ...base.quality, ...(value.quality ?? {}) },
     policy: { ...base.policy, ...(value.policy ?? {}) },
   };
+  if (value.githubApp !== undefined) {
+    migrated.githubApp = value.githubApp;
+  } else {
+    delete migrated.githubApp;
+  }
+  return migrated;
 }
 
 /** Project config load path: migrate defaults then apply environment overrides. */
@@ -227,6 +233,60 @@ export function assertConfig(config: MasweConfig): void {
     !config.policy.allowedPathGlobs.every((glob) => typeof glob === "string" && glob.trim().length > 0)
   ) {
     throw new Error("policy.allowedPathGlobs must contain at least one glob");
+  }
+  if (config.githubApp !== undefined) {
+    assertGitHubAppConfig(config.githubApp);
+  }
+}
+
+function assertGitHubAppConfig(githubApp: MasweConfig["githubApp"]): void {
+  if (!githubApp || typeof githubApp !== "object") {
+    throw new Error("githubApp must be an object when set");
+  }
+  if (typeof githubApp.enabled !== "boolean") {
+    throw new Error("githubApp.enabled must be a boolean");
+  }
+  if (typeof githubApp.readOnlyChecks !== "boolean") {
+    throw new Error("githubApp.readOnlyChecks must be a boolean");
+  }
+  if (githubApp.enabled && githubApp.readOnlyChecks !== true) {
+    throw new Error(
+      "githubApp.readOnlyChecks must be true when githubApp.enabled is true (Phase A pilot)",
+    );
+  }
+  for (const key of ["webhookSecretEnv", "appIdEnv", "privateKeyEnv"] as const) {
+    if (typeof githubApp[key] !== "string" || !githubApp[key].trim()) {
+      throw new Error(`githubApp.${key} must be a non-empty string`);
+    }
+  }
+  if (
+    !Array.isArray(githubApp.allowedRepositories) ||
+    !githubApp.allowedRepositories.every(
+      (repo) => typeof repo === "string" && /^[^/\s]+\/[^/\s]+$/.test(repo),
+    )
+  ) {
+    throw new Error(
+      "githubApp.allowedRepositories must be an array of owner/repo strings",
+    );
+  }
+  if (githubApp.enabled && githubApp.allowedRepositories.length < 1) {
+    throw new Error(
+      "githubApp.allowedRepositories must contain at least one repository when enabled",
+    );
+  }
+  if (
+    githubApp.webhookHost !== undefined &&
+    (typeof githubApp.webhookHost !== "string" || !githubApp.webhookHost.trim())
+  ) {
+    throw new Error("githubApp.webhookHost must be a non-empty string when set");
+  }
+  if (
+    githubApp.webhookPort !== undefined &&
+    (!Number.isInteger(githubApp.webhookPort) ||
+      githubApp.webhookPort < 1 ||
+      githubApp.webhookPort > 65535)
+  ) {
+    throw new Error("githubApp.webhookPort must be an integer between 1 and 65535 when set");
   }
 }
 

@@ -90,6 +90,34 @@
           "items": { "type": "string", "minLength": 1 }
         }
       }
+    },
+    "githubApp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "readOnlyChecks",
+        "webhookSecretEnv",
+        "appIdEnv",
+        "privateKeyEnv",
+        "allowedRepositories"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "readOnlyChecks": { "type": "boolean" },
+        "webhookSecretEnv": { "type": "string", "minLength": 1 },
+        "appIdEnv": { "type": "string", "minLength": 1 },
+        "privateKeyEnv": { "type": "string", "minLength": 1 },
+        "allowedRepositories": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[^/\\s]+/[^/\\s]+$"
+          }
+        },
+        "webhookHost": { "type": "string", "minLength": 1 },
+        "webhookPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
     }
   },
   "$defs": {
