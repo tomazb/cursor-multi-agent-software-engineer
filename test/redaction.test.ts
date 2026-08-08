@@ -440,6 +440,9 @@ test("assignment sanitizer handles large match-heavy input within a hard bound",
 
 test("URI userinfo scanning scales below the reviewed quadratic curve", () => {
   const moduleUrl = new URL("../src/redaction.ts", import.meta.url).href;
+  // Match the documented seven-sample URI probe and the assignment-sanitizer
+  // harness: short wall-clock runs with one call per sample are ratio-noisy
+  // under CI contention and falsely look super-linear.
   const script = `
     import { writeSync } from "node:fs";
     import { performance } from "node:perf_hooks";
@@ -453,11 +456,16 @@ test("URI userinfo scanning scales below the reviewed quadratic curve", () => {
     function measure(uriCount) {
       const input = "https://host.invalid/repository\\n".repeat(uriCount);
       const samples = [];
-      redactSecrets(input);
-      for (let sample = 0; sample < 3; sample += 1) {
-        const started = performance.now();
+      const callsPerSample = 20;
+      for (let index = 0; index < 5; index += 1) {
         redactSecrets(input);
-        samples.push(performance.now() - started);
+      }
+      for (let sample = 0; sample < 7; sample += 1) {
+        const started = performance.now();
+        for (let call = 0; call < callsPerSample; call += 1) {
+          redactSecrets(input);
+        }
+        samples.push((performance.now() - started) / callsPerSample);
       }
       return median(samples);
     }
@@ -474,7 +482,7 @@ test("URI userinfo scanning scales below the reviewed quadratic curve", () => {
       "--eval",
       script,
     ],
-    { encoding: "utf8", timeout: 10_000 },
+    { encoding: "utf8", timeout: 30_000 },
   );
 
   assert.equal(
@@ -487,9 +495,17 @@ test("URI userinfo scanning scales below the reviewed quadratic curve", () => {
     largeMs: number;
     ratio: number;
   };
+  // Historical backward-search probe was ~3.8x on doubling; keep headroom
+  // under load while still rejecting that class of regression.
   assert.ok(
     measured.ratio < 3,
     `doubling credential-free URI input scaled ${measured.ratio.toFixed(2)}x (${measured.smallMs.toFixed(2)}ms -> ${measured.largeMs.toFixed(2)}ms)`,
+  );
+  // Absolute bound: the reviewed quadratic probe spent ~293ms on 8,000 URIs;
+  // the forward scan stays near ~10ms locally. Bound far below the old curve.
+  assert.ok(
+    measured.largeMs < 100,
+    `8,000 credential-free URI median ${measured.largeMs.toFixed(2)}ms exceeded the 100ms regression bound`,
   );
 });
 
