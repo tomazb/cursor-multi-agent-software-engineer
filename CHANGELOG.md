@@ -8,6 +8,14 @@ The project follows semantic versioning once a public release process is establi
 
 ### Added
 
+- GitHub App Phase A read-only pilot (`src/github/`): webhook signature verification,
+  `X-GitHub-Delivery` deduplication, event normalization, PR/run association, SHA-bound check
+  publishing for four MASWE checks, installation suspension, and CLI commands
+  `maswe github-webhook` / `maswe github-publish-checks`.
+- Optional `githubApp` config (enabled only with `readOnlyChecks: true`) and `RunRecord.github`
+  association fields with schema and artifact-contract updates.
+- Integration coverage for forged signatures, delivery replay, stale SHA invalidation, rate limits,
+  and installation removal.
 - `policy.doctorProbeTimeoutMs` configuration contract (default `60_000`, integer bounds
   `1_000..300_000`) with fail-closed validation and schema coverage.
 - Typed doctor check codes across runtimes plus CLI `maswe doctor --json` output of full
@@ -116,7 +124,7 @@ The project follows semantic versioning once a public release process is establi
 
 ### Planned
 
-- GitHub App webhooks, check runs, and review-thread automation.
+- GitHub App Phase B: push/PR writes, review-thread replies, digest-bound GitHub approvals, Actions artifact ingestion.
 - SQLite and PostgreSQL stores.
 - Remote control-plane API and MCP server.
 

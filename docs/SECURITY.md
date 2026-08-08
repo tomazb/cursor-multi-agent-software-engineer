@@ -223,19 +223,21 @@ authentication field.
 - Quality, verification, and merge-ready evidence records bind to the evaluated git **head SHA**.
 - Head-SHA movement after a successful stage invalidates stale evidence before merge-ready.
 
-**Gap:** Digests and evidence are not yet cryptographically signed, and remote GitHub check-run automation remains a later milestone. Production GitHub integration must continue to invalidate verification on every head-SHA change.
+**Gap:** Digests and evidence are not yet cryptographically signed. Phase A mirrors SHA-bound evidence into GitHub Checks; Phase B still owns push/PR writes and comment replies.
 
 ### T10 — Webhook replay or forged GitHub event
 
-**Future threat:** An attacker replays a review or approval event.
+**Threat:** An attacker replays or forges a GitHub webhook delivery.
 
-**Planned controls:**
+**Controls (Phase A):**
 
-- Verify GitHub webhook signatures.
-- Store delivery IDs and reject duplicates.
-- Use installation-scoped tokens.
-- Authorize approvals by repository role/team.
-- Use idempotency keys for side effects.
+- Verify `X-Hub-Signature-256` against the raw body (timing-safe); reject without state change.
+- Claim `X-GitHub-Delivery` under a unique file constraint; duplicates return success without repeating side effects.
+- Acquire installation-scoped tokens only for the handling installation; tokens are not persisted.
+- Idempotency keys for check-run side effects under `.maswe/github/side-effects/`.
+- Repository allowlist; installation removal suspends associations.
+
+**Gap:** Digest-bound GitHub approval authorization by repository role/team remains Phase B.
 
 ### T11 — Resource and cost exhaustion
 

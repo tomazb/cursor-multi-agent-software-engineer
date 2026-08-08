@@ -1,6 +1,15 @@
 # GitHub App design
 
-This document specifies the next production integration. It is not implemented in v0.1.
+This document specifies the GitHub App integration. **Phase A (read-only checks)** is implemented in the single-package tree under `src/github/` (issue #3). The `apps/` / `packages/` layout below remains the **target** for the v0.4 control-plane split and is not required to run the Phase A pilot.
+
+## Phase A status (implemented)
+
+- CLI: `maswe github-webhook`, `maswe github-publish-checks <run-id>`
+- Modules: `src/github/` (signature verify, delivery dedupe, normalize, association index, installation token helper, check publisher, adapter, webhook server)
+- File-backed state under `.maswe/github/` (deliveries, side-effect idempotency keys, associations)
+- Config: optional `githubApp` with `readOnlyChecks: true` required when enabled
+- Check names: specification compliance, deterministic quality, independent verification, review comments resolved (always `neutral` in Phase A)
+- Non-goals still deferred (Phase B / later): push, PR create/update, comment replies, digest-bound GitHub approvals, Actions artifact ingestion, Postgres control plane
 
 ## Objectives
 
@@ -10,10 +19,10 @@ This document specifies the next production integration. It is not implemented i
 - Use least-privilege installation tokens and idempotent side effects.
 - Keep GitHub-specific code outside the orchestration core.
 
-## Proposed components
+## Proposed components (v0.4+ target layout)
 
 ```text
-apps/github-app/
+apps/github-app/          # future extraction from src/github/
   webhook HTTP endpoint
   signature verification
   event normalization
@@ -22,17 +31,30 @@ apps/github-app/
   check-run publisher
   review reply/thread adapter
 
-apps/control-plane/
+apps/control-plane/       # ROADMAP v0.4
   workflow API
   durable queue/workers
   PostgreSQL store
   artifact object store
   runtime adapters
 
-packages/github/
+packages/github/          # future shared library extraction
   typed GitHub event contracts
   installation-token client
   idempotent operations
+```
+
+Phase A equivalent paths today:
+
+```text
+src/github/
+  webhook-server.ts
+  signature.ts
+  normalize.ts
+  delivery-store.ts / side-effect-store.ts / association.ts
+  checks.ts
+  token.ts
+  adapter.ts
 ```
 
 ## Repository permissions

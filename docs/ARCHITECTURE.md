@@ -285,18 +285,17 @@ The CLI can run in CI against an existing checkout. Approval and GitHub event wi
 
 A service will own durable runs and workers, use PostgreSQL, issue idempotent jobs, launch Cursor cloud or self-hosted agents, receive GitHub webhooks, and expose HTTP/MCP interfaces.
 
-## 8. GitHub architecture — planned
+## 8. GitHub architecture — Phase A implemented
 
-The GitHub App will:
+Phase A (read-only checks) lives in `src/github/` and calls public orchestrator/store operations through `GitHubAppAdapter`. It:
 
-- Receive pull request, review, review comment/thread, push, and check events.
-- De-duplicate deliveries by webhook delivery ID.
-- Bind every verification result to the exact PR head SHA.
-- Create separate check runs for specification compliance, independent verification, and comment resolution.
-- Post evidence-based replies but resolve threads only after CI and verification pass.
-- Use installation tokens with least-privilege repository permissions.
+- Receives pull request, push, installation, and observe-only check/workflow events.
+- Verifies `X-Hub-Signature-256` and de-duplicates `X-GitHub-Delivery`.
+- Binds runs to repository/PR/head SHA and invalidates local evidence when head SHA changes.
+- Creates separate check runs for specification compliance, deterministic quality, independent verification, and review-comment resolution (resolution remains `neutral` until Phase B).
+- Uses installation tokens with least privilege; `githubApp.readOnlyChecks: true` refuses Contents/PR/comment write APIs.
 
-See `docs/GITHUB_APP.md`.
+Phase B adds push/PR writes, comment replies, and digest-bound GitHub approvals. See `docs/GITHUB_APP.md`.
 
 ## 9. Consistency and concurrency
 
@@ -445,7 +444,7 @@ GitHub input (future)
   before persistence, but typed SDK-specific metadata requires a separate adapter lifecycle/test
   seam change.
 - Reasoning effort is stored but not translated into provider-specific SDK parameters.
-- GitHub App check runs and authenticated PR automation remain v0.3+.
+- GitHub App Phase A read-only check runs are implemented in `src/github/`; push/PR writes, comment replies, and digest-bound GitHub approvals remain Phase B (issue #3).
 
 Closed in v0.2: branch/worktree manager, git SHA persistence on the run record, atomic file-store writes with optimistic versioning, artifact digest revalidation, attempt history, secret redaction, stdin prompt transport, budgets/timeouts, retry/supersede recovery, and governed Node runtime enforcement.
 

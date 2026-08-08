@@ -4,7 +4,7 @@ A durable, model-configurable software delivery orchestrator for Cursor and the 
 
 The system separates product discovery, specification, implementation, independent verification, and pull-request comment resolution into distinct roles. A deterministic state machine owns stage transitions and file-based artifacts preserve every handoff.
 
-> Project status: **v0.2 local hardening**. The local CLI now includes atomic run storage, git worktree isolation, deterministic commits/scope checks, marker enforcement, secret redaction, stdin prompt transport, budgets/timeouts, retry/supersede recovery, and a governed Node runtime contract. Native GitHub App automation and a hosted control plane remain scheduled for later milestones.
+> Project status: **v0.2 local hardening + v0.3 Phase A read-only GitHub checks**. The local CLI includes atomic run storage, git worktree isolation, deterministic commits/scope checks, marker enforcement, secret redaction, stdin prompt transport, budgets/timeouts, retry/supersede recovery, and a governed Node runtime contract. A read-only GitHub App webhook/check publisher lives in `src/github/`. Push/PR writes, comment automation, and the hosted control plane remain later milestones.
 
 ## Why this exists
 
@@ -178,13 +178,13 @@ The current implementation provides:
 - Re-running quality checks and a fresh verifier after every resolver edit.
 - Layered Node-runtime rejection through bounded package engines, strict npm engine policy, guarded repository scripts, and the CLI entry boundary before repository or durable-state actions.
 
-The v0.2 verifier and quality gates bind evidence to the current git **head SHA**. Read-only roles still use workspace fingerprinting to detect unauthorized edits. Remote GitHub check-run automation remains a later milestone.
+The v0.2 verifier and quality gates bind evidence to the current git **head SHA**. Read-only roles still use workspace fingerprinting to detect unauthorized edits. Phase A mirrors that evidence into GitHub Checks via `maswe github-webhook` / `maswe github-publish-checks` when `githubApp` is enabled.
 
 ## Current limitations
 
-- The local CLI creates isolated `maswe/<run-id>` branches/worktrees and deterministic commits by default. Pull request creation and GitHub check automation remain a later milestone.
-- GitHub webhooks and check runs are not yet wired to the CLI.
-- Human approvals are local commands rather than signed GitHub actions.
+- The local CLI creates isolated `maswe/<run-id>` branches/worktrees and deterministic commits by default. Pull request creation and Contents write from the GitHub App remain Phase B.
+- GitHub App Phase A publishes read-only check runs; it does not push branches, open PRs, or reply to review comments yet.
+- Human approvals are local commands rather than signed GitHub actions (GitHub comment/label approvals are Phase B).
 - File-based state is suitable for one operator or CI job, not concurrent distributed workers.
 - Lock journals require a coherent same-host local filesystem with atomic no-clobber hard links;
   they are not distributed locks or process fencing, and Windows support requires native NTFS

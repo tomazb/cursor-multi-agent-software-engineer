@@ -28,4 +28,4 @@ Models may edit an isolated workspace and propose messages. Deterministic integr
 
 ## Local progress (v0.2)
 
-`src/git-workspace.ts` owns local branch/worktree creation, deterministic commits, and change-scope checks. Push, PR creation, check runs, and webhook ingestion remain v0.3+.
+`src/git-workspace.ts` owns local branch/worktree creation, deterministic commits, and change-scope checks. Phase A adds webhook intake and SHA-bound check publishing in `src/github/` (no push/PR write). Push, PR creation, comment replies, and thread resolution remain Phase B.
