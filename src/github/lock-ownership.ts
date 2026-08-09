@@ -42,13 +42,25 @@ export interface CompareAndSwapHooks extends BytesMatchHooks {
   beforeInstall?: (filePath: string, reclaimPath: string) => Promise<void>;
 }
 
-async function restoreMoved(reclaimPath: string, filePath: string): Promise<boolean> {
+/**
+ * Restore moved bytes only when `filePath` is absent.
+ * Never `rename` onto an existing destination — on POSIX rename replaces and
+ * would destroy a newer successor.
+ */
+export async function restoreMoved(
+  reclaimPath: string,
+  filePath: string,
+): Promise<boolean> {
+  let raw: string;
   try {
-    await rename(reclaimPath, filePath);
-    return true;
+    raw = await readFile(reclaimPath, "utf8");
+  } catch {
+    return false;
+  }
+  try {
+    await writeFile(filePath, raw, { encoding: "utf8", flag: "wx" });
   } catch (error) {
     if (errno(error) === "EEXIST") {
-      // A successor already occupies filePath; the moved copy is obsolete.
       try {
         await unlink(reclaimPath);
       } catch {
@@ -56,18 +68,29 @@ async function restoreMoved(reclaimPath: string, filePath: string): Promise<bool
       }
       return false;
     }
-    // Leave reclaimPath in place — never delete the only remaining copy on
-    // ambiguous restore failures (EACCES, etc.).
+    // Leave reclaimPath for recovery.
     return false;
   }
+  try {
+    await unlink(reclaimPath);
+  } catch {
+    /* ignore */
+  }
+  return true;
+}
+
+function stagingPathFor(filePath: string): string {
+  return `${filePath}.staging`;
+}
+
+function reclaimPathFor(filePath: string): string {
+  return `${filePath}.reclaim`;
 }
 
 /**
  * Unlink `filePath` only if its bytes are still exactly `expectedRaw`.
  * Renames the path aside atomically, verifies the moved bytes, then deletes the
- * reclaim copy — never unlinks a pathname after a separate inode check.
- * Failures fail closed (restore when possible, return false; never throw for
- * ordinary races / unsupported operations).
+ * reclaim copy. Mismatch recovery uses wx-only restore (never rename-over).
  */
 export async function unlinkIfBytesMatch(
   filePath: string,
@@ -79,7 +102,6 @@ export async function unlinkIfBytesMatch(
     await rename(filePath, reclaimPath);
   } catch (error) {
     if (errno(error) === "ENOENT") return false;
-    // EXDEV / EPERM / etc.: fail closed so callers retry via lock timeout.
     return false;
   }
 
@@ -105,8 +127,16 @@ export async function unlinkIfBytesMatch(
 
 /**
  * Replace `filePath` with `newRaw` only if current bytes still equal `expectedRaw`.
- * Keeps the old bytes in a reclaim file until the new file is installed with `wx`,
- * so a failed install restores the ledger instead of leaving a gap.
+ *
+ * Crash-safe protocol:
+ * 1. Durably write `filePath.staging` with `newRaw` while canonical still exists.
+ * 2. Move canonical aside to `filePath.reclaim` and verify bytes.
+ * 3. Install via `wx` write (never rename-over a successor).
+ * 4. Delete staging + reclaim.
+ *
+ * A crash after step 1 leaves staging+canonical (safe). A crash after step 2
+ * leaves staging+reclaim with an empty canonical — callers must recover via
+ * {@link recoverCompareAndSwapArtifacts}.
  */
 export async function compareAndSwapFile(
   filePath: string,
@@ -114,11 +144,42 @@ export async function compareAndSwapFile(
   newRaw: string,
   hooks: CompareAndSwapHooks = {},
 ): Promise<boolean> {
-  const reclaimPath = `${filePath}.${randomUUID()}.reclaim`;
+  const stagingPath = stagingPathFor(filePath);
+  const reclaimPath = reclaimPathFor(filePath);
+
+  try {
+    await writeFile(stagingPath, newRaw, { encoding: "utf8" });
+  } catch {
+    return false;
+  }
+
+  try {
+    const current = await readFile(filePath, "utf8");
+    if (current !== expectedRaw) {
+      try {
+        await unlink(stagingPath);
+      } catch {
+        /* ignore */
+      }
+      return false;
+    }
+  } catch {
+    try {
+      await unlink(stagingPath);
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+
   try {
     await rename(filePath, reclaimPath);
-  } catch (error) {
-    if (errno(error) === "ENOENT") return false;
+  } catch {
+    try {
+      await unlink(stagingPath);
+    } catch {
+      /* ignore */
+    }
     return false;
   }
 
@@ -127,6 +188,11 @@ export async function compareAndSwapFile(
     const movedRaw = await readFile(reclaimPath, "utf8");
     if (movedRaw !== expectedRaw) {
       await restoreMoved(reclaimPath, filePath);
+      try {
+        await unlink(stagingPath);
+      } catch {
+        /* ignore */
+      }
       return false;
     }
 
@@ -136,7 +202,11 @@ export async function compareAndSwapFile(
       await writeFile(filePath, newRaw, { encoding: "utf8", flag: "wx" });
     } catch (error) {
       if (errno(error) === "EEXIST") {
-        // Successor installed while we held the old bytes aside — keep successor.
+        try {
+          await unlink(stagingPath);
+        } catch {
+          /* ignore */
+        }
         try {
           await unlink(reclaimPath);
         } catch {
@@ -145,19 +215,137 @@ export async function compareAndSwapFile(
         return false;
       }
       await restoreMoved(reclaimPath, filePath);
+      try {
+        await unlink(stagingPath);
+      } catch {
+        /* ignore */
+      }
       return false;
     }
 
     try {
+      await unlink(stagingPath);
+    } catch {
+      /* ignore */
+    }
+    try {
       await unlink(reclaimPath);
     } catch {
-      /* orphan reclaim is harmless; new file is authoritative */
+      /* ignore */
     }
     return true;
   } catch {
     await restoreMoved(reclaimPath, filePath);
+    try {
+      await unlink(stagingPath);
+    } catch {
+      /* ignore */
+    }
     return false;
   }
+}
+
+export type CompareAndSwapRecovery =
+  | { kind: "none" }
+  | { kind: "installed"; raw: string }
+  | { kind: "restored"; raw: string }
+  | { kind: "canonical"; raw: string };
+
+/**
+ * Finish or roll back a crashed {@link compareAndSwapFile} attempt.
+ * Prefer installing durable staging when the canonical path is empty.
+ */
+export async function recoverCompareAndSwapArtifacts(
+  filePath: string,
+): Promise<CompareAndSwapRecovery> {
+  const stagingPath = stagingPathFor(filePath);
+  const reclaimPath = reclaimPathFor(filePath);
+
+  let canonical: string | undefined;
+  try {
+    canonical = await readFile(filePath, "utf8");
+  } catch {
+    canonical = undefined;
+  }
+
+  if (canonical !== undefined) {
+    // Canonical won; drop leftover artifacts from a prior attempt.
+    try {
+      await unlink(stagingPath);
+    } catch {
+      /* ignore */
+    }
+    try {
+      await unlink(reclaimPath);
+    } catch {
+      /* ignore */
+    }
+    return { kind: "canonical", raw: canonical };
+  }
+
+  let staging: string | undefined;
+  try {
+    staging = await readFile(stagingPath, "utf8");
+  } catch {
+    staging = undefined;
+  }
+
+  if (staging !== undefined) {
+    try {
+      await writeFile(filePath, staging, { encoding: "utf8", flag: "wx" });
+      try {
+        await unlink(stagingPath);
+      } catch {
+        /* ignore */
+      }
+      try {
+        await unlink(reclaimPath);
+      } catch {
+        /* ignore */
+      }
+      return { kind: "installed", raw: staging };
+    } catch (error) {
+      if (errno(error) === "EEXIST") {
+        try {
+          const raw = await readFile(filePath, "utf8");
+          try {
+            await unlink(stagingPath);
+          } catch {
+            /* ignore */
+          }
+          try {
+            await unlink(reclaimPath);
+          } catch {
+            /* ignore */
+          }
+          return { kind: "canonical", raw };
+        } catch {
+          return { kind: "none" };
+        }
+      }
+      // Fall through to reclaim restore.
+    }
+  }
+
+  let reclaim: string | undefined;
+  try {
+    reclaim = await readFile(reclaimPath, "utf8");
+  } catch {
+    reclaim = undefined;
+  }
+  if (reclaim !== undefined) {
+    const restored = await restoreMoved(reclaimPath, filePath);
+    if (restored) {
+      try {
+        await unlink(stagingPath);
+      } catch {
+        /* ignore */
+      }
+      return { kind: "restored", raw: reclaim };
+    }
+  }
+
+  return { kind: "none" };
 }
 
 /**
@@ -181,7 +369,6 @@ export async function reclaimDeadOwnerLock(
   try {
     meta = JSON.parse(raw) as { pid?: number; token?: string };
   } catch {
-    // Cannot confirm owner death from a malformed lock.
     return false;
   }
 

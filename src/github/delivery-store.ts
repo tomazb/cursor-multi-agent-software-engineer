@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import {
   compareAndSwapFile,
+  recoverCompareAndSwapArtifacts,
   unlinkIfBytesMatch,
   type BytesMatchHooks,
   type CompareAndSwapHooks,
@@ -120,6 +121,7 @@ export class GitHubDeliveryStore {
   private async readRaw(
     deliveryId: string,
   ): Promise<{ raw: string; record: DeliveryRecord } | undefined> {
+    await recoverCompareAndSwapArtifacts(this.filePath(deliveryId));
     try {
       const raw = await readFile(this.filePath(deliveryId), "utf8");
       return { raw, record: JSON.parse(raw) as DeliveryRecord };
