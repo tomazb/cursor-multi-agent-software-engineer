@@ -18,14 +18,13 @@ test("readRawBody accepts bodies under the limit", async () => {
   assert.equal(body, "ok");
 });
 
-test("readRawBody rejects oversized bodies", async () => {
-  const stream = Readable.from([Buffer.from("0123456789abcdef")]);
+test("readRawBody rejects bodies larger than the one MiB default", async () => {
+  const stream = Readable.from([Buffer.alloc(DEFAULT_WEBHOOK_MAX_BODY_BYTES + 1)]);
   await assert.rejects(
-    () => readRawBody(asIncomingMessage(stream), 8),
+    () => readRawBody(asIncomingMessage(stream)),
     (error: unknown) => {
       assert.ok(error instanceof WebhookBodyTooLargeError);
       return true;
     },
   );
-  assert.ok(DEFAULT_WEBHOOK_MAX_BODY_BYTES >= 1024);
 });

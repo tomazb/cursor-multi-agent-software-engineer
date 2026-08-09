@@ -34,6 +34,37 @@ export interface WebhookServerOptions {
   port?: number;
   path?: string;
   maxBodyBytes?: number;
+  onDiagnostic?: (error: unknown) => void;
+}
+
+const SAFE_DELIVERY_ID = /^[A-Za-z0-9._-]+$/;
+const safeDiagnostic = (_error: unknown): void => undefined;
+
+function singleHeader(req: IncomingMessage, name: string): string | undefined {
+  const distinctValues = req.headersDistinct?.[name];
+  if (distinctValues !== undefined) {
+    if (distinctValues.length !== 1) return undefined;
+    const [value] = distinctValues;
+    if (typeof value !== "string" || !value.trim()) return undefined;
+    return value;
+  }
+
+  const value = req.headers[name];
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  return value;
+}
+
+function invalidWebhookHeaders(res: ServerResponse): void {
+  res.writeHead(400, { "content-type": "application/json" });
+  res.end(JSON.stringify({ ok: false, message: "invalid webhook headers" }));
+}
+
+function emitDiagnostic(onDiagnostic: ((error: unknown) => void) | undefined, error: unknown): void {
+  try {
+    (onDiagnostic ?? safeDiagnostic)(error);
+  } catch {
+    // Diagnostics must not alter the unauthenticated HTTP response.
+  }
 }
 
 export function createWebhookServer(options: WebhookServerOptions): Server {
@@ -46,14 +77,18 @@ export function createWebhookServer(options: WebhookServerOptions): Server {
         res.end(JSON.stringify({ ok: false, message: "not found" }));
         return;
       }
+      const deliveryId = singleHeader(req, "x-github-delivery");
+      const eventName = singleHeader(req, "x-github-event");
+      const signatureHeader = singleHeader(req, "x-hub-signature-256");
+      if (!deliveryId || !eventName || !signatureHeader || !SAFE_DELIVERY_ID.test(deliveryId)) {
+        invalidWebhookHeaders(res);
+        return;
+      }
       const rawBody = await readRawBody(req, maxBodyBytes);
       const result = await options.adapter.handleWebhook({
-        deliveryId: String(req.headers["x-github-delivery"] ?? ""),
-        eventName: String(req.headers["x-github-event"] ?? ""),
-        signatureHeader:
-          typeof req.headers["x-hub-signature-256"] === "string"
-            ? req.headers["x-hub-signature-256"]
-            : undefined,
+        deliveryId,
+        eventName,
+        signatureHeader,
         rawBody,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
@@ -65,13 +100,9 @@ export function createWebhookServer(options: WebhookServerOptions): Server {
         res.end(JSON.stringify({ ok: false, message: error.message }));
         return;
       }
+      emitDiagnostic(options.onDiagnostic, error);
       res.writeHead(500, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          ok: false,
-          message: error instanceof Error ? error.message : String(error),
-        }),
-      );
+      res.end(JSON.stringify({ ok: false, message: "internal server error" }));
     }
   });
 }
