@@ -802,6 +802,7 @@ export async function withGitHubJournal<T>(
         try {
           await recoverCurrentLock(target, "data", {
             force: false,
+            ownerDeathProof: "esrch-only",
             ...(options.linkFile ? { linkFile: options.linkFile } : {}),
             ...(options.transition ? { transition: options.transition } : {}),
           });

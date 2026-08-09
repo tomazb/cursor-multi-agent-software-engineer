@@ -1733,6 +1733,15 @@ async function claimIsLive(claim: ClaimRecordV3): Promise<boolean> {
   return current === claim.process.platformIdentity;
 }
 
+function pidIsLiveUnlessEsrch(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return errno(error) !== "ESRCH";
+  }
+}
+
 async function cleanupExactTemporary(temporaryPath: string): Promise<void> {
   let stat;
   try {
@@ -2356,6 +2365,7 @@ export async function recoverCurrentLock(
     force: boolean;
     transition?: PublishClaimOptions["transition"];
     linkFile?: LinkFile;
+    ownerDeathProof?: "process-identity" | "esrch-only";
   },
 ): Promise<void> {
   const scan = await scanLockJournal(runDirectory, kind, {
@@ -2369,7 +2379,12 @@ export async function recoverCurrentLock(
           `Legacy ${kind} ticket zero is corrupt; force requires operator quiescence`,
         );
       }
-    } else if (scan.legacy.state === "valid-live") {
+    } else if (
+      scan.legacy.state === "valid-live" ||
+      (options.ownerDeathProof === "esrch-only" &&
+        scan.legacy.pid !== undefined &&
+        pidIsLiveUnlessEsrch(scan.legacy.pid))
+    ) {
       if (kind === "admin-recovery") {
         throw new LockJournalError(
           "ADMIN_RECOVERY_CONCURRENT",
@@ -2426,7 +2441,10 @@ export async function recoverCurrentLock(
       throw corrupt(`Contiguous ${kind} ticket ${ticketText} has no stable interpretation`);
     }
     if (scan.releases.has(ticketText)) continue;
-    const live = await claimIsLive(claim);
+    const live =
+      options.ownerDeathProof === "esrch-only"
+        ? pidIsLiveUnlessEsrch(claim.pid)
+        : await claimIsLive(claim);
     if (live) {
       if (kind === "admin-recovery") {
         throw new LockJournalError(

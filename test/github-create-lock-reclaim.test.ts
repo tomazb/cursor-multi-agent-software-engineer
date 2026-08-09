@@ -7,6 +7,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  canonicalClaim,
+  initializeLockJournal,
   journalPaths,
   publishLockClaim,
   scanLockJournal,
@@ -132,3 +134,97 @@ test("a conservative EPERM process probe keeps the lower owner blocking", async 
     process.kill = originalKill;
   }
 });
+
+test("an indeterminate EIO process probe cannot release a GitHub lower owner", async () => {
+  const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-eio-"));
+  const logicalKey = "eio-lower-owner";
+  const journalDirectory = checkJournalDirectory(githubRoot, logicalKey);
+  await mkdir(journalDirectory, { recursive: true });
+  const lower = await publishLockClaim(
+    journalDirectory,
+    "data",
+    "github-check-create",
+  );
+
+  const originalKill = process.kill;
+  (process as { kill: typeof process.kill }).kill = (() => {
+    const error = new Error("indeterminate process probe") as NodeJS.ErrnoException;
+    error.code = "EIO";
+    throw error;
+  }) as typeof process.kill;
+  let entered = false;
+  try {
+    await assert.rejects(
+      withGitHubJournal(
+        githubRoot,
+        "check-create",
+        logicalKey,
+        async () => {
+          entered = true;
+        },
+        { timeoutMs: 50, pollIntervalMs: 5 },
+      ),
+      /Timed out acquiring GitHub check-create journal/,
+    );
+  } finally {
+    process.kill = originalKill;
+  }
+
+  const scan = await scanLockJournal(journalDirectory, "data");
+  assert.equal(entered, false);
+  assert.equal(scan.releases.has(lower.claim.ticket), false);
+  assert.equal(scan.claims.length, 2);
+  assert.equal(scan.releases.has(scan.claims[1]!.ticket), true);
+});
+
+test(
+  "a process identity mismatch cannot release a GitHub lower owner without ESRCH",
+  { skip: process.platform !== "linux" },
+  async () => {
+    const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-pid-id-"));
+    const logicalKey = "identity-mismatch-lower-owner";
+    const journalDirectory = checkJournalDirectory(githubRoot, logicalKey);
+    await mkdir(journalDirectory, { recursive: true });
+    await initializeLockJournal(journalDirectory);
+    const lower = canonicalClaim({
+      kind: "data",
+      ticket: 1n,
+      owner: "550e8400-e29b-41d4-a716-446655440000",
+      pid: process.pid,
+      process: {
+        startedAt: "2026-08-09T10:00:00.000Z",
+        platformIdentity: "linux:550e8400-e29b-41d4-a716-446655440000:0",
+      },
+      at: "2026-08-09T10:00:00.000Z",
+      operation: "github-check-create",
+    });
+    await writeFile(
+      path.join(
+        journalPaths(journalDirectory, "data").claims,
+        "00000000000000000001.json",
+      ),
+      lower.bytes,
+      "utf8",
+    );
+
+    let entered = false;
+    await assert.rejects(
+      withGitHubJournal(
+        githubRoot,
+        "check-create",
+        logicalKey,
+        async () => {
+          entered = true;
+        },
+        { timeoutMs: 50, pollIntervalMs: 5 },
+      ),
+      /Timed out acquiring GitHub check-create journal/,
+    );
+
+    const scan = await scanLockJournal(journalDirectory, "data");
+    assert.equal(entered, false);
+    assert.equal(scan.releases.has(lower.record.ticket), false);
+    assert.equal(scan.claims.length, 2);
+    assert.equal(scan.releases.has(scan.claims[1]!.ticket), true);
+  },
+);
