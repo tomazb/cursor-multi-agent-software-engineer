@@ -7,6 +7,9 @@ test("createInstallationAccessToken scopes checks write to one repository", asyn
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
   let seenBody: unknown;
+  let seenMethod: string | undefined;
+  let seenUrl: string | undefined;
+  let seenHeaders: Record<string, string> | undefined;
   const token = await createInstallationAccessToken({
     appId: "123",
     privateKeyPem: pem,
@@ -14,13 +17,19 @@ test("createInstallationAccessToken scopes checks write to one repository", asyn
     repository: "repo",
     readOnlyChecks: true,
     http: {
-      async request(_method, _url, options) {
+      async request(method, url, options) {
+        seenMethod = method;
+        seenUrl = url;
+        seenHeaders = options?.headers;
         seenBody = options?.body;
         return { status: 201, headers: {}, body: { token: "ghs_test" } };
       },
     },
   });
   assert.equal(token, "ghs_test");
+  assert.equal(seenMethod, "POST");
+  assert.equal(seenUrl, "https://api.github.com/app/installations/9/access_tokens");
+  assert.equal(seenHeaders?.["content-type"], "application/json");
   assert.deepEqual(seenBody, {
     repositories: ["repo"],
     permissions: { checks: "write", metadata: "read" },

@@ -1,12 +1,7 @@
 import { createSign, createPrivateKey } from "node:crypto";
+import type { GitHubHttpClient } from "./http.ts";
 
-export interface GitHubTokenHttp {
-  request(
-    method: string,
-    url: string,
-    options?: { headers?: Record<string, string>; body?: unknown },
-  ): Promise<{ status: number; headers: Record<string, string>; body: unknown }>;
-}
+export type GitHubTokenHttp = GitHubHttpClient;
 
 function base64Url(input: Buffer | string): string {
   const buf = typeof input === "string" ? Buffer.from(input, "utf8") : input;
@@ -58,6 +53,7 @@ export async function createInstallationAccessToken(options: {
         authorization: `Bearer ${jwt}`,
         accept: "application/vnd.github+json",
         "user-agent": "maswe-github-app",
+        "content-type": "application/json",
       },
       body,
     },

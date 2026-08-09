@@ -1,0 +1,223 @@
+import assert from "node:assert/strict";
+import { createHmac, generateKeyPairSync } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { runCli } from "../src/cli-runner.ts";
+import { mergeConfigForTest } from "../src/config.ts";
+import type { GitHubAppAdapter } from "../src/github/adapter.ts";
+import { CANONICAL_NODE_VERSION } from "../src/node-version.ts";
+import { FileRunStore } from "../src/store.ts";
+
+const WEBHOOK_SECRET_ENV = "MASWE_TEST_CLI_HTTP_WEBHOOK_SECRET";
+const APP_ID_ENV = "MASWE_TEST_CLI_HTTP_APP_ID";
+const PRIVATE_KEY_ENV = "MASWE_TEST_CLI_HTTP_PRIVATE_KEY";
+const WEBHOOK_SECRET = "cli-http-secret";
+
+const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+const PRIVATE_KEY = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+
+function testConfig() {
+  return mergeConfigForTest({
+    runtime: { kind: "mock" },
+    quality: { commands: [] },
+    githubApp: {
+      enabled: true,
+      readOnlyChecks: true,
+      webhookSecretEnv: WEBHOOK_SECRET_ENV,
+      appIdEnv: APP_ID_ENV,
+      privateKeyEnv: PRIVATE_KEY_ENV,
+      allowedRepositories: ["owner/repo"],
+    },
+  });
+}
+
+async function setupProject() {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-cli-http-"));
+  const config = testConfig();
+  await mkdir(path.join(cwd, ".maswe"), { recursive: true });
+  await writeFile(
+    path.join(cwd, ".maswe", "config.json"),
+    `${JSON.stringify(config, null, 2)}\n`,
+    "utf8",
+  );
+  return { cwd, config, store: new FileRunStore(cwd) };
+}
+
+function sign(body: string): string {
+  return `sha256=${createHmac("sha256", WEBHOOK_SECRET).update(body, "utf8").digest("hex")}`;
+}
+
+function pullRequestBody(headSha: string): string {
+  return JSON.stringify({
+    action: "synchronize",
+    installation: { id: 44 },
+    repository: { full_name: "owner/repo" },
+    pull_request: {
+      number: 9,
+      head: { sha: headSha, ref: "feature" },
+      base: { sha: "base-sha" },
+    },
+  });
+}
+
+function recordingFetch(liveHead = "sha-new") {
+  const calls: Array<{ method: string; url: string; signal: AbortSignal }> = [];
+  let nextCheckId = 100;
+  const fetchFn: typeof fetch = async (input, init) => {
+    if (!(init?.signal instanceof AbortSignal)) {
+      throw new Error("GitHub CLI fetch was called without an AbortSignal");
+    }
+    const method = init.method ?? "GET";
+    const url = String(input);
+    calls.push({ method, url, signal: init.signal });
+    if (url.includes("/access_tokens")) {
+      return new Response(JSON.stringify({ token: "ghs_cli_test" }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (method === "GET" && url.includes("/pulls/9")) {
+      return new Response(JSON.stringify({ head: { sha: liveHead } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (method === "GET" && url.includes("/check-runs")) {
+      return new Response(JSON.stringify({ check_runs: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (method === "POST" && url.includes("/check-runs")) {
+      return new Response(JSON.stringify({ id: nextCheckId++ }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (method === "PATCH" && url.includes("/check-runs/")) {
+      return new Response(JSON.stringify({ id: nextCheckId++ }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    throw new Error(`Unexpected GitHub request: ${method} ${url}`);
+  };
+  return { calls, fetchFn };
+}
+
+function installGitHubEnvironment(): () => void {
+  const previous = {
+    webhookSecret: process.env[WEBHOOK_SECRET_ENV],
+    appId: process.env[APP_ID_ENV],
+    privateKey: process.env[PRIVATE_KEY_ENV],
+  };
+  process.env[WEBHOOK_SECRET_ENV] = WEBHOOK_SECRET;
+  process.env[APP_ID_ENV] = "123";
+  process.env[PRIVATE_KEY_ENV] = PRIVATE_KEY;
+  return () => {
+    if (previous.webhookSecret === undefined) delete process.env[WEBHOOK_SECRET_ENV];
+    else process.env[WEBHOOK_SECRET_ENV] = previous.webhookSecret;
+    if (previous.appId === undefined) delete process.env[APP_ID_ENV];
+    else process.env[APP_ID_ENV] = previous.appId;
+    if (previous.privateKey === undefined) delete process.env[PRIVATE_KEY_ENV];
+    else process.env[PRIVATE_KEY_ENV] = previous.privateKey;
+  };
+}
+
+test("github-webhook shares one bounded client across token, live-head, and check requests", async () => {
+  const { cwd, config, store } = await setupProject();
+  const restoreEnvironment = installGitHubEnvironment();
+  const { calls, fetchFn } = recordingFetch();
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  globalThis.fetch = fetchFn;
+  console.log = () => undefined;
+  try {
+    const run = await store.create("associated", "request", config);
+    run.workspace = {
+      baseSha: "base-sha",
+      headSha: "sha-old",
+      branch: "feature",
+      fingerprint: "fingerprint",
+      remote: "https://github.com/owner/repo.git",
+    };
+    await store.save(run);
+
+    const webhookListener = async (options: { adapter: GitHubAppAdapter }) => {
+      for (const [deliveryId, headSha] of [
+        ["cli-http-old", "sha-old"],
+        ["cli-http-new", "sha-new"],
+      ] as const) {
+        const rawBody = pullRequestBody(headSha);
+        const result = await options.adapter.handleWebhook({
+          deliveryId,
+          eventName: "pull_request",
+          signatureHeader: sign(rawBody),
+          rawBody,
+        });
+        assert.equal(result.status, 200);
+      }
+      return { url: "http://127.0.0.1:0/github/webhook" };
+    };
+
+    await runCli({
+      argv: ["github-webhook", "--cwd", cwd],
+      observedNodeVersion: CANONICAL_NODE_VERSION,
+      githubHttpOptions: { timeoutMs: 25, fetchFn },
+      webhookListener,
+    });
+
+    assert.ok(calls.some((call) => call.url.includes("/access_tokens")));
+    assert.ok(calls.some((call) => call.method === "GET" && call.url.includes("/pulls/9")));
+    assert.ok(calls.some((call) => call.method === "GET" && call.url.includes("/check-runs")));
+    assert.ok(calls.some((call) => call.method === "POST" && call.url.includes("/check-runs")));
+    assert.ok(calls.some((call) => call.method === "PATCH" && call.url.includes("/check-runs/")));
+    assert.ok(calls.every((call) => call.signal instanceof AbortSignal));
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+    restoreEnvironment();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("github-publish-checks uses the command's shared bounded client", async () => {
+  const { cwd, config, store } = await setupProject();
+  const restoreEnvironment = installGitHubEnvironment();
+  const { calls, fetchFn } = recordingFetch();
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  globalThis.fetch = fetchFn;
+  console.log = () => undefined;
+  try {
+    const run = await store.create("manual", "request", config);
+    run.github = {
+      installationId: 44,
+      repository: "owner/repo",
+      pullRequestNumber: 9,
+      baseSha: "base-sha",
+      headSha: "manual-sha",
+      branch: "feature",
+      suspended: false,
+    };
+    await store.save(run);
+
+    await runCli({
+      argv: ["github-publish-checks", run.id, "--cwd", cwd],
+      observedNodeVersion: CANONICAL_NODE_VERSION,
+      githubHttpOptions: { timeoutMs: 25, fetchFn },
+    });
+
+    assert.ok(calls.some((call) => call.url.includes("/access_tokens")));
+    assert.ok(calls.some((call) => call.method === "GET" && call.url.includes("/check-runs")));
+    assert.ok(calls.some((call) => call.method === "POST" && call.url.includes("/check-runs")));
+    assert.ok(calls.every((call) => call.signal instanceof AbortSignal));
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+    restoreEnvironment();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});

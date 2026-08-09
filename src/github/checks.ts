@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import type { RunRecord } from "../domain.ts";
+import type { GitHubHttpClient } from "./http.ts";
 import type { GitHubSideEffectStore } from "./side-effect-store.ts";
 import { MASWE_CHECK_NAMES, type MasweCheckName } from "./types.ts";
+
+export type { GitHubHttpClient } from "./http.ts";
 
 export type CheckConclusion =
   | "success"
@@ -28,14 +31,6 @@ export function assertReadOnlyChecksMode(
   throw new Error(
     `GitHub App is in read-only check mode; refusing side effect kind '${kind}'`,
   );
-}
-
-export interface GitHubHttpClient {
-  request(
-    method: string,
-    url: string,
-    options?: { headers?: Record<string, string>; body?: unknown },
-  ): Promise<{ status: number; headers: Record<string, string>; body: unknown }>;
 }
 
 function hasApprovedSpecArtifacts(run: RunRecord): boolean {

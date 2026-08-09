@@ -3,9 +3,16 @@ import path from "node:path";
 import { loadConfig, writeStarterConfig } from "./config.ts";
 import type { AgentRuntime, MasweConfig, RunRecord } from "./domain.ts";
 import { GitHubAppAdapter } from "./github/adapter.ts";
-import { createFetchGitHubHttpClient } from "./github/http.ts";
+import {
+  createFetchGitHubHttpClient,
+  type FetchGitHubHttpClientOptions,
+  type GitHubHttpClient,
+} from "./github/http.ts";
 import { createInstallationAccessToken } from "./github/token.ts";
-import { listenWebhookServer } from "./github/webhook-server.ts";
+import {
+  listenWebhookServer,
+  type WebhookServerOptions,
+} from "./github/webhook-server.ts";
 import { assertSupportedNodeVersion } from "./node-version.ts";
 import { Orchestrator } from "./orchestrator.ts";
 import { createRuntime } from "./runtime.ts";
@@ -87,6 +94,39 @@ const PROJECT_CONFIG_COMMANDS = new Set(["doctor", "start", "github-webhook", "g
 export interface RunCliOptions {
   argv?: string[];
   observedNodeVersion?: string;
+  githubHttpOptions?: FetchGitHubHttpClientOptions;
+  webhookListener?: (options: WebhookServerOptions) => Promise<{ url: string }>;
+}
+
+function githubAdapterForCommand(
+  cwd: string,
+  config: MasweConfig,
+  store: FileRunStore,
+  http: GitHubHttpClient,
+): GitHubAppAdapter {
+  return new GitHubAppAdapter({
+    cwd,
+    config,
+    store,
+    http,
+    tokenProvider: async (installationId, repository) => {
+      const githubApp = config.githubApp!;
+      const appId = process.env[githubApp.appIdEnv];
+      const privateKey = process.env[githubApp.privateKeyEnv];
+      if (!appId || !privateKey) {
+        throw new Error("GitHub App id or private key environment variables are missing");
+      }
+      const repoName = repository.split("/")[1];
+      return createInstallationAccessToken({
+        appId,
+        privateKeyPem: privateKey,
+        installationId,
+        http,
+        ...(repoName ? { repository: repoName } : {}),
+        readOnlyChecks: githubApp.readOnlyChecks,
+      });
+    },
+  });
 }
 
 export async function runCli(options: RunCliOptions = {}): Promise<void> {
@@ -250,30 +290,9 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
       if (!config.githubApp?.enabled) {
         throw new Error("githubApp.enabled must be true to start the webhook server");
       }
-      const http = createFetchGitHubHttpClient();
-      const adapter = new GitHubAppAdapter({
-        cwd,
-        config,
-        store,
-        http,
-        tokenProvider: async (installationId, repository) => {
-          const appId = process.env[config.githubApp!.appIdEnv];
-          const privateKey = process.env[config.githubApp!.privateKeyEnv];
-          if (!appId || !privateKey) {
-            throw new Error("GitHub App id or private key environment variables are missing");
-          }
-          const repoName = repository.split("/")[1];
-          return createInstallationAccessToken({
-            appId,
-            privateKeyPem: privateKey,
-            installationId,
-            http,
-            ...(repoName ? { repository: repoName } : {}),
-            readOnlyChecks: config.githubApp!.readOnlyChecks,
-          });
-        },
-      });
-      const { url } = await listenWebhookServer({
+      const http = createFetchGitHubHttpClient(options.githubHttpOptions);
+      const adapter = githubAdapterForCommand(cwd, config, store, http);
+      const { url } = await (options.webhookListener ?? listenWebhookServer)({
         adapter,
         host: config.githubApp.webhookHost ?? "127.0.0.1",
         port: config.githubApp.webhookPort ?? 8787,
@@ -288,29 +307,8 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
       if (!config.githubApp?.enabled) {
         throw new Error("githubApp.enabled must be true to publish checks");
       }
-      const http = createFetchGitHubHttpClient();
-      const adapter = new GitHubAppAdapter({
-        cwd,
-        config,
-        store,
-        http,
-        tokenProvider: async (installationId, repository) => {
-          const appId = process.env[config.githubApp!.appIdEnv];
-          const privateKey = process.env[config.githubApp!.privateKeyEnv];
-          if (!appId || !privateKey) {
-            throw new Error("GitHub App id or private key environment variables are missing");
-          }
-          const repoName = repository.split("/")[1];
-          return createInstallationAccessToken({
-            appId,
-            privateKeyPem: privateKey,
-            installationId,
-            http,
-            ...(repoName ? { repository: repoName } : {}),
-            readOnlyChecks: config.githubApp!.readOnlyChecks,
-          });
-        },
-      });
+      const http = createFetchGitHubHttpClient(options.githubHttpOptions);
+      const adapter = githubAdapterForCommand(cwd, config, store, http);
       const run = await adapter.publishChecksForRun(runId);
       console.log(has(args, "--json") ? JSON.stringify(run, null, 2) : renderRun(run));
       return;
