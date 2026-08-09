@@ -17,7 +17,7 @@ export async function readRawBody(
 ): Promise<string> {
   const chunks: Buffer[] = [];
   let total = 0;
-  for await (const chunk of req) {
+  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     total += buf.length;
     if (total > maxBytes) {

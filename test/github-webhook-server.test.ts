@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 import test from "node:test";
@@ -17,6 +18,13 @@ interface HttpResponse {
 interface RecordingAdapter {
   adapter: GitHubAppAdapter;
   calls: WebhookRequest[];
+}
+
+interface DispatchOptions {
+  headersDistinct?: Record<string, string[]> | undefined;
+  body?: string | Readable;
+  method?: string;
+  url?: string;
 }
 
 function recordingAdapter(result: WebhookHandleResult = { status: 200, body: { ok: true } }): RecordingAdapter {
@@ -43,13 +51,16 @@ function defaultDistinctHeaders(headers: IncomingHttpHeaders): Record<string, st
 function dispatchWebhook(
   options: WebhookServerOptions,
   headers: IncomingHttpHeaders,
-  headersDistinct = defaultDistinctHeaders(headers),
-  body = "{}",
+  requestOptions: DispatchOptions = {},
 ): Promise<HttpResponse> {
   const server = createWebhookServer(options);
-  const request = Object.assign(Readable.from([Buffer.from(body)]), {
-    method: "POST",
-    url: "/github/webhook",
+  const headersDistinct = Object.hasOwn(requestOptions, "headersDistinct")
+    ? requestOptions.headersDistinct
+    : defaultDistinctHeaders(headers);
+  const body = requestOptions.body ?? "{}";
+  const request = Object.assign(typeof body === "string" ? Readable.from([Buffer.from(body)]) : body, {
+    method: requestOptions.method ?? "POST",
+    url: requestOptions.url ?? "/github/webhook",
     headers,
     headersDistinct,
   }) as IncomingMessage;
@@ -120,8 +131,7 @@ test("webhook rejects repeated delivery and event headers before adapter dispatc
     const fake = recordingAdapter();
     const headers = { ...validHeaders, [header]: "first, second" };
     const response = await dispatchWebhook({ adapter: fake.adapter }, headers, {
-      ...defaultDistinctHeaders(headers),
-      [header]: ["first", "second"],
+      headersDistinct: { ...defaultDistinctHeaders(headers), [header]: ["first", "second"] },
     });
 
     assert.equal(response.status, 400, header);
@@ -134,8 +144,7 @@ test("webhook rejects a repeated signature header before adapter dispatch", asyn
   const fake = recordingAdapter();
   const headers = { ...validHeaders, "x-hub-signature-256": "first, second" };
   const response = await dispatchWebhook({ adapter: fake.adapter }, headers, {
-    ...defaultDistinctHeaders(headers),
-    "x-hub-signature-256": ["first", "second"],
+    headersDistinct: { ...defaultDistinctHeaders(headers), "x-hub-signature-256": ["first", "second"] },
   });
 
   assert.equal(response.status, 400);
@@ -184,11 +193,108 @@ test("webhook preserves adapter-generated unauthorized responses", async () => {
   assert.equal(fake.calls.length, 1);
 });
 
-test("webhook retains the body-limit response without adapter dispatch", async () => {
+test("webhook retains the default one MiB body limit across streamed chunks", async () => {
   const fake = recordingAdapter();
-  const response = await dispatchWebhook({ adapter: fake.adapter, maxBodyBytes: 8 }, validHeaders, undefined, "123456789");
+  const chunks = [
+    Buffer.alloc(524_288),
+    Buffer.alloc(524_289),
+    Buffer.from("transport-drain-after-limit"),
+  ];
+  const body = new Readable({
+    read() {
+      this.push(chunks.shift() ?? null);
+    },
+  });
+  const drained = once(body, "end");
+  const response = await dispatchWebhook({ adapter: fake.adapter }, validHeaders, { body });
+  await drained;
 
   assert.equal(response.status, 413);
-  assert.equal(response.body, JSON.stringify({ ok: false, message: "Webhook body exceeds limit of 8 bytes" }));
+  assert.equal(response.body, JSON.stringify({ ok: false, message: "Webhook body exceeds limit of 1048576 bytes" }));
+  assert.deepEqual(fake.calls, []);
+  assert.equal(chunks.length, 0);
+  assert.equal(body.readableLength, 0);
+});
+
+test("webhook rejects array-valued fallback headers before adapter dispatch", async () => {
+  for (const header of ["x-github-delivery", "x-github-event", "x-hub-signature-256"] as const) {
+    const fake = recordingAdapter();
+    const response = await dispatchWebhook(
+      { adapter: fake.adapter },
+      { ...validHeaders, [header]: ["first", "second"] },
+      { headersDistinct: undefined },
+    );
+
+    assert.equal(response.status, 400, header);
+    assert.equal(response.body, JSON.stringify({ ok: false, message: "invalid webhook headers" }), header);
+    assert.deepEqual(fake.calls, [], header);
+  }
+});
+
+test("webhook rejects a missing signature header before adapter dispatch", async () => {
+  const fake = recordingAdapter();
+  const response = await dispatchWebhook(
+    { adapter: fake.adapter },
+    { "x-github-delivery": "delivery-1", "x-github-event": "push" },
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(response.body, JSON.stringify({ ok: false, message: "invalid webhook headers" }));
+  assert.deepEqual(fake.calls, []);
+});
+
+test("webhook does not read invalid-header bodies before returning 400", async () => {
+  let reads = 0;
+  const body = new Readable({
+    read() {
+      reads += 1;
+      this.push(Buffer.from("ignored"));
+      this.push(null);
+    },
+  });
+  const fake = recordingAdapter();
+  const response = await dispatchWebhook(
+    { adapter: fake.adapter },
+    { "x-github-event": "push", "x-hub-signature-256": validHeaders["x-hub-signature-256"] },
+    { body },
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(reads, 0);
+  assert.deepEqual(fake.calls, []);
+});
+
+test("webhook keeps internal failures generic when diagnostics throw", async () => {
+  const privateDetail = "MASWE_DIAGNOSTIC_THROW_SECRET";
+  const fake = recordingAdapter();
+  fake.adapter.handleWebhook = async () => {
+    throw new Error(`internal ${privateDetail}`);
+  };
+
+  const response = await dispatchWebhook(
+    { adapter: fake.adapter, onDiagnostic: () => { throw new Error("diagnostic failed"); } },
+    validHeaders,
+  );
+
+  assert.equal(response.status, 500);
+  assert.equal(response.body, JSON.stringify({ ok: false, message: "internal server error" }));
+  assert.doesNotMatch(response.body, /MASWE_DIAGNOSTIC_THROW_SECRET|diagnostic failed/);
+});
+
+test("webhook passes adapter-produced bad-request responses through", async () => {
+  const fake = recordingAdapter({ status: 400, body: { ok: false, message: "invalid payload" } });
+  const response = await dispatchWebhook({ adapter: fake.adapter }, validHeaders);
+
+  assert.equal(response.status, 400);
+  assert.equal(response.body, JSON.stringify({ ok: false, message: "invalid payload" }));
+  assert.equal(fake.calls.length, 1);
+});
+
+test("webhook returns 404 outside its route", async () => {
+  const fake = recordingAdapter();
+  const response = await dispatchWebhook({ adapter: fake.adapter }, validHeaders, { url: "/other" });
+
+  assert.equal(response.status, 404);
+  assert.equal(response.body, JSON.stringify({ ok: false, message: "not found" }));
   assert.deepEqual(fake.calls, []);
 });
