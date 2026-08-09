@@ -421,6 +421,172 @@ test("CheckPublisher rejects unsafe or looping reconciliation links", async (t) 
   }
 });
 
+test("CheckPublisher rejects duplicate, unknown, and noncanonical pagination query parameters", async (t) => {
+  const cases: Array<{
+    name: string;
+    mutate: (next: URL) => void;
+  }> = [
+    {
+      name: "duplicate check_name",
+      mutate: (next) => next.searchParams.append("check_name", "MASWE / deterministic quality"),
+    },
+    {
+      name: "conflicting duplicate filter",
+      mutate: (next) => next.searchParams.append("filter", "latest"),
+    },
+    {
+      name: "duplicate per_page",
+      mutate: (next) => next.searchParams.append("per_page", "100"),
+    },
+    {
+      name: "unknown query key",
+      mutate: (next) => next.searchParams.set("cursor", "opaque"),
+    },
+    {
+      name: "duplicate page",
+      mutate: (next) => {
+        next.searchParams.set("page", "1");
+        next.searchParams.append("page", "2");
+      },
+    },
+    {
+      name: "zero page",
+      mutate: (next) => next.searchParams.set("page", "0"),
+    },
+    {
+      name: "leading-zero page",
+      mutate: (next) => next.searchParams.set("page", "01"),
+    },
+    {
+      name: "signed page",
+      mutate: (next) => next.searchParams.set("page", "+1"),
+    },
+    {
+      name: "fractional page",
+      mutate: (next) => next.searchParams.set("page", "1.0"),
+    },
+  ];
+
+  for (const fixture of cases) {
+    await t.test(fixture.name, async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-query-page-"));
+      let gets = 0;
+      const http: GitHubHttpClient = {
+        async request(method, url) {
+          if (method === "GET") {
+            gets += 1;
+            if (gets !== 1) {
+              throw new Error("HTTP double received an unsafe pagination URL");
+            }
+            const next = new URL(url);
+            fixture.mutate(next);
+            return {
+              status: 200,
+              headers: { link: `<${next.toString()}>; rel="next"` },
+              body: { check_runs: [] },
+            };
+          }
+          if (method === "POST") return { status: 201, headers: {}, body: { id: 1 } };
+          return { status: 200, headers: {}, body: {} };
+        },
+      };
+      const publisher = new CheckPublisher({
+        http,
+        sideEffects: new GitHubSideEffectStore(root),
+        readOnlyChecks: true,
+        owner: "owner",
+        repo: "repo",
+        pullRequestNumber: 1,
+        token: "token",
+      });
+      const run = {
+        schemaVersion: 1,
+        version: 1,
+        id: "run-1",
+        title: "t",
+        request: "r",
+        repositoryPath: "/tmp",
+        state: "PR_REVIEW",
+        createdAt: "",
+        updatedAt: "",
+        approvals: { brainstorm: false, design: false },
+        counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
+        config: DEFAULT_CONFIG,
+        artifacts: [],
+        events: [],
+      } as RunRecord;
+
+      await assert.rejects(
+        () => publisher.publishForHeadSha(run, "sha"),
+        /pagination Link URL is unsafe/i,
+      );
+      assert.equal(gets, 1);
+    });
+  }
+});
+
+test("CheckPublisher rejects duplicate rel attributes or relation tokens", async (t) => {
+  const cases = [
+    'rel="next"; rel="prev"',
+    'rel="next"; rel="next"',
+    'rel="next next"',
+  ];
+
+  for (const relParameters of cases) {
+    await t.test(relParameters, async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-duplicate-rel-"));
+      let posts = 0;
+      const http: GitHubHttpClient = {
+        async request(method, url) {
+          if (method === "GET") {
+            return {
+              status: 200,
+              headers: { link: `<${url}>; ${relParameters}` },
+              body: { check_runs: [] },
+            };
+          }
+          if (method === "POST") {
+            posts += 1;
+            return { status: 201, headers: {}, body: { id: posts } };
+          }
+          return { status: 200, headers: {}, body: {} };
+        },
+      };
+      const publisher = new CheckPublisher({
+        http,
+        sideEffects: new GitHubSideEffectStore(root),
+        readOnlyChecks: true,
+        owner: "owner",
+        repo: "repo",
+        pullRequestNumber: 1,
+        token: "token",
+      });
+      const run = {
+        schemaVersion: 1,
+        version: 1,
+        id: "run-1",
+        title: "t",
+        request: "r",
+        repositoryPath: "/tmp",
+        state: "PR_REVIEW",
+        createdAt: "",
+        updatedAt: "",
+        approvals: { brainstorm: false, design: false },
+        counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
+        config: DEFAULT_CONFIG,
+        artifacts: [],
+        events: [],
+      } as RunRecord;
+
+      await assert.rejects(
+        () => publisher.publishForHeadSha(run, "sha"),
+        /pagination Link header is malformed/i,
+      );
+      assert.equal(posts, 0);
+    });
+  }
+});
+
 test("CheckPublisher stops reconciliation at a finite page ceiling", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-page-limit-"));
   let gets = 0;

@@ -147,11 +147,20 @@ function nextLinkFrom(headers: Record<string, string>): string | undefined {
     }
 
     let relations: string[] = [];
+    let hasRelationParameter = false;
     for (const parameter of parameters) {
       const parsed = /^\s*([^=\s]+)\s*=\s*(?:"([^"]*)"|([^"\s;]+))\s*$/.exec(parameter);
       if (!parsed) throw new Error("GitHub check-run pagination Link header is malformed");
       if (parsed[1]!.toLowerCase() === "rel") {
+        if (hasRelationParameter) {
+          throw new Error("GitHub check-run pagination Link header is malformed");
+        }
+        hasRelationParameter = true;
         relations = (parsed[2] ?? parsed[3] ?? "").split(/\s+/).filter(Boolean);
+        const normalizedRelations = relations.map((relation) => relation.toLowerCase());
+        if (new Set(normalizedRelations).size !== normalizedRelations.length) {
+          throw new Error("GitHub check-run pagination Link header is malformed");
+        }
       }
     }
     if (!relations.some((relation) => relation.toLowerCase() === "next")) continue;
@@ -174,6 +183,18 @@ function safePaginationUrl(
   } catch {
     throw new Error("GitHub check-run pagination Link URL is malformed");
   }
+  const allowedQueryKeys = new Set(["check_name", "filter", "per_page", "page"]);
+  const hasOnlyAllowedQueryKeys = Array.from(parsed.searchParams.keys()).every((key) =>
+    allowedQueryKeys.has(key),
+  );
+  const hasExactSingleValue = (key: string, expected: string): boolean => {
+    const values = parsed.searchParams.getAll(key);
+    return values.length === 1 && values[0] === expected;
+  };
+  const pageValues = parsed.searchParams.getAll("page");
+  const hasValidPage =
+    pageValues.length === 0 ||
+    (pageValues.length === 1 && /^[1-9]\d*$/.test(pageValues[0]!));
   if (
     parsed.protocol !== "https:" ||
     parsed.origin !== "https://api.github.com" ||
@@ -181,9 +202,11 @@ function safePaginationUrl(
     parsed.password !== "" ||
     parsed.pathname !== endpointPath ||
     parsed.hash !== "" ||
-    parsed.searchParams.get("check_name") !== checkName ||
-    parsed.searchParams.get("filter") !== "all" ||
-    parsed.searchParams.get("per_page") !== "100"
+    !hasOnlyAllowedQueryKeys ||
+    !hasExactSingleValue("check_name", checkName) ||
+    !hasExactSingleValue("filter", "all") ||
+    !hasExactSingleValue("per_page", "100") ||
+    !hasValidPage
   ) {
     throw new Error("GitHub check-run pagination Link URL is unsafe");
   }
