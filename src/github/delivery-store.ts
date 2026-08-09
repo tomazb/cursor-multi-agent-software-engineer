@@ -81,6 +81,7 @@ interface FailureSuppressionEvidence {
 interface FailureSuppressionBody {
   format: 1;
   record: "github-delivery-failure-suppression";
+  publicationId: string;
   deliveryId: string;
   failedLeaseId: string;
   failedClaimedAt: string;
@@ -124,6 +125,15 @@ function exactKeys(value: Record<string, unknown>, expected: string[]): boolean 
 
 function validDigest(value: unknown): value is string {
   return typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value);
+}
+
+function isCanonicalPublicationId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+      value,
+    )
+  );
 }
 
 function compareCanonicalText(left: string, right: string): number {
@@ -191,6 +201,7 @@ function parseDelivery(raw: string): ParsedDelivery | undefined {
 }
 
 function encodeFailureSuppression(
+  publicationId: string,
   deliveryId: string,
   failed: ParsedDelivery,
   attempts: DeliveryAttempt[],
@@ -208,6 +219,7 @@ function encodeFailureSuppression(
   const body: FailureSuppressionBody = {
     format: 1,
     record: "github-delivery-failure-suppression",
+    publicationId,
     deliveryId,
     failedLeaseId: failed.record.leaseId,
     failedClaimedAt: failed.record.claimedAt,
@@ -223,6 +235,7 @@ function parseFailureSuppression(
   raw: string,
   deliveryId: string,
   canonicalBase: string,
+  markerName: string,
 ): FailureSuppressionMarker | undefined {
   let parsed: unknown;
   try {
@@ -235,6 +248,7 @@ function parseFailureSuppression(
     !exactKeys(parsed, [
       "format",
       "record",
+      "publicationId",
       "deliveryId",
       "failedLeaseId",
       "failedClaimedAt",
@@ -244,6 +258,8 @@ function parseFailureSuppression(
     ]) ||
     parsed.format !== 1 ||
     parsed.record !== "github-delivery-failure-suppression" ||
+    !isCanonicalPublicationId(parsed.publicationId) ||
+    markerName !== `${canonicalBase}.suppression.${parsed.publicationId}` ||
     parsed.deliveryId !== deliveryId ||
     typeof parsed.failedLeaseId !== "string" ||
     !parsed.failedLeaseId ||
@@ -291,6 +307,7 @@ function parseFailureSuppression(
   const body: FailureSuppressionBody = {
     format: 1,
     record: "github-delivery-failure-suppression",
+    publicationId: parsed.publicationId,
     deliveryId,
     failedLeaseId: parsed.failedLeaseId,
     failedClaimedAt: parsed.failedClaimedAt,
@@ -303,6 +320,15 @@ function parseFailureSuppression(
     markerDigest: parsed.markerDigest,
   };
   return raw === `${JSON.stringify(marker)}\n` ? marker : undefined;
+}
+
+async function syncDirectory(directoryPath: string): Promise<void> {
+  const handle = await open(directoryPath, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
 }
 
 function sameCompletion(left: DeliveryRecord, right: DeliveryRecord): boolean {
@@ -360,6 +386,7 @@ export class GitHubDeliveryStore {
     filePath: string,
     suppressionPath: string,
   ) => Promise<void>;
+  private readonly syncDirectory: (directoryPath: string) => Promise<void>;
   private staleReclaims = 0;
   private ownerMismatchAttempts = 0;
 
@@ -384,6 +411,8 @@ export class GitHubDeliveryStore {
         filePath: string,
         suppressionPath: string,
       ) => Promise<void>;
+      /** Test seam for deterministic directory-durability failures. */
+      syncDirectory?: (directoryPath: string) => Promise<void>;
     } = {},
   ) {
     this.githubRoot = githubRoot;
@@ -399,6 +428,7 @@ export class GitHubDeliveryStore {
     if (options.afterFailureSuppressionPublished) {
       this.afterFailureSuppressionPublished = options.afterFailureSuppressionPublished;
     }
+    this.syncDirectory = options.syncDirectory ?? syncDirectory;
   }
 
   /** Counters for reclaim/mismatch monitoring (tests and operators). */
@@ -501,7 +531,7 @@ export class GitHubDeliveryStore {
         if (errno(error) === "ENOENT") continue;
         throw error;
       }
-      const marker = parseFailureSuppression(raw, deliveryId, canonicalBase);
+      const marker = parseFailureSuppression(raw, deliveryId, canonicalBase, name);
       if (!marker) {
         throw new Error(`Invalid GitHub delivery failure-suppression marker for ${deliveryId}`);
       }
@@ -548,7 +578,7 @@ export class GitHubDeliveryStore {
     const publicationId = randomUUID();
     const stagingPath = `${canonical}.suppression-staging.${publicationId}`;
     const suppressionPath = `${canonical}.suppression.${publicationId}`;
-    const { raw } = encodeFailureSuppression(deliveryId, failed, attempts);
+    const { raw } = encodeFailureSuppression(publicationId, deliveryId, failed, attempts);
     const handle = await open(stagingPath, "wx", 0o600);
     try {
       await handle.writeFile(raw, "utf8");
@@ -558,6 +588,7 @@ export class GitHubDeliveryStore {
     }
     await link(stagingPath, suppressionPath);
     await unlinkExact(stagingPath);
+    await this.syncDirectory(this.deliveriesDir);
     await this.afterFailureSuppressionPublished?.(canonical, suppressionPath);
   }
 
@@ -761,6 +792,7 @@ export class GitHubDeliveryStore {
       const attempts = await this.readArtifacts(deliveryId);
       await this.publishFailureSuppression(deliveryId, existing, attempts);
       await unlink(this.filePath(deliveryId));
+      await this.syncDirectory(this.deliveriesDir);
       void errorMessage;
       return { ok: true };
     });

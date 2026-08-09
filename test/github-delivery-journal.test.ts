@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -257,6 +265,93 @@ test("a crash after durable suppression publication leaves the current lease ret
   assert.notEqual(retry.leaseId, "lease-a");
   await access(olderStaging);
   await access(olderReclaim);
+});
+
+test("fail keeps the processing canonical when suppression directory sync fails", async () => {
+  const deliveryId = "d-failure-marker-sync";
+  const { root, deliveries, canonical } = await deliveryFixture(deliveryId);
+  await writeRecord(canonical, processing(deliveryId, "lease-b"));
+  await writeRecord(`${canonical}.staging.older-a`, completed(deliveryId, "lease-a"));
+  await writeRecord(`${canonical}.reclaim.older-a`, processing(deliveryId, "lease-a"));
+  let directorySyncs = 0;
+  const store = new GitHubDeliveryStore(root, {
+    staleProcessingMs: 60_000,
+    syncDirectory: async (directoryPath) => {
+      assert.equal(directoryPath, deliveries);
+      directorySyncs += 1;
+      throw new Error("simulated suppression directory sync failure");
+    },
+  });
+
+  await assert.rejects(
+    () => store.fail(deliveryId, "retry B", "lease-b"),
+    /simulated suppression directory sync failure/,
+  );
+
+  assert.equal(directorySyncs, 1);
+  assert.equal(JSON.parse(await readFile(canonical, "utf8")).leaseId, "lease-b");
+});
+
+test("fail rejects a removal sync failure while leaving suppression recovery safe", async () => {
+  const deliveryId = "d-failure-removal-sync";
+  const { root, deliveries, canonical } = await deliveryFixture(deliveryId);
+  await writeRecord(canonical, processing(deliveryId, "lease-b"));
+  const olderStaging = `${canonical}.staging.older-a`;
+  const olderReclaim = `${canonical}.reclaim.older-a`;
+  await writeRecord(olderStaging, completed(deliveryId, "lease-a"));
+  await writeRecord(olderReclaim, processing(deliveryId, "lease-a"));
+  let directorySyncs = 0;
+  const store = new GitHubDeliveryStore(root, {
+    staleProcessingMs: 60_000,
+    syncDirectory: async (directoryPath) => {
+      assert.equal(directoryPath, deliveries);
+      directorySyncs += 1;
+      if (directorySyncs === 2) {
+        throw new Error("simulated canonical removal sync failure");
+      }
+    },
+  });
+
+  await assert.rejects(
+    () => store.fail(deliveryId, "retry B", "lease-b"),
+    /simulated canonical removal sync failure/,
+  );
+
+  assert.equal(directorySyncs, 2);
+  await assert.rejects(() => access(canonical), { code: "ENOENT" });
+  const retry = await store.claim(deliveryId, Date.parse(CLAIMED_AT));
+  assert.equal(retry.claimed, true);
+  assert.notEqual(retry.leaseId, "lease-a");
+  await access(olderStaging);
+  await access(olderReclaim);
+});
+
+test("failure-suppression marker filename must match its canonical publication identity", async (t) => {
+  for (const replacementId of [
+    "not-a-publication-id",
+    "00000000-0000-4000-8000-000000000000",
+  ]) {
+    await t.test(replacementId, async () => {
+      const deliveryId = `d-marker-name-${replacementId.slice(0, 8)}`;
+      const { deliveries, canonical, store } = await deliveryFixture(deliveryId);
+      await writeRecord(canonical, processing(deliveryId, "lease-b"));
+      await writeRecord(`${canonical}.staging.older-a`, completed(deliveryId, "lease-a"));
+      await writeRecord(`${canonical}.reclaim.older-a`, processing(deliveryId, "lease-a"));
+      assert.deepEqual(await store.fail(deliveryId, "retry B", "lease-b"), { ok: true });
+      const canonicalBase = path.basename(canonical);
+      const markerNames = (await readdir(deliveries)).filter((name) =>
+        name.startsWith(`${canonicalBase}.suppression.`),
+      );
+      assert.equal(markerNames.length, 1);
+      const replacementPath = `${canonical}.suppression.${replacementId}`;
+      await rename(path.join(deliveries, markerNames[0]!), replacementPath);
+
+      await assert.rejects(() => store.claim(deliveryId), /suppression|marker/i);
+
+      await access(replacementPath);
+      await assert.rejects(() => access(canonical), { code: "ENOENT" });
+    });
+  }
 });
 
 test("a malformed published failure-suppression marker fails closed", async () => {
