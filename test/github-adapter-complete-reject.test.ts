@@ -66,6 +66,12 @@ test("adapter does not return 200 when delivery completion is rejected", async (
         signatureHeader: sign(body),
         rawBody: body,
       }),
-    /completion rejected|owner_mismatch/i,
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /completion rejected|owner_mismatch/i);
+      assert.ok(error.cause instanceof Error);
+      assert.match(error.cause.message, /failure rejected|already_completed/i);
+      return true;
+    },
   );
 });

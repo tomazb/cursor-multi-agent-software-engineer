@@ -1,4 +1,9 @@
-import type { GitHubInternalEvent, GitHubInternalEventType } from "./types.ts";
+import {
+  MalformedGitHubWebhookError,
+  UnsupportedGitHubWebhookError,
+  type GitHubInternalEvent,
+  type GitHubInternalEventType,
+} from "./types.ts";
 
 export interface NormalizeInput {
   deliveryId: string;
@@ -19,6 +24,46 @@ function installationId(payload: Record<string, unknown>): number | undefined {
 function repositoryFullName(payload: Record<string, unknown>): string | undefined {
   const repository = asRecord(payload.repository);
   return typeof repository?.full_name === "string" ? repository.full_name : undefined;
+}
+
+function malformed(message: string): never {
+  throw new MalformedGitHubWebhookError(message);
+}
+
+function requireAction(
+  eventName: string,
+  action: string | undefined,
+  supported: ReadonlySet<string>,
+): string {
+  if (!action) malformed(`${eventName} action is required`);
+  if (!supported.has(action)) {
+    throw new UnsupportedGitHubWebhookError(`Unsupported ${eventName} action: ${action}`);
+  }
+  return action;
+}
+
+function requirePositiveInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    malformed(`${field} must be a positive integer`);
+  }
+  return value;
+}
+
+function requireString(value: unknown, field: string): string {
+  if (typeof value !== "string" || !value.trim()) {
+    malformed(`${field} must be a non-empty string`);
+  }
+  return value;
+}
+
+function requireRepository(payload: Record<string, unknown>): string {
+  const repository = requireString(repositoryFullName(payload), "repository.full_name");
+  if (!repository.includes("/")) malformed("repository.full_name must use owner/repository form");
+  return repository;
+}
+
+function requireInstallationId(payload: Record<string, unknown>): number {
+  return requirePositiveInteger(installationId(payload), "installation.id");
 }
 
 function withOptional(
@@ -60,88 +105,102 @@ const PR_ACTIONS = new Set([
 
 export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEvent {
   if (!input.deliveryId?.trim()) {
-    throw new Error("deliveryId is required");
+    malformed("deliveryId is required");
   }
   const receivedAt = input.receivedAt ?? new Date().toISOString();
   const payload = input.payload ?? {};
   const action = typeof payload.action === "string" ? payload.action : undefined;
 
   if (input.eventName === "pull_request") {
-    if (!action || !PR_ACTIONS.has(action)) {
-      throw new Error(`Unsupported pull_request action: ${String(action)}`);
-    }
+    const supportedAction = requireAction("pull_request", action, PR_ACTIONS);
     const pr = asRecord(payload.pull_request);
+    if (!pr) malformed("pull_request must be an object");
     const head = asRecord(pr?.head);
+    if (!head) malformed("pull_request.head must be an object");
     const base = asRecord(pr?.base);
-    const type = `pull_request.${action}` as GitHubInternalEventType;
+    if (!base) malformed("pull_request.base must be an object");
+    const type = `pull_request.${supportedAction}` as GitHubInternalEventType;
     return withOptional(
       { eventId: input.deliveryId, type, receivedAt },
       {
-        repository: repositoryFullName(payload),
-        installationId: installationId(payload),
-        pullRequestNumber: typeof pr?.number === "number" ? pr.number : undefined,
-        headSha: typeof head?.sha === "string" ? head.sha : undefined,
-        baseSha: typeof base?.sha === "string" ? base.sha : undefined,
-        branch: typeof head?.ref === "string" ? head.ref : undefined,
-        rawAction: action,
+        repository: requireRepository(payload),
+        installationId: requireInstallationId(payload),
+        pullRequestNumber: requirePositiveInteger(pr.number, "pull_request.number"),
+        headSha: requireString(head.sha, "pull_request.head.sha"),
+        baseSha: requireString(base.sha, "pull_request.base.sha"),
+        branch: requireString(head.ref, "pull_request.head.ref"),
+        rawAction: supportedAction,
       },
     );
   }
 
   if (input.eventName === "push") {
-    const ref = typeof payload.ref === "string" ? payload.ref : undefined;
-    const branch = ref?.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : undefined;
+    const ref = requireString(payload.ref, "ref");
+    if (!ref.startsWith("refs/heads/") || ref.length === "refs/heads/".length) {
+      malformed("ref must identify a branch");
+    }
+    const branch = ref.slice("refs/heads/".length);
     return withOptional(
       { eventId: input.deliveryId, type: "push", receivedAt },
       {
-        repository: repositoryFullName(payload),
-        installationId: installationId(payload),
-        headSha: typeof payload.after === "string" ? payload.after : undefined,
+        repository: requireRepository(payload),
+        installationId: requireInstallationId(payload),
+        headSha: requireString(payload.after, "after"),
         branch,
       },
     );
   }
 
   if (input.eventName === "installation") {
-    if (action !== "created" && action !== "deleted") {
-      throw new Error(`Unsupported installation action: ${String(action)}`);
-    }
+    const supportedAction = requireAction(
+      "installation",
+      action,
+      new Set(["created", "deleted"]),
+    );
     return withOptional(
       {
         eventId: input.deliveryId,
-        type: action === "created" ? "installation.created" : "installation.deleted",
+        type:
+          supportedAction === "created" ? "installation.created" : "installation.deleted",
         receivedAt,
       },
       {
-        installationId: installationId(payload),
-        rawAction: action,
+        installationId: requireInstallationId(payload),
+        rawAction: supportedAction,
       },
     );
   }
 
   if (input.eventName === "installation_repositories") {
-    if (action !== "added" && action !== "removed") {
-      throw new Error(`Unsupported installation_repositories action: ${String(action)}`);
-    }
-    const listKey = action === "removed" ? "repositories_removed" : "repositories_added";
-    const listed = Array.isArray(payload[listKey]) ? (payload[listKey] as unknown[]) : [];
+    const supportedAction = requireAction(
+      "installation_repositories",
+      action,
+      new Set(["added", "removed"]),
+    );
+    const listKey =
+      supportedAction === "removed" ? "repositories_removed" : "repositories_added";
+    if (!Array.isArray(payload[listKey])) malformed(`${listKey} must be an array`);
+    const listed = payload[listKey] as unknown[];
     const repositories = listed
       .map((item) => asRecord(item)?.full_name)
       .filter((name): name is string => typeof name === "string" && name.includes("/"));
+    if (repositories.length !== listed.length) {
+      malformed(`${listKey} entries must include full_name`);
+    }
     return withOptional(
       {
         eventId: input.deliveryId,
         type:
-          action === "added"
+          supportedAction === "added"
             ? "installation_repositories.added"
             : "installation_repositories.removed",
         receivedAt,
       },
       {
-        installationId: installationId(payload),
+        installationId: requireInstallationId(payload),
         repository: repositories[0] ?? repositoryFullName(payload),
         repositories,
-        rawAction: action,
+        rawAction: supportedAction,
       },
     );
   }
@@ -195,5 +254,7 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
     );
   }
 
-  throw new Error(`Unsupported GitHub webhook event: ${input.eventName}`);
+  throw new UnsupportedGitHubWebhookError(
+    `Unsupported GitHub webhook event: ${input.eventName}`,
+  );
 }

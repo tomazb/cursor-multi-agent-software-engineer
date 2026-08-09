@@ -22,6 +22,24 @@ export type GitHubInternalEventType =
   | "check_run.completed"
   | "check_suite.completed";
 
+export class UnsupportedGitHubWebhookError extends Error {
+  readonly code = "UNSUPPORTED_GITHUB_WEBHOOK";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "UnsupportedGitHubWebhookError";
+  }
+}
+
+export class MalformedGitHubWebhookError extends Error {
+  readonly code = "MALFORMED_GITHUB_WEBHOOK";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "MalformedGitHubWebhookError";
+  }
+}
+
 export interface GitHubInternalEvent {
   eventId: string;
   type: GitHubInternalEventType;

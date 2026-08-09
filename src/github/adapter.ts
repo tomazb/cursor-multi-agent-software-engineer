@@ -4,11 +4,19 @@ import { invalidateStaleEvidence } from "../git-workspace.ts";
 import type { RunStore } from "../store.ts";
 import { GitHubAssociationIndex } from "./association.ts";
 import { CheckPublisher, type GitHubHttpClient } from "./checks.ts";
-import { GitHubDeliveryStore } from "./delivery-store.ts";
+import {
+  GitHubDeliveryStore,
+  type DeliveryMutationResult,
+  type DeliveryStoreMonitor,
+} from "./delivery-store.ts";
 import { normalizeGitHubWebhook } from "./normalize.ts";
 import { verifyGitHubWebhookSignature } from "./signature.ts";
 import { GitHubSideEffectStore } from "./side-effect-store.ts";
-import type { GitHubInternalEvent } from "./types.ts";
+import {
+  MalformedGitHubWebhookError,
+  UnsupportedGitHubWebhookError,
+  type GitHubInternalEvent,
+} from "./types.ts";
 
 export interface WebhookRequest {
   deliveryId: string;
@@ -35,6 +43,42 @@ function parseOwnerRepo(repository: string): { owner: string; repo: string } {
 function isRepoAllowed(config: GitHubAppConfig, repository: string | undefined): boolean {
   if (!repository) return false;
   return config.allowedRepositories.includes(repository);
+}
+
+function deliveryMutationRejected(
+  operation: "completion" | "failure",
+  deliveryId: string,
+  result: Exclude<DeliveryMutationResult, { ok: true }>,
+): Error {
+  return new Error(
+    `Delivery ${operation} rejected for ${deliveryId}: ${result.reason}`,
+  );
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function preservePrimaryError(primary: unknown, cleanup: unknown): Error {
+  const primaryError = asError(primary);
+  const cleanupError = asError(cleanup);
+  Object.defineProperty(primaryError, "deliveryCleanupError", {
+    configurable: true,
+    enumerable: false,
+    value: cleanupError,
+  });
+  if (primaryError.cause === undefined) {
+    Object.defineProperty(primaryError, "cause", {
+      configurable: true,
+      enumerable: false,
+      value: cleanupError,
+    });
+  }
+  return primaryError;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Match only github.com remotes (HTTPS or SSH) to owner/repo. Plain HTTP is rejected. */
@@ -78,6 +122,7 @@ export class GitHubAppAdapter {
     store: RunStore;
     http: GitHubHttpClient;
     tokenProvider: (installationId: number, repository: string) => Promise<string>;
+    deliveryMonitor?: DeliveryStoreMonitor;
   }) {
     this.cwd = options.cwd;
     this.config = options.config;
@@ -85,7 +130,7 @@ export class GitHubAppAdapter {
     this.http = options.http;
     this.tokenProvider = options.tokenProvider;
     const root = githubRoot(options.cwd);
-    this.deliveries = new GitHubDeliveryStore(root);
+    this.deliveries = new GitHubDeliveryStore(root, options.deliveryMonitor);
     this.sideEffects = new GitHubSideEffectStore(root);
     this.associations = new GitHubAssociationIndex(root);
   }
@@ -115,41 +160,98 @@ export class GitHubAppAdapter {
     }
 
     const claim = await this.deliveries.claim(request.deliveryId);
-    if (claim.duplicate || !claim.claimed || !claim.leaseId) {
+    if (claim.duplicate && claim.status === "completed") {
       return { status: 200, body: { ok: true, duplicate: true } };
+    }
+    if (claim.duplicate && claim.status === "processing") {
+      return {
+        status: 503,
+        body: { ok: false, duplicate: true, message: "delivery already processing" },
+      };
+    }
+    if (!claim.claimed || !claim.leaseId) {
+      throw new Error(`Delivery claim returned an invalid state for ${request.deliveryId}`);
     }
     const leaseId = claim.leaseId;
 
+    let parsed: unknown;
     try {
-      let payload: Record<string, unknown>;
-      try {
-        payload = JSON.parse(request.rawBody) as Record<string, unknown>;
-      } catch {
-        await this.deliveries.fail(request.deliveryId, "invalid JSON body", leaseId);
-        return { status: 400, body: { ok: false, message: "invalid JSON body" } };
-      }
+      parsed = JSON.parse(request.rawBody) as unknown;
+    } catch {
+      const malformed = new MalformedGitHubWebhookError("invalid JSON body");
+      await this.failDelivery(request.deliveryId, leaseId, malformed);
+      return { status: 400, body: { ok: false, message: malformed.message } };
+    }
+    if (!isRecord(parsed)) {
+      const malformed = new MalformedGitHubWebhookError(
+        "webhook payload must be a JSON object",
+      );
+      await this.failDelivery(request.deliveryId, leaseId, malformed);
+      return { status: 400, body: { ok: false, message: malformed.message } };
+    }
 
-      const event = normalizeGitHubWebhook({
+    let event: GitHubInternalEvent;
+    try {
+      event = normalizeGitHubWebhook({
         deliveryId: request.deliveryId,
         eventName: request.eventName,
-        payload,
+        payload: parsed,
       });
-
-      await this.dispatch(event, app);
-      const completed = await this.deliveries.complete(request.deliveryId, leaseId);
-      if (!completed.ok) {
-        throw new Error(
-          `Delivery completion rejected for ${request.deliveryId}: ${completed.reason}`,
-        );
+    } catch (error) {
+      if (error instanceof UnsupportedGitHubWebhookError) {
+        try {
+          await this.completeDelivery(request.deliveryId, leaseId);
+        } catch (completionError) {
+          await this.failDelivery(request.deliveryId, leaseId, completionError);
+          throw completionError;
+        }
+        return { status: 200, body: { ok: true, message: "unsupported webhook ignored" } };
       }
+      if (error instanceof MalformedGitHubWebhookError) {
+        await this.failDelivery(request.deliveryId, leaseId, error);
+        return { status: 400, body: { ok: false, message: error.message } };
+      }
+      await this.failDelivery(request.deliveryId, leaseId, error);
+      throw error;
+    }
+
+    try {
+      await this.dispatch(event, app);
+      await this.completeDelivery(request.deliveryId, leaseId);
       return { status: 200, body: { ok: true } };
     } catch (error) {
-      await this.deliveries.fail(
-        request.deliveryId,
-        error instanceof Error ? error.message : String(error),
+      await this.failDelivery(request.deliveryId, leaseId, error);
+      throw error;
+    }
+  }
+
+  private async completeDelivery(deliveryId: string, leaseId: string): Promise<void> {
+    const completed = await this.deliveries.complete(deliveryId, leaseId);
+    if (!completed.ok) {
+      throw deliveryMutationRejected("completion", deliveryId, completed);
+    }
+  }
+
+  private async failDelivery(
+    deliveryId: string,
+    leaseId: string,
+    primaryError: unknown,
+  ): Promise<void> {
+    let cleanupError: unknown;
+    try {
+      const failed = await this.deliveries.fail(
+        deliveryId,
+        asError(primaryError).message,
         leaseId,
       );
-      throw error;
+      if (!failed.ok) {
+        cleanupError = deliveryMutationRejected("failure", deliveryId, failed);
+      }
+    } catch (error) {
+      cleanupError = error;
+    }
+    if (cleanupError !== undefined) {
+      throw preservePrimaryError(primaryError, cleanupError);
     }
   }
 

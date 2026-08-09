@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeGitHubWebhook } from "../src/github/normalize.ts";
+import {
+  MalformedGitHubWebhookError,
+  UnsupportedGitHubWebhookError,
+} from "../src/github/types.ts";
 
 test("normalize pull_request.synchronize into an internal event", () => {
   const event = normalizeGitHubWebhook({
@@ -68,7 +72,38 @@ test("normalize rejects unsupported event names", () => {
         eventName: "gollum",
         payload: {},
       }),
-    /unsupported/i,
+    UnsupportedGitHubWebhookError,
+  );
+});
+
+test("normalize distinguishes an unsupported action from a malformed supported payload", () => {
+  assert.throws(
+    () =>
+      normalizeGitHubWebhook({
+        deliveryId: "del-unsupported-action",
+        eventName: "pull_request",
+        payload: {
+          action: "labeled",
+          installation: { id: 99 },
+          repository: { full_name: "owner/repo" },
+          pull_request: {
+            number: 7,
+            head: { sha: "abc123", ref: "feature" },
+            base: { sha: "def456" },
+          },
+        },
+      }),
+    UnsupportedGitHubWebhookError,
+  );
+
+  assert.throws(
+    () =>
+      normalizeGitHubWebhook({
+        deliveryId: "del-malformed",
+        eventName: "pull_request",
+        payload: { action: "synchronize" },
+      }),
+    MalformedGitHubWebhookError,
   );
 });
 
