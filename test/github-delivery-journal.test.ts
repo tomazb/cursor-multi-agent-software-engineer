@@ -200,6 +200,100 @@ test("an older lone staging lease cannot beat the sole eligible current staging/
   await assert.rejects(() => access(`${canonical}.reclaim.b-current`), { code: "ENOENT" });
 });
 
+test("failing the current lease keeps an older retained pair from suppressing retry", async () => {
+  const deliveryId = "d-failed-current";
+  const { canonical, store } = await deliveryFixture(deliveryId);
+  await writeRecord(canonical, processing(deliveryId, "lease-b"));
+  const olderStaging = `${canonical}.staging.older-a`;
+  const olderReclaim = `${canonical}.reclaim.older-a`;
+  await writeRecord(olderStaging, completed(deliveryId, "lease-a"));
+  await writeRecord(olderReclaim, processing(deliveryId, "lease-a"));
+
+  assert.deepEqual(await store.fail(deliveryId, "retry B", "lease-b"), { ok: true });
+  const retry = await store.claim(deliveryId, Date.parse(CLAIMED_AT));
+
+  assert.equal(retry.claimed, true);
+  assert.equal(retry.duplicate, false);
+  assert.equal(retry.status, "processing");
+  assert.notEqual(retry.leaseId, "lease-a");
+  assert.notEqual(retry.leaseId, "lease-b");
+  await access(olderStaging);
+  await access(olderReclaim);
+});
+
+test("a crash after durable suppression publication leaves the current lease retryable", async () => {
+  const deliveryId = "d-failure-marker-crash";
+  const { root, canonical } = await deliveryFixture(deliveryId);
+  await writeRecord(canonical, processing(deliveryId, "lease-b"));
+  const olderStaging = `${canonical}.staging.older-a`;
+  const olderReclaim = `${canonical}.reclaim.older-a`;
+  await writeRecord(olderStaging, completed(deliveryId, "lease-a"));
+  await writeRecord(olderReclaim, processing(deliveryId, "lease-a"));
+  let injectCrash = true;
+  let suppressionPath: string | undefined;
+  const store = new GitHubDeliveryStore(root, {
+    staleProcessingMs: 60_000,
+    afterFailureSuppressionPublished: async (_canonical, markerPath) => {
+      if (!injectCrash) return;
+      injectCrash = false;
+      suppressionPath = markerPath;
+      throw new Error("simulated crash after failure suppression");
+    },
+  });
+
+  await assert.rejects(
+    () => store.fail(deliveryId, "retry B", "lease-b"),
+    /simulated crash after failure suppression/,
+  );
+  assert.equal(JSON.parse(await readFile(canonical, "utf8")).leaseId, "lease-b");
+  assert.ok(suppressionPath);
+  await access(suppressionPath);
+  await access(olderStaging);
+  await access(olderReclaim);
+
+  assert.deepEqual(await store.fail(deliveryId, "retry B", "lease-b"), { ok: true });
+  const retry = await store.claim(deliveryId, Date.parse(CLAIMED_AT));
+  assert.equal(retry.claimed, true);
+  assert.notEqual(retry.leaseId, "lease-a");
+  await access(olderStaging);
+  await access(olderReclaim);
+});
+
+test("a malformed published failure-suppression marker fails closed", async () => {
+  const deliveryId = "d-malformed-suppression";
+  const { canonical, store } = await deliveryFixture(deliveryId);
+  await writeRecord(canonical, processing(deliveryId, "lease-b"));
+  await writeFile(`${canonical}.suppression.corrupt`, '{"format":1', "utf8");
+
+  await assert.rejects(
+    () => store.fail(deliveryId, "retry B", "lease-b"),
+    /suppression|marker/i,
+  );
+
+  assert.equal(JSON.parse(await readFile(canonical, "utf8")).leaseId, "lease-b");
+});
+
+test("failure suppression does not hide a candidate whose exact artifact bytes changed", async () => {
+  const deliveryId = "d-new-artifact-bytes";
+  const { canonical, store } = await deliveryFixture(deliveryId);
+  await writeRecord(canonical, processing(deliveryId, "lease-b"));
+  const stagingPath = `${canonical}.staging.older-a`;
+  const reclaimPath = `${canonical}.reclaim.older-a`;
+  await writeRecord(stagingPath, completed(deliveryId, "lease-a"));
+  await writeRecord(reclaimPath, processing(deliveryId, "lease-a"));
+  assert.deepEqual(await store.fail(deliveryId, "retry B", "lease-b"), { ok: true });
+
+  await writeRecord(stagingPath, {
+    ...completed(deliveryId, "lease-a"),
+    completedAt: "2026-08-09T10:00:02.000Z",
+  });
+  const retry = await store.claim(deliveryId);
+
+  assert.equal(retry.claimed, false);
+  assert.equal(retry.status, "completed");
+  assert.equal(JSON.parse(await readFile(canonical, "utf8")).leaseId, "lease-a");
+});
+
 test("recovery groups staging and reclaim records by attempt before pairing them", async () => {
   const { canonical, store } = await deliveryFixture("d-attempt");
   await writeRecord(`${canonical}.staging.attempt-a`, completed("d-attempt", "lease-a"));

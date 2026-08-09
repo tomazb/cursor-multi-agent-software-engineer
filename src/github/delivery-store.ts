@@ -1,5 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  link,
   mkdir,
   open,
   readFile,
@@ -51,11 +52,16 @@ export type DeliveryLeaseValidatedOp = "complete" | "fail" | "claim-reclaim";
 export const DEFAULT_STALE_PROCESSING_MS = 5 * 60 * 1000;
 
 interface ParsedDelivery {
+  raw: string;
   record: DeliveryRecord;
 }
 
 interface DeliveryArtifact {
+  attempt: string;
+  kind: "staging" | "reclaim";
+  name: string;
   path: string;
+  digest: string;
   parsed?: ParsedDelivery;
 }
 
@@ -63,6 +69,27 @@ interface DeliveryAttempt {
   attempt: string;
   staging?: DeliveryArtifact;
   reclaim?: DeliveryArtifact;
+}
+
+interface FailureSuppressionEvidence {
+  attempt: string;
+  kind: "staging" | "reclaim";
+  path: string;
+  digest: string;
+}
+
+interface FailureSuppressionBody {
+  format: 1;
+  record: "github-delivery-failure-suppression";
+  deliveryId: string;
+  failedLeaseId: string;
+  failedClaimedAt: string;
+  failedCanonicalDigest: string;
+  artifacts: FailureSuppressionEvidence[];
+}
+
+interface FailureSuppressionMarker extends FailureSuppressionBody {
+  markerDigest: string;
 }
 
 function errno(error: unknown): string | undefined {
@@ -80,6 +107,27 @@ function assertSafeDeliveryId(deliveryId: string): void {
 
 function encodeRecord(record: DeliveryRecord): string {
   return `${JSON.stringify(record)}\n`;
+}
+
+function digest(bytes: string | Uint8Array): string {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function exactKeys(value: Record<string, unknown>, expected: string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  return (
+    actual.length === sortedExpected.length &&
+    actual.every((key, index) => key === sortedExpected[index])
+  );
+}
+
+function validDigest(value: unknown): value is string {
+  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value);
+}
+
+function compareCanonicalText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -139,7 +187,122 @@ function parseDelivery(raw: string): ParsedDelivery | undefined {
       : {}),
     ...(typeof parsed.lastError === "string" ? { lastError: parsed.lastError } : {}),
   };
-  return { record };
+  return { raw, record };
+}
+
+function encodeFailureSuppression(
+  deliveryId: string,
+  failed: ParsedDelivery,
+  attempts: DeliveryAttempt[],
+): { raw: string; marker: FailureSuppressionMarker } {
+  const artifacts = attempts
+    .flatMap((attempt) => [attempt.staging, attempt.reclaim])
+    .filter((artifact): artifact is DeliveryArtifact => artifact !== undefined)
+    .map((artifact) => ({
+      attempt: artifact.attempt,
+      kind: artifact.kind,
+      path: artifact.name,
+      digest: artifact.digest,
+    }))
+    .sort((left, right) => compareCanonicalText(left.path, right.path));
+  const body: FailureSuppressionBody = {
+    format: 1,
+    record: "github-delivery-failure-suppression",
+    deliveryId,
+    failedLeaseId: failed.record.leaseId,
+    failedClaimedAt: failed.record.claimedAt,
+    failedCanonicalDigest: digest(failed.raw),
+    artifacts,
+  };
+  const markerDigest = digest(`${JSON.stringify(body)}\n`);
+  const marker: FailureSuppressionMarker = { ...body, markerDigest };
+  return { raw: `${JSON.stringify(marker)}\n`, marker };
+}
+
+function parseFailureSuppression(
+  raw: string,
+  deliveryId: string,
+  canonicalBase: string,
+): FailureSuppressionMarker | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed)) return undefined;
+  if (
+    !exactKeys(parsed, [
+      "format",
+      "record",
+      "deliveryId",
+      "failedLeaseId",
+      "failedClaimedAt",
+      "failedCanonicalDigest",
+      "artifacts",
+      "markerDigest",
+    ]) ||
+    parsed.format !== 1 ||
+    parsed.record !== "github-delivery-failure-suppression" ||
+    parsed.deliveryId !== deliveryId ||
+    typeof parsed.failedLeaseId !== "string" ||
+    !parsed.failedLeaseId ||
+    !isCanonicalTimestamp(parsed.failedClaimedAt) ||
+    !validDigest(parsed.failedCanonicalDigest) ||
+    !Array.isArray(parsed.artifacts) ||
+    !validDigest(parsed.markerDigest)
+  ) {
+    return undefined;
+  }
+
+  const artifacts: FailureSuppressionEvidence[] = [];
+  const seenPaths = new Set<string>();
+  for (const candidate of parsed.artifacts) {
+    if (
+      !isRecord(candidate) ||
+      !exactKeys(candidate, ["attempt", "kind", "path", "digest"]) ||
+      typeof candidate.attempt !== "string" ||
+      !candidate.attempt ||
+      (candidate.kind !== "staging" && candidate.kind !== "reclaim") ||
+      candidate.path !== `${canonicalBase}.${candidate.kind}.${candidate.attempt}` ||
+      !validDigest(candidate.digest) ||
+      seenPaths.has(candidate.path)
+    ) {
+      return undefined;
+    }
+    seenPaths.add(candidate.path);
+    artifacts.push({
+      attempt: candidate.attempt,
+      kind: candidate.kind,
+      path: candidate.path,
+      digest: candidate.digest,
+    });
+  }
+  if (
+    artifacts.some(
+      (artifact, index) =>
+        index > 0 &&
+        compareCanonicalText(artifacts[index - 1]!.path, artifact.path) >= 0,
+    )
+  ) {
+    return undefined;
+  }
+
+  const body: FailureSuppressionBody = {
+    format: 1,
+    record: "github-delivery-failure-suppression",
+    deliveryId,
+    failedLeaseId: parsed.failedLeaseId,
+    failedClaimedAt: parsed.failedClaimedAt,
+    failedCanonicalDigest: parsed.failedCanonicalDigest,
+    artifacts,
+  };
+  if (parsed.markerDigest !== digest(`${JSON.stringify(body)}\n`)) return undefined;
+  const marker: FailureSuppressionMarker = {
+    ...body,
+    markerDigest: parsed.markerDigest,
+  };
+  return raw === `${JSON.stringify(marker)}\n` ? marker : undefined;
 }
 
 function sameCompletion(left: DeliveryRecord, right: DeliveryRecord): boolean {
@@ -193,6 +356,10 @@ export class GitHubDeliveryStore {
     filePath: string,
     stagingPath: string,
   ) => Promise<void>;
+  private readonly afterFailureSuppressionPublished?: (
+    filePath: string,
+    suppressionPath: string,
+  ) => Promise<void>;
   private staleReclaims = 0;
   private ownerMismatchAttempts = 0;
 
@@ -212,6 +379,11 @@ export class GitHubDeliveryStore {
         filePath: string,
         stagingPath: string,
       ) => Promise<void>;
+      /** Test hook after failure suppression is durably published, before canonical removal. */
+      afterFailureSuppressionPublished?: (
+        filePath: string,
+        suppressionPath: string,
+      ) => Promise<void>;
     } = {},
   ) {
     this.githubRoot = githubRoot;
@@ -223,6 +395,9 @@ export class GitHubDeliveryStore {
     if (options.afterLeaseValidated) this.afterLeaseValidated = options.afterLeaseValidated;
     if (options.afterCompletionStaged) {
       this.afterCompletionStaged = options.afterCompletionStaged;
+    }
+    if (options.afterFailureSuppressionPublished) {
+      this.afterFailureSuppressionPublished = options.afterFailureSuppressionPublished;
     }
   }
 
@@ -277,14 +452,20 @@ export class GitHubDeliveryStore {
       if (!kind || !attempt) continue;
       const artifactPath = path.join(this.deliveriesDir, name);
       let parsed: ParsedDelivery | undefined;
+      let bytes: Buffer;
       try {
-        parsed = parseDelivery(await readFile(artifactPath, "utf8"));
+        bytes = await readFile(artifactPath);
+        parsed = parseDelivery(bytes.toString("utf8"));
       } catch (error) {
         if (errno(error) === "ENOENT") continue;
         throw error;
       }
       const artifact: DeliveryArtifact = {
+        attempt,
+        kind,
+        name,
         path: artifactPath,
+        digest: digest(bytes),
         ...(parsed ? { parsed } : {}),
       };
       const group = byAttempt.get(attempt) ?? { attempt };
@@ -297,6 +478,38 @@ export class GitHubDeliveryStore {
     );
   }
 
+  private async readFailureSuppressions(
+    deliveryId: string,
+  ): Promise<FailureSuppressionMarker[]> {
+    const canonicalBase = path.basename(this.filePath(deliveryId));
+    const prefix = `${canonicalBase}.suppression.`;
+    let names: string[];
+    try {
+      names = (await readdir(this.deliveriesDir))
+        .filter((name) => name.startsWith(prefix))
+        .sort();
+    } catch (error) {
+      if (errno(error) === "ENOENT") return [];
+      throw error;
+    }
+    const markers: FailureSuppressionMarker[] = [];
+    for (const name of names) {
+      let raw: string;
+      try {
+        raw = await readFile(path.join(this.deliveriesDir, name), "utf8");
+      } catch (error) {
+        if (errno(error) === "ENOENT") continue;
+        throw error;
+      }
+      const marker = parseFailureSuppression(raw, deliveryId, canonicalBase);
+      if (!marker) {
+        throw new Error(`Invalid GitHub delivery failure-suppression marker for ${deliveryId}`);
+      }
+      markers.push(marker);
+    }
+    return markers;
+  }
+
   private pairIsEligible(deliveryId: string, attempt: DeliveryAttempt): boolean {
     const staging = attempt.staging?.parsed?.record;
     const reclaim = attempt.reclaim?.parsed?.record;
@@ -305,6 +518,47 @@ export class GitHubDeliveryStore {
       reclaim?.deliveryId === deliveryId &&
       completionMatchesProcessing(staging, reclaim)
     );
+  }
+
+  private pairIsSuppressed(
+    attempt: DeliveryAttempt,
+    markers: FailureSuppressionMarker[],
+  ): boolean {
+    const staging = attempt.staging;
+    const reclaim = attempt.reclaim;
+    if (!staging || !reclaim) return false;
+    return markers.some((marker) => {
+      const evidence = new Map(
+        marker.artifacts.map((artifact) => [artifact.path, artifact.digest]),
+      );
+      return (
+        evidence.get(staging.name) === staging.digest &&
+        evidence.get(reclaim.name) === reclaim.digest
+      );
+    });
+  }
+
+  private async publishFailureSuppression(
+    deliveryId: string,
+    failed: ParsedDelivery,
+    attempts: DeliveryAttempt[],
+  ): Promise<void> {
+    if (attempts.length === 0) return;
+    const canonical = this.filePath(deliveryId);
+    const publicationId = randomUUID();
+    const stagingPath = `${canonical}.suppression-staging.${publicationId}`;
+    const suppressionPath = `${canonical}.suppression.${publicationId}`;
+    const { raw } = encodeFailureSuppression(deliveryId, failed, attempts);
+    const handle = await open(stagingPath, "wx", 0o600);
+    try {
+      await handle.writeFile(raw, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await link(stagingPath, suppressionPath);
+    await unlinkExact(stagingPath);
+    await this.afterFailureSuppressionPublished?.(canonical, suppressionPath);
   }
 
   private async cleanupWinner(
@@ -335,6 +589,7 @@ export class GitHubDeliveryStore {
   private async recover(deliveryId: string): Promise<ParsedDelivery | undefined> {
     const canonical = await this.readCanonical(deliveryId);
     const attempts = await this.readArtifacts(deliveryId);
+    const suppressions = await this.readFailureSuppressions(deliveryId);
 
     if (canonical.state === "valid") {
       const current = canonical.value.record;
@@ -364,7 +619,11 @@ export class GitHubDeliveryStore {
       return this.installCompleted(winner, attempts);
     }
 
-    const eligible = attempts.filter((attempt) => this.pairIsEligible(deliveryId, attempt));
+    const eligible = attempts.filter(
+      (attempt) =>
+        this.pairIsEligible(deliveryId, attempt) &&
+        !this.pairIsSuppressed(attempt, suppressions),
+    );
     if (eligible.length > 0) {
       const winner = eligible[0]!.staging!;
       if (
@@ -499,6 +758,8 @@ export class GitHubDeliveryStore {
       }
 
       await this.afterLeaseValidated?.("fail", deliveryId);
+      const attempts = await this.readArtifacts(deliveryId);
+      await this.publishFailureSuppression(deliveryId, existing, attempts);
       await unlink(this.filePath(deliveryId));
       void errorMessage;
       return { ok: true };
