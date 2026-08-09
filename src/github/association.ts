@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AssociationRecord } from "./types.ts";
-import { withDirLock, type ReclaimHooks } from "./lock-ownership.ts";
+import { withGitHubJournal } from "./journal.ts";
 
 function associationKey(repository: string, pullRequestNumber: number): string {
   return `${repository}#${pullRequestNumber}`;
@@ -16,35 +16,28 @@ async function writeAtomic(filePath: string, content: string): Promise<void> {
   await rename(tempPath, filePath);
 }
 
-/**
- * Serialize association index mutations with an exclusive directory lock.
- * Live owners never expose an absence window; dead owners are reclaimed only
- * when ESRCH is proven and owner.json is unchanged after the death check.
- */
+/** Serialize association index mutations with immutable journal ownership. */
 export class GitHubAssociationIndex {
+  private readonly githubRoot: string;
   private readonly filePath: string;
-  private readonly lockDir: string;
-  private readonly reclaimHooks: ReclaimHooks;
 
   constructor(
     githubRoot: string,
-    options: { lockStaleMs?: number } & ReclaimHooks = {},
+    options: { lockStaleMs?: number } = {},
   ) {
+    this.githubRoot = githubRoot;
     this.filePath = path.join(githubRoot, "associations.json");
-    this.lockDir = path.join(githubRoot, "associations.lock");
     void options.lockStaleMs;
-    this.reclaimHooks = {
-      ...(options.afterDeadConfirmed
-        ? { afterDeadConfirmed: options.afterDeadConfirmed }
-        : {}),
-    };
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
-    return withDirLock(this.lockDir, fn, {
-      timeoutMs: 5_000,
-      ...this.reclaimHooks,
-    });
+    return withGitHubJournal(
+      this.githubRoot,
+      "association",
+      "associations",
+      fn,
+      { timeoutMs: 5_000 },
+    );
   }
 
   private async readAll(): Promise<Record<string, AssociationRecord>> {

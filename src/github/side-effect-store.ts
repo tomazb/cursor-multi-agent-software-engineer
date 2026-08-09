@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { withDirLock, type ReclaimHooks } from "./lock-ownership.ts";
+import { withGitHubJournal } from "./journal.ts";
 
 export interface SideEffectRecord {
   resourceId: number;
@@ -22,14 +22,12 @@ function keyToFilename(idempotencyKey: string): string {
 }
 
 export class GitHubSideEffectStore {
+  private readonly githubRoot: string;
   private readonly dir: string;
-  private readonly createLocksDir: string;
-  private readonly reclaimHooks: ReclaimHooks;
 
-  constructor(githubRoot: string, options: ReclaimHooks = {}) {
+  constructor(githubRoot: string) {
+    this.githubRoot = githubRoot;
     this.dir = path.join(githubRoot, "side-effects");
-    this.createLocksDir = path.join(githubRoot, "side-effect-create-locks");
-    this.reclaimHooks = options;
   }
 
   async get(idempotencyKey: string): Promise<SideEffectRecord | undefined> {
@@ -55,28 +53,19 @@ export class GitHubSideEffectStore {
 
   /**
    * Serialize create/reconcile for one idempotency key across concurrent publishers.
-   * Uses mkdir locks so live owners never expose an absence window.
+   * The complete key selects one immutable ownership journal.
    */
   async withCreateLock<T>(
     idempotencyKey: string,
     fn: () => Promise<T>,
     options: { timeoutMs?: number } = {},
   ): Promise<T> {
-    await mkdir(this.createLocksDir, { recursive: true });
-    const lockDir = path.join(this.createLocksDir, `${keyToFilename(idempotencyKey)}.lock`);
-    try {
-      return await withDirLock(lockDir, fn, {
-        timeoutMs: options.timeoutMs ?? 10_000,
-        ...this.reclaimHooks,
-      });
-    } catch (error) {
-      if (
-        error instanceof Error &&
-        /Timed out acquiring directory lock/.test(error.message)
-      ) {
-        throw new Error(`Timed out acquiring check-create lock for ${idempotencyKey}`);
-      }
-      throw error;
-    }
+    return withGitHubJournal(
+      this.githubRoot,
+      "check-create",
+      idempotencyKey,
+      fn,
+      { timeoutMs: options.timeoutMs ?? 10_000 },
+    );
   }
 }
