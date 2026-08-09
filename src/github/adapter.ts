@@ -37,20 +37,24 @@ function isRepoAllowed(config: GitHubAppConfig, repository: string | undefined):
   return config.allowedRepositories.includes(repository);
 }
 
-/** Match only github.com remotes (https or ssh) to owner/repo. */
+/** Match only github.com remotes (HTTPS or SSH) to owner/repo. Plain HTTP is rejected. */
 export function remoteMatchesRepository(
   remote: string | undefined,
   repository: string,
 ): boolean {
   if (!remote) return false;
   const trimmed = remote.trim().replace(/\.git$/i, "");
-  const https = trimmed.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)$/i);
+  const https = trimmed.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)$/i);
   if (https) {
     return `${https[1]}/${https[2]}`.toLowerCase() === repository.toLowerCase();
   }
-  const ssh = trimmed.match(/^(?:ssh:\/\/)?git@github\.com:([^/]+)\/([^/]+)$/i);
-  if (ssh) {
-    return `${ssh[1]}/${ssh[2]}`.toLowerCase() === repository.toLowerCase();
+  const sshScp = trimmed.match(/^git@github\.com:([^/]+)\/([^/]+)$/i);
+  if (sshScp) {
+    return `${sshScp[1]}/${sshScp[2]}`.toLowerCase() === repository.toLowerCase();
+  }
+  const sshUrl = trimmed.match(/^ssh:\/\/git@github\.com\/([^/]+)\/([^/]+)$/i);
+  if (sshUrl) {
+    return `${sshUrl[1]}/${sshUrl[2]}`.toLowerCase() === repository.toLowerCase();
   }
   return false;
 }
@@ -111,16 +115,17 @@ export class GitHubAppAdapter {
     }
 
     const claim = await this.deliveries.claim(request.deliveryId);
-    if (claim.duplicate) {
+    if (claim.duplicate || !claim.claimed || !claim.leaseId) {
       return { status: 200, body: { ok: true, duplicate: true } };
     }
+    const leaseId = claim.leaseId;
 
     try {
       let payload: Record<string, unknown>;
       try {
         payload = JSON.parse(request.rawBody) as Record<string, unknown>;
       } catch {
-        await this.deliveries.fail(request.deliveryId, "invalid JSON body");
+        await this.deliveries.fail(request.deliveryId, "invalid JSON body", leaseId);
         return { status: 400, body: { ok: false, message: "invalid JSON body" } };
       }
 
@@ -131,12 +136,13 @@ export class GitHubAppAdapter {
       });
 
       await this.dispatch(event, app);
-      await this.deliveries.complete(request.deliveryId);
+      await this.deliveries.complete(request.deliveryId, leaseId);
       return { status: 200, body: { ok: true } };
     } catch (error) {
       await this.deliveries.fail(
         request.deliveryId,
         error instanceof Error ? error.message : String(error),
+        leaseId,
       );
       throw error;
     }

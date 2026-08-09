@@ -152,15 +152,16 @@ Installation tokens are acquired per event and never persisted.
 | Scenario | Behavior |
 |----------|----------|
 | Replay same delivery | 200, no duplicate checks/runs |
-| Crash mid-delivery | Stale `processing` claim reclaimable after TTL; retry can complete |
+| Crash mid-delivery | Stale `processing` claim reclaimable after TTL; retry can complete; expired lease cannot complete/fail successor |
 | Bad signature | 401, no state change |
 | Stale SHA | No success for wrong SHA; invalidate evidence |
 | Live-head lookup failure | Fail closed; do not store/process the event SHA |
-| Non-GitHub remote | Do not associate (`gitlab.com/...` etc. rejected) |
+| Non-GitHub / plain HTTP remote | Do not associate |
 | Rate limit | Backoff; no false success |
-| Concurrent check publishers | Serialized creates per key; one POST per check |
-| Installation removed | Suspend all listed repositories; stop mutations |
+| Concurrent check publishers | Serialized creates per key; one POST per check; dead-owner create locks reclaimable |
+| Installation removed | Suspend all listed repositories; redelivery reconciles already-suspended index into runs |
 | Out-of-order webhooks | Latest head SHA wins when live head is resolved |
+| Association lock | Reclaim only confirmed-dead owners; identity-bound release |
 
 ### Testing
 

@@ -204,15 +204,16 @@ Store the key and resulting GitHub resource ID transactionally before acknowledg
 ## Failure behavior
 
 - Signature or authorization failure: reject without workflow changes.
-- Duplicate delivery: return success without repeating side effects. Only `completed` deliveries are terminal; stale `processing` claims (crash mid-handler) become reclaimable after a TTL so GitHub retries are not stuck as permanent duplicates.
+- Duplicate delivery: return success without repeating side effects. Only `completed` deliveries are terminal; stale `processing` claims (crash mid-handler) become reclaimable after a TTL so GitHub retries are not stuck as permanent duplicates. Each claim carries a lease nonce; `complete`/`fail` require that lease so an expired owner cannot fence a successor. Stale reclaims and owner-mismatch attempts are counted for monitoring (`diagnostics()` / callbacks).
 - GitHub rate limit: retry according to reset and backoff headers.
 - Stale head SHA: cancel current attempt and restart classification/verification for the new SHA. Live-head lookup failures fail closed (do not apply the event SHA).
-- Exact PR identity: association matches only `github.com` remotes (HTTPS or SSH); other hosts with the same `owner/repo` path are rejected.
-- Concurrent check creates for the same idempotency key are serialized; retries reconcile existing check-run ids.
+- Exact PR identity: association matches only `github.com` remotes over HTTPS or SSH (`git@` / `ssh://git@…/`); plain HTTP and non-GitHub hosts are rejected.
+- Concurrent check creates for the same idempotency key are serialized; confirmed-dead create-lock owners are reclaimable; release is identity-bound.
+- Association index mutations use the same dead-owner reclaim and identity-bound release rules; age alone never authorizes lock deletion.
 - Merge conflict: `WAITING_FOR_HUMAN` or a dedicated reconciliation stage.
 - CI failure: builder/resolver correction loop under budget.
 - Ambiguous review comment: `WAITING_FOR_HUMAN`.
-- Permission change or installation removal: suspend every listed repository (including multi-repo `repositories_removed`) and stop mutations; run-save errors other than missing runs surface to the handler.
+- Permission change or installation removal: suspend every listed repository (including multi-repo `repositories_removed`) and reconcile run records even when the index was already suspended; run-save errors other than missing runs surface to the handler.
 
 ## Rollout plan
 

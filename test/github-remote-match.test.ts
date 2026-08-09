@@ -12,6 +12,14 @@ test("remoteMatchesRepository accepts only GitHub hosts", () => {
     true,
   );
   assert.equal(
+    remoteMatchesRepository("ssh://git@github.com/owner/repo.git", "owner/repo"),
+    true,
+  );
+  assert.equal(
+    remoteMatchesRepository("http://github.com/owner/repo.git", "owner/repo"),
+    false,
+  );
+  assert.equal(
     remoteMatchesRepository("https://gitlab.com/owner/repo.git", "owner/repo"),
     false,
   );

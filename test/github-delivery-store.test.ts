@@ -11,13 +11,14 @@ test("delivery store claims a new delivery id once until completed", async () =>
   const first = await store.claim("delivery-1");
   assert.equal(first.claimed, true);
   assert.equal(first.duplicate, false);
+  assert.ok(first.leaseId);
 
   const inFlight = await store.claim("delivery-1");
   assert.equal(inFlight.claimed, false);
   assert.equal(inFlight.duplicate, true);
   assert.equal(inFlight.status, "processing");
 
-  await store.complete("delivery-1");
+  await store.complete("delivery-1", first.leaseId!);
   const replay = await store.claim("delivery-1");
   assert.equal(replay.claimed, false);
   assert.equal(replay.duplicate, true);
@@ -27,8 +28,9 @@ test("delivery store claims a new delivery id once until completed", async () =>
 test("delivery store releases failed claims for retry", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-delivery-fail-"));
   const store = new GitHubDeliveryStore(root);
-  assert.equal((await store.claim("delivery-2")).claimed, true);
-  await store.fail("delivery-2", "boom");
+  const first = await store.claim("delivery-2");
+  assert.equal(first.claimed, true);
+  await store.fail("delivery-2", "boom", first.leaseId!);
   const retry = await store.claim("delivery-2");
   assert.equal(retry.claimed, true);
   assert.equal(retry.duplicate, false);

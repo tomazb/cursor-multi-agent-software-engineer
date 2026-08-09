@@ -29,41 +29,45 @@ function processAlive(pid: number): boolean {
   }
 }
 
-/** Default: reclaim abandoned locks older than 30s when the owner pid is dead or missing. */
-export const DEFAULT_ASSOCIATION_LOCK_STALE_MS = 30_000;
+interface LockMeta {
+  pid: number;
+  token: string;
+  at: string;
+}
 
 /**
  * Serialize association index mutations with an exclusive lock file (`wx`).
- * Abandoned locks (dead pid or aged beyond staleMs) are reclaimable.
+ * Abandoned locks are reclaimable only when the owner pid is confirmed dead.
+ * Age alone never authorizes deletion. Release is identity-bound to the lock token.
  */
 export class GitHubAssociationIndex {
   private readonly filePath: string;
   private readonly lockPath: string;
-  private readonly lockStaleMs: number;
 
-  constructor(
-    githubRoot: string,
-    options: { lockStaleMs?: number } = {},
-  ) {
+  constructor(githubRoot: string, _options: { lockStaleMs?: number } = {}) {
     this.filePath = path.join(githubRoot, "associations.json");
     this.lockPath = path.join(githubRoot, "associations.lock");
-    this.lockStaleMs = options.lockStaleMs ?? DEFAULT_ASSOCIATION_LOCK_STALE_MS;
+    // lockStaleMs retained in options for API compatibility but ignored: age alone
+    // must not authorize lock deletion (confirmed-dead owner only).
+    void _options.lockStaleMs;
   }
 
-  private async tryReclaimStaleLock(nowMs: number): Promise<void> {
+  private async tryReclaimDeadOwnerLock(): Promise<void> {
     try {
       const raw = await readFile(this.lockPath, "utf8");
-      const meta = JSON.parse(raw) as { pid?: number; at?: string };
-      const at = typeof meta.at === "string" ? Date.parse(meta.at) : Number.NaN;
+      let meta: LockMeta;
+      try {
+        meta = JSON.parse(raw) as LockMeta;
+      } catch {
+        await unlink(this.lockPath);
+        return;
+      }
       const pid = typeof meta.pid === "number" ? meta.pid : -1;
-      const aged = !Number.isFinite(at) || nowMs - at >= this.lockStaleMs;
-      const dead = !processAlive(pid);
-      if (aged || dead) {
+      if (!processAlive(pid)) {
         await unlink(this.lockPath);
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        // Malformed lock: reclaim.
         try {
           await unlink(this.lockPath);
         } catch {
@@ -73,20 +77,37 @@ export class GitHubAssociationIndex {
     }
   }
 
+  private async releaseIfOwned(token: string): Promise<void> {
+    try {
+      const raw = await readFile(this.lockPath, "utf8");
+      const meta = JSON.parse(raw) as LockMeta;
+      if (meta.token === token) {
+        await unlink(this.lockPath);
+      }
+    } catch {
+      /* missing or malformed: ignore */
+    }
+  }
+
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
     await mkdir(path.dirname(this.lockPath), { recursive: true });
+    const token = randomUUID();
     const started = Date.now();
     for (;;) {
       try {
-        await writeFile(
-          this.lockPath,
-          `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`,
-          { encoding: "utf8", flag: "wx" },
-        );
+        const meta: LockMeta = {
+          pid: process.pid,
+          token,
+          at: new Date().toISOString(),
+        };
+        await writeFile(this.lockPath, `${JSON.stringify(meta)}\n`, {
+          encoding: "utf8",
+          flag: "wx",
+        });
         break;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        await this.tryReclaimStaleLock(Date.now());
+        await this.tryReclaimDeadOwnerLock();
         if (Date.now() - started > 5_000) {
           throw new Error("Timed out acquiring GitHub association index lock");
         }
@@ -96,11 +117,7 @@ export class GitHubAssociationIndex {
     try {
       return await fn();
     } finally {
-      try {
-        await unlink(this.lockPath);
-      } catch {
-        /* ignore missing lock */
-      }
+      await this.releaseIfOwned(token);
     }
   }
 
@@ -161,42 +178,54 @@ export class GitHubAssociationIndex {
     );
   }
 
+  /**
+   * Suspend all associations for an installation.
+   * Returns every matching record (including already suspended) so run stores can reconcile.
+   */
   async suspendInstallation(installationId: number): Promise<AssociationRecord[]> {
     return this.withLock(async () => {
       const records = await this.readAll();
-      const suspended: AssociationRecord[] = [];
+      const affected: AssociationRecord[] = [];
+      let dirty = false;
       for (const record of Object.values(records)) {
-        if (record.installationId === installationId && !record.suspended) {
+        if (record.installationId !== installationId) continue;
+        if (!record.suspended) {
           record.suspended = true;
           record.updatedAt = new Date().toISOString();
-          suspended.push({ ...record });
+          dirty = true;
         }
+        affected.push({ ...record });
       }
-      if (suspended.length > 0) await this.writeAll(records);
-      return suspended;
+      if (dirty) await this.writeAll(records);
+      return affected;
     });
   }
 
+  /**
+   * Suspend all associations for an installation+repository.
+   * Returns every matching record (including already suspended) so run stores can reconcile.
+   */
   async suspendRepository(
     installationId: number,
     repository: string,
   ): Promise<AssociationRecord[]> {
     return this.withLock(async () => {
       const records = await this.readAll();
-      const suspended: AssociationRecord[] = [];
+      const affected: AssociationRecord[] = [];
+      let dirty = false;
       for (const record of Object.values(records)) {
-        if (
-          record.installationId === installationId &&
-          record.repository === repository &&
-          !record.suspended
-        ) {
+        if (record.installationId !== installationId || record.repository !== repository) {
+          continue;
+        }
+        if (!record.suspended) {
           record.suspended = true;
           record.updatedAt = new Date().toISOString();
-          suspended.push({ ...record });
+          dirty = true;
         }
+        affected.push({ ...record });
       }
-      if (suspended.length > 0) await this.writeAll(records);
-      return suspended;
+      if (dirty) await this.writeAll(records);
+      return affected;
     });
   }
 }
