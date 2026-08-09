@@ -1,136 +1,126 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile, mkdir } from "node:fs/promises";
+import { fork, type ChildProcess } from "node:child_process";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { withDirLock } from "../src/github/lock-ownership.ts";
-import { GitHubSideEffectStore } from "../src/github/side-effect-store.ts";
-import { GitHubAssociationIndex } from "../src/github/association.ts";
-import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
-test("dir lock does not create an absence window against a live owner", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-dir-live-"));
-  const lockDir = path.join(root, "lock.d");
-  let contenderEntered = false;
+const workerPath = fileURLToPath(
+  new URL("./fixtures/github-journal-worker.ts", import.meta.url),
+);
+const WATCHDOG_MS = 10_000;
 
-  const holder = withDirLock(lockDir, async () => {
-    await assert.rejects(
-      () =>
-        withDirLock(
-          lockDir,
-          async () => {
-            contenderEntered = true;
-          },
-          { timeoutMs: 150 },
-        ),
-      /Timed out/,
-    );
-  });
+interface WorkerMessage {
+  type: "ENTER" | "TRANSITION" | "COMPLETE" | "ERROR";
+  actor: string;
+  pid: number;
+  event?: string;
+  ticket?: string;
+  code?: string;
+  message?: string;
+}
 
-  await holder;
-  assert.equal(contenderEntered, false);
-});
+interface Worker {
+  child: ChildProcess;
+  next(predicate: (message: WorkerMessage) => boolean): Promise<WorkerMessage>;
+  release(): void;
+}
 
-test("dir lock reclaim aborts if owner metadata changes after death check", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-dir-race-"));
-  const lockDir = path.join(root, "lock.d");
-  await mkdir(lockDir);
-  await writeFile(
-    path.join(lockDir, "owner.json"),
-    `${JSON.stringify({ pid: 999_999_999, token: "dead", at: new Date().toISOString() })}\n`,
-  );
-
-  let entered = false;
-  await assert.rejects(
-    () =>
-      withDirLock(
-        lockDir,
-        async () => {
-          entered = true;
-        },
-        {
-          timeoutMs: 200,
-          afterDeadConfirmed: async (dir) => {
-            await writeFile(
-              path.join(dir, "owner.json"),
-              `${JSON.stringify({ pid: process.pid, token: "live", at: new Date().toISOString() })}\n`,
-            );
-          },
-        },
-      ),
-    /Timed out/,
-  );
-  assert.equal(entered, false);
-  assert.match(await readFile(path.join(lockDir, "owner.json"), "utf8"), /live/);
-});
-
-test("create-lock uses dir locks and preserves live successor metadata", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-create-dir-"));
-  const key = "k";
-  const lockName = `${createHash("sha256").update(key).digest("hex")}.json.lock`;
-  const lockDir = path.join(root, "side-effect-create-locks", lockName);
-  await mkdir(lockDir, { recursive: true });
-  await writeFile(
-    path.join(lockDir, "owner.json"),
-    `${JSON.stringify({ pid: 999_999_999, token: "dead", at: new Date().toISOString() })}\n`,
-  );
-
-  const store = new GitHubSideEffectStore(root, {
-    afterDeadConfirmed: async (dir) => {
-      await writeFile(
-        path.join(dir, "owner.json"),
-        `${JSON.stringify({ pid: process.pid, token: "live", at: new Date().toISOString() })}\n`,
-      );
+function spawnWorker(
+  githubRoot: string,
+  eventsPath: string,
+  actor: string,
+  timeoutMs = 3_000,
+): Worker {
+  const child = fork(workerPath, [], {
+    execArgv: ["--experimental-strip-types"],
+    env: {
+      ...process.env,
+      MASWE_GITHUB_ROOT: githubRoot,
+      MASWE_GITHUB_EVENTS_PATH: eventsPath,
+      MASWE_GITHUB_ACTOR: actor,
+      MASWE_GITHUB_JOURNAL_KIND: "check-create",
+      MASWE_GITHUB_LOGICAL_KEY: "shared-key",
+      MASWE_GITHUB_TIMEOUT_MS: String(timeoutMs),
     },
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  const messages: WorkerMessage[] = [];
+  const waiters: Array<{
+    predicate: (message: WorkerMessage) => boolean;
+    resolve: (message: WorkerMessage) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }> = [];
+
+  child.on("message", (message: WorkerMessage) => {
+    const index = waiters.findIndex((waiter) => waiter.predicate(message));
+    if (index >= 0) {
+      const [waiter] = waiters.splice(index, 1);
+      clearTimeout(waiter!.timer);
+      waiter!.resolve(message);
+    } else {
+      messages.push(message);
+    }
+  });
+  child.on("exit", (code, signal) => {
+    const error =
+      code === 0
+        ? new Error(`GitHub journal worker ${actor} exited before the expected message`)
+        : new Error(`GitHub journal worker ${actor} exited ${code ?? signal}`);
+    for (const waiter of waiters.splice(0)) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
   });
 
-  let entered = false;
-  await assert.rejects(
-    () =>
-      store.withCreateLock(
-        key,
-        async () => {
-          entered = true;
-        },
-        { timeoutMs: 200 },
-      ),
-    /Timed out/,
-  );
-  assert.equal(entered, false);
-  assert.match(await readFile(path.join(lockDir, "owner.json"), "utf8"), /live/);
-});
-
-test("association dir lock does not mutate index over live successor metadata", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-dir-"));
-  const lockDir = path.join(root, "associations.lock");
-  await mkdir(lockDir);
-  await writeFile(
-    path.join(lockDir, "owner.json"),
-    `${JSON.stringify({ pid: 999_999_999, token: "dead", at: new Date().toISOString() })}\n`,
-  );
-
-  const index = new GitHubAssociationIndex(root, {
-    afterDeadConfirmed: async (dir) => {
-      await writeFile(
-        path.join(dir, "owner.json"),
-        `${JSON.stringify({ pid: process.pid, token: "live", at: new Date().toISOString() })}\n`,
-      );
+  return {
+    child,
+    next(predicate) {
+      const index = messages.findIndex(predicate);
+      if (index >= 0) return Promise.resolve(messages.splice(index, 1)[0]!);
+      return new Promise<WorkerMessage>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const waiterIndex = waiters.findIndex((waiter) => waiter.resolve === resolve);
+          if (waiterIndex >= 0) waiters.splice(waiterIndex, 1);
+          reject(new Error(`GitHub journal worker ${actor} watchdog expired`));
+        }, WATCHDOG_MS);
+        waiters.push({ predicate, resolve, reject, timer });
+      });
     },
-  });
+    release() {
+      child.send({ type: "RELEASE" });
+    },
+  };
+}
 
-  await assert.rejects(
-    () =>
-      index.bind({
-        runId: "x",
-        installationId: 1,
-        repository: "owner/repo",
-        pullRequestNumber: 1,
-        baseSha: "b",
-        headSha: "h",
-        branch: "b",
-      }),
-    /Timed out/,
+async function waitForExit(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+}
+
+test("two child processes enter one logical GitHub journal strictly one at a time", async () => {
+  const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-process-"));
+  const eventsPath = path.join(githubRoot, "events.log");
+  await writeFile(eventsPath, "", "utf8");
+  const first = spawnWorker(githubRoot, eventsPath, "first");
+  await first.next((message) => message.type === "ENTER");
+
+  const second = spawnWorker(githubRoot, eventsPath, "second");
+  await second.next(
+    (message) => message.type === "TRANSITION" && message.event === "CLAIM_PUBLISHED",
   );
-  assert.equal(await index.find("owner/repo", 1), undefined);
-  assert.match(await readFile(path.join(lockDir, "owner.json"), "utf8"), /live/);
+  assert.equal(await readFile(eventsPath, "utf8"), "first:enter\n");
+
+  first.release();
+  await first.next((message) => message.type === "COMPLETE");
+  await second.next((message) => message.type === "ENTER");
+  assert.equal(
+    await readFile(eventsPath, "utf8"),
+    "first:enter\nfirst:exit\nsecond:enter\n",
+  );
+  second.release();
+  await second.next((message) => message.type === "COMPLETE");
+  await Promise.all([waitForExit(first.child), waitForExit(second.child)]);
 });

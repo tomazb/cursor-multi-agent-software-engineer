@@ -1,63 +1,90 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { GitHubAssociationIndex } from "../src/github/association.ts";
+import {
+  LockJournalError,
+  publishLockClaim,
+  scanLockJournal,
+} from "../src/lock-journal.ts";
+import { withGitHubJournal } from "../src/github/journal.ts";
 
-test("association lock does not reclaim a live owner based on age alone", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-age-"));
-  const index = new GitHubAssociationIndex(root, { lockStaleMs: 1 });
-  // Hold the directory lock by creating it with this process as owner.
-  const lockDir = path.join(root, "associations.lock");
-  const { mkdir } = await import("node:fs/promises");
-  await mkdir(lockDir);
-  await writeFile(
-    path.join(lockDir, "owner.json"),
-    `${JSON.stringify({
-      pid: process.pid,
-      token: "live-owner",
-      at: new Date(Date.now() - 60_000).toISOString(),
-    })}\n`,
+const ASSOCIATION_DIGEST =
+  "0d0eff7483f9df60bddf94736a2ce4e3e77fe46d895ebd415d72351adb890e30";
+
+test("a live lower-ticket owner remains blocking and the queued claim is exactly released", async () => {
+  const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-live-"));
+  const journalDirectory = path.join(
+    githubRoot,
+    "journals",
+    "association",
+    ASSOCIATION_DIGEST,
+  );
+  await mkdir(journalDirectory, { recursive: true });
+  const lower = await publishLockClaim(
+    journalDirectory,
+    "data",
+    "github-association",
   );
 
   await assert.rejects(
-    () =>
-      index.bind({
-        runId: "should-not",
-        installationId: 1,
-        repository: "owner/repo",
-        pullRequestNumber: 1,
-        baseSha: "b",
-        headSha: "h",
-        branch: "x",
-      }),
-    /Timed out acquiring directory lock/,
+    withGitHubJournal(
+      githubRoot,
+      "association",
+      "associations",
+      async () => assert.fail("live owner must remain blocking"),
+      { timeoutMs: 50, pollIntervalMs: 5 },
+    ),
+    /Timed out acquiring GitHub association journal/,
   );
+
+  const scan = await scanLockJournal(journalDirectory, "data");
+  assert.equal(scan.releases.has(lower.claim.ticket), false);
+  assert.equal(scan.claims.length, 2);
+  assert.equal(scan.releases.has(scan.claims[1]!.ticket), true);
 });
 
-test("association lock release is identity-bound", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-id-"));
-  const index = new GitHubAssociationIndex(root);
-  const locked = index as unknown as {
-    withLock: <T>(fn: () => Promise<T>) => Promise<T>;
-  };
+test("the GitHub journal path hashes the complete logical key", async () => {
+  const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-path-"));
+  const logicalKey = "credential-looking-value:secret";
+  await withGitHubJournal(githubRoot, "delivery", logicalKey, async () => undefined);
+  const digest = createHash("sha256").update(logicalKey).digest("hex");
+  const scan = await scanLockJournal(
+    path.join(githubRoot, "journals", "delivery", digest),
+    "data",
+  );
+  assert.equal(scan.claims.length, 1);
+  assert.equal(scan.claims[0]!.operation, "github-delivery");
+});
 
-  await locked.withLock(async () => {
-    const { mkdir, rm } = await import("node:fs/promises");
-    // Replace our lock directory with a successor owner while we still hold work.
-    await rm(path.join(root, "associations.lock"), { recursive: true, force: true });
-    await mkdir(path.join(root, "associations.lock"));
-    await writeFile(
-      path.join(root, "associations.lock", "owner.json"),
-      `${JSON.stringify({
-        pid: process.pid,
-        token: "successor-token",
-        at: new Date().toISOString(),
-      })}\n`,
-    );
-  });
+test("a callback LockJournalError is propagated once instead of being treated as contention", async () => {
+  const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-callback-"));
+  const callbackError = new LockJournalError(
+    "LOCK_QUEUED",
+    "callback-owned lock error",
+  );
+  let calls = 0;
+  await assert.rejects(
+    withGitHubJournal(
+      githubRoot,
+      "association",
+      "associations",
+      async () => {
+        calls += 1;
+        throw callbackError;
+      },
+      { timeoutMs: 20, pollIntervalMs: 5 },
+    ),
+    (error: unknown) => error === callbackError,
+  );
+  assert.equal(calls, 1);
 
-  const raw = await readFile(path.join(root, "associations.lock", "owner.json"), "utf8");
-  assert.match(raw, /successor-token/);
+  const scan = await scanLockJournal(
+    path.join(githubRoot, "journals", "association", ASSOCIATION_DIGEST),
+    "data",
+  );
+  assert.equal(scan.claims.length, 1);
+  assert.equal(scan.releases.has(scan.claims[0]!.ticket), true);
 });
