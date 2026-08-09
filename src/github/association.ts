@@ -1,7 +1,12 @@
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AssociationRecord } from "./types.ts";
+import {
+  reclaimDeadOwnerLock,
+  releaseLockIfToken,
+  type ReclaimHooks,
+} from "./lock-ownership.ts";
 
 function associationKey(repository: string, pullRequestNumber: number): string {
   return `${repository}#${pullRequestNumber}`;
@@ -19,16 +24,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function processAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 interface LockMeta {
   pid: number;
   token: string;
@@ -37,56 +32,27 @@ interface LockMeta {
 
 /**
  * Serialize association index mutations with an exclusive lock file (`wx`).
- * Abandoned locks are reclaimable only when the owner pid is confirmed dead.
- * Age alone never authorizes deletion. Release is identity-bound to the lock token.
+ * Abandoned locks are reclaimable only when the owner pid is confirmed dead and
+ * on-disk bytes still match the observed dead record. Release is identity-bound.
  */
 export class GitHubAssociationIndex {
   private readonly filePath: string;
   private readonly lockPath: string;
+  private readonly reclaimHooks: ReclaimHooks;
 
-  constructor(githubRoot: string, _options: { lockStaleMs?: number } = {}) {
+  constructor(
+    githubRoot: string,
+    options: { lockStaleMs?: number } & ReclaimHooks = {},
+  ) {
     this.filePath = path.join(githubRoot, "associations.json");
     this.lockPath = path.join(githubRoot, "associations.lock");
-    // lockStaleMs retained in options for API compatibility but ignored: age alone
-    // must not authorize lock deletion (confirmed-dead owner only).
-    void _options.lockStaleMs;
-  }
-
-  private async tryReclaimDeadOwnerLock(): Promise<void> {
-    try {
-      const raw = await readFile(this.lockPath, "utf8");
-      let meta: LockMeta;
-      try {
-        meta = JSON.parse(raw) as LockMeta;
-      } catch {
-        await unlink(this.lockPath);
-        return;
-      }
-      const pid = typeof meta.pid === "number" ? meta.pid : -1;
-      if (!processAlive(pid)) {
-        await unlink(this.lockPath);
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        try {
-          await unlink(this.lockPath);
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-  }
-
-  private async releaseIfOwned(token: string): Promise<void> {
-    try {
-      const raw = await readFile(this.lockPath, "utf8");
-      const meta = JSON.parse(raw) as LockMeta;
-      if (meta.token === token) {
-        await unlink(this.lockPath);
-      }
-    } catch {
-      /* missing or malformed: ignore */
-    }
+    // lockStaleMs retained for API compatibility; age alone never authorizes deletion.
+    void options.lockStaleMs;
+    this.reclaimHooks = {
+      ...(options.afterDeadConfirmed
+        ? { afterDeadConfirmed: options.afterDeadConfirmed }
+        : {}),
+    };
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -107,7 +73,7 @@ export class GitHubAssociationIndex {
         break;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        await this.tryReclaimDeadOwnerLock();
+        await reclaimDeadOwnerLock(this.lockPath, this.reclaimHooks);
         if (Date.now() - started > 5_000) {
           throw new Error("Timed out acquiring GitHub association index lock");
         }
@@ -117,7 +83,7 @@ export class GitHubAssociationIndex {
     try {
       return await fn();
     } finally {
-      await this.releaseIfOwned(token);
+      await releaseLockIfToken(this.lockPath, token);
     }
   }
 

@@ -1,6 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import {
+  reclaimDeadOwnerLock,
+  releaseLockIfToken,
+  type ReclaimHooks,
+} from "./lock-ownership.ts";
 
 export interface SideEffectRecord {
   resourceId: number;
@@ -29,23 +34,15 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function processAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export class GitHubSideEffectStore {
   private readonly dir: string;
   private readonly createLocksDir: string;
+  private readonly reclaimHooks: ReclaimHooks;
 
-  constructor(githubRoot: string) {
+  constructor(githubRoot: string, options: ReclaimHooks = {}) {
     this.dir = path.join(githubRoot, "side-effects");
     this.createLocksDir = path.join(githubRoot, "side-effect-create-locks");
+    this.reclaimHooks = options;
   }
 
   async get(idempotencyKey: string): Promise<SideEffectRecord | undefined> {
@@ -69,46 +66,9 @@ export class GitHubSideEffectStore {
     );
   }
 
-  private async tryReclaimDeadOwnerLock(lockPath: string): Promise<void> {
-    try {
-      const raw = await readFile(lockPath, "utf8");
-      let meta: LockMeta;
-      try {
-        meta = JSON.parse(raw) as LockMeta;
-      } catch {
-        await unlink(lockPath);
-        return;
-      }
-      const pid = typeof meta.pid === "number" ? meta.pid : -1;
-      if (!processAlive(pid)) {
-        await unlink(lockPath);
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        try {
-          await unlink(lockPath);
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-  }
-
-  private async releaseIfOwned(lockPath: string, token: string): Promise<void> {
-    try {
-      const raw = await readFile(lockPath, "utf8");
-      const meta = JSON.parse(raw) as LockMeta;
-      if (meta.token === token) {
-        await unlink(lockPath);
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-
   /**
    * Serialize create/reconcile for one idempotency key across concurrent publishers.
-   * Confirmed-dead owner locks are reclaimable; release is identity-bound.
+   * Confirmed-dead owner locks are reclaimable via bytes-matched unlink; release is identity-bound.
    */
   async withCreateLock<T>(
     idempotencyKey: string,
@@ -134,7 +94,7 @@ export class GitHubSideEffectStore {
         break;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        await this.tryReclaimDeadOwnerLock(lockPath);
+        await reclaimDeadOwnerLock(lockPath, this.reclaimHooks);
         if (Date.now() - started > timeoutMs) {
           throw new Error(`Timed out acquiring check-create lock for ${idempotencyKey}`);
         }
@@ -144,7 +104,7 @@ export class GitHubSideEffectStore {
     try {
       return await fn();
     } finally {
-      await this.releaseIfOwned(lockPath, token);
+      await releaseLockIfToken(lockPath, token);
     }
   }
 }

@@ -1,6 +1,7 @@
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { unlinkIfBytesMatch } from "./lock-ownership.ts";
 
 export type DeliveryStatus = "processing" | "completed";
 
@@ -36,6 +37,8 @@ export interface DeliveryStoreMonitor {
   ) => void;
 }
 
+export type DeliveryLeaseValidatedOp = "complete" | "fail" | "claim-reclaim";
+
 /** Default: reclaim processing claims older than 5 minutes (crash recovery). */
 export const DEFAULT_STALE_PROCESSING_MS = 5 * 60 * 1000;
 
@@ -48,24 +51,24 @@ function assertSafeDeliveryId(deliveryId: string): void {
   }
 }
 
-async function writeAtomic(filePath: string, content: string): Promise<void> {
-  const directory = path.dirname(filePath);
-  await mkdir(directory, { recursive: true });
-  const tempPath = path.join(directory, `.${path.basename(filePath)}.${randomUUID()}.tmp`);
-  await writeFile(tempPath, content, "utf8");
-  await rename(tempPath, filePath);
+function encodeRecord(record: DeliveryRecord): string {
+  return `${JSON.stringify(record)}\n`;
 }
 
 /**
  * File-backed delivery ledger for `X-GitHub-Delivery` ids.
  * Claims start as `processing`; only `completed` deliveries are terminal duplicates.
- * Failed processing releases the claim. Stale `processing` claims (crash) are reclaimable.
- * complete/fail require the claim leaseId so an expired owner cannot fence a successor.
+ * complete/fail fence with leaseId and compare-and-swap unlink so a successor
+ * inserted after the lease check cannot be overwritten or deleted.
  */
 export class GitHubDeliveryStore {
   private readonly deliveriesDir: string;
   private readonly staleProcessingMs: number;
   private readonly monitor: DeliveryStoreMonitor;
+  private readonly afterLeaseValidated?: (
+    op: DeliveryLeaseValidatedOp,
+    deliveryId: string,
+  ) => Promise<void>;
   private staleReclaims = 0;
   private ownerMismatchAttempts = 0;
 
@@ -75,6 +78,11 @@ export class GitHubDeliveryStore {
       staleProcessingMs?: number;
       onStaleReclaim?: DeliveryStoreMonitor["onStaleReclaim"];
       onOwnerMismatch?: DeliveryStoreMonitor["onOwnerMismatch"];
+      /** Test hook after lease validation, before CAS mutate. */
+      afterLeaseValidated?: (
+        op: DeliveryLeaseValidatedOp,
+        deliveryId: string,
+      ) => Promise<void>;
     } = {},
   ) {
     this.deliveriesDir = path.join(githubRoot, "deliveries");
@@ -82,6 +90,7 @@ export class GitHubDeliveryStore {
     this.monitor = {};
     if (options.onStaleReclaim) this.monitor.onStaleReclaim = options.onStaleReclaim;
     if (options.onOwnerMismatch) this.monitor.onOwnerMismatch = options.onOwnerMismatch;
+    if (options.afterLeaseValidated) this.afterLeaseValidated = options.afterLeaseValidated;
   }
 
   /** Counters for reclaim/mismatch monitoring (tests and operators). */
@@ -96,10 +105,12 @@ export class GitHubDeliveryStore {
     return path.join(this.deliveriesDir, `${deliveryId}.json`);
   }
 
-  private async read(deliveryId: string): Promise<DeliveryRecord | undefined> {
+  private async readRaw(
+    deliveryId: string,
+  ): Promise<{ raw: string; record: DeliveryRecord } | undefined> {
     try {
       const raw = await readFile(this.filePath(deliveryId), "utf8");
-      return JSON.parse(raw) as DeliveryRecord;
+      return { raw, record: JSON.parse(raw) as DeliveryRecord };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw error;
@@ -126,20 +137,25 @@ export class GitHubDeliveryStore {
   async claim(deliveryId: string, nowMs = Date.now()): Promise<DeliveryClaimResult> {
     assertSafeDeliveryId(deliveryId);
     await mkdir(this.deliveriesDir, { recursive: true });
-    const existing = await this.read(deliveryId);
-    if (existing?.status === "completed") {
+    const existing = await this.readRaw(deliveryId);
+    if (existing?.record.status === "completed") {
       return { claimed: false, duplicate: true, status: "completed" };
     }
-    if (existing?.status === "processing") {
-      if (!this.isStaleProcessing(existing, nowMs)) {
+    if (existing?.record.status === "processing") {
+      if (!this.isStaleProcessing(existing.record, nowMs)) {
         return { claimed: false, duplicate: true, status: "processing" };
       }
       this.staleReclaims += 1;
-      this.monitor.onStaleReclaim?.(deliveryId, existing.leaseId);
-      try {
-        await unlink(this.filePath(deliveryId));
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      this.monitor.onStaleReclaim?.(deliveryId, existing.record.leaseId);
+      await this.afterLeaseValidated?.("claim-reclaim", deliveryId);
+      const removed = await unlinkIfBytesMatch(this.filePath(deliveryId), existing.raw);
+      if (!removed) {
+        const raced = await this.readRaw(deliveryId);
+        return {
+          claimed: false,
+          duplicate: true,
+          ...(raced?.record.status ? { status: raced.record.status } : { status: "processing" }),
+        };
       }
     }
 
@@ -151,7 +167,7 @@ export class GitHubDeliveryStore {
       claimedAt: new Date(nowMs).toISOString(),
     };
     try {
-      await writeFile(this.filePath(deliveryId), `${JSON.stringify(record)}\n`, {
+      await writeFile(this.filePath(deliveryId), encodeRecord(record), {
         encoding: "utf8",
         flag: "wx",
       });
@@ -159,11 +175,11 @@ export class GitHubDeliveryStore {
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === "EEXIST") {
-        const raced = await this.read(deliveryId);
+        const raced = await this.readRaw(deliveryId);
         return {
           claimed: false,
           duplicate: true,
-          ...(raced?.status ? { status: raced.status } : {}),
+          ...(raced?.record.status ? { status: raced.record.status } : {}),
         };
       }
       throw error;
@@ -176,27 +192,46 @@ export class GitHubDeliveryStore {
       this.noteOwnerMismatch("complete", deliveryId, leaseId, undefined);
       return { ok: false, reason: "owner_mismatch" };
     }
-    const existing = await this.read(deliveryId);
+    const existing = await this.readRaw(deliveryId);
     if (!existing) {
       return { ok: false, reason: "not_found" };
     }
-    if (existing.status === "completed") {
-      if (existing.leaseId === leaseId) return { ok: true };
-      this.noteOwnerMismatch("complete", deliveryId, leaseId, existing.leaseId);
+    if (existing.record.status === "completed") {
+      if (existing.record.leaseId === leaseId) return { ok: true };
+      this.noteOwnerMismatch("complete", deliveryId, leaseId, existing.record.leaseId);
       return { ok: false, reason: "already_completed" };
     }
-    if (existing.leaseId !== leaseId) {
-      this.noteOwnerMismatch("complete", deliveryId, leaseId, existing.leaseId);
+    if (existing.record.leaseId !== leaseId) {
+      this.noteOwnerMismatch("complete", deliveryId, leaseId, existing.record.leaseId);
       return { ok: false, reason: "owner_mismatch" };
     }
-    const record: DeliveryRecord = {
-      ...existing,
+
+    await this.afterLeaseValidated?.("complete", deliveryId);
+
+    const completed: DeliveryRecord = {
+      ...existing.record,
       status: "completed",
       completedAt: new Date().toISOString(),
     };
-    delete record.lastError;
-    await writeAtomic(this.filePath(deliveryId), `${JSON.stringify(record)}\n`);
-    return { ok: true };
+    delete completed.lastError;
+    const removed = await unlinkIfBytesMatch(this.filePath(deliveryId), existing.raw);
+    if (!removed) {
+      this.noteOwnerMismatch("complete", deliveryId, leaseId, undefined);
+      return { ok: false, reason: "owner_mismatch" };
+    }
+    try {
+      await writeFile(this.filePath(deliveryId), encodeRecord(completed), {
+        encoding: "utf8",
+        flag: "wx",
+      });
+      return { ok: true };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        this.noteOwnerMismatch("complete", deliveryId, leaseId, undefined);
+        return { ok: false, reason: "owner_mismatch" };
+      }
+      throw error;
+    }
   }
 
   async fail(
@@ -209,21 +244,24 @@ export class GitHubDeliveryStore {
       this.noteOwnerMismatch("fail", deliveryId, leaseId, undefined);
       return { ok: false, reason: "owner_mismatch" };
     }
-    const existing = await this.read(deliveryId);
+    const existing = await this.readRaw(deliveryId);
     if (!existing) {
       return { ok: false, reason: "not_found" };
     }
-    if (existing.leaseId !== leaseId) {
-      this.noteOwnerMismatch("fail", deliveryId, leaseId, existing.leaseId);
+    if (existing.record.leaseId !== leaseId) {
+      this.noteOwnerMismatch("fail", deliveryId, leaseId, existing.record.leaseId);
       return { ok: false, reason: "owner_mismatch" };
     }
-    if (existing.status === "completed") {
+    if (existing.record.status === "completed") {
       return { ok: false, reason: "already_completed" };
     }
-    try {
-      await unlink(this.filePath(deliveryId));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+
+    await this.afterLeaseValidated?.("fail", deliveryId);
+
+    const removed = await unlinkIfBytesMatch(this.filePath(deliveryId), existing.raw);
+    if (!removed) {
+      this.noteOwnerMismatch("fail", deliveryId, leaseId, undefined);
+      return { ok: false, reason: "owner_mismatch" };
     }
     void errorMessage;
     return { ok: true };

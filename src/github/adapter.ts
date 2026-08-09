@@ -136,7 +136,12 @@ export class GitHubAppAdapter {
       });
 
       await this.dispatch(event, app);
-      await this.deliveries.complete(request.deliveryId, leaseId);
+      const completed = await this.deliveries.complete(request.deliveryId, leaseId);
+      if (!completed.ok) {
+        throw new Error(
+          `Delivery completion rejected for ${request.deliveryId}: ${completed.reason}`,
+        );
+      }
       return { status: 200, body: { ok: true } };
     } catch (error) {
       await this.deliveries.fail(
