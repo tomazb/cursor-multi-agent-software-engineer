@@ -86,15 +86,21 @@ export class GitHubAssociationIndex {
     return records[associationKey(repository, pullRequestNumber)];
   }
 
-  async findByRepositoryBranch(
+  async findAllByRepositoryBranch(
     repository: string,
     branch: string,
-  ): Promise<AssociationRecord | undefined> {
+  ): Promise<AssociationRecord[]> {
     const records = await this.readAll();
-    return Object.values(records).find(
-      (record) =>
-        record.repository === repository && record.branch === branch && !record.suspended,
-    );
+    return Object.values(records)
+      .filter(
+        (record) =>
+          record.repository === repository && record.branch === branch && !record.suspended,
+      )
+      .map((record) => ({ ...record }))
+      .sort(
+        (left, right) =>
+          left.pullRequestNumber - right.pullRequestNumber || left.runId.localeCompare(right.runId),
+      );
   }
 
   async suspendInstallation(installationId: number): Promise<AssociationRecord[]> {

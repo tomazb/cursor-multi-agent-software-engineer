@@ -360,19 +360,20 @@ export class GitHubAppAdapter {
     const repository = event.repository!;
     const branch = event.branch!;
     const headSha = event.headSha!;
-    const association = await this.associations.findByRepositoryBranch(repository, branch);
-    if (!association || association.suspended) return;
-
-    const synthetic: GitHubInternalEvent = {
-      ...event,
-      type: "pull_request.synchronize",
-      pullRequestNumber: association.pullRequestNumber,
-      headSha,
-      branch,
-      repository,
-      installationId: association.installationId,
-    };
-    await this.handlePullRequestEvent(synthetic);
+    const associations = await this.associations.findAllByRepositoryBranch(repository, branch);
+    for (const association of associations) {
+      if (association.suspended) continue;
+      const synthetic: GitHubInternalEvent = {
+        ...event,
+        type: "pull_request.synchronize",
+        pullRequestNumber: association.pullRequestNumber,
+        headSha,
+        branch,
+        repository,
+        installationId: association.installationId,
+      };
+      await this.handlePullRequestEvent(synthetic);
+    }
   }
 
   private async currentPullRequestHead(

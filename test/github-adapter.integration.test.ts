@@ -38,7 +38,8 @@ async function setup(options: { liveHead?: string } = {}) {
   const store = new FileRunStore(cwd);
   const config = testConfig();
   const posts: unknown[] = [];
-  const patches: unknown[] = [];
+  const checkRunHeadShas = new Map<number, string>();
+  const patches: Array<{ url: string; body: unknown; headSha: string | undefined }> = [];
   const tokens: Array<{ installationId: number; repository: string }> = [];
   let nextId = 1;
   let rateLimitOnce = false;
@@ -73,10 +74,18 @@ async function setup(options: { liveHead?: string } = {}) {
       }
       if (method === "POST" && url.includes("/check-runs")) {
         posts.push(options?.body);
-        return { status: 201, headers: {}, body: { id: nextId++ } };
+        const id = nextId++;
+        const headSha = (options?.body as { head_sha?: unknown } | undefined)?.head_sha;
+        if (typeof headSha === "string") checkRunHeadShas.set(id, headSha);
+        return { status: 201, headers: {}, body: { id } };
       }
       if (method === "PATCH") {
-        patches.push(options?.body);
+        const checkRunId = Number(url.match(/\/check-runs\/(\d+)$/)?.[1]);
+        patches.push({
+          url,
+          body: options?.body,
+          headSha: checkRunHeadShas.get(checkRunId),
+        });
         return { status: 200, headers: {}, body: { id: 1 } };
       }
       return { status: 200, headers: {}, body: {} };
@@ -377,32 +386,80 @@ test("integration: does not steal another PR's associated run", async () => {
   assert.equal(loaded.github?.headSha, "h");
 });
 
-test("integration: push events invalidate the matching PR association", async () => {
+test("integration: push events invalidate every matching PR association", async () => {
   process.env[SECRET_ENV] = SECRET;
-  const { adapter, store, cwd, setLiveHead } = await setup({ liveHead: "sha-push" });
-  const run = await store.create("push-run", "req", testConfig());
-  run.workspace = {
+  const { adapter, posts, patches, store, cwd, setLiveHead } = await setup({
+    liveHead: "sha-push",
+  });
+  const firstRun = await store.create("first-push-run", "req", testConfig());
+  firstRun.workspace = {
     baseSha: "base",
-    headSha: "old",
+    headSha: "old-first",
     branch: "maswe/run-1",
     fingerprint: "fp",
     remote: "https://github.com/owner/repo.git",
   };
-  run.evidence = {
-    quality: { headSha: "old", passed: true, at: "t" },
-    verification: { headSha: "old", passed: true, at: "t" },
+  firstRun.evidence = {
+    quality: { headSha: "old-first", passed: true, at: "t" },
+    verification: { headSha: "old-first", passed: true, at: "t" },
   };
-  await store.save(run);
-  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
-  await index.bind({
-    runId: run.id,
+  firstRun.github = {
     installationId: 44,
     repository: "owner/repo",
     pullRequestNumber: 9,
     baseSha: "base",
-    headSha: "old",
+    headSha: "old-first",
+    branch: "maswe/run-1",
+    suspended: false,
+  };
+  await store.save(firstRun);
+
+  const secondRun = await store.create("second-push-run", "req", testConfig());
+  secondRun.workspace = {
+    baseSha: "base",
+    headSha: "old-second",
+    branch: "maswe/run-1",
+    fingerprint: "fp",
+    remote: "https://github.com/owner/repo.git",
+  };
+  secondRun.evidence = {
+    quality: { headSha: "old-second", passed: true, at: "t" },
+    verification: { headSha: "old-second", passed: true, at: "t" },
+  };
+  secondRun.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 10,
+    baseSha: "base",
+    headSha: "old-second",
+    branch: "maswe/run-1",
+    suspended: false,
+  };
+  await store.save(secondRun);
+
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  await index.bind({
+    runId: firstRun.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "old-first",
     branch: "maswe/run-1",
   });
+  await index.bind({
+    runId: secondRun.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 10,
+    baseSha: "base",
+    headSha: "old-second",
+    branch: "maswe/run-1",
+  });
+
+  await adapter.publishChecksForRun(firstRun.id);
+  await adapter.publishChecksForRun(secondRun.id);
+  const postCountBeforePush = posts.length;
 
   setLiveHead("sha-push");
   const body = JSON.stringify({
@@ -418,9 +475,29 @@ test("integration: push events invalidate the matching PR association", async ()
     rawBody: body,
   });
   assert.equal(result.status, 200);
-  const loaded = await store.load(run.id);
-  assert.equal(loaded.github?.headSha, "sha-push");
-  assert.equal(loaded.evidence?.quality, undefined);
+  const loadedFirst = await store.load(firstRun.id);
+  const loadedSecond = await store.load(secondRun.id);
+  assert.equal(loadedFirst.github?.headSha, "sha-push");
+  assert.equal(loadedFirst.evidence?.quality, undefined);
+  assert.equal(loadedSecond.github?.headSha, "sha-push");
+  assert.equal(loadedSecond.evidence?.quality, undefined);
+
+  assert.equal(patches.filter((patch) => patch.headSha === "old-first").length, 4);
+  assert.equal(patches.filter((patch) => patch.headSha === "old-second").length, 4);
+  assert.deepEqual(
+    patches.map((patch) => (patch.body as { conclusion?: string }).conclusion),
+    Array(8).fill("cancelled"),
+  );
+  assert.equal(
+    posts
+      .slice(postCountBeforePush)
+      .filter((post) => {
+        const headSha = (post as { head_sha?: unknown }).head_sha;
+        return typeof headSha === "string" && ["old-first", "old-second"].includes(headSha);
+      })
+      .length,
+    0,
+  );
 });
 
 test("integration: live-head lookup failure fails closed", async () => {

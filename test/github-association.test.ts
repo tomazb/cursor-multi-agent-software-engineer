@@ -54,3 +54,50 @@ test("association index suspends all entries for an installation", async () => {
   assert.equal((await index.find("owner/repo", 1))?.suspended, true);
   assert.equal((await index.find("owner/other", 2))?.suspended, false);
 });
+
+test("association index finds all non-suspended branch associations in PR order", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-branch-assoc-"));
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  await index.bind({
+    runId: "run-five",
+    installationId: 10,
+    repository: "owner/repo",
+    pullRequestNumber: 5,
+    baseSha: "base",
+    headSha: "head-five",
+    branch: "maswe/shared",
+  });
+  await index.bind({
+    runId: "run-two",
+    installationId: 10,
+    repository: "owner/repo",
+    pullRequestNumber: 2,
+    baseSha: "base",
+    headSha: "head-two",
+    branch: "maswe/shared",
+  });
+  await index.bind({
+    runId: "run-suspended",
+    installationId: 10,
+    repository: "owner/repo",
+    pullRequestNumber: 7,
+    baseSha: "base",
+    headSha: "head-suspended",
+    branch: "maswe/shared",
+    suspended: true,
+  });
+
+  const matches = await index.findAllByRepositoryBranch("owner/repo", "maswe/shared");
+
+  assert.deepEqual(
+    matches.map((record) => [record.pullRequestNumber, record.runId]),
+    [
+      [2, "run-two"],
+      [5, "run-five"],
+    ],
+  );
+  const firstMatch = matches[0];
+  assert.ok(firstMatch);
+  firstMatch.headSha = "mutated-snapshot";
+  assert.equal((await index.find("owner/repo", 2))?.headSha, "head-two");
+});
