@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { RunRecord } from "../domain.ts";
 import type { GitHubSideEffectStore } from "./side-effect-store.ts";
 import { MASWE_CHECK_NAMES, type MasweCheckName } from "./types.ts";
@@ -113,9 +114,80 @@ function idempotencyKey(
   return `check-run:${owner}/${repo}/${pullRequestNumber}/${headSha}/${checkName}/${attempt}`;
 }
 
-function externalIdFor(key: string): string {
-  // GitHub external_id is free-form; keep it stable and filesystem-safe length.
-  return key.length <= 64 ? key : key.slice(0, 64);
+export function externalIdFor(key: string): string {
+  return `maswe:check-run:sha256:${createHash("sha256").update(key).digest("hex")}`;
+}
+
+const CHECK_RECONCILIATION_PAGE_LIMIT = 10;
+
+function headerValue(
+  headers: Record<string, string>,
+  expectedName: string,
+): string | undefined {
+  const normalizedExpectedName = expectedName.toLowerCase();
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() === normalizedExpectedName) return value;
+  }
+  return undefined;
+}
+
+function nextLinkFrom(headers: Record<string, string>): string | undefined {
+  const value = headerValue(headers, "link");
+  if (value === undefined) return undefined;
+  if (value.trim() === "") throw new Error("GitHub check-run pagination Link header is malformed");
+
+  let nextUrl: string | undefined;
+  for (const segment of value.split(",")) {
+    const link = /^\s*<([^<>]+)>(.*)$/.exec(segment);
+    if (!link) throw new Error("GitHub check-run pagination Link header is malformed");
+    const parameterText = link[2]!;
+    const parameters = parameterText.split(";");
+    if (parameters.shift()!.trim() !== "") {
+      throw new Error("GitHub check-run pagination Link header is malformed");
+    }
+
+    let relations: string[] = [];
+    for (const parameter of parameters) {
+      const parsed = /^\s*([^=\s]+)\s*=\s*(?:"([^"]*)"|([^"\s;]+))\s*$/.exec(parameter);
+      if (!parsed) throw new Error("GitHub check-run pagination Link header is malformed");
+      if (parsed[1]!.toLowerCase() === "rel") {
+        relations = (parsed[2] ?? parsed[3] ?? "").split(/\s+/).filter(Boolean);
+      }
+    }
+    if (!relations.some((relation) => relation.toLowerCase() === "next")) continue;
+    if (nextUrl !== undefined) {
+      throw new Error("GitHub check-run pagination Link header has multiple next links");
+    }
+    nextUrl = link[1]!;
+  }
+  return nextUrl;
+}
+
+function safePaginationUrl(
+  rawUrl: string,
+  endpointPath: string,
+  checkName: string,
+): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error("GitHub check-run pagination Link URL is malformed");
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.origin !== "https://api.github.com" ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.pathname !== endpointPath ||
+    parsed.hash !== "" ||
+    parsed.searchParams.get("check_name") !== checkName ||
+    parsed.searchParams.get("filter") !== "all" ||
+    parsed.searchParams.get("per_page") !== "100"
+  ) {
+    throw new Error("GitHub check-run pagination Link URL is unsafe");
+  }
+  return parsed.toString();
 }
 
 export function isRateLimited(
@@ -273,6 +345,7 @@ export class CheckPublisher {
           throw new Error("GitHub check-run response missing id");
         }
         await this.sideEffects.put(key, { resourceId: recovered, kind: "check-run" });
+        await this.patchCheck(recovered, outcome);
         return;
       }
       await this.sideEffects.put(key, { resourceId: id, kind: "check-run" });
@@ -284,15 +357,42 @@ export class CheckPublisher {
     headSha: string,
     externalId: string,
   ): Promise<number | undefined> {
-    const response = await this.requestWithRateLimitRetry(
-      "GET",
-      `https://api.github.com/repos/${this.owner}/${this.repo}/commits/${encodeURIComponent(headSha)}/check-runs?check_name=${encodeURIComponent(name)}&filter=latest`,
-    );
-    const checkRuns = (response.body as { check_runs?: Array<{ id?: number; external_id?: string }> })
-      .check_runs;
-    if (!Array.isArray(checkRuns)) return undefined;
-    const match = checkRuns.find((run) => run.external_id === externalId && typeof run.id === "number");
-    return match?.id;
+    const endpointPath = `/repos/${this.owner}/${this.repo}/commits/${encodeURIComponent(headSha)}/check-runs`;
+    const initialUrl = new URL(`https://api.github.com${endpointPath}`);
+    initialUrl.searchParams.set("check_name", name);
+    initialUrl.searchParams.set("filter", "all");
+    initialUrl.searchParams.set("per_page", "100");
+
+    let pageUrl = initialUrl.toString();
+    const visited = new Set<string>();
+    for (let page = 0; page < CHECK_RECONCILIATION_PAGE_LIMIT; page += 1) {
+      if (visited.has(pageUrl)) {
+        throw new Error("GitHub check-run pagination Link loop detected");
+      }
+      visited.add(pageUrl);
+      const response = await this.requestWithRateLimitRetry("GET", pageUrl);
+      const checkRuns = (
+        response.body as { check_runs?: Array<{ id?: number; external_id?: string }> }
+      ).check_runs;
+      if (Array.isArray(checkRuns)) {
+        const match = checkRuns.find(
+          (run) => run.external_id === externalId && typeof run.id === "number",
+        );
+        if (match) return match.id;
+      }
+
+      const nextLink = nextLinkFrom(response.headers);
+      if (nextLink === undefined) return undefined;
+      const nextUrl = safePaginationUrl(nextLink, endpointPath, name);
+      if (visited.has(nextUrl)) {
+        throw new Error("GitHub check-run pagination Link loop detected");
+      }
+      if (page + 1 >= CHECK_RECONCILIATION_PAGE_LIMIT) {
+        throw new Error("GitHub check-run pagination page limit exceeded");
+      }
+      pageUrl = nextUrl;
+    }
+    throw new Error("GitHub check-run pagination page limit exceeded");
   }
 
   private async patchCheck(checkRunId: number, outcome: CheckOutcome): Promise<void> {

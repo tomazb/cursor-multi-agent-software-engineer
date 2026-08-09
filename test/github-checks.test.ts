@@ -8,6 +8,7 @@ import {
   assertReadOnlyChecksMode,
   buildCheckConclusions,
   CheckPublisher,
+  externalIdFor,
   type GitHubHttpClient,
 } from "../src/github/checks.ts";
 import type { RunRecord } from "../src/domain.ts";
@@ -27,6 +28,27 @@ test("read-only mode rejects write side effects", () => {
   assert.throws(() => assertReadOnlyChecksMode(true, "push"), /read-only/i);
   assert.throws(() => assertReadOnlyChecksMode(true, "pull_request_write"), /read-only/i);
   assert.throws(() => assertReadOnlyChecksMode(true, "comment_reply"), /read-only/i);
+});
+
+test("externalIdFor is a stable full SHA-256 identity for the complete key", () => {
+  const key = "check-run:owner/repo/1/sha/MASWE / deterministic quality/1";
+  const externalId = externalIdFor(key);
+
+  assert.equal(
+    externalId,
+    "maswe:check-run:sha256:26f91d94b5264f291f2cfbafef75c48fe7f65713108a4b4251ad8eebc68e407e",
+  );
+  assert.match(externalId, /^maswe:check-run:sha256:[0-9a-f]{64}$/);
+  assert.equal(externalIdFor(key), externalId);
+});
+
+test("externalIdFor distinguishes long keys that differ only after byte 64", () => {
+  const sharedPrefix = "x".repeat(64);
+
+  assert.notEqual(
+    externalIdFor(`${sharedPrefix}first-complete-key`),
+    externalIdFor(`${sharedPrefix}second-complete-key`),
+  );
 });
 
 test("buildCheckConclusions binds success only to matching evidence SHA", () => {
@@ -165,6 +187,291 @@ test("CheckPublisher PATCH bodies omit head_sha", async () => {
   for (const body of patches) {
     assert.equal(Object.hasOwn(body as object, "head_sha"), false);
   }
+});
+
+test("CheckPublisher reconciles all pages with filter=all and patches a later-page match", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-pages-"));
+  const sideEffects = new GitHubSideEffectStore(root);
+  const calls: Array<{ method: string; url: string; body?: unknown }> = [];
+  const http: GitHubHttpClient = {
+    async request(method, url, options) {
+      calls.push({ method, url, body: options?.body });
+      if (method === "GET") {
+        const requested = new URL(url);
+        assert.equal(requested.searchParams.get("filter"), "all");
+        assert.equal(requested.searchParams.get("per_page"), "100");
+        const name = requested.searchParams.get("check_name")!;
+        const key = `check-run:owner/repo/1/sha/${name}/1`;
+        const id = name === "MASWE / specification compliance" ? 401 : 402 + calls.length;
+        if (name === "MASWE / specification compliance" && !requested.searchParams.has("page")) {
+          requested.searchParams.set("page", "2");
+          return {
+            status: 200,
+            headers: { LiNk: `<${requested.toString()}>; rel="next"` },
+            body: { check_runs: [] },
+          };
+        }
+        return {
+          status: 200,
+          headers: {},
+          body: { check_runs: [{ id, external_id: externalIdFor(key) }] },
+        };
+      }
+      if (method === "PATCH") {
+        return { status: 200, headers: {}, body: { id: Number(url.split("/").pop()) } };
+      }
+      throw new Error(`Unexpected ${method} ${url}`);
+    },
+  };
+  const publisher = new CheckPublisher({
+    http,
+    sideEffects,
+    readOnlyChecks: true,
+    owner: "owner",
+    repo: "repo",
+    pullRequestNumber: 1,
+    token: "token",
+  });
+  const run = {
+    schemaVersion: 1,
+    version: 1,
+    id: "run-1",
+    title: "t",
+    request: "r",
+    repositoryPath: "/tmp",
+    state: "PR_REVIEW",
+    createdAt: "",
+    updatedAt: "",
+    approvals: { brainstorm: false, design: false },
+    counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
+    config: DEFAULT_CONFIG,
+    artifacts: [],
+    events: [],
+  } as RunRecord;
+
+  await publisher.publishForHeadSha(run, "sha");
+
+  assert.equal(calls.filter((call) => call.method === "POST").length, 0);
+  assert.equal(
+    calls.filter(
+      (call) =>
+        call.method === "GET" &&
+        new URL(call.url).searchParams.get("check_name") ===
+          "MASWE / specification compliance",
+    ).length,
+    2,
+  );
+  const recoveredPatch = calls.find(
+    (call) => call.method === "PATCH" && call.url.endsWith("/check-runs/401"),
+  );
+  assert.deepEqual(recoveredPatch?.body, {
+    status: "completed",
+    conclusion: "action_required",
+    output: {
+      title: "Specification incomplete",
+      summary: "Approved brainstorm/design artifacts are required before specification compliance succeeds.",
+    },
+  });
+});
+
+test("CheckPublisher reconciles a POST response without id, persists it, and patches the outcome", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-ambiguous-post-"));
+  const sideEffects = new GitHubSideEffectStore(root);
+  const calls: Array<{ method: string; url: string; body?: unknown }> = [];
+  const getsByName = new Map<string, number>();
+  const idsByName = new Map<string, number>();
+  let nextId = 700;
+  const http: GitHubHttpClient = {
+    async request(method, url, options) {
+      calls.push({ method, url, body: options?.body });
+      if (method === "GET") {
+        const name = new URL(url).searchParams.get("check_name")!;
+        const getCount = (getsByName.get(name) ?? 0) + 1;
+        getsByName.set(name, getCount);
+        if (getCount === 1) {
+          return { status: 200, headers: {}, body: { check_runs: [] } };
+        }
+        return {
+          status: 200,
+          headers: {},
+          body: {
+            check_runs: [{ id: idsByName.get(name), external_id: externalIdFor(`check-run:owner/repo/1/sha/${name}/1`) }],
+          },
+        };
+      }
+      if (method === "POST") {
+        const name = (options?.body as { name: string }).name;
+        idsByName.set(name, nextId++);
+        return { status: 201, headers: {}, body: {} };
+      }
+      if (method === "PATCH") {
+        return { status: 200, headers: {}, body: { id: Number(url.split("/").pop()) } };
+      }
+      throw new Error(`Unexpected ${method} ${url}`);
+    },
+  };
+  const publisher = new CheckPublisher({
+    http,
+    sideEffects,
+    readOnlyChecks: true,
+    owner: "owner",
+    repo: "repo",
+    pullRequestNumber: 1,
+    token: "token",
+  });
+  const run = {
+    schemaVersion: 1,
+    version: 1,
+    id: "run-1",
+    title: "t",
+    request: "r",
+    repositoryPath: "/tmp",
+    state: "PR_REVIEW",
+    createdAt: "",
+    updatedAt: "",
+    approvals: { brainstorm: false, design: false },
+    counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
+    config: DEFAULT_CONFIG,
+    artifacts: [],
+    events: [],
+  } as RunRecord;
+
+  await publisher.publishForHeadSha(run, "sha");
+
+  const key = "check-run:owner/repo/1/sha/MASWE / specification compliance/1";
+  assert.deepEqual(await sideEffects.get(key), { resourceId: 700, kind: "check-run" });
+  assert.equal(calls.filter((call) => call.method === "POST").length, 4);
+  const recoveredPatch = calls.find(
+    (call) => call.method === "PATCH" && call.url.endsWith("/check-runs/700"),
+  );
+  assert.deepEqual(recoveredPatch?.body, {
+    status: "completed",
+    conclusion: "action_required",
+    output: {
+      title: "Specification incomplete",
+      summary: "Approved brainstorm/design artifacts are required before specification compliance succeeds.",
+    },
+  });
+  assert.equal(Object.hasOwn(recoveredPatch?.body as object, "head_sha"), false);
+});
+
+test("CheckPublisher rejects unsafe or looping reconciliation links", async (t) => {
+  const cases = [
+    {
+      name: "loop",
+      nextUrl: (current: string) => current,
+    },
+    {
+      name: "cross-origin",
+      nextUrl: (current: string) => current.replace("https://api.github.com", "https://example.invalid"),
+    },
+    {
+      name: "repository path escape",
+      nextUrl: (current: string) => current.replace("/repos/owner/repo/", "/repos/owner/other/"),
+    },
+  ];
+
+  for (const fixture of cases) {
+    await t.test(fixture.name, async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-unsafe-page-"));
+      const http: GitHubHttpClient = {
+        async request(method, url) {
+          if (method === "GET") {
+            return {
+              status: 200,
+              headers: { link: `<${fixture.nextUrl(url)}>; rel="next"` },
+              body: { check_runs: [] },
+            };
+          }
+          if (method === "POST") return { status: 201, headers: {}, body: { id: 1 } };
+          return { status: 200, headers: {}, body: {} };
+        },
+      };
+      const publisher = new CheckPublisher({
+        http,
+        sideEffects: new GitHubSideEffectStore(root),
+        readOnlyChecks: true,
+        owner: "owner",
+        repo: "repo",
+        pullRequestNumber: 1,
+        token: "token",
+      });
+      const run = {
+        schemaVersion: 1,
+        version: 1,
+        id: "run-1",
+        title: "t",
+        request: "r",
+        repositoryPath: "/tmp",
+        state: "PR_REVIEW",
+        createdAt: "",
+        updatedAt: "",
+        approvals: { brainstorm: false, design: false },
+        counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
+        config: DEFAULT_CONFIG,
+        artifacts: [],
+        events: [],
+      } as RunRecord;
+
+      await assert.rejects(
+        () => publisher.publishForHeadSha(run, "sha"),
+        /pagination|link|loop|unsafe/i,
+      );
+    });
+  }
+});
+
+test("CheckPublisher stops reconciliation at a finite page ceiling", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-page-limit-"));
+  let gets = 0;
+  const http: GitHubHttpClient = {
+    async request(method, url) {
+      if (method === "GET") {
+        gets += 1;
+        const next = new URL(url);
+        next.searchParams.set("page", String(gets + 1));
+        return {
+          status: 200,
+          headers: { link: `<${next.toString()}>; rel="next"` },
+          body: { check_runs: [] },
+        };
+      }
+      if (method === "POST") return { status: 201, headers: {}, body: { id: 1 } };
+      return { status: 200, headers: {}, body: {} };
+    },
+  };
+  const publisher = new CheckPublisher({
+    http,
+    sideEffects: new GitHubSideEffectStore(root),
+    readOnlyChecks: true,
+    owner: "owner",
+    repo: "repo",
+    pullRequestNumber: 1,
+    token: "token",
+  });
+  const run = {
+    schemaVersion: 1,
+    version: 1,
+    id: "run-1",
+    title: "t",
+    request: "r",
+    repositoryPath: "/tmp",
+    state: "PR_REVIEW",
+    createdAt: "",
+    updatedAt: "",
+    approvals: { brainstorm: false, design: false },
+    counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
+    config: DEFAULT_CONFIG,
+    artifacts: [],
+    events: [],
+  } as RunRecord;
+
+  await assert.rejects(
+    () => publisher.publishForHeadSha(run, "sha"),
+    /pagination|page limit/i,
+  );
+  assert.ok(gets > 1);
+  assert.ok(gets <= 20);
 });
 
 test("CheckPublisher creates checks idempotently and invalidates prior SHA success", async () => {
