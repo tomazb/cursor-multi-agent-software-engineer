@@ -1,7 +1,12 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { unlinkIfBytesMatch } from "./lock-ownership.ts";
+import {
+  compareAndSwapFile,
+  unlinkIfBytesMatch,
+  type BytesMatchHooks,
+  type CompareAndSwapHooks,
+} from "./lock-ownership.ts";
 
 export type DeliveryStatus = "processing" | "completed";
 
@@ -69,6 +74,7 @@ export class GitHubDeliveryStore {
     op: DeliveryLeaseValidatedOp,
     deliveryId: string,
   ) => Promise<void>;
+  private readonly casHooks: CompareAndSwapHooks;
   private staleReclaims = 0;
   private ownerMismatchAttempts = 0;
 
@@ -83,6 +89,9 @@ export class GitHubDeliveryStore {
         op: DeliveryLeaseValidatedOp,
         deliveryId: string,
       ) => Promise<void>;
+      /** Test hooks for rename-based compare-and-swap. */
+      afterPathMoved?: BytesMatchHooks["afterPathMoved"];
+      beforeInstall?: CompareAndSwapHooks["beforeInstall"];
     } = {},
   ) {
     this.deliveriesDir = path.join(githubRoot, "deliveries");
@@ -91,6 +100,9 @@ export class GitHubDeliveryStore {
     if (options.onStaleReclaim) this.monitor.onStaleReclaim = options.onStaleReclaim;
     if (options.onOwnerMismatch) this.monitor.onOwnerMismatch = options.onOwnerMismatch;
     if (options.afterLeaseValidated) this.afterLeaseValidated = options.afterLeaseValidated;
+    this.casHooks = {};
+    if (options.afterPathMoved) this.casHooks.afterPathMoved = options.afterPathMoved;
+    if (options.beforeInstall) this.casHooks.beforeInstall = options.beforeInstall;
   }
 
   /** Counters for reclaim/mismatch monitoring (tests and operators). */
@@ -148,7 +160,11 @@ export class GitHubDeliveryStore {
       this.staleReclaims += 1;
       this.monitor.onStaleReclaim?.(deliveryId, existing.record.leaseId);
       await this.afterLeaseValidated?.("claim-reclaim", deliveryId);
-      const removed = await unlinkIfBytesMatch(this.filePath(deliveryId), existing.raw);
+      const removed = await unlinkIfBytesMatch(
+        this.filePath(deliveryId),
+        existing.raw,
+        this.casHooks,
+      );
       if (!removed) {
         const raced = await this.readRaw(deliveryId);
         return {
@@ -214,24 +230,17 @@ export class GitHubDeliveryStore {
       completedAt: new Date().toISOString(),
     };
     delete completed.lastError;
-    const removed = await unlinkIfBytesMatch(this.filePath(deliveryId), existing.raw);
-    if (!removed) {
+    const swapped = await compareAndSwapFile(
+      this.filePath(deliveryId),
+      existing.raw,
+      encodeRecord(completed),
+      this.casHooks,
+    );
+    if (!swapped) {
       this.noteOwnerMismatch("complete", deliveryId, leaseId, undefined);
       return { ok: false, reason: "owner_mismatch" };
     }
-    try {
-      await writeFile(this.filePath(deliveryId), encodeRecord(completed), {
-        encoding: "utf8",
-        flag: "wx",
-      });
-      return { ok: true };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-        this.noteOwnerMismatch("complete", deliveryId, leaseId, undefined);
-        return { ok: false, reason: "owner_mismatch" };
-      }
-      throw error;
-    }
+    return { ok: true };
   }
 
   async fail(
@@ -258,7 +267,11 @@ export class GitHubDeliveryStore {
 
     await this.afterLeaseValidated?.("fail", deliveryId);
 
-    const removed = await unlinkIfBytesMatch(this.filePath(deliveryId), existing.raw);
+    const removed = await unlinkIfBytesMatch(
+      this.filePath(deliveryId),
+      existing.raw,
+      this.casHooks,
+    );
     if (!removed) {
       this.noteOwnerMismatch("fail", deliveryId, leaseId, undefined);
       return { ok: false, reason: "owner_mismatch" };

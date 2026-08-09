@@ -204,11 +204,11 @@ Store the key and resulting GitHub resource ID transactionally before acknowledg
 ## Failure behavior
 
 - Signature or authorization failure: reject without workflow changes.
-- Duplicate delivery: return success without repeating side effects. Only `completed` deliveries are terminal; stale `processing` claims (crash mid-handler) become reclaimable after a TTL so GitHub retries are not stuck as permanent duplicates. Each claim carries a lease nonce; `complete`/`fail` require that lease and compare-and-swap the exact observed bytes so an expired owner cannot overwrite or delete a successor. Rejected completion surfaces as a handler error (not HTTP 200). Stale reclaims and owner-mismatch attempts are counted for monitoring (`diagnostics()` / callbacks).
+- Duplicate delivery: return success without repeating side effects. Only `completed` deliveries are terminal; stale `processing` claims (crash mid-handler) become reclaimable after a TTL so GitHub retries are not stuck as permanent duplicates. Each claim carries a lease nonce; `complete`/`fail` use rename-based compare-and-swap (move aside → verify bytes → install/`unlink` reclaim) so a successor cannot be overwritten or deleted, and a failed install restores the processing ledger instead of leaving a gap. Rejected completion surfaces as a handler error (not HTTP 200). Stale reclaims and owner-mismatch attempts are counted for monitoring (`diagnostics()` / callbacks).
 - GitHub rate limit: retry according to reset and backoff headers.
 - Stale head SHA: cancel current attempt and restart classification/verification for the new SHA. Live-head lookup failures fail closed (do not apply the event SHA).
 - Exact PR identity: association matches only `github.com` remotes over HTTPS or SSH (`git@` / `ssh://git@…/`); plain HTTP and non-GitHub hosts are rejected.
-- Concurrent check creates for the same idempotency key are serialized; confirmed-dead create-lock owners are reclaimable via bytes-matched unlink (EPERM counts as alive; filesystem read errors never authorize deletion); release is identity-bound.
+- Concurrent check creates for the same idempotency key are serialized; create/association locks reclaim only when owner death is proven via `ESRCH` (EPERM and other probe errors fail closed as alive). Malformed locks are never reclaimed. Reclaim uses the same rename-based bytes match and fails closed on unsupported filesystem operations (lock acquire times out). Release is identity-bound.
 - Association index mutations use the same dead-owner reclaim and identity-bound release rules; age alone never authorizes lock deletion.
 - Merge conflict: `WAITING_FOR_HUMAN` or a dedicated reconciliation stage.
 - CI failure: builder/resolver correction loop under budget.

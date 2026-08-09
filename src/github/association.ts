@@ -52,6 +52,7 @@ export class GitHubAssociationIndex {
       ...(options.afterDeadConfirmed
         ? { afterDeadConfirmed: options.afterDeadConfirmed }
         : {}),
+      ...(options.afterPathMoved ? { afterPathMoved: options.afterPathMoved } : {}),
     };
   }
 
