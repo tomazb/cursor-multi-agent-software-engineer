@@ -62,19 +62,27 @@ function asError(error: unknown): Error {
 function preservePrimaryError(primary: unknown, cleanup: unknown): Error {
   const primaryError = asError(primary);
   const cleanupError = asError(cleanup);
-  Object.defineProperty(primaryError, "deliveryCleanupError", {
-    configurable: true,
-    enumerable: false,
-    value: cleanupError,
-  });
-  if (primaryError.cause === undefined) {
-    Object.defineProperty(primaryError, "cause", {
+  try {
+    Object.defineProperty(primaryError, "deliveryCleanupError", {
       configurable: true,
       enumerable: false,
       value: cleanupError,
     });
+    if (primaryError.cause === undefined) {
+      Object.defineProperty(primaryError, "cause", {
+        configurable: true,
+        enumerable: false,
+        value: cleanupError,
+      });
+    }
+    return primaryError;
+  } catch {
+    return new AggregateError(
+      [primaryError, cleanupError],
+      primaryError.message,
+      { cause: primaryError },
+    );
   }
-  return primaryError;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

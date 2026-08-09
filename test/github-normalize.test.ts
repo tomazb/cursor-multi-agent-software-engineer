@@ -64,6 +64,39 @@ test("normalize workflow_run as observe-only", () => {
   assert.equal(event.observeOnly, true);
 });
 
+test("observe-only event families reject every non-completed action as unsupported", () => {
+  const cases = [
+    { eventName: "workflow_run", action: "requested" },
+    { eventName: "workflow_run", action: "in_progress" },
+    { eventName: "workflow_run", action: undefined },
+    { eventName: "workflow_run", action: "other" },
+    { eventName: "check_run", action: "created" },
+    { eventName: "check_run", action: "rerequested" },
+    { eventName: "check_run", action: "requested_action" },
+    { eventName: "check_run", action: undefined },
+    { eventName: "check_run", action: "other" },
+    { eventName: "check_suite", action: "requested" },
+    { eventName: "check_suite", action: "in_progress" },
+    { eventName: "check_suite", action: "rerequested" },
+    { eventName: "check_suite", action: undefined },
+    { eventName: "check_suite", action: "other" },
+  ] as const;
+
+  for (const [index, candidate] of cases.entries()) {
+    assert.throws(
+      () =>
+        normalizeGitHubWebhook({
+          deliveryId: `del-observe-unsupported-${index}`,
+          eventName: candidate.eventName,
+          payload:
+            candidate.action === undefined ? {} : { action: candidate.action },
+        }),
+      UnsupportedGitHubWebhookError,
+      `${candidate.eventName}:${String(candidate.action)}`,
+    );
+  }
+});
+
 test("normalize rejects unsupported event names", () => {
   assert.throws(
     () =>

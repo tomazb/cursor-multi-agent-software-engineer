@@ -140,6 +140,25 @@ test("unsupported event and action are durably completed without dispatch", asyn
   assert.equal(requests, 0);
 });
 
+test("non-completed observe-only actions are durably ignored by family", async () => {
+  const { adapter, deliveries } = await setup();
+  const cases = [
+    { deliveryId: "workflow-requested", eventName: "workflow_run", action: "requested" },
+    { deliveryId: "check-run-rerequested", eventName: "check_run", action: "rerequested" },
+    { deliveryId: "check-suite-progress", eventName: "check_suite", action: "in_progress" },
+  ];
+
+  for (const candidate of cases) {
+    const body = JSON.stringify({ action: candidate.action });
+    const result = await adapter.handleWebhook(
+      request(candidate.deliveryId, candidate.eventName, body),
+    );
+    assert.equal(result.status, 200);
+    assert.equal(result.body.message, "unsupported webhook ignored");
+    assert.equal((await deliveries.claim(candidate.deliveryId)).status, "completed");
+  }
+});
+
 test("malformed supported payload returns 400 only after releasing its exact lease", async () => {
   const { adapter, deliveries } = await setup();
   const body = JSON.stringify({ action: "synchronize" });
@@ -216,6 +235,115 @@ test("failure cleanup rejection preserves the primary error and exposes cleanup 
       assert.equal(error.message, "primary dispatch failure");
       assert.ok(error.cause instanceof Error);
       assert.match(error.cause.message, /failure rejected|owner_mismatch/i);
+      return true;
+    },
+  );
+});
+
+test("failure cleanup wraps frozen primary errors without losing either failure", async () => {
+  const primary = Object.freeze(new Error("frozen primary dispatch failure"));
+  const { adapter } = await setup({
+    http: {
+      async request() {
+        throw primary;
+      },
+    },
+  });
+  const internal = (adapter as unknown as { deliveries: GitHubDeliveryStore }).deliveries;
+  internal.fail = async () => ({ ok: false, reason: "owner_mismatch" });
+
+  await assert.rejects(
+    () =>
+      adapter.handleWebhook(
+        request("frozen-primary", "pull_request", JSON.stringify(prPayload())),
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.cause, primary);
+      assert.equal(error.errors[0], primary);
+      assert.ok(error.errors[1] instanceof Error);
+      assert.match(error.errors[1].message, /failure rejected|owner_mismatch/i);
+      return true;
+    },
+  );
+});
+
+test("failure cleanup wraps primary errors with conflicting diagnostic properties", async () => {
+  const primary = new Error("conflicting primary dispatch failure");
+  Object.defineProperty(primary, "deliveryCleanupError", {
+    configurable: false,
+    value: "reserved",
+  });
+  Object.defineProperty(primary, "cause", {
+    configurable: false,
+    value: new Error("existing primary cause"),
+  });
+  const cleanup = new Error("thrown failure cleanup");
+  const { adapter } = await setup({
+    http: {
+      async request() {
+        throw primary;
+      },
+    },
+  });
+  const internal = (adapter as unknown as { deliveries: GitHubDeliveryStore }).deliveries;
+  internal.fail = async () => {
+    throw cleanup;
+  };
+
+  await assert.rejects(
+    () =>
+      adapter.handleWebhook(
+        request("conflicting-primary", "pull_request", JSON.stringify(prPayload())),
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.cause, primary);
+      assert.deepEqual(error.errors, [primary, cleanup]);
+      return true;
+    },
+  );
+});
+
+test("thrown completion failure is never acknowledged and releases for retry", async () => {
+  const { adapter, deliveries } = await setup();
+  const internal = (adapter as unknown as { deliveries: GitHubDeliveryStore }).deliveries;
+  const completionFailure = new Error("thrown delivery completion");
+  internal.complete = async () => {
+    throw completionFailure;
+  };
+  const body = JSON.stringify({ action: "deleted", installation: { id: 1 } });
+
+  await assert.rejects(
+    () => adapter.handleWebhook(request("complete-throws", "installation", body)),
+    (error: unknown) => error === completionFailure,
+  );
+  assert.equal((await deliveries.claim("complete-throws")).claimed, true);
+});
+
+test("thrown failure cleanup is attached to the original dispatch failure", async () => {
+  const primary = new Error("dispatch before thrown fail");
+  const cleanup = new Error("thrown delivery failure cleanup");
+  const { adapter } = await setup({
+    http: {
+      async request() {
+        throw primary;
+      },
+    },
+  });
+  const internal = (adapter as unknown as { deliveries: GitHubDeliveryStore }).deliveries;
+  internal.fail = async () => {
+    throw cleanup;
+  };
+
+  await assert.rejects(
+    () =>
+      adapter.handleWebhook(
+        request("fail-throws", "pull_request", JSON.stringify(prPayload())),
+      ),
+    (error: unknown) => {
+      assert.equal(error, primary);
+      assert.equal((error as Error).cause, cleanup);
       return true;
     },
   );

@@ -42,6 +42,15 @@ function requireAction(
   return action;
 }
 
+function requireCompletedAction(eventName: string, action: string | undefined): "completed" {
+  if (action !== "completed") {
+    throw new UnsupportedGitHubWebhookError(
+      `Unsupported ${eventName} action: ${String(action)}`,
+    );
+  }
+  return action;
+}
+
 function requirePositiveInteger(value: unknown, field: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
     malformed(`${field} must be a positive integer`);
@@ -206,6 +215,7 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
   }
 
   if (input.eventName === "workflow_run") {
+    const supportedAction = requireCompletedAction("workflow_run", action);
     const run = asRecord(payload.workflow_run);
     return withOptional(
       { eventId: input.deliveryId, type: "workflow_run.completed", receivedAt },
@@ -214,12 +224,13 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
         installationId: installationId(payload),
         headSha: typeof run?.head_sha === "string" ? run.head_sha : undefined,
         observeOnly: true,
-        rawAction: action,
+        rawAction: supportedAction,
       },
     );
   }
 
   if (input.eventName === "check_run") {
+    const supportedAction = requireCompletedAction("check_run", action);
     const checkRun = asRecord(payload.check_run);
     const suite = asRecord(checkRun?.check_suite);
     const headSha =
@@ -235,12 +246,13 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
         installationId: installationId(payload),
         headSha,
         observeOnly: true,
-        rawAction: action,
+        rawAction: supportedAction,
       },
     );
   }
 
   if (input.eventName === "check_suite") {
+    const supportedAction = requireCompletedAction("check_suite", action);
     const suite = asRecord(payload.check_suite);
     return withOptional(
       { eventId: input.deliveryId, type: "check_suite.completed", receivedAt },
@@ -249,7 +261,7 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
         installationId: installationId(payload),
         headSha: typeof suite?.head_sha === "string" ? suite.head_sha : undefined,
         observeOnly: true,
-        rawAction: action,
+        rawAction: supportedAction,
       },
     );
   }
