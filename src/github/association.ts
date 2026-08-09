@@ -2,11 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AssociationRecord } from "./types.ts";
-import {
-  reclaimDeadOwnerLock,
-  releaseLockIfToken,
-  type ReclaimHooks,
-} from "./lock-ownership.ts";
+import { withDirLock, type ReclaimHooks } from "./lock-ownership.ts";
 
 function associationKey(repository: string, pullRequestNumber: number): string {
   return `${repository}#${pullRequestNumber}`;
@@ -20,24 +16,14 @@ async function writeAtomic(filePath: string, content: string): Promise<void> {
   await rename(tempPath, filePath);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-interface LockMeta {
-  pid: number;
-  token: string;
-  at: string;
-}
-
 /**
- * Serialize association index mutations with an exclusive lock file (`wx`).
- * Abandoned locks are reclaimable only when the owner pid is confirmed dead and
- * on-disk bytes still match the observed dead record. Release is identity-bound.
+ * Serialize association index mutations with an exclusive directory lock.
+ * Live owners never expose an absence window; dead owners are reclaimed only
+ * when ESRCH is proven and owner.json is unchanged after the death check.
  */
 export class GitHubAssociationIndex {
   private readonly filePath: string;
-  private readonly lockPath: string;
+  private readonly lockDir: string;
   private readonly reclaimHooks: ReclaimHooks;
 
   constructor(
@@ -45,47 +31,20 @@ export class GitHubAssociationIndex {
     options: { lockStaleMs?: number } & ReclaimHooks = {},
   ) {
     this.filePath = path.join(githubRoot, "associations.json");
-    this.lockPath = path.join(githubRoot, "associations.lock");
-    // lockStaleMs retained for API compatibility; age alone never authorizes deletion.
+    this.lockDir = path.join(githubRoot, "associations.lock");
     void options.lockStaleMs;
     this.reclaimHooks = {
       ...(options.afterDeadConfirmed
         ? { afterDeadConfirmed: options.afterDeadConfirmed }
         : {}),
-      ...(options.afterPathMoved ? { afterPathMoved: options.afterPathMoved } : {}),
     };
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
-    await mkdir(path.dirname(this.lockPath), { recursive: true });
-    const token = randomUUID();
-    const started = Date.now();
-    for (;;) {
-      try {
-        const meta: LockMeta = {
-          pid: process.pid,
-          token,
-          at: new Date().toISOString(),
-        };
-        await writeFile(this.lockPath, `${JSON.stringify(meta)}\n`, {
-          encoding: "utf8",
-          flag: "wx",
-        });
-        break;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        await reclaimDeadOwnerLock(this.lockPath, this.reclaimHooks);
-        if (Date.now() - started > 5_000) {
-          throw new Error("Timed out acquiring GitHub association index lock");
-        }
-        await sleep(10);
-      }
-    }
-    try {
-      return await fn();
-    } finally {
-      await releaseLockIfToken(this.lockPath, token);
-    }
+    return withDirLock(this.lockDir, fn, {
+      timeoutMs: 5_000,
+      ...this.reclaimHooks,
+    });
   }
 
   private async readAll(): Promise<Record<string, AssociationRecord>> {
@@ -145,10 +104,6 @@ export class GitHubAssociationIndex {
     );
   }
 
-  /**
-   * Suspend all associations for an installation.
-   * Returns every matching record (including already suspended) so run stores can reconcile.
-   */
   async suspendInstallation(installationId: number): Promise<AssociationRecord[]> {
     return this.withLock(async () => {
       const records = await this.readAll();
@@ -168,10 +123,6 @@ export class GitHubAssociationIndex {
     });
   }
 
-  /**
-   * Suspend all associations for an installation+repository.
-   * Returns every matching record (including already suspended) so run stores can reconcile.
-   */
   async suspendRepository(
     installationId: number,
     repository: string,

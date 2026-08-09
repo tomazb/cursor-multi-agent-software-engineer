@@ -10,11 +10,15 @@ test("check-create lock reclaim succeeds for confirmed-dead owner", async () => 
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-create-lock-"));
   const store = new GitHubSideEffectStore(root);
   const key = "owner/repo/1/sha/check/1";
-  const lockDir = path.join(root, "side-effect-create-locks");
-  await mkdir(lockDir, { recursive: true });
-  const lockName = `${createHash("sha256").update(key).digest("hex")}.json.lock`;
+  const locksRoot = path.join(root, "side-effect-create-locks");
+  await mkdir(locksRoot, { recursive: true });
+  const lockDir = path.join(
+    locksRoot,
+    `${createHash("sha256").update(key).digest("hex")}.json.lock`,
+  );
+  await mkdir(lockDir);
   await writeFile(
-    path.join(lockDir, lockName),
+    path.join(lockDir, "owner.json"),
     `${JSON.stringify({ pid: 999_999_999, token: "dead-owner", at: new Date().toISOString() })}\n`,
   );
 

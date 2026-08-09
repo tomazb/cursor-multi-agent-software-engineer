@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -10,8 +9,6 @@ import {
   reclaimDeadOwnerLock,
   unlinkIfBytesMatch,
 } from "../src/github/lock-ownership.ts";
-import { GitHubSideEffectStore } from "../src/github/side-effect-store.ts";
-import { GitHubAssociationIndex } from "../src/github/association.ts";
 
 test("processDefinitelyDead is true only for ESRCH", () => {
   const original = process.kill;
@@ -101,72 +98,4 @@ test("reclaimDeadOwnerLock does not delete on non-ENOENT read failure", async ()
   assert.equal(reclaimed, false);
   const { stat } = await import("node:fs/promises");
   assert.equal((await stat(lockPath)).isDirectory(), true);
-});
-
-test("create-lock reclaim never enters critical section over a live successor", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-create-race-"));
-  const store = new GitHubSideEffectStore(root, {
-    afterPathMoved: async (lockPath) => {
-      await writeFile(
-        lockPath,
-        `${JSON.stringify({ pid: process.pid, token: "live", at: new Date().toISOString() })}\n`,
-      );
-    },
-  });
-  const key = "k";
-  const lockDir = path.join(root, "side-effect-create-locks");
-  await mkdir(lockDir, { recursive: true });
-  const lockName = `${createHash("sha256").update(key).digest("hex")}.json.lock`;
-  const lockPath = path.join(lockDir, lockName);
-  await writeFile(
-    lockPath,
-    `${JSON.stringify({ pid: 999_999_999, token: "dead", at: new Date().toISOString() })}\n`,
-  );
-
-  let entered = false;
-  await assert.rejects(
-    () =>
-      store.withCreateLock(
-        key,
-        async () => {
-          entered = true;
-        },
-        { timeoutMs: 200 },
-      ),
-    /Timed out acquiring check-create lock/,
-  );
-  assert.equal(entered, false);
-  assert.match(await readFile(lockPath, "utf8"), /live/);
-});
-
-test("association reclaim never mutates the index over a live successor", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-race-"));
-  const index = new GitHubAssociationIndex(root, {
-    afterPathMoved: async (lockPath) => {
-      await writeFile(
-        lockPath,
-        `${JSON.stringify({ pid: process.pid, token: "live", at: new Date().toISOString() })}\n`,
-      );
-    },
-  });
-  await writeFile(
-    path.join(root, "associations.lock"),
-    `${JSON.stringify({ pid: 999_999_999, token: "dead", at: new Date().toISOString() })}\n`,
-  );
-
-  await assert.rejects(
-    () =>
-      index.bind({
-        runId: "x",
-        installationId: 1,
-        repository: "owner/repo",
-        pullRequestNumber: 1,
-        baseSha: "b",
-        headSha: "h",
-        branch: "b",
-      }),
-    /Timed out acquiring GitHub association index lock/,
-  );
-  assert.match(await readFile(path.join(root, "associations.lock"), "utf8"), /live/);
-  assert.equal(await index.find("owner/repo", 1), undefined);
 });

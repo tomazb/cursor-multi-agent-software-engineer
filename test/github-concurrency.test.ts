@@ -71,8 +71,11 @@ test("concurrent check publishers serialize creates for the same key", async () 
 test("association index reclaim abandoned locks and survive concurrent binds", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-lock-"));
   const index = new GitHubAssociationIndex(root);
+  const { mkdir } = await import("node:fs/promises");
+  const lockDir = path.join(root, "associations.lock");
+  await mkdir(lockDir);
   await writeFile(
-    path.join(root, "associations.lock"),
+    path.join(lockDir, "owner.json"),
     `${JSON.stringify({ pid: 999_999_999, token: "dead", at: new Date().toISOString() })}\n`,
   );
 

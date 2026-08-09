@@ -1,4 +1,14 @@
-import { readFile, rename, unlink, writeFile } from "node:fs/promises";
+import {
+  link,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
+import path from "node:path";
 import { randomUUID } from "node:crypto";
 
 function errno(error: unknown): string | undefined {
@@ -25,27 +35,81 @@ export function processAliveConservative(pid: number): boolean {
 }
 
 export interface BytesMatchHooks {
-  /**
-   * After `filePath` has been renamed aside to `reclaimPath`, before verifying bytes.
-   * Used for fault injection of a successor at `filePath`.
-   */
   afterPathMoved?: (filePath: string, reclaimPath: string) => Promise<void>;
 }
 
-export interface ReclaimHooks extends BytesMatchHooks {
-  /** Test hook after the owner is confirmed dead, before bytes-matched reclaim. */
+export interface ReclaimHooks {
   afterDeadConfirmed?: (lockPath: string) => Promise<void>;
 }
 
 export interface CompareAndSwapHooks extends BytesMatchHooks {
-  /** After expected bytes are verified in reclaim, before installing `newRaw`. */
   beforeInstall?: (filePath: string, reclaimPath: string) => Promise<void>;
 }
 
+export interface DirLockOptions extends ReclaimHooks {
+  timeoutMs?: number;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function tryParseJson(raw: string): unknown | undefined {
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Delivery ledger records must parse and carry status + leaseId. */
+export function isValidDeliveryLedgerRaw(raw: string): boolean {
+  const parsed = tryParseJson(raw);
+  if (!isObjectRecord(parsed)) return false;
+  return typeof parsed.status === "string" && typeof parsed.leaseId === "string";
+}
+
 /**
- * Restore moved bytes only when `filePath` is absent.
- * Never `rename` onto an existing destination — on POSIX rename replaces and
- * would destroy a newer successor.
+ * Publish `content` at `filePath` only when absent.
+ * Writes a temp file to completion first, then `link`s into place so readers never
+ * observe a truncated canonical. Fails closed if link is unsupported.
+ */
+export async function installExclusive(
+  filePath: string,
+  content: string,
+): Promise<boolean> {
+  const tmpPath = `${filePath}.${randomUUID()}.install`;
+  try {
+    await writeFile(tmpPath, content, "utf8");
+  } catch {
+    return false;
+  }
+  try {
+    await link(tmpPath, filePath);
+  } catch (error) {
+    try {
+      await unlink(tmpPath);
+    } catch {
+      /* ignore */
+    }
+    if (errno(error) === "EEXIST") return false;
+    return false;
+  }
+  try {
+    await unlink(tmpPath);
+  } catch {
+    /* ignore */
+  }
+  return true;
+}
+
+/**
+ * Restore moved bytes only when `filePath` is absent (wx/link install).
+ * Never `rename` onto an existing destination.
  */
 export async function restoreMoved(
   reclaimPath: string,
@@ -57,18 +121,21 @@ export async function restoreMoved(
   } catch {
     return false;
   }
-  try {
-    await writeFile(filePath, raw, { encoding: "utf8", flag: "wx" });
-  } catch (error) {
-    if (errno(error) === "EEXIST") {
-      try {
-        await unlink(reclaimPath);
-      } catch {
-        /* ignore */
+  const installed = await installExclusive(filePath, raw);
+  if (!installed) {
+    try {
+      // Destination occupied by a newer successor — drop obsolete reclaim.
+      const existing = await readFile(filePath, "utf8");
+      if (existing.length > 0) {
+        try {
+          await unlink(reclaimPath);
+        } catch {
+          /* ignore */
+        }
       }
-      return false;
+    } catch {
+      /* leave reclaim if destination missing/unreadable */
     }
-    // Leave reclaimPath for recovery.
     return false;
   }
   try {
@@ -79,18 +146,8 @@ export async function restoreMoved(
   return true;
 }
 
-function stagingPathFor(filePath: string): string {
-  return `${filePath}.staging`;
-}
-
-function reclaimPathFor(filePath: string): string {
-  return `${filePath}.reclaim`;
-}
-
 /**
  * Unlink `filePath` only if its bytes are still exactly `expectedRaw`.
- * Renames the path aside atomically, verifies the moved bytes, then deletes the
- * reclaim copy. Mismatch recovery uses wx-only restore (never rename-over).
  */
 export async function unlinkIfBytesMatch(
   filePath: string,
@@ -100,8 +157,7 @@ export async function unlinkIfBytesMatch(
   const reclaimPath = `${filePath}.${randomUUID()}.reclaim`;
   try {
     await rename(filePath, reclaimPath);
-  } catch (error) {
-    if (errno(error) === "ENOENT") return false;
+  } catch {
     return false;
   }
 
@@ -125,18 +181,35 @@ export async function unlinkIfBytesMatch(
   }
 }
 
+async function listAttemptArtifacts(
+  filePath: string,
+  kind: "staging" | "reclaim",
+): Promise<string[]> {
+  const directory = path.dirname(filePath);
+  const base = path.basename(filePath);
+  const prefix = `${base}.${kind}.`;
+  let entries: string[];
+  try {
+    entries = await readdir(directory);
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((name) => name.startsWith(prefix))
+    .map((name) => path.join(directory, name));
+}
+
+async function unlinkQuiet(filePath: string): Promise<void> {
+  try {
+    await unlink(filePath);
+  } catch {
+    /* ignore */
+  }
+}
+
 /**
  * Replace `filePath` with `newRaw` only if current bytes still equal `expectedRaw`.
- *
- * Crash-safe protocol:
- * 1. Durably write `filePath.staging` with `newRaw` while canonical still exists.
- * 2. Move canonical aside to `filePath.reclaim` and verify bytes.
- * 3. Install via `wx` write (never rename-over a successor).
- * 4. Delete staging + reclaim.
- *
- * A crash after step 1 leaves staging+canonical (safe). A crash after step 2
- * leaves staging+reclaim with an empty canonical — callers must recover via
- * {@link recoverCompareAndSwapArtifacts}.
+ * Uses attempt-scoped staging/reclaim names and link-based exclusive install.
  */
 export async function compareAndSwapFile(
   filePath: string,
@@ -144,8 +217,9 @@ export async function compareAndSwapFile(
   newRaw: string,
   hooks: CompareAndSwapHooks = {},
 ): Promise<boolean> {
-  const stagingPath = stagingPathFor(filePath);
-  const reclaimPath = reclaimPathFor(filePath);
+  const attemptId = randomUUID();
+  const stagingPath = `${filePath}.staging.${attemptId}`;
+  const reclaimPath = `${filePath}.reclaim.${attemptId}`;
 
   try {
     await writeFile(stagingPath, newRaw, { encoding: "utf8" });
@@ -156,30 +230,18 @@ export async function compareAndSwapFile(
   try {
     const current = await readFile(filePath, "utf8");
     if (current !== expectedRaw) {
-      try {
-        await unlink(stagingPath);
-      } catch {
-        /* ignore */
-      }
+      await unlinkQuiet(stagingPath);
       return false;
     }
   } catch {
-    try {
-      await unlink(stagingPath);
-    } catch {
-      /* ignore */
-    }
+    await unlinkQuiet(stagingPath);
     return false;
   }
 
   try {
     await rename(filePath, reclaimPath);
   } catch {
-    try {
-      await unlink(stagingPath);
-    } catch {
-      /* ignore */
-    }
+    await unlinkQuiet(stagingPath);
     return false;
   }
 
@@ -188,59 +250,25 @@ export async function compareAndSwapFile(
     const movedRaw = await readFile(reclaimPath, "utf8");
     if (movedRaw !== expectedRaw) {
       await restoreMoved(reclaimPath, filePath);
-      try {
-        await unlink(stagingPath);
-      } catch {
-        /* ignore */
-      }
+      await unlinkQuiet(stagingPath);
       return false;
     }
 
     await hooks.beforeInstall?.(filePath, reclaimPath);
 
-    try {
-      await writeFile(filePath, newRaw, { encoding: "utf8", flag: "wx" });
-    } catch (error) {
-      if (errno(error) === "EEXIST") {
-        try {
-          await unlink(stagingPath);
-        } catch {
-          /* ignore */
-        }
-        try {
-          await unlink(reclaimPath);
-        } catch {
-          /* ignore */
-        }
-        return false;
-      }
+    const installed = await installExclusive(filePath, newRaw);
+    if (!installed) {
       await restoreMoved(reclaimPath, filePath);
-      try {
-        await unlink(stagingPath);
-      } catch {
-        /* ignore */
-      }
+      await unlinkQuiet(stagingPath);
       return false;
     }
 
-    try {
-      await unlink(stagingPath);
-    } catch {
-      /* ignore */
-    }
-    try {
-      await unlink(reclaimPath);
-    } catch {
-      /* ignore */
-    }
+    await unlinkQuiet(stagingPath);
+    await unlinkQuiet(reclaimPath);
     return true;
   } catch {
     await restoreMoved(reclaimPath, filePath);
-    try {
-      await unlink(stagingPath);
-    } catch {
-      /* ignore */
-    }
+    await unlinkQuiet(stagingPath);
     return false;
   }
 }
@@ -249,114 +277,229 @@ export type CompareAndSwapRecovery =
   | { kind: "none" }
   | { kind: "installed"; raw: string }
   | { kind: "restored"; raw: string }
-  | { kind: "canonical"; raw: string };
+  | { kind: "canonical"; raw: string }
+  | { kind: "finished"; raw: string };
 
 /**
- * Finish or roll back a crashed {@link compareAndSwapFile} attempt.
- * Prefer installing durable staging when the canonical path is empty.
+ * Finish or roll back crashed {@link compareAndSwapFile} attempts.
+ * Never treats truncated/invalid canonical bytes as authoritative, and never
+ * deletes staging/reclaim until a valid ledger is installed.
  */
 export async function recoverCompareAndSwapArtifacts(
   filePath: string,
 ): Promise<CompareAndSwapRecovery> {
-  const stagingPath = stagingPathFor(filePath);
-  const reclaimPath = reclaimPathFor(filePath);
+  const stagings = await listAttemptArtifacts(filePath, "staging");
+  const reclaims = await listAttemptArtifacts(filePath, "reclaim");
 
-  let canonical: string | undefined;
+  let canonicalRaw: string | undefined;
   try {
-    canonical = await readFile(filePath, "utf8");
+    canonicalRaw = await readFile(filePath, "utf8");
   } catch {
-    canonical = undefined;
+    canonicalRaw = undefined;
   }
 
-  if (canonical !== undefined) {
-    // Canonical won; drop leftover artifacts from a prior attempt.
+  const canonicalValid =
+    canonicalRaw !== undefined && isValidDeliveryLedgerRaw(canonicalRaw)
+      ? canonicalRaw
+      : undefined;
+
+  if (canonicalRaw !== undefined && canonicalValid === undefined) {
+    // Truncated/corrupt canonical — remove so staging can install; keep artifacts.
+    await unlinkQuiet(filePath);
+    canonicalRaw = undefined;
+  }
+
+  // Prefer a durable completed staging that matches an in-progress lease.
+  for (const stagingPath of stagings) {
+    let stagingRaw: string;
     try {
-      await unlink(stagingPath);
+      stagingRaw = await readFile(stagingPath, "utf8");
     } catch {
-      /* ignore */
+      continue;
     }
-    try {
-      await unlink(reclaimPath);
-    } catch {
-      /* ignore */
-    }
-    return { kind: "canonical", raw: canonical };
-  }
+    if (!isValidDeliveryLedgerRaw(stagingRaw)) continue;
+    const staging = JSON.parse(stagingRaw) as {
+      status: string;
+      leaseId: string;
+    };
+    if (staging.status !== "completed") continue;
 
-  let staging: string | undefined;
-  try {
-    staging = await readFile(stagingPath, "utf8");
-  } catch {
-    staging = undefined;
-  }
-
-  if (staging !== undefined) {
-    try {
-      await writeFile(filePath, staging, { encoding: "utf8", flag: "wx" });
-      try {
-        await unlink(stagingPath);
-      } catch {
-        /* ignore */
+    if (canonicalValid !== undefined) {
+      const canonical = JSON.parse(canonicalValid) as {
+        status: string;
+        leaseId: string;
+      };
+      if (canonical.status === "completed") {
+        await unlinkQuiet(stagingPath);
+        continue;
       }
-      try {
-        await unlink(reclaimPath);
-      } catch {
-        /* ignore */
-      }
-      return { kind: "installed", raw: staging };
-    } catch (error) {
-      if (errno(error) === "EEXIST") {
-        try {
-          const raw = await readFile(filePath, "utf8");
-          try {
-            await unlink(stagingPath);
-          } catch {
-            /* ignore */
-          }
-          try {
-            await unlink(reclaimPath);
-          } catch {
-            /* ignore */
-          }
-          return { kind: "canonical", raw };
-        } catch {
-          return { kind: "none" };
+      if (
+        canonical.status === "processing" &&
+        canonical.leaseId === staging.leaseId
+      ) {
+        const swapped = await compareAndSwapFile(
+          filePath,
+          canonicalValid,
+          stagingRaw,
+        );
+        if (swapped) {
+          for (const p of [...stagings, ...reclaims]) await unlinkQuiet(p);
+          return { kind: "finished", raw: stagingRaw };
         }
       }
-      // Fall through to reclaim restore.
+      continue;
+    }
+
+    const installed = await installExclusive(filePath, stagingRaw);
+    if (installed) {
+      for (const p of [...stagings, ...reclaims]) await unlinkQuiet(p);
+      return { kind: "installed", raw: stagingRaw };
     }
   }
 
-  let reclaim: string | undefined;
-  try {
-    reclaim = await readFile(reclaimPath, "utf8");
-  } catch {
-    reclaim = undefined;
+  if (canonicalValid !== undefined) {
+    for (const p of [...stagings, ...reclaims]) await unlinkQuiet(p);
+    return { kind: "canonical", raw: canonicalValid };
   }
-  if (reclaim !== undefined) {
+
+  for (const reclaimPath of reclaims) {
+    let reclaimRaw: string;
+    try {
+      reclaimRaw = await readFile(reclaimPath, "utf8");
+    } catch {
+      continue;
+    }
+    if (!isValidDeliveryLedgerRaw(reclaimRaw)) continue;
     const restored = await restoreMoved(reclaimPath, filePath);
     if (restored) {
-      try {
-        await unlink(stagingPath);
-      } catch {
-        /* ignore */
-      }
-      return { kind: "restored", raw: reclaim };
+      for (const p of stagings) await unlinkQuiet(p);
+      for (const p of reclaims) await unlinkQuiet(p);
+      return { kind: "restored", raw: reclaimRaw };
     }
   }
 
   return { kind: "none" };
 }
 
+interface DirLockMeta {
+  pid: number;
+  token: string;
+  at: string;
+}
+
+async function readDirLockMeta(
+  lockDir: string,
+): Promise<{ raw: string; meta: DirLockMeta } | undefined> {
+  try {
+    const raw = await readFile(path.join(lockDir, "owner.json"), "utf8");
+    const parsed = tryParseJson(raw);
+    if (!isObjectRecord(parsed)) return undefined;
+    if (typeof parsed.pid !== "number" || typeof parsed.token !== "string") {
+      return undefined;
+    }
+    return {
+      raw,
+      meta: {
+        pid: parsed.pid,
+        token: parsed.token,
+        at: typeof parsed.at === "string" ? parsed.at : "",
+      },
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 /**
- * Reclaim a lock file only when its owner pid is proven dead (ESRCH) and the
- * on-disk bytes still match the observed dead-owner record.
- * Malformed JSON is never reclaimed (cannot confirm owner death).
- * Filesystem errors fail closed without deletion.
+ * Reclaim a directory lock only when owner death is proven (ESRCH) and the
+ * owner.json bytes are unchanged after the death check. Never creates an
+ * absence window against a live owner.
  */
+export async function reclaimDeadOwnerDir(
+  lockDir: string,
+  hooks: ReclaimHooks = {},
+): Promise<boolean> {
+  const observed = await readDirLockMeta(lockDir);
+  if (!observed) return false;
+  if (!processDefinitelyDead(observed.meta.pid)) return false;
+
+  await hooks.afterDeadConfirmed?.(lockDir);
+
+  const again = await readDirLockMeta(lockDir);
+  if (!again || again.raw !== observed.raw) return false;
+  if (!processDefinitelyDead(again.meta.pid)) return false;
+
+  try {
+    await rm(lockDir, { recursive: true, force: false });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function releaseDirLock(
+  lockDir: string,
+  token: string,
+): Promise<boolean> {
+  const observed = await readDirLockMeta(lockDir);
+  if (!observed || observed.meta.token !== token) return false;
+  try {
+    await rm(lockDir, { recursive: true, force: false });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Exclusive mkdir-based lock with identity-bound release and dead-owner reclaim.
+ * Live owners never lose the directory name while inside the critical section.
+ */
+export async function withDirLock<T>(
+  lockDir: string,
+  fn: () => Promise<T>,
+  options: DirLockOptions = {},
+): Promise<T> {
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  const token = randomUUID();
+  const started = Date.now();
+  await mkdir(path.dirname(lockDir), { recursive: true });
+
+  for (;;) {
+    try {
+      await mkdir(lockDir);
+      const meta: DirLockMeta = {
+        pid: process.pid,
+        token,
+        at: new Date().toISOString(),
+      };
+      await writeFile(
+        path.join(lockDir, "owner.json"),
+        `${JSON.stringify(meta)}\n`,
+        "utf8",
+      );
+      break;
+    } catch (error) {
+      if (errno(error) !== "EEXIST") throw error;
+      await reclaimDeadOwnerDir(lockDir, options);
+      if (Date.now() - started > timeoutMs) {
+        throw new Error(`Timed out acquiring directory lock at ${lockDir}`);
+      }
+      await sleep(10);
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    await releaseDirLock(lockDir, token);
+  }
+}
+
+/** @deprecated file-lock reclaim retained for delivery CAS helpers only */
 export async function reclaimDeadOwnerLock(
   lockPath: string,
-  hooks: ReclaimHooks = {},
+  hooks: ReclaimHooks & BytesMatchHooks = {},
 ): Promise<boolean> {
   let raw: string;
   try {
@@ -364,24 +507,18 @@ export async function reclaimDeadOwnerLock(
   } catch {
     return false;
   }
-
   let meta: { pid?: number; token?: string };
   try {
     meta = JSON.parse(raw) as { pid?: number; token?: string };
   } catch {
     return false;
   }
-
   const pid = typeof meta.pid === "number" ? meta.pid : -1;
   if (!processDefinitelyDead(pid)) return false;
-
   await hooks.afterDeadConfirmed?.(lockPath);
   return unlinkIfBytesMatch(lockPath, raw, hooks);
 }
 
-/**
- * Identity-bound release: unlink only if the lock bytes still embed `token`.
- */
 export async function releaseLockIfToken(
   lockPath: string,
   token: string,

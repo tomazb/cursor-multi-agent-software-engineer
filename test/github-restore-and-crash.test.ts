@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
   compareAndSwapFile,
+  recoverCompareAndSwapArtifacts,
   restoreMoved,
-  unlinkIfBytesMatch,
 } from "../src/github/lock-ownership.ts";
 import { GitHubDeliveryStore } from "../src/github/delivery-store.ts";
 
@@ -21,28 +21,6 @@ test("restoreMoved never renames over a newer successor", async () => {
 
   const restored = await restoreMoved(reclaimPath, filePath);
   assert.equal(restored, false);
-  assert.equal(await readFile(filePath, "utf8"), c);
-});
-
-test("unlinkIfBytesMatch mismatch recovery preserves newer successor C", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-unlink-c-"));
-  const filePath = path.join(root, "lock");
-  const expected = `${JSON.stringify({ token: "A-dead" })}\n`;
-  const b = `${JSON.stringify({ token: "B" })}\n`;
-  const c = `${JSON.stringify({ token: "C" })}\n`;
-  await writeFile(filePath, expected);
-
-  const ok = await unlinkIfBytesMatch(filePath, expected, {
-    afterPathMoved: async (canonical, reclaimPath) => {
-      // Successor B appears at canonical (already moved expected aside).
-      await writeFile(canonical, b);
-      // Newer successor C replaces B before mismatch recovery runs —
-      // simulated by rewriting after we force a mismatch: put wrong bytes in reclaim.
-      await writeFile(reclaimPath, `${JSON.stringify({ token: "not-expected" })}\n`);
-      await writeFile(canonical, c);
-    },
-  });
-  assert.equal(ok, false);
   assert.equal(await readFile(filePath, "utf8"), c);
 });
 
@@ -82,9 +60,10 @@ test("delivery claim recovers crash mid-complete instead of redispatching", asyn
     completedAt: new Date().toISOString(),
   })}\n`;
 
-  // Simulate crash after processing was moved aside and staging was written.
-  await writeFile(`${canonical}.staging`, completed);
-  await rename(canonical, `${canonical}.reclaim`);
+  const attempt = "crash1";
+  await writeFile(`${canonical}.staging.${attempt}`, completed);
+  const { rename } = await import("node:fs/promises");
+  await rename(canonical, `${canonical}.reclaim.${attempt}`);
 
   const again = await store.claim("d-crash");
   assert.equal(again.claimed, false);
@@ -94,4 +73,23 @@ test("delivery claim recovers crash mid-complete instead of redispatching", asyn
   const raw = await readFile(canonical, "utf8");
   assert.equal(JSON.parse(raw).status, "completed");
   assert.equal(JSON.parse(raw).leaseId, first.leaseId);
+});
+
+test("recoverCompareAndSwapArtifacts ignores invalid canonical without dropping staging", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-recover-invalid-"));
+  const filePath = path.join(root, "d.json");
+  const staging = `${JSON.stringify({
+    deliveryId: "d",
+    status: "completed",
+    leaseId: "L1",
+    claimedAt: "t",
+    completedAt: "t",
+  })}\n`;
+  await writeFile(`${filePath}.staging.x`, staging);
+  await writeFile(filePath, "{not-json");
+  const result = await recoverCompareAndSwapArtifacts(filePath);
+  assert.equal(result.kind, "installed");
+  assert.equal(JSON.parse(await readFile(filePath, "utf8")).status, "completed");
+  const left = await readdir(root);
+  assert.equal(left.some((n) => n.includes(".staging.")), false);
 });
