@@ -1,95 +1,81 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import {
-  compareAndSwapFile,
-  recoverCompareAndSwapArtifacts,
-  restoreMoved,
-} from "../src/github/lock-ownership.ts";
-import { GitHubDeliveryStore } from "../src/github/delivery-store.ts";
+import { GitHubDeliveryStore, type DeliveryRecord } from "../src/github/delivery-store.ts";
 
-test("restoreMoved never renames over a newer successor", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-restore-c-"));
-  const filePath = path.join(root, "lock");
-  const reclaimPath = path.join(root, "lock.reclaim");
-  const b = `${JSON.stringify({ token: "B" })}\n`;
-  const c = `${JSON.stringify({ token: "C" })}\n`;
-  await writeFile(reclaimPath, b);
-  await writeFile(filePath, c);
+const CLAIMED_AT = "2026-08-09T12:00:00.000Z";
+const COMPLETED_AT = "2026-08-09T12:00:01.000Z";
 
-  const restored = await restoreMoved(reclaimPath, filePath);
-  assert.equal(restored, false);
-  assert.equal(await readFile(filePath, "utf8"), c);
-});
+function processing(deliveryId: string, leaseId: string): DeliveryRecord {
+  return { deliveryId, status: "processing", leaseId, claimedAt: CLAIMED_AT };
+}
 
-test("compareAndSwapFile mismatch recovery preserves newer successor C", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-cas-c-"));
-  const filePath = path.join(root, "delivery.json");
-  const expected = `${JSON.stringify({ leaseId: "A", status: "processing" })}\n`;
-  const c = `${JSON.stringify({ leaseId: "C", status: "processing" })}\n`;
-  await writeFile(filePath, expected);
+function completed(deliveryId: string, leaseId: string): DeliveryRecord {
+  return {
+    ...processing(deliveryId, leaseId),
+    status: "completed",
+    completedAt: COMPLETED_AT,
+  };
+}
 
-  const ok = await compareAndSwapFile(
-    filePath,
-    expected,
-    `${JSON.stringify({ leaseId: "A", status: "completed" })}\n`,
-    {
-      afterPathMoved: async (canonical, reclaimPath) => {
-        await writeFile(reclaimPath, `${JSON.stringify({ leaseId: "B" })}\n`);
-        await writeFile(canonical, c);
-      },
-    },
+async function writeRecord(filePath: string, record: DeliveryRecord): Promise<void> {
+  await writeFile(filePath, `${JSON.stringify(record)}\n`, "utf8");
+}
+
+test("processing canonical plus same-lease completed staging finishes completion", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-current-stage-"));
+  const deliveries = path.join(root, "deliveries");
+  await mkdir(deliveries);
+  const canonical = path.join(deliveries, "d-current.json");
+  await writeRecord(canonical, processing("d-current", "lease-current"));
+  await writeRecord(
+    `${canonical}.staging.crash-before-replace`,
+    completed("d-current", "lease-current"),
   );
-  assert.equal(ok, false);
-  assert.equal(await readFile(filePath, "utf8"), c);
+
+  const retry = await new GitHubDeliveryStore(root).claim("d-current");
+
+  assert.equal(retry.claimed, false);
+  assert.equal(retry.status, "completed");
+  assert.deepEqual(JSON.parse(await readFile(canonical, "utf8")), {
+    deliveryId: "d-current",
+    status: "completed",
+    leaseId: "lease-current",
+    claimedAt: CLAIMED_AT,
+    completedAt: COMPLETED_AT,
+  });
 });
 
-test("delivery claim recovers crash mid-complete instead of redispatching", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-crash-gap-"));
-  const store = new GitHubDeliveryStore(root, { staleProcessingMs: 60_000 });
-  const first = await store.claim("d-crash");
-  assert.ok(first.leaseId);
+test("a matching legacy staging/reclaim pair recovers missing or truncated canonical", async (t) => {
+  for (const canonicalState of ["missing", "truncated"] as const) {
+    await t.test(canonicalState, async () => {
+      const deliveryId = `d-${canonicalState}`;
+      const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-legacy-pair-"));
+      const deliveries = path.join(root, "deliveries");
+      await mkdir(deliveries);
+      const canonical = path.join(deliveries, `${deliveryId}.json`);
+      await writeRecord(
+        `${canonical}.staging.legacy-attempt`,
+        completed(deliveryId, "lease-legacy"),
+      );
+      await writeRecord(
+        `${canonical}.reclaim.legacy-attempt`,
+        processing(deliveryId, "lease-legacy"),
+      );
+      if (canonicalState === "truncated") {
+        await writeFile(canonical, "{\"deliveryId\":", "utf8");
+      }
 
-  const canonical = path.join(root, "deliveries", "d-crash.json");
-  const processing = await readFile(canonical, "utf8");
-  const completed = `${JSON.stringify({
-    ...JSON.parse(processing),
-    status: "completed",
-    completedAt: new Date().toISOString(),
-  })}\n`;
+      const retry = await new GitHubDeliveryStore(root).claim(deliveryId);
 
-  const attempt = "crash1";
-  await writeFile(`${canonical}.staging.${attempt}`, completed);
-  const { rename } = await import("node:fs/promises");
-  await rename(canonical, `${canonical}.reclaim.${attempt}`);
-
-  const again = await store.claim("d-crash");
-  assert.equal(again.claimed, false);
-  assert.equal(again.duplicate, true);
-  assert.equal(again.status, "completed");
-
-  const raw = await readFile(canonical, "utf8");
-  assert.equal(JSON.parse(raw).status, "completed");
-  assert.equal(JSON.parse(raw).leaseId, first.leaseId);
-});
-
-test("recoverCompareAndSwapArtifacts ignores invalid canonical without dropping staging", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-recover-invalid-"));
-  const filePath = path.join(root, "d.json");
-  const staging = `${JSON.stringify({
-    deliveryId: "d",
-    status: "completed",
-    leaseId: "L1",
-    claimedAt: "t",
-    completedAt: "t",
-  })}\n`;
-  await writeFile(`${filePath}.staging.x`, staging);
-  await writeFile(filePath, "{not-json");
-  const result = await recoverCompareAndSwapArtifacts(filePath);
-  assert.equal(result.kind, "installed");
-  assert.equal(JSON.parse(await readFile(filePath, "utf8")).status, "completed");
-  const left = await readdir(root);
-  assert.equal(left.some((n) => n.includes(".staging.")), false);
+      assert.equal(retry.claimed, false);
+      assert.equal(retry.duplicate, true);
+      assert.equal(retry.status, "completed");
+      const recovered = JSON.parse(await readFile(canonical, "utf8")) as DeliveryRecord;
+      assert.equal(recovered.status, "completed");
+      assert.equal(recovered.leaseId, "lease-legacy");
+    });
+  }
 });

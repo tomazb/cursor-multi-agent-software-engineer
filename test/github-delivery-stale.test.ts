@@ -8,7 +8,9 @@ import { GitHubDeliveryStore } from "../src/github/delivery-store.ts";
 test("stale processing claims can be reclaimed after crash TTL", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-stale-del-"));
   const store = new GitHubDeliveryStore(root, { staleProcessingMs: 1 });
-  assert.equal((await store.claim("d1")).claimed, true);
+  const first = await store.claim("d1");
+  assert.equal(first.claimed, true);
+  assert.ok(first.leaseId);
 
   // Simulate a crash leaving processing forever by rewriting claimedAt into the past.
   const file = path.join(root, "deliveries", "d1.json");
@@ -17,6 +19,7 @@ test("stale processing claims can be reclaimed after crash TTL", async () => {
     `${JSON.stringify({
       deliveryId: "d1",
       status: "processing",
+      leaseId: first.leaseId,
       claimedAt: new Date(Date.now() - 10_000).toISOString(),
     })}\n`,
   );

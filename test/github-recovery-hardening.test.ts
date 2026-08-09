@@ -1,104 +1,99 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import {
-  compareAndSwapFile,
-  recoverCompareAndSwapArtifacts,
-} from "../src/github/lock-ownership.ts";
-import { GitHubDeliveryStore } from "../src/github/delivery-store.ts";
+import { GitHubDeliveryStore, type DeliveryRecord } from "../src/github/delivery-store.ts";
 
-test("recovery does not delete staging when canonical is truncated", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-trunc-"));
-  const filePath = path.join(root, "d.json");
-  const staging = `${JSON.stringify({
-    deliveryId: "d",
+const CLAIMED_AT = "2026-08-09T11:00:00.000Z";
+const COMPLETED_AT = "2026-08-09T11:00:01.000Z";
+
+function processing(deliveryId: string, leaseId: string): DeliveryRecord {
+  return { deliveryId, status: "processing", leaseId, claimedAt: CLAIMED_AT };
+}
+
+function completed(deliveryId: string, leaseId: string): DeliveryRecord {
+  return {
+    deliveryId,
     status: "completed",
-    leaseId: "L1",
-    claimedAt: new Date().toISOString(),
-    completedAt: new Date().toISOString(),
-  })}\n`;
-  const reclaim = `${JSON.stringify({
-    deliveryId: "d",
-    status: "processing",
-    leaseId: "L1",
-    claimedAt: new Date().toISOString(),
-  })}\n`;
-  const attempt = "attempt1";
-  await writeFile(`${filePath}.staging.${attempt}`, staging);
-  await writeFile(`${filePath}.reclaim.${attempt}`, reclaim);
-  await writeFile(filePath, '{"status":"com'); // truncated
+    leaseId,
+    claimedAt: CLAIMED_AT,
+    completedAt: COMPLETED_AT,
+  };
+}
 
-  const recovered = await recoverCompareAndSwapArtifacts(filePath);
-  assert.equal(recovered.kind, "installed");
-  assert.equal(JSON.parse(recovered.raw).status, "completed");
-  assert.equal(JSON.parse(await readFile(filePath, "utf8")).status, "completed");
-});
+async function writeRecord(filePath: string, record: object): Promise<void> {
+  await writeFile(filePath, `${JSON.stringify(record)}\n`, "utf8");
+}
 
-test("delivery claim recovers truncated canonical via staging", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-trunc-claim-"));
-  const store = new GitHubDeliveryStore(root, { staleProcessingMs: 60_000 });
-  const first = await store.claim("d-trunc");
-  assert.ok(first.leaseId);
-  const canonical = path.join(root, "deliveries", "d-trunc.json");
-  const processing = await readFile(canonical, "utf8");
-  const completed = `${JSON.stringify({
-    ...JSON.parse(processing),
-    status: "completed",
-    completedAt: new Date().toISOString(),
-  })}\n`;
-  const attempt = "a1";
-  await writeFile(`${canonical}.staging.${attempt}`, completed);
-  await writeFile(`${canonical}.reclaim.${attempt}`, processing);
-  await writeFile(canonical, '{"incomplete":');
-
-  const again = await store.claim("d-trunc");
-  assert.equal(again.claimed, false);
-  assert.equal(again.status, "completed");
-  assert.equal(JSON.parse(await readFile(canonical, "utf8")).leaseId, first.leaseId);
-});
-
-test("crash after staging before move finishes as completed", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-stage-only-"));
-  const store = new GitHubDeliveryStore(root, { staleProcessingMs: 60_000 });
-  const first = await store.claim("d-stage");
-  assert.ok(first.leaseId);
-  const canonical = path.join(root, "deliveries", "d-stage.json");
-  const processing = await readFile(canonical, "utf8");
-  const completed = `${JSON.stringify({
-    ...JSON.parse(processing),
-    status: "completed",
-    completedAt: new Date().toISOString(),
-  })}\n`;
-  await writeFile(`${canonical}.staging.only`, completed);
-
-  const again = await store.claim("d-stage");
-  assert.equal(again.claimed, false);
-  assert.equal(again.status, "completed");
-  assert.equal(JSON.parse(await readFile(canonical, "utf8")).status, "completed");
-  assert.equal(JSON.parse(await readFile(canonical, "utf8")).leaseId, first.leaseId);
-});
-
-test("compareAndSwapFile uses attempt-scoped artifacts", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-attempt-"));
-  const filePath = path.join(root, "d.json");
-  const expected = `${JSON.stringify({ leaseId: "A", status: "processing" })}\n`;
-  await writeFile(filePath, expected);
-  let seenReclaim: string | undefined;
-  const ok = await compareAndSwapFile(
-    filePath,
-    expected,
-    `${JSON.stringify({ leaseId: "A", status: "completed" })}\n`,
+test("legacy recovery requires full records with matching identity, status, and timestamps", async (t) => {
+  const cases: Array<{
+    name: string;
+    staging: object;
+    reclaim: object;
+  }> = [
     {
-      afterPathMoved: async (_canonical, reclaimPath) => {
-        seenReclaim = reclaimPath;
-        const entries = await readdir(path.dirname(filePath));
-        assert.ok(entries.some((e) => e.includes(".staging.")));
+      name: "delivery id",
+      staging: completed("other-delivery", "lease-a"),
+      reclaim: processing("d-structural", "lease-a"),
+    },
+    {
+      name: "lease id",
+      staging: completed("d-structural", "lease-a"),
+      reclaim: processing("d-structural", "lease-b"),
+    },
+    {
+      name: "statuses",
+      staging: processing("d-structural", "lease-a"),
+      reclaim: processing("d-structural", "lease-a"),
+    },
+    {
+      name: "claimed timestamp",
+      staging: completed("d-structural", "lease-a"),
+      reclaim: {
+        ...processing("d-structural", "lease-a"),
+        claimedAt: "2026-08-09T11:00:00.001Z",
       },
     },
-  );
-  assert.equal(ok, true);
-  assert.ok(seenReclaim?.includes(".reclaim."));
-  assert.notEqual(seenReclaim, `${filePath}.reclaim`);
+    {
+      name: "canonical timestamps",
+      staging: {
+        ...completed("d-structural", "lease-a"),
+        completedAt: "2026-08-09 11:00:01",
+      },
+      reclaim: processing("d-structural", "lease-a"),
+    },
+    {
+      name: "timestamp order",
+      staging: {
+        ...completed("d-structural", "lease-a"),
+        completedAt: "2026-08-09T10:59:59.000Z",
+      },
+      reclaim: processing("d-structural", "lease-a"),
+    },
+  ];
+
+  for (const fixture of cases) {
+    await t.test(fixture.name, async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-structural-"));
+      const deliveries = path.join(root, "deliveries");
+      await mkdir(deliveries);
+      const canonical = path.join(deliveries, "d-structural.json");
+      const staging = `${canonical}.staging.attempt`;
+      const reclaim = `${canonical}.reclaim.attempt`;
+      await writeRecord(staging, fixture.staging);
+      await writeRecord(reclaim, fixture.reclaim);
+
+      const claim = await new GitHubDeliveryStore(root).claim(
+        "d-structural",
+        Date.parse(CLAIMED_AT),
+      );
+
+      assert.equal(claim.claimed, true);
+      assert.notEqual(claim.leaseId, "lease-a");
+      assert.equal(JSON.parse(await readFile(canonical, "utf8")).status, "processing");
+      await access(staging);
+      await access(reclaim);
+    });
+  }
 });

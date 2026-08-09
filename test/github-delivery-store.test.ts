@@ -42,3 +42,15 @@ test("delivery store rejects empty delivery ids", async () => {
   await assert.rejects(() => store.claim(""), /delivery/i);
   await assert.rejects(() => store.claim("../escape"), /delivery/i);
 });
+
+test("completion remains structurally valid if the wall clock moves behind claimedAt", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-delivery-clock-"));
+  const store = new GitHubDeliveryStore(root);
+  const futureClaimedAt = Date.now() + 60_000;
+  const first = await store.claim("delivery-clock", futureClaimedAt);
+  assert.ok(first.leaseId);
+
+  assert.deepEqual(await store.complete("delivery-clock", first.leaseId!), { ok: true });
+  const replay = await store.claim("delivery-clock");
+  assert.equal(replay.status, "completed");
+});
