@@ -220,6 +220,46 @@ Cursor CLI assistant extraction and terminal markers:
 - Marker validation rejects quoted examples, embedded tokens, duplicates, conflicts, non-final markers, and content after a marker. Operator-visible messages name the violated contract and logical line number without dumping full model output.
 - Authenticated validation for the earlier JSON-marker repair used Cursor CLI `2026.07.23-e383d2b` on Linux. A new exact-head external validation is required after the Thermos blocker repairs; do not infer broader provider or platform coverage.
 
+### GitHub App Phase A operations
+
+When `githubApp.enabled` is true, `readOnlyChecks` must be true and
+`allowedRepositories` must contain at least one `owner/repo`. A disabled configuration may retain
+an empty list.
+
+Both `maswe github-webhook` and `maswe github-publish-checks <run-id>` initialize
+`.maswe/github/journals/association/<digest>/.lock-journal-v3/` and complete the root hard-link
+probe before accepting work. Per-check and per-delivery journals are created beneath the sibling
+`check-create/<digest>` and `delivery/<digest>` trees. Each journal contains `format.json` plus
+`data`, `admin`, and `admin-recovery` streams with immutable `claims`, `releases`, and `tmp`
+records. Do not prune them.
+
+Run GitHub state only on one host and one coherent local filesystem with atomic no-clobber hard
+links. NFS, SMB, distributed FUSE, object-store mounts, cross-host use, and filesystems without
+hard-link support are unsupported. Before upgrading from legacy `associations.lock` or
+`side-effect-create-locks/*.lock`, stop every old webhook server and manual publisher. Start only
+the new binary; it publishes digest/stable-identity migration evidence and retains the legacy
+path. Mixed old/new execution is unsupported.
+
+Webhook response semantics are operationally significant:
+
+- completed duplicates and intentionally unsupported events/actions return 200;
+- a live processing duplicate returns 503 so GitHub retries;
+- malformed headers/body return 400, forged signatures return 401, and oversized bodies return
+  413;
+- other handler failures return a generic 500 body while details are emitted only to local
+  diagnostics.
+
+Every production GitHub HTTP request has a 30-second default deadline, including installation
+token, live-head, Checks API, webhook-triggered, and manual-publication calls. Rate-limit retries
+remain bounded and do not create an indefinite request. Check reconciliation uses the full digest
+of repository/PR/head/name/attempt and visits bounded `filter=all`, 100-item pages before creating
+a replacement.
+
+Delivery failure-suppression files (`deliveries/<id>.json.suppression.*`) are immutable audit
+markers bound to the failed lease, canonical digest, and retained artifact digests. Do not remove
+them: they keep old recovery artifacts from suppressing a newer retry. A malformed marker or
+ambiguous recovery evidence fails closed and should be preserved for diagnosis.
+
 ## 4. Configure quality commands
 
 Replace starter commands with commands that are authoritative for the target repository, for example:

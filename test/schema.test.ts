@@ -3,13 +3,16 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
-import type { RuntimeFailureCode } from "../src/domain.ts";
+import type { MasweConfig, RuntimeFailureCode } from "../src/domain.ts";
 import { FileRunStore, migrateRunRecord } from "../src/store.ts";
 import os from "node:os";
 
 type JsonSchema = {
   $ref?: string;
   $defs?: Record<string, JsonSchema>;
+  allOf?: JsonSchema[];
+  if?: JsonSchema;
+  then?: JsonSchema;
   required?: string[];
   properties?: Record<string, JsonSchema>;
   items?: JsonSchema;
@@ -19,6 +22,7 @@ type JsonSchema = {
   maximum?: number;
   minLength?: number;
   maxLength?: number;
+  minItems?: number;
   maxItems?: number;
   pattern?: string;
   enum?: unknown[];
@@ -36,6 +40,20 @@ function resolveRef(root: JsonSchema, schema: JsonSchema): JsonSchema {
 
 function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, label: string): void {
   const effective = resolveRef(root, schema);
+  for (const child of effective.allOf ?? []) {
+    assertMatches(root, child, value, `${label}.allOf`);
+  }
+  if (effective.if && effective.then) {
+    let conditionMatches = true;
+    try {
+      assertMatches(root, effective.if, value, `${label}.if`);
+    } catch {
+      conditionMatches = false;
+    }
+    if (conditionMatches) {
+      assertMatches(root, effective.then, value, `${label}.then`);
+    }
+  }
   if (effective.const !== undefined) {
     assert.equal(value, effective.const, `${label} const`);
   }
@@ -65,6 +83,12 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
   }
   if (effective.type === "array") {
     assert.ok(Array.isArray(value), label);
+    if (effective.minItems !== undefined) {
+      assert.ok(
+        (value as unknown[]).length >= effective.minItems,
+        `${label} minItems`,
+      );
+    }
     if (effective.maxItems !== undefined) {
       assert.ok(
         (value as unknown[]).length <= effective.maxItems,
@@ -101,6 +125,28 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
   }
 }
 
+async function loadConfigSchema(): Promise<JsonSchema> {
+  return JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/config.schema.json"), "utf8"),
+  ) as JsonSchema;
+}
+
+function configWithGitHubApp(
+  overrides: Partial<NonNullable<MasweConfig["githubApp"]>> = {},
+): MasweConfig {
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.githubApp = {
+    enabled: true,
+    readOnlyChecks: true,
+    webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+    appIdEnv: "MASWE_GITHUB_APP_ID",
+    privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+    allowedRepositories: ["owner/repo"],
+    ...overrides,
+  };
+  return config;
+}
+
 test("schema assertion rejects fractional values for integer fields", () => {
   const integerSchema = { type: "integer" };
 
@@ -115,6 +161,44 @@ test("DEFAULT_CONFIG satisfies config JSON schema required shape", async () => {
     await readFile(path.join(process.cwd(), "schemas/config.schema.json"), "utf8"),
   ) as JsonSchema;
   assertMatches(schema, schema, DEFAULT_CONFIG, "config");
+});
+
+test("config schema rejects enabled GitHub App write mode", async () => {
+  const schema = await loadConfigSchema();
+  const config = configWithGitHubApp({ readOnlyChecks: false });
+
+  assert.throws(
+    () => assertMatches(schema, schema, config, "config.githubApp.write-mode"),
+    /const/,
+  );
+});
+
+test("config schema rejects an enabled GitHub App with an empty allowlist", async () => {
+  const schema = await loadConfigSchema();
+  const config = configWithGitHubApp({ allowedRepositories: [] });
+
+  assert.throws(
+    () => assertMatches(schema, schema, config, "config.githubApp.empty-allowlist"),
+    /minItems/,
+  );
+});
+
+test("config schema accepts an enabled read-only GitHub App with an allowed repository", async () => {
+  const schema = await loadConfigSchema();
+  const config = configWithGitHubApp();
+
+  assert.doesNotThrow(() =>
+    assertMatches(schema, schema, config, "config.githubApp.enabled"),
+  );
+});
+
+test("config schema accepts a disabled GitHub App with an empty allowlist", async () => {
+  const schema = await loadConfigSchema();
+  const config = configWithGitHubApp({ enabled: false, allowedRepositories: [] });
+
+  assert.doesNotThrow(() =>
+    assertMatches(schema, schema, config, "config.githubApp.disabled"),
+  );
 });
 
 test("config schema requires the normalized doctor probe timeout", async () => {

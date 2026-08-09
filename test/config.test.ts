@@ -186,3 +186,18 @@ test("githubApp rejects empty allowlist when enabled", () => {
     /allowedRepositories/,
   );
 });
+
+test("githubApp accepts an empty allowlist when disabled", () => {
+  const config = mergeConfigForTest({
+    githubApp: {
+      enabled: false,
+      readOnlyChecks: false,
+      webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+      appIdEnv: "MASWE_GITHUB_APP_ID",
+      privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+      allowedRepositories: [],
+    },
+  });
+
+  assert.deepEqual(config.githubApp?.allowedRepositories, []);
+});

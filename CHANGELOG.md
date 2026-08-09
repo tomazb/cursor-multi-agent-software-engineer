@@ -16,6 +16,11 @@ The project follows semantic versioning once a public release process is establi
   association fields with schema and artifact-contract updates.
 - Integration coverage for forged signatures, delivery replay, stale SHA invalidation, rate limits,
   and installation removal.
+- Immutable hash-addressed GitHub association, check-create, and delivery journals with startup
+  hard-link probing, quiescent retained-path legacy migration, and same-host coherent-filesystem
+  support boundaries.
+- Lease/digest-bound delivery failure-suppression audit markers, full-digest check identity,
+  bounded paginated reconciliation, and a 30-second default deadline per GitHub HTTP request.
 - Review hardening for Phase A: canonical `03-specification-and-design.md` check binding, real
   installation tokens for unassociated PRs, delivery complete-after-success, exact PR association
   matching, scoped checks tokens, PATCH without `head_sha`, webhook body limits, rate-limit
@@ -61,6 +66,12 @@ The project follows semantic versioning once a public release process is establi
   the active version, supported range, canonical baseline, and an optional NVM recovery command.
 - Cursor CLI doctor probe timeout now uses `policy.doctorProbeTimeoutMs` instead of the former
   implicit 5-second cap (`Math.min(5_000, commandTimeoutMs)`).
+- Phase A webhook acknowledgement now distinguishes completed/unsupported deliveries (HTTP 200)
+  from live processing duplicates (HTTP 503); internal failures emit local diagnostics and expose
+  only a generic HTTP 500 body.
+- Enabled `githubApp` JSON Schema validation now matches runtime policy by requiring
+  `readOnlyChecks: true` and at least one allowed repository; disabled configuration may retain an
+  empty repository list.
 - Cursor CLI doctor classification now separates executable-unavailable, version-check failures,
   catalogue failures, role-resolution failures, skipped-prerequisite failures, probe invocation
   failures, probe transport timeouts, cleanup failures, and doctor unexpected errors.
