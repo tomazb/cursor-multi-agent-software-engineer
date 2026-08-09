@@ -37,15 +37,22 @@ function isRepoAllowed(config: GitHubAppConfig, repository: string | undefined):
   return config.allowedRepositories.includes(repository);
 }
 
-function remoteMatchesRepository(remote: string | undefined, repository: string): boolean {
+/** Match only github.com remotes (https or ssh) to owner/repo. */
+export function remoteMatchesRepository(
+  remote: string | undefined,
+  repository: string,
+): boolean {
   if (!remote) return false;
-  const normalized = remote.replace(/\.git$/i, "").replace(/\/$/, "");
-  return (
-    normalized.endsWith(`/${repository}`) ||
-    normalized.endsWith(`:${repository}`) ||
-    normalized.includes(`github.com/${repository}`) ||
-    normalized.includes(`github.com:${repository}`)
-  );
+  const trimmed = remote.trim().replace(/\.git$/i, "");
+  const https = trimmed.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)$/i);
+  if (https) {
+    return `${https[1]}/${https[2]}`.toLowerCase() === repository.toLowerCase();
+  }
+  const ssh = trimmed.match(/^(?:ssh:\/\/)?git@github\.com:([^/]+)\/([^/]+)$/i);
+  if (ssh) {
+    return `${ssh[1]}/${ssh[2]}`.toLowerCase() === repository.toLowerCase();
+  }
+  return false;
 }
 
 export class GitHubAppAdapter {
@@ -169,15 +176,22 @@ export class GitHubAppAdapter {
     }
 
     if (event.type === "installation_repositories.removed") {
-      if (event.installationId !== undefined && event.repository) {
+      if (event.installationId === undefined) return;
+      const repositories =
+        event.repositories && event.repositories.length > 0
+          ? event.repositories
+          : event.repository
+            ? [event.repository]
+            : [];
+      const runIds: string[] = [];
+      for (const repository of repositories) {
         const suspended = await this.associations.suspendRepository(
           event.installationId,
-          event.repository,
+          repository,
         );
-        await this.suspendRunRecords(suspended.map((record) => record.runId));
+        runIds.push(...suspended.map((record) => record.runId));
       }
-      // Also suspend any allowlisted repos carried only in the raw event via association scan:
-      // normalize currently does not expand repositories_removed; handle via repository when present.
+      await this.suspendRunRecords(runIds);
       return;
     }
 
@@ -206,14 +220,18 @@ export class GitHubAppAdapter {
 
   private async suspendRunRecords(runIds: string[]): Promise<void> {
     for (const runId of runIds) {
+      let run: RunRecord;
       try {
-        const run = await this.store.load(runId);
-        if (!run.github || run.github.suspended) continue;
-        run.github = { ...run.github, suspended: true };
-        await this.store.save(run);
-      } catch {
-        // Run may have been deleted; index suspension still holds.
+        run = await this.store.load(runId);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") continue;
+        if (error instanceof Error && /not found|missing/i.test(error.message)) continue;
+        throw error;
       }
+      if (!run.github || run.github.suspended) continue;
+      run.github = { ...run.github, suspended: true };
+      await this.store.save(run);
     }
   }
 
@@ -240,7 +258,7 @@ export class GitHubAppAdapter {
     repository: string,
     pullRequestNumber: number,
     installationId: number,
-  ): Promise<string | undefined> {
+  ): Promise<string> {
     const { owner, repo } = parseOwnerRepo(repository);
     const token = await this.tokenProvider(installationId, repository);
     const response = await this.http.request(
@@ -254,9 +272,18 @@ export class GitHubAppAdapter {
         },
       },
     );
-    if (response.status < 200 || response.status >= 300) return undefined;
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(
+        `Failed to resolve current PR head for ${repository}#${pullRequestNumber}: HTTP ${response.status}`,
+      );
+    }
     const head = (response.body as { head?: { sha?: string } }).head;
-    return typeof head?.sha === "string" ? head.sha : undefined;
+    if (typeof head?.sha !== "string" || !head.sha) {
+      throw new Error(
+        `Failed to resolve current PR head for ${repository}#${pullRequestNumber}: missing head.sha`,
+      );
+    }
+    return head.sha;
   }
 
   private async handlePullRequestEvent(event: GitHubInternalEvent): Promise<void> {
@@ -279,7 +306,7 @@ export class GitHubAppAdapter {
         pullRequestNumber,
         installationId,
       );
-      if (liveHead && liveHead !== headSha) {
+      if (liveHead !== headSha) {
         // Stale out-of-order delivery: current PR head has already moved on.
         return;
       }

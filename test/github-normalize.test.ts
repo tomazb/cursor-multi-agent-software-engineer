@@ -71,3 +71,21 @@ test("normalize rejects unsupported event names", () => {
     /unsupported/i,
   );
 });
+
+test("normalize installation_repositories.removed keeps all repositories", () => {
+  const event = normalizeGitHubWebhook({
+    deliveryId: "del-5",
+    eventName: "installation_repositories",
+    payload: {
+      action: "removed",
+      installation: { id: 7 },
+      repositories_removed: [
+        { full_name: "owner/one" },
+        { full_name: "owner/two" },
+      ],
+    },
+  });
+  assert.equal(event.type, "installation_repositories.removed");
+  assert.deepEqual(event.repositories, ["owner/one", "owner/two"]);
+  assert.equal(event.repository, "owner/one");
+});

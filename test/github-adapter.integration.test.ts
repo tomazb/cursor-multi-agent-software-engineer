@@ -422,3 +422,139 @@ test("integration: push events invalidate the matching PR association", async ()
   assert.equal(loaded.github?.headSha, "sha-push");
   assert.equal(loaded.evidence?.quality, undefined);
 });
+
+test("integration: live-head lookup failure fails closed", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { adapter, store, cwd } = await setup({ liveHead: "sha-new" });
+  const run = await store.create("fail-closed", "req", testConfig());
+  run.workspace = {
+    baseSha: "base",
+    headSha: "sha-new",
+    branch: "maswe/run-1",
+    fingerprint: "fp",
+    remote: "https://github.com/owner/repo.git",
+  };
+  await store.save(run);
+  await adapter.handleWebhook({
+    deliveryId: "del-new-head",
+    eventName: "pull_request",
+    signatureHeader: sign(JSON.stringify(prPayload("sha-new"))),
+    rawBody: JSON.stringify(prPayload("sha-new")),
+  });
+  assert.equal((await store.load(run.id)).github?.headSha, "sha-new");
+
+  const failingHttp: GitHubHttpClient = {
+    async request(method) {
+      if (method === "GET") {
+        return { status: 500, headers: {}, body: { message: "boom" } };
+      }
+      return { status: 201, headers: {}, body: { id: 99 } };
+    },
+  };
+  const badAdapter = new GitHubAppAdapter({
+    cwd,
+    config: testConfig(),
+    store,
+    http: failingHttp,
+    tokenProvider: async () => "token",
+  });
+  await assert.rejects(
+    () =>
+      badAdapter.handleWebhook({
+        deliveryId: "del-old-after-fail",
+        eventName: "pull_request",
+        signatureHeader: sign(JSON.stringify(prPayload("sha-old"))),
+        rawBody: JSON.stringify(prPayload("sha-old")),
+      }),
+    /Failed to resolve current PR head/i,
+  );
+  assert.equal((await store.load(run.id)).github?.headSha, "sha-new");
+});
+
+test("integration: installation_repositories.removed suspends every listed repo", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { store, cwd } = await setup();
+  const runOne = await store.create("r1", "req", testConfig());
+  runOne.github = {
+    installationId: 44,
+    repository: "owner/one",
+    pullRequestNumber: 1,
+    baseSha: "b",
+    headSha: "h",
+    branch: "a",
+    suspended: false,
+  };
+  await store.save(runOne);
+  const runTwo = await store.create("r2", "req", testConfig());
+  runTwo.github = {
+    installationId: 44,
+    repository: "owner/two",
+    pullRequestNumber: 2,
+    baseSha: "b",
+    headSha: "h",
+    branch: "b",
+    suspended: false,
+  };
+  await store.save(runTwo);
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  await index.bind({
+    runId: runOne.id,
+    installationId: 44,
+    repository: "owner/one",
+    pullRequestNumber: 1,
+    baseSha: "b",
+    headSha: "h",
+    branch: "a",
+  });
+  await index.bind({
+    runId: runTwo.id,
+    installationId: 44,
+    repository: "owner/two",
+    pullRequestNumber: 2,
+    baseSha: "b",
+    headSha: "h",
+    branch: "b",
+  });
+
+  // Allowlist both for this test config by writing a dedicated adapter.
+  const config = mergeConfigForTest({
+    runtime: { kind: "mock" },
+    quality: { commands: [] },
+    githubApp: {
+      enabled: true,
+      readOnlyChecks: true,
+      webhookSecretEnv: SECRET_ENV,
+      appIdEnv: "MASWE_TEST_GITHUB_APP_ID",
+      privateKeyEnv: "MASWE_TEST_GITHUB_APP_PRIVATE_KEY",
+      allowedRepositories: ["owner/one", "owner/two", "owner/repo"],
+    },
+  });
+  const multiAdapter = new GitHubAppAdapter({
+    cwd,
+    config,
+    store,
+    http: {
+      async request() {
+        return { status: 200, headers: {}, body: {} };
+      },
+    },
+    tokenProvider: async () => "token",
+  });
+
+  const body = JSON.stringify({
+    action: "removed",
+    installation: { id: 44 },
+    repositories_removed: [{ full_name: "owner/one" }, { full_name: "owner/two" }],
+  });
+  const result = await multiAdapter.handleWebhook({
+    deliveryId: "del-multi-removed",
+    eventName: "installation_repositories",
+    signatureHeader: sign(body),
+    rawBody: body,
+  });
+  assert.equal(result.status, 200);
+  assert.equal((await index.find("owner/one", 1))?.suspended, true);
+  assert.equal((await index.find("owner/two", 2))?.suspended, true);
+  assert.equal((await store.load(runOne.id)).github?.suspended, true);
+  assert.equal((await store.load(runTwo.id)).github?.suspended, true);
+});

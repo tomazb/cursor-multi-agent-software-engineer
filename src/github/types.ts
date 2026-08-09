@@ -26,6 +26,8 @@ export interface GitHubInternalEvent {
   eventId: string;
   type: GitHubInternalEventType;
   repository?: string;
+  /** All repositories affected by installation_repositories events. */
+  repositories?: string[];
   installationId?: number;
   pullRequestNumber?: number;
   headSha?: string;

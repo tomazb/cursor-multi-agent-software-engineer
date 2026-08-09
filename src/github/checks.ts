@@ -239,43 +239,44 @@ export class CheckPublisher {
       name,
       this.attempt,
     );
-    const externalId = externalIdFor(key);
-    const existing = await this.sideEffects.get(key);
-    if (existing) {
-      await this.patchCheck(existing.resourceId, outcome);
-      return;
-    }
-
-    const reconciled = await this.reconcileExistingCheck(name, headSha, externalId);
-    if (reconciled !== undefined) {
-      await this.sideEffects.put(key, { resourceId: reconciled, kind: "check-run" });
-      await this.patchCheck(reconciled, outcome);
-      return;
-    }
-
-    const response = await this.requestWithRateLimitRetry(
-      "POST",
-      `https://api.github.com/repos/${this.owner}/${this.repo}/check-runs`,
-      {
-        name,
-        head_sha: headSha,
-        external_id: externalId,
-        status: "completed",
-        conclusion: outcome.conclusion,
-        output: { title: outcome.title, summary: outcome.summary },
-      },
-    );
-    const id = (response.body as { id?: number }).id;
-    if (typeof id !== "number") {
-      // POST may have succeeded server-side; try reconcile before failing closed.
-      const recovered = await this.reconcileExistingCheck(name, headSha, externalId);
-      if (recovered === undefined) {
-        throw new Error("GitHub check-run response missing id");
+    await this.sideEffects.withCreateLock(key, async () => {
+      const externalId = externalIdFor(key);
+      const existing = await this.sideEffects.get(key);
+      if (existing) {
+        await this.patchCheck(existing.resourceId, outcome);
+        return;
       }
-      await this.sideEffects.put(key, { resourceId: recovered, kind: "check-run" });
-      return;
-    }
-    await this.sideEffects.put(key, { resourceId: id, kind: "check-run" });
+
+      const reconciled = await this.reconcileExistingCheck(name, headSha, externalId);
+      if (reconciled !== undefined) {
+        await this.sideEffects.put(key, { resourceId: reconciled, kind: "check-run" });
+        await this.patchCheck(reconciled, outcome);
+        return;
+      }
+
+      const response = await this.requestWithRateLimitRetry(
+        "POST",
+        `https://api.github.com/repos/${this.owner}/${this.repo}/check-runs`,
+        {
+          name,
+          head_sha: headSha,
+          external_id: externalId,
+          status: "completed",
+          conclusion: outcome.conclusion,
+          output: { title: outcome.title, summary: outcome.summary },
+        },
+      );
+      const id = (response.body as { id?: number }).id;
+      if (typeof id !== "number") {
+        const recovered = await this.reconcileExistingCheck(name, headSha, externalId);
+        if (recovered === undefined) {
+          throw new Error("GitHub check-run response missing id");
+        }
+        await this.sideEffects.put(key, { resourceId: recovered, kind: "check-run" });
+        return;
+      }
+      await this.sideEffects.put(key, { resourceId: id, kind: "check-run" });
+    });
   }
 
   private async reconcileExistingCheck(

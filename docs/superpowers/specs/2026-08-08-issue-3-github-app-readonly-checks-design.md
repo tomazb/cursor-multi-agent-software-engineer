@@ -152,11 +152,15 @@ Installation tokens are acquired per event and never persisted.
 | Scenario | Behavior |
 |----------|----------|
 | Replay same delivery | 200, no duplicate checks/runs |
+| Crash mid-delivery | Stale `processing` claim reclaimable after TTL; retry can complete |
 | Bad signature | 401, no state change |
 | Stale SHA | No success for wrong SHA; invalidate evidence |
+| Live-head lookup failure | Fail closed; do not store/process the event SHA |
+| Non-GitHub remote | Do not associate (`gitlab.com/...` etc. rejected) |
 | Rate limit | Backoff; no false success |
-| Installation removed | Suspend associations; stop mutations |
-| Out-of-order webhooks | Latest head SHA wins |
+| Concurrent check publishers | Serialized creates per key; one POST per check |
+| Installation removed | Suspend all listed repositories; stop mutations |
+| Out-of-order webhooks | Latest head SHA wins when live head is resolved |
 
 ### Testing
 
@@ -166,8 +170,12 @@ Mocked GitHub HTTP + file store:
 2. Forged signature → no delivery claim
 3. Stale SHA → no success on wrong SHA
 4. Rate limit → backoff, idempotent retry
-5. Installation removed → suspended
+5. Installation removed → every listed repo suspended
 6. Ordering SHA₁ then SHA₂ → SHA₁ cannot remain successful
+7. Live-head HTTP failure → head unchanged
+8. Concurrent publishers → four creates, not eight
+9. Non-GitHub remote → no association
+10. Stale processing delivery → reclaimable after TTL
 
 ## Commit strategy
 

@@ -290,10 +290,11 @@ A service will own durable runs and workers, use PostgreSQL, issue idempotent jo
 Phase A (read-only checks) lives in `src/github/` and calls public orchestrator/store operations through `GitHubAppAdapter`. It:
 
 - Receives pull request, push, installation, and observe-only check/workflow events.
-- Verifies `X-Hub-Signature-256` and de-duplicates `X-GitHub-Delivery`.
-- Binds runs to repository/PR/head SHA and invalidates local evidence when head SHA changes.
-- Creates separate check runs for specification compliance, deterministic quality, independent verification, and review-comment resolution (resolution remains `neutral` until Phase B).
+- Verifies `X-Hub-Signature-256` and de-duplicates `X-GitHub-Delivery` (stale in-flight claims are reclaimable after a crash TTL).
+- Binds runs to repository/PR/head SHA via github.com remotes only; invalidates local evidence when head SHA changes; fails closed when live-head lookup errors.
+- Creates separate check runs for specification compliance, deterministic quality, independent verification, and review-comment resolution (resolution remains `neutral` until Phase B), serializing concurrent creates per idempotency key.
 - Uses installation tokens with least privilege; `githubApp.readOnlyChecks: true` refuses Contents/PR/comment write APIs.
+- Suspends every repository listed on installation removal events and surfaces non-missing run-save failures.
 
 Phase B adds push/PR writes, comment replies, and digest-bound GitHub approvals. See `docs/GITHUB_APP.md`.
 

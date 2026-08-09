@@ -19,16 +19,58 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function processAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Default: reclaim abandoned locks older than 30s when the owner pid is dead or missing. */
+export const DEFAULT_ASSOCIATION_LOCK_STALE_MS = 30_000;
+
 /**
  * Serialize association index mutations with an exclusive lock file (`wx`).
+ * Abandoned locks (dead pid or aged beyond staleMs) are reclaimable.
  */
 export class GitHubAssociationIndex {
   private readonly filePath: string;
   private readonly lockPath: string;
+  private readonly lockStaleMs: number;
 
-  constructor(githubRoot: string) {
+  constructor(
+    githubRoot: string,
+    options: { lockStaleMs?: number } = {},
+  ) {
     this.filePath = path.join(githubRoot, "associations.json");
     this.lockPath = path.join(githubRoot, "associations.lock");
+    this.lockStaleMs = options.lockStaleMs ?? DEFAULT_ASSOCIATION_LOCK_STALE_MS;
+  }
+
+  private async tryReclaimStaleLock(nowMs: number): Promise<void> {
+    try {
+      const raw = await readFile(this.lockPath, "utf8");
+      const meta = JSON.parse(raw) as { pid?: number; at?: string };
+      const at = typeof meta.at === "string" ? Date.parse(meta.at) : Number.NaN;
+      const pid = typeof meta.pid === "number" ? meta.pid : -1;
+      const aged = !Number.isFinite(at) || nowMs - at >= this.lockStaleMs;
+      const dead = !processAlive(pid);
+      if (aged || dead) {
+        await unlink(this.lockPath);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        // Malformed lock: reclaim.
+        try {
+          await unlink(this.lockPath);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -44,6 +86,7 @@ export class GitHubAssociationIndex {
         break;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        await this.tryReclaimStaleLock(Date.now());
         if (Date.now() - started > 5_000) {
           throw new Error("Timed out acquiring GitHub association index lock");
         }

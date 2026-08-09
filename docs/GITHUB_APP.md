@@ -204,13 +204,15 @@ Store the key and resulting GitHub resource ID transactionally before acknowledg
 ## Failure behavior
 
 - Signature or authorization failure: reject without workflow changes.
-- Duplicate delivery: return success without repeating side effects.
+- Duplicate delivery: return success without repeating side effects. Only `completed` deliveries are terminal; stale `processing` claims (crash mid-handler) become reclaimable after a TTL so GitHub retries are not stuck as permanent duplicates.
 - GitHub rate limit: retry according to reset and backoff headers.
-- Stale head SHA: cancel current attempt and restart classification/verification for the new SHA.
+- Stale head SHA: cancel current attempt and restart classification/verification for the new SHA. Live-head lookup failures fail closed (do not apply the event SHA).
+- Exact PR identity: association matches only `github.com` remotes (HTTPS or SSH); other hosts with the same `owner/repo` path are rejected.
+- Concurrent check creates for the same idempotency key are serialized; retries reconcile existing check-run ids.
 - Merge conflict: `WAITING_FOR_HUMAN` or a dedicated reconciliation stage.
 - CI failure: builder/resolver correction loop under budget.
 - Ambiguous review comment: `WAITING_FOR_HUMAN`.
-- Permission change or installation removal: suspend runs and revoke leases.
+- Permission change or installation removal: suspend every listed repository (including multi-repo `repositories_removed`) and stop mutations; run-save errors other than missing runs surface to the handler.
 
 ## Rollout plan
 

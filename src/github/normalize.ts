@@ -25,6 +25,7 @@ function withOptional(
   base: GitHubInternalEvent,
   extras: {
     repository?: string | undefined;
+    repositories?: string[] | undefined;
     installationId?: number | undefined;
     pullRequestNumber?: number | undefined;
     headSha?: string | undefined;
@@ -36,6 +37,7 @@ function withOptional(
 ): GitHubInternalEvent {
   const event: GitHubInternalEvent = { ...base };
   if (extras.repository !== undefined) event.repository = extras.repository;
+  if (extras.repositories !== undefined) event.repositories = extras.repositories;
   if (extras.installationId !== undefined) event.installationId = extras.installationId;
   if (extras.pullRequestNumber !== undefined) {
     event.pullRequestNumber = extras.pullRequestNumber;
@@ -121,12 +123,11 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
     if (action !== "added" && action !== "removed") {
       throw new Error(`Unsupported installation_repositories action: ${String(action)}`);
     }
-    const removed = Array.isArray(payload.repositories_removed)
-      ? payload.repositories_removed
-      : [];
-    const firstRemoved = asRecord(removed[0]);
-    const removedFullName =
-      typeof firstRemoved?.full_name === "string" ? firstRemoved.full_name : undefined;
+    const listKey = action === "removed" ? "repositories_removed" : "repositories_added";
+    const listed = Array.isArray(payload[listKey]) ? (payload[listKey] as unknown[]) : [];
+    const repositories = listed
+      .map((item) => asRecord(item)?.full_name)
+      .filter((name): name is string => typeof name === "string" && name.includes("/"));
     return withOptional(
       {
         eventId: input.deliveryId,
@@ -138,7 +139,8 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
       },
       {
         installationId: installationId(payload),
-        repository: removedFullName ?? repositoryFullName(payload),
+        repository: repositories[0] ?? repositoryFullName(payload),
+        repositories,
         rawAction: action,
       },
     );
