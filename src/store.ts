@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
+import { writeDurableAtomic, type DurableFileOptions } from "./durable-file.ts";
 import type {
   ArtifactReference,
   MasweConfig,
@@ -43,14 +44,6 @@ function sha256(content: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function writeAtomic(filePath: string, content: string): Promise<void> {
-  const directory = path.dirname(filePath);
-  await mkdir(directory, { recursive: true });
-  const tempPath = path.join(directory, `.${path.basename(filePath)}.${randomUUID()}.tmp`);
-  await writeFile(tempPath, content, "utf8");
-  await rename(tempPath, filePath);
 }
 
 interface LockMeta {
@@ -304,16 +297,18 @@ export class FileRunStore implements RunStore {
   readonly root: string;
   private readonly cwd: string;
   private readonly lockRetries: number;
+  private readonly durableOptions: DurableFileOptions;
 
   constructor(
     cwd: string,
-    options: { lockStaleMs?: number; lockRetries?: number } = {},
+    options: { lockStaleMs?: number; lockRetries?: number } & DurableFileOptions = {},
   ) {
     this.cwd = cwd;
     this.root = path.join(cwd, ".maswe", "runs");
     // lockStaleMs retained for API compatibility; reclaim is ownership/PID based, not age based.
     void options.lockStaleMs;
     this.lockRetries = options.lockRetries ?? 50;
+    this.durableOptions = options;
   }
 
   private runDirectory(runId: string): string {
@@ -598,7 +593,12 @@ export class FileRunStore implements RunStore {
       events: [],
     };
     await this.withLock(run.id, async () => {
-      await writeAtomic(this.runFile(run.id), `${JSON.stringify(run, null, 2)}\n`);
+      await writeDurableAtomic(
+        this.runFile(run.id),
+        `${JSON.stringify(run, null, 2)}\n`,
+        "run record",
+        this.durableOptions,
+      );
     });
     return run;
   }
@@ -614,7 +614,12 @@ export class FileRunStore implements RunStore {
       }
       run.version += 1;
       run.updatedAt = now();
-      await writeAtomic(this.runFile(run.id), `${JSON.stringify(run, null, 2)}\n`);
+      await writeDurableAtomic(
+        this.runFile(run.id),
+        `${JSON.stringify(run, null, 2)}\n`,
+        "run record",
+        this.durableOptions,
+      );
     });
   }
 
@@ -681,10 +686,12 @@ export class FileRunStore implements RunStore {
       const relativePath = path.join(".maswe", "runs", run.id, "artifacts", fileName);
       const absolutePath = path.join(this.cwd, relativePath);
       const redacted = redactSecrets(content);
-      await mkdir(path.dirname(absolutePath), { recursive: true });
-      const tempPath = `${absolutePath}.${randomUUID()}.tmp`;
-      await writeFile(tempPath, redacted, "utf8");
-      await rename(tempPath, absolutePath);
+      await writeDurableAtomic(
+        absolutePath,
+        redacted,
+        "run artifact",
+        this.durableOptions,
+      );
 
       const reference: ArtifactReference = {
         name: logicalName,
@@ -707,7 +714,12 @@ export class FileRunStore implements RunStore {
       ];
       next.version += 1;
       next.updatedAt = now();
-      await writeAtomic(this.runFile(run.id), `${JSON.stringify(next, null, 2)}\n`);
+      await writeDurableAtomic(
+        this.runFile(run.id),
+        `${JSON.stringify(next, null, 2)}\n`,
+        "run record",
+        this.durableOptions,
+      );
 
       run.version = next.version;
       run.updatedAt = next.updatedAt;

@@ -1,6 +1,10 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import {
+  readBoundedOrdinaryFile,
+  requireOrdinaryDirectory,
+  writeDurableAtomic,
+  type DurableFileOptions,
+} from "../durable-file.ts";
 import type { AssociationRecord } from "./types.ts";
 import { withGitHubJournal } from "./journal.ts";
 
@@ -114,14 +118,6 @@ export interface GitHubAssociationTransaction {
 
 type WriteRecords = (filePath: string, content: string) => Promise<void>;
 
-async function writeAtomic(filePath: string, content: string): Promise<void> {
-  const directory = path.dirname(filePath);
-  await mkdir(directory, { recursive: true });
-  const tempPath = path.join(directory, `.${path.basename(filePath)}.${randomUUID()}.tmp`);
-  await writeFile(tempPath, content, "utf8");
-  await rename(tempPath, filePath);
-}
-
 /** Serialize association index mutations with immutable journal ownership. */
 export class GitHubAssociationIndex {
   private readonly githubRoot: string;
@@ -130,11 +126,12 @@ export class GitHubAssociationIndex {
 
   constructor(
     githubRoot: string,
-    options: { lockStaleMs?: number; writeRecords?: WriteRecords } = {},
+    options: { lockStaleMs?: number; writeRecords?: WriteRecords } & DurableFileOptions = {},
   ) {
     this.githubRoot = githubRoot;
     this.filePath = path.join(githubRoot, "associations.json");
-    this.writeRecords = options.writeRecords ?? writeAtomic;
+    this.writeRecords = options.writeRecords ?? ((filePath, content) =>
+      writeDurableAtomic(filePath, content, "GitHub association index", options));
     void options.lockStaleMs;
   }
 
@@ -150,7 +147,8 @@ export class GitHubAssociationIndex {
 
   private async readAll(): Promise<Record<string, AssociationRecord>> {
     try {
-      const raw = await readFile(this.filePath, "utf8");
+      await requireOrdinaryDirectory(this.githubRoot, "GitHub state namespace");
+      const raw = await readBoundedOrdinaryFile(this.filePath, "GitHub association index");
       return parseAssociationRecords(raw);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};

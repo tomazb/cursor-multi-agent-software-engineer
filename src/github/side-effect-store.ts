@@ -1,20 +1,17 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import {
+  ensureOrdinaryDirectory,
+  readBoundedOrdinaryFile,
+  requireOrdinaryDirectory,
+  writeDurableAtomic,
+  type DurableFileOptions,
+} from "../durable-file.ts";
 import { withGitHubJournal } from "./journal.ts";
 
 export interface SideEffectRecord {
   resourceId: number;
-  kind: string;
-}
-
-async function writeAtomic(filePath: string, content: string): Promise<void> {
-  const directory = path.dirname(filePath);
-  await mkdir(directory, { recursive: true });
-  const tempPath = path.join(directory, `.${path.basename(filePath)}.${randomUUID()}.tmp`);
-  await writeFile(tempPath, content, "utf8");
-  await rename(tempPath, filePath);
+  kind: "check-run";
 }
 
 function keyToFilename(idempotencyKey: string): string {
@@ -24,30 +21,67 @@ function keyToFilename(idempotencyKey: string): string {
 export class GitHubSideEffectStore {
   private readonly githubRoot: string;
   private readonly dir: string;
+  private readonly durableOptions: DurableFileOptions;
 
-  constructor(githubRoot: string) {
+  constructor(githubRoot: string, options: DurableFileOptions = {}) {
     this.githubRoot = githubRoot;
     this.dir = path.join(githubRoot, "side-effects");
+    this.durableOptions = options;
   }
 
   async get(idempotencyKey: string): Promise<SideEffectRecord | undefined> {
     try {
-      const raw = await readFile(path.join(this.dir, keyToFilename(idempotencyKey)), "utf8");
-      const parsed = JSON.parse(raw) as SideEffectRecord & { idempotencyKey: string };
-      if (typeof parsed.resourceId !== "number" || typeof parsed.kind !== "string") {
-        return undefined;
+      await requireOrdinaryDirectory(this.githubRoot, "GitHub state namespace");
+      await requireOrdinaryDirectory(this.dir, "GitHub side-effect namespace");
+      const raw = await readBoundedOrdinaryFile(
+        path.join(this.dir, keyToFilename(idempotencyKey)),
+        "GitHub side-effect record",
+      );
+      const parsed = JSON.parse(raw) as unknown;
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        Array.isArray(parsed) ||
+        Object.keys(parsed).length !== 3 ||
+        !Object.hasOwn(parsed, "idempotencyKey") ||
+        !Object.hasOwn(parsed, "resourceId") ||
+        !Object.hasOwn(parsed, "kind") ||
+        (parsed as { idempotencyKey?: unknown }).idempotencyKey !== idempotencyKey ||
+        !Number.isSafeInteger((parsed as { resourceId?: unknown }).resourceId) ||
+        Number((parsed as { resourceId?: unknown }).resourceId) <= 0 ||
+        (parsed as { kind?: unknown }).kind !== "check-run"
+      ) {
+        throw new Error("Invalid GitHub side-effect record");
       }
-      return { resourceId: parsed.resourceId, kind: parsed.kind };
+      return {
+        resourceId: Number((parsed as { resourceId: number }).resourceId),
+        kind: "check-run",
+      };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      if (error instanceof SyntaxError) {
+        throw new Error("Invalid GitHub side-effect record", { cause: error });
+      }
       throw error;
     }
   }
 
   async put(idempotencyKey: string, record: SideEffectRecord): Promise<void> {
-    await writeAtomic(
+    if (!idempotencyKey || !Number.isSafeInteger(record.resourceId) || record.resourceId <= 0 ||
+      record.kind !== "check-run") {
+      throw new Error("Invalid GitHub side-effect record");
+    }
+    await requireOrdinaryDirectory(this.githubRoot, "GitHub state namespace");
+    await ensureOrdinaryDirectory(
+      this.dir,
+      "GitHub side-effect namespace",
+      this.durableOptions,
+    );
+    await writeDurableAtomic(
       path.join(this.dir, keyToFilename(idempotencyKey)),
       `${JSON.stringify({ idempotencyKey, ...record }, null, 2)}\n`,
+      "GitHub side-effect record",
+      this.durableOptions,
     );
   }
 
