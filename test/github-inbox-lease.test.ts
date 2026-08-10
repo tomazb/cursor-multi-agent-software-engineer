@@ -120,8 +120,9 @@ test("enqueue reserves enough state capacity for every delivery lifecycle transi
     const headSha = "h".repeat(stateCapacity - contentBytes(base));
     assert.equal(contentBytes(recordFor(deliveryId, headSha)), stateCapacity);
 
+    const inbox = new GitHubDeliveryInbox(root);
     await assert.rejects(
-      new GitHubDeliveryInbox(root).enqueue({
+      inbox.enqueue({
         deliveryId,
         eventName: "push",
         receivedAt: RECEIVED_AT,
@@ -130,6 +131,14 @@ test("enqueue reserves enough state capacity for every delivery lifecycle transi
       }),
       /lifecycle|bounded|capacity|exceed/i,
     );
+    assert.equal((await inbox.enqueue({
+      deliveryId,
+      eventName: "push",
+      receivedAt: RECEIVED_AT,
+      rawBodyDigest: BODY_DIGEST,
+      event: { ...event(deliveryId), headSha: "small-head" },
+    })).outcome, "enqueued");
+    assert.ok(await inbox.claimNext(Date.now() + 1));
   });
 
   await t.test("the largest accepted event can be claimed, retried, and completed", async (t) => {
