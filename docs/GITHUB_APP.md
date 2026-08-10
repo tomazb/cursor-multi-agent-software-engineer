@@ -5,9 +5,10 @@ This document specifies the GitHub App integration. **Phase A (read-only checks)
 ## Phase A status (implemented)
 
 - CLI: `maswe github-webhook`, `maswe github-publish-checks <run-id>`
-- Modules: `src/github/` (signature verify, delivery dedupe, normalize, association index, installation token helper, check publisher, adapter, webhook server)
-- File-backed state under `.maswe/github/` (deliveries, side-effect idempotency keys, associations,
-  and immutable ownership journals)
+- Modules: `src/github/` (signature verify, normalized durable inbox, association index,
+  installation token helper, check publisher, adapter, webhook server)
+- File-backed state under `.maswe/github/` (hash-addressed delivery state/queue, side-effect
+  idempotency keys, associations, and immutable ownership journals)
 - Config: optional `githubApp` with `readOnlyChecks: true` required when enabled
 - Check names: specification compliance, deterministic quality, independent verification, review comments resolved (always `neutral` in Phase A)
 - Non-goals still deferred (Phase B / later): push, PR create/update, comment replies, digest-bound GitHub approvals, Actions artifact ingestion, Postgres control plane
@@ -52,7 +53,7 @@ src/github/
   webhook-server.ts
   signature.ts
   normalize.ts
-  delivery-store.ts / side-effect-store.ts / association.ts
+  delivery-inbox.ts / side-effect-store.ts / association.ts
   checks.ts
   token.ts
   adapter.ts
@@ -60,10 +61,11 @@ src/github/
 
 ## Phase A state and support boundary
 
-Phase A supports concurrent webhook and manual-publisher processes on one host when
+Phase A supports exactly one webhook listener/worker plus simultaneous manual-publisher processes
+on one host when
 `.maswe/github/` is on one coherent local filesystem with atomic no-clobber hard links. It is not a
-distributed lock. NFS, SMB, distributed FUSE, object-store mounts, cross-host access, and
-filesystems without those hard-link semantics are unsupported.
+distributed queue or lock. A second listener, NFS, SMB, distributed FUSE, object-store mounts,
+cross-host access, and filesystems without those hard-link semantics are unsupported.
 
 Each logical association, check-create key, and delivery uses a permanent hash-addressed journal:
 
@@ -71,7 +73,8 @@ Each logical association, check-create key, and delivery uses a permanent hash-a
 .maswe/github/journals/
 ├── association/<sha256-logical-key>/.lock-journal-v3/
 ├── check-create/<sha256-logical-key>/.lock-journal-v3/
-└── delivery/<sha256-logical-key>/.lock-journal-v3/
+├── delivery/<sha256-logical-key>/.lock-journal-v3/
+└── publication/<sha256-repository-and-pr>/.lock-journal-v3/
     ├── format.json
     ├── data/{claims,releases,tmp}/
     ├── admin/{claims,releases,tmp}/
@@ -80,8 +83,25 @@ Each logical association, check-create key, and delivery uses a permanent hash-a
 
 Claims and releases are canonical, digest-bound immutable files published with hard links. No
 published ownership pathname is deleted, replaced, or reused. Before the webhook listener accepts
-traffic or manual publication begins, initialization creates the root association journal and
-runs the journal hard-link probe; failure is fatal.
+traffic, initialization probes the association, check-create, publication, and delivery journals,
+migrates legacy delivery files, recovers pending leases, and starts the single worker. Manual
+publication probes only the journals it uses and never reclaims the listener's delivery leases.
+Any required probe or migration failure is fatal before listener readiness or GitHub API work.
+
+Durable ingress uses a bounded two-level SHA-256 layout rather than scanning a flat delivery
+directory during normal operations:
+
+```text
+.maswe/github/inbox/
+├── state/<digest-prefix>/<delivery-id-digest>/state.json
+├── queue/<digest-prefix>/<delivery-id-digest>.queued
+└── legacy/<digest-prefix>/<delivery-id-digest>/...
+```
+
+The state record contains only the normalized internal event, event name, delivery ID, receive
+time, raw-body SHA-256, and lease/retry fields. It never contains the signature, raw request body,
+HTTP headers, installation token, app key, webhook secret, or arbitrary exception text. Completed
+records are durable tombstones without the normalized event body.
 
 Migration from the earlier association and check-create regular-file/directory locks requires a
 quiescent upgrade: stop every old webhook and manual-publisher process, then start only the new
@@ -123,13 +143,13 @@ Subscribe to:
 
 ## Authentication and replay protection
 
-1. Verify `X-Hub-Signature-256` against the raw request body.
-2. Read `X-GitHub-Delivery` and claim its lease-fenced ledger under the delivery's immutable
-   journal.
-3. Reject timestamps outside an operational replay window where applicable.
-4. Normalize the payload into an internal event before business logic.
-5. Acquire an installation token only for the repository handling the event.
-6. Record external request and response IDs without storing tokens.
+1. Read one syntactically safe `X-GitHub-Delivery` and `X-GitHub-Event` value.
+2. Verify `X-Hub-Signature-256` against the exact request bytes before decoding.
+3. Strictly decode UTF-8, parse a JSON object, and normalize it into the closed internal event.
+4. Durably write and sync the normalized envelope and queue marker under the delivery journal.
+5. Return the acknowledgement without waiting for GitHub API work; the lease worker acquires an
+   installation token only when dispatch starts.
+6. Record external request/resource IDs without storing credentials.
 
 ## Internal event example
 
@@ -243,20 +263,21 @@ bounded pagination across every advertised page; patch a recovered check with th
 ## Failure behavior
 
 - Signature or authorization failure: reject without workflow changes.
-- Delivery replay is state-sensitive: a `completed` duplicate returns HTTP 200 without repeating
-  side effects, while a live `processing` duplicate returns retryable HTTP 503. A stale processing
-  lease can be reclaimed after the crash TTL, but an expired lease cannot complete or fail its
-  successor.
+- Delivery replay is state-sensitive: a completed tombstone returns HTTP 200 without repeating
+  side effects; the same delivery ID/body while queued or processing returns HTTP 202; and the same
+  ID with a different event/body digest returns HTTP 409. GitHub does not guarantee automatic
+  redelivery after a non-2xx response, so 202 means the normalized event is already durable. A
+  storage/sync failure returns 503 and requires operator-observed redelivery if GitHub does not
+  retry it.
 - Unsupported event/action classifications are completed as intentionally ignored and return HTTP
-  200. Malformed or transient failures for supported events are not recorded as successful.
-- Every claim, complete, fail, and recovery mutation runs inside the delivery's immutable journal.
-  Completion staging is attempt- and lease-bound. Recovery installs a completed result only from
-  one structurally valid compatible outcome; conflicts and lone staging without canonical state
-  fail closed and preserve evidence.
-- Before removing a failed processing canonical, the store publishes an immutable
-  `deliveries/<delivery>.json.suppression.<publication-id>` audit marker bound to the failed lease,
-  canonical digest, and exact retained artifact digests. These permanent markers prevent an old
-  completed staging/reclaim pair from suppressing a later retry; malformed markers fail closed.
+  200. Invalid UTF-8, JSON, or supported-event fields return 400 without enqueueing.
+- Queue claims, heartbeats, retries, and completion are exact-lease mutations under the delivery's
+  immutable journal. Dispatch failure emits a sanitized local diagnostic and requeues with bounded
+  exponential backoff. Startup runs before listen and converts interrupted processing records to
+  queued work; a late lease cannot complete its successor.
+- Version-1 completed deliveries migrate to terminal legacy tombstones. Version-1 processing
+  records did not retain a normalized payload, so they migrate to `awaiting-redelivery` and cannot
+  be invented or dispatched until the exact delivery is redelivered.
 - Unhandled server failures are emitted through the local diagnostic callback and return only
   generic HTTP 500 JSON (`internal server error`). Diagnostic callback failure cannot change that
   response or leak environment-variable names/internal exception text. The existing HTTP 413 body
@@ -274,6 +295,30 @@ bounded pagination across every advertised page; patch a recovered check with th
 - CI failure: builder/resolver correction loop under budget.
 - Ambiguous review comment: `WAITING_FOR_HUMAN`.
 - Permission change or installation removal: suspend every listed repository (including multi-repo `repositories_removed`) and reconcile run records even when the index was already suspended; run-save errors other than missing runs surface to the handler.
+
+## Capacity, retention, shutdown, and recovery
+
+Completed delivery tombstones, side-effect records, publication/association state, migrated legacy
+evidence, and immutable journal claims/releases are retained for the lifetime of an active Phase A
+installation. There is no supported automatic pruning: webhook signatures have no replay-expiry
+field, and silently deleting a tombstone could re-enable a replayed side effect. Monitor free
+bytes, inode consumption, queue depth, oldest queued receive time, retry diagnostics, and journal
+growth; provision capacity or stop ingress before the filesystem becomes full.
+
+The worker uses one lease at a time, a 30-second lease with a five-second heartbeat, exponential
+retry from 250 ms capped at 30 seconds, and a five-second default drain budget when an embedding
+caller asks it to stop. An interrupted active lease remains durable and is recovered at the next
+pre-listener startup. `maswe github-publish-checks <run-id>` is a fenced check republisher, not a
+delivery-queue repair command; use GitHub's operator-initiated webhook redelivery for a version-1
+`awaiting-redelivery` record.
+
+Roll out quiescently: stop every old listener and manual publisher, back up the complete
+`.maswe/github/` tree, start one new listener, and verify startup recovery before restoring traffic.
+After the new listener acknowledges traffic, do not roll an old binary onto the migrated tree and
+do not restore a pre-traffic backup, because either action can strand acknowledged queue entries.
+Stop traffic and roll forward with the complete state tree. Permanent decommission may archive the
+whole tree only after disabling the App endpoint and rotating/revoking its webhook secret; partial
+active-state deletion is unsupported.
 
 ## Rollout plan
 

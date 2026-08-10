@@ -290,9 +290,10 @@ A service will own durable runs and workers, use PostgreSQL, issue idempotent jo
 Phase A (read-only checks) lives in `src/github/` and calls public orchestrator/store operations through `GitHubAppAdapter`. It:
 
 - Receives pull request, push, installation, and observe-only check/workflow events.
-- Verifies `X-Hub-Signature-256` and de-duplicates `X-GitHub-Delivery` through a journal-protected,
-  lease-fenced ledger. Completed duplicates and unsupported events return 200; live processing
-  duplicates return retryable 503; stale in-flight claims are reclaimable after a crash TTL.
+- Verifies `X-Hub-Signature-256` over the exact bytes, strictly normalizes the JSON object, and
+  file/directory-syncs a hash-addressed normalized inbox envelope before returning 202. Completed
+  duplicates return 200, queued/processing duplicates return 202, and same-ID content conflicts
+  return 409. One lease worker recovers durable pending work before listener readiness.
 - Binds runs to repository/PR/head SHA via github.com HTTPS/SSH remotes only; invalidates local evidence when head SHA changes; fails closed when live-head lookup errors.
 - Creates separate check runs for specification compliance, deterministic quality, independent
   verification, and review-comment resolution (resolution remains `neutral` until Phase B).
@@ -301,17 +302,16 @@ Phase A (read-only checks) lives in `src/github/` and calls public orchestrator/
   immutable ticket journals rather than reusable ownership paths.
 - Uses installation tokens with least privilege; `githubApp.readOnlyChecks: true` refuses Contents/PR/comment write APIs.
 - Suspends every repository listed on installation removal events, reconciles already-suspended index entries into run records, and surfaces non-missing run-save failures.
-- Initializes the root GitHub journal and hard-link probe before accepting webhook/manual work,
-  applies a 30-second deadline per GitHub HTTP request, sends generic HTTP 500 responses while
-  retaining local diagnostics, and writes immutable failure-suppression audit markers before a
-  failed delivery lease can expose retained legacy artifacts to recovery.
+- Initializes every journal needed by each command before accepting webhook/manual work, applies a
+  30-second deadline per GitHub HTTP request, and sends generic HTTP 500 responses while retaining
+  sanitized local diagnostics. Manual publication never reclaims the listener's inbox leases.
 
 GitHub journals live beneath
-`.maswe/github/journals/{association,check-create,delivery}/<logical-key-sha256>/.lock-journal-v3/`
+`.maswe/github/journals/{association,check-create,delivery,publication}/<logical-key-sha256>/.lock-journal-v3/`
 and use the same claims/releases/tmp layout as local journals. The Phase A concurrency boundary is
-same-host access to one coherent local filesystem with atomic no-clobber hard links. Legacy
-association/check-create migration requires all old processes to stop, retains every legacy path,
-and does not support mixed old/new binaries.
+one listener plus simultaneous manual publishers on one host and one coherent local filesystem
+with atomic no-clobber hard links. Legacy association/check-create/delivery migration requires all
+old processes to stop, retains legacy evidence, and does not support mixed old/new binaries.
 
 Phase B adds push/PR writes, comment replies, and digest-bound GitHub approvals. See `docs/GITHUB_APP.md`.
 

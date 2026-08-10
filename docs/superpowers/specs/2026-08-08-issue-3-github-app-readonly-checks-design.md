@@ -2,7 +2,7 @@
 
 **Issue:** [GitHub #3](https://github.com/tomazb/cursor-multi-agent-software-engineer/issues/3) (ROADMAP milestone v0.3 Phase A)  
 **Date:** 2026-08-08  
-**Status:** Approved for implementation
+**Status:** Implemented; durable-ingress amendments incorporated 2026-08-10
 
 ## Problem
 
@@ -17,8 +17,8 @@ v0.2 binds quality, verification, and merge-ready evidence to local git head SHA
 - Invalidate prior check success when head SHA changes.
 - Keep GitHub-specific code outside the orchestration core; adapter calls public `Orchestrator` operations only.
 - Support read-only check mode (`readOnlyChecks: true`) that refuses Contents/PR/comment write APIs.
-- Support concurrent Phase A processes only on one host and one coherent local filesystem with
-  atomic no-clobber hard links.
+- Support one listener/worker plus simultaneous manual publishers only on one host and one
+  coherent local filesystem with atomic no-clobber hard links.
 - Integration tests for replay, forged signature, stale SHA, rate limit, installation/permission loss, and webhook ordering.
 
 ## Non-goals (deferred; still issue #3 Phase B)
@@ -38,7 +38,9 @@ Matches the proposed layout in `docs/GITHUB_APP.md`. Large structural change bef
 
 ### 2 — Single-package `src/github/` adapter + webhook entry (chosen)
 
-Keep the existing one-package CLI. Add `src/github/` for verify, dedupe, normalize, tokens, checks, association, and adapter. File-backed `.maswe/github/` for deliveries and idempotency. Extract to `apps/`/`packages/` with the v0.4 control plane. **Chosen.**
+Keep the existing one-package CLI. Add `src/github/` for verify, normalize, a durable normalized
+inbox, tokens, checks, association, and adapter. File-backed `.maswe/github/` owns delivery and
+idempotency state. Extract to `apps/`/`packages/` with the v0.4 control plane. **Chosen.**
 
 ### 3 — Library-only stdin processor (no HTTP server)
 
@@ -51,9 +53,10 @@ Easier to host behind any gateway, weaker fit for a real App pilot. **Rejected.*
 ```text
 GitHub webhook
   -> signature verify (raw body)
-  -> delivery journal + lease-fenced ledger claim
   -> normalize to internal event
-  -> GitHub adapter
+  -> file/directory-sync normalized inbox envelope
+  -> HTTP 202
+  -> one lease worker / GitHub adapter
        -> optional Orchestrator public ops (sync/associate; no auto-start)
        -> check publisher (Checks API only when readOnlyChecks)
 ```
@@ -64,8 +67,11 @@ Hard rules:
 - Untrusted payload bodies never become shell commands.
 - Quality commands remain trusted config only.
 - `readOnlyChecks: true` is required when `githubApp.enabled` in this pilot.
-- The webhook server and manual publisher initialize the root association journal and complete its
-  hard-link capability probe before accepting work.
+- Repository-scoped installation tokens request exactly Checks write, Pull requests read, and
+  Metadata read. Contents and PR/comment writes remain forbidden.
+- The listener probes required journals, migrates/recovers the durable inbox, and starts one worker
+  before accepting work. The manual publisher probes only association/check/publication journals
+  and never reclaims listener leases.
 - Reusable CAS or `mkdir` ownership pathnames are not ownership identities.
 
 ### Package layout
@@ -75,7 +81,7 @@ Hard rules:
 | `src/github/types.ts` | Internal events, check names, association types |
 | `src/github/signature.ts` | Timing-safe HMAC SHA-256 verification |
 | `src/github/journal.ts` | Hash-addressed immutable ownership journals and retained-path legacy migration |
-| `src/github/delivery-store.ts` | Journal-protected, lease-fenced delivery ledger under `.maswe/github/deliveries/` |
+| `src/github/delivery-inbox.ts` | Hash-addressed normalized envelopes, queue markers, exact leases, and legacy migration |
 | `src/github/side-effect-store.ts` | Journal-serialized idempotency key → GitHub resource id |
 | `src/github/normalize.ts` | Raw payloads → internal events |
 | `src/github/token.ts` | Installation JWT + token fetch (injectable HTTP) |
@@ -95,7 +101,8 @@ Hard rules:
 | Review comments / approval comments | Out of Phase A |
 
 Forged signature → HTTP 401, zero writes. A completed duplicate returns 200 without repeating side
-effects; a still-processing duplicate returns retryable HTTP 503.
+effects; the same body while queued/processing returns 202, and a same-ID content conflict returns
+409.
 
 ### Check runs
 
@@ -127,24 +134,28 @@ Default lookup: non-terminal run matching `(repository, pullRequestNumber)` or b
 
 Under `.maswe/github/`:
 
-- `deliveries/{deliveryId}.json`
-- `side-effects/{idempotencyKey}.json`
+- `inbox/state/{digest-prefix}/{sha256(deliveryId)}/state.json`
+- `inbox/queue/{digest-prefix}/{sha256(deliveryId)}.queued`
+- `inbox/legacy/{digest-prefix}/{sha256(deliveryId)}/...` for retained v1 evidence
+- `side-effects/{sha256(idempotencyKey)}.json`
 - Association index for `(repository, pullRequestNumber)` → `runId`
-- Installation allowlist snapshots
-- `journals/{association|check-create|delivery}/{sha256(logical-key)}/.lock-journal-v3/` with
+- The configured allowlist remains configuration; no installation allowlist snapshot is persisted
+- `journals/{association|check-create|delivery|publication}/{sha256(logical-key)}/.lock-journal-v3/` with
   immutable claims, releases, and temporary publication records
-- Digest-bound `deliveries/{deliveryId}.json.suppression.*` audit markers that prevent retained
-  failed-lease artifacts from suppressing a later retry
+
+Inbox state stores the canonical normalized event, event name, delivery ID, receive time, raw-body
+SHA-256, and operational lease fields only. It excludes raw bodies, signatures, headers,
+credentials, and arbitrary errors. Completed tombstones drop the event body and are not pruned
+while the integration is active.
 
 File-backed with atomic writes and immutable journal serialization. This is a same-host,
 coherent-local-filesystem pilot, not the v0.4 authoritative run store or a distributed lock.
 NFS, SMB, distributed FUSE, object-store mounts, and filesystems without atomic no-clobber hard
 links are unsupported.
 
-Upgrading from the earlier association/check-create lock formats is quiescent: stop every old
-webhook server and manual publisher, start only the new binary, and retain each legacy path after a
-digest- or stable-identity-bound migration marker is published. Mixed old/new active binaries are
-unsupported.
+Upgrading legacy locks and flat deliveries is quiescent: stop every old webhook server and manual
+publisher, back up the complete state tree, start only one new listener, and retain legacy evidence
+after digest- or stable-identity-bound migration. Mixed old/new active binaries are unsupported.
 
 ### Config
 
@@ -173,10 +184,12 @@ Installation tokens are acquired per event and never persisted.
 | Scenario | Behavior |
 |----------|----------|
 | Replay completed delivery | 200, no duplicate checks/runs |
-| Duplicate live processing delivery | 503 so GitHub retries |
-| Crash mid-delivery | Stale `processing` claim reclaimable after TTL; retry can complete; expired lease cannot complete/fail successor |
+| Duplicate queued/processing delivery | 202 after the existing durable handoff is confirmed |
+| Same ID, different event/body digest | 409; no replacement or dispatch |
+| Crash after acknowledgement | Pre-listener startup requeues the normalized event; expired lease cannot complete a successor |
 | Unsupported event/action | Complete as intentionally ignored and return 200 |
-| Internal supported-event failure | Fail the exact lease, emit local diagnostics, and return generic HTTP 500 |
+| Async supported-event failure | Emit a sanitized local diagnostic and exact-lease requeue with bounded backoff |
+| Durable handoff failure | 503; alert and operator-redeliver because automatic redelivery is not guaranteed |
 | Bad signature | 401, no state change |
 | Stale SHA | No success for wrong SHA; invalidate evidence |
 | Live-head lookup failure | Fail closed; do not store/process the event SHA |
@@ -201,8 +214,8 @@ Mocked GitHub HTTP + file store:
 7. Live-head HTTP failure → head unchanged
 8. Concurrent publishers → four creates, not eight
 9. Non-GitHub remote → no association
-10. Stale processing delivery → reclaimable after TTL
-11. Live processing duplicate → 503; completed/unsupported delivery → 200
+10. Interrupted processing delivery → recovered before listener readiness
+11. Queued/processing duplicate → 202; completed/unsupported delivery → 200
 12. Full-digest check identity and bounded multi-page reconciliation
 
 ## Commit strategy

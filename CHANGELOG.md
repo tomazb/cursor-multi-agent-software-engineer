@@ -19,8 +19,11 @@ The project follows semantic versioning once a public release process is establi
 - Immutable hash-addressed GitHub association, check-create, and delivery journals with startup
   hard-link probing, quiescent retained-path legacy migration, and same-host coherent-filesystem
   support boundaries.
-- Lease/digest-bound delivery failure-suppression audit markers, full-digest check identity,
-  bounded paginated reconciliation, and a 30-second default deadline per GitHub HTTP request.
+- Retained migration of legacy delivery/recovery evidence, full-digest check identity, bounded
+  paginated reconciliation, and a 30-second default deadline per GitHub HTTP request.
+- Hash-addressed normalized webhook inbox with file/directory-synced acknowledgement, exact leases,
+  heartbeat/backoff, pre-listener restart recovery, terminal tombstones, and quiescent migration of
+  legacy delivery evidence without persisting raw bodies or credentials.
 - Review hardening for Phase A: canonical `03-specification-and-design.md` check binding, real
   installation tokens for unassociated PRs, delivery complete-after-success, exact PR association
   matching, scoped checks tokens, PATCH without `head_sha`, webhook body limits, rate-limit
@@ -66,9 +69,10 @@ The project follows semantic versioning once a public release process is establi
   the active version, supported range, canonical baseline, and an optional NVM recovery command.
 - Cursor CLI doctor probe timeout now uses `policy.doctorProbeTimeoutMs` instead of the former
   implicit 5-second cap (`Math.min(5_000, commandTimeoutMs)`).
-- Phase A webhook acknowledgement now distinguishes completed/unsupported deliveries (HTTP 200)
-  from live processing duplicates (HTTP 503); internal failures emit local diagnostics and expose
-  only a generic HTTP 500 body.
+- Phase A webhook acknowledgement now returns 202 only after durable normalized handoff, 200 for
+  completed/unsupported deliveries, 202 for same-ID queued/processing duplicates, 409 for a
+  same-ID content conflict, and 503 for handoff failure. Internal failures emit sanitized local
+  diagnostics and expose only a generic HTTP 500 body.
 - Enabled `githubApp` JSON Schema validation now matches runtime policy by requiring
   `readOnlyChecks: true` and at least one allowed repository; disabled configuration may retain an
   empty repository list.

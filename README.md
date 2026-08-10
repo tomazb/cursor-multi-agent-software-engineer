@@ -189,10 +189,10 @@ The v0.2 verifier and quality gates bind evidence to the current git **head SHA*
 - Lock journals require a coherent same-host local filesystem with atomic no-clobber hard links;
   they are not distributed locks or process fencing, and Windows support requires native NTFS
   qualification.
-- GitHub Phase A supports same-host webhook/manual-publisher concurrency through immutable
-  hash-addressed journals. Startup probes hard-link publication; legacy GitHub locks require a
-  quiescent retained-path migration, and mixed old/new binaries are unsupported. GitHub HTTP calls
-  use a 30-second per-request deadline.
+- GitHub Phase A supports one same-host webhook listener/worker plus simultaneous manual publishers
+  through immutable hash-addressed journals. Startup recovers a file-synced normalized inbox before
+  listen; legacy GitHub state requires a quiescent retained-path migration, and mixed old/new
+  binaries are unsupported. GitHub HTTP calls use a 30-second per-request deadline.
 - Model catalogue output differs across Cursor versions; for Cursor CLI, `maswe doctor` resolves logical names against exact catalogue IDs for its probe (without persisting a run snapshot) and fails closed on missing or ambiguous matches. `maswe start` persists resolved exact IDs into the new run config.
 - The Cursor SDK is a public beta and is kept behind an adapter boundary.
 

@@ -232,9 +232,13 @@ authentication field.
 **Controls (Phase A):**
 
 - Verify `X-Hub-Signature-256` against the raw body (timing-safe); reject without state change.
-- Claim `X-GitHub-Delivery` in a lease-fenced ledger serialized by an immutable per-delivery
-  journal. Completed duplicates return 200 without repeating side effects; live processing
-  duplicates return retryable 503. Unsupported events are durably completed and acknowledged 200.
+- After exact-byte HMAC and strict UTF-8/JSON normalization, persist a lease-fenced normalized
+  envelope under an immutable per-delivery journal. Completed duplicates return 200 without
+  repeating side effects, queued/processing duplicates return 202, and same-ID digest conflicts
+  return 409. Unsupported events are durably completed and acknowledged 200.
+- Persist only the normalized event, event name, delivery ID, receive time, raw-body SHA-256, and
+  operational lease fields. Raw payloads, signatures, headers, tokens, secrets, keys, and arbitrary
+  exception text are excluded.
 - Acquire installation-scoped tokens only for the handling installation; tokens are not persisted.
 - Idempotency keys for check-run side effects under `.maswe/github/side-effects/`.
 - Repository allowlist; installation removal suspends associations.
@@ -242,13 +246,15 @@ authentication field.
   diagnostic callback. Every production GitHub HTTP request has a 30-second default deadline.
 - Full-digest `external_id` values bind repository, PR, head SHA, check name, and attempt; bounded
   paginated reconciliation searches all advertised check pages before a replacement create.
-- Delivery failure publishes a digest-bound immutable suppression marker before canonical removal,
-  preserving an audit trail and preventing exact retained artifacts from changing retry meaning.
+- Startup migrates legacy delivery artifacts into hash-addressed retained evidence and recovers
+  pending queue state before the listener accepts traffic. Active tombstones/journals are not
+  silently pruned because removing replay evidence could re-enable a signed delivery.
 
-**Boundary:** Phase A journals are cooperative same-host locking on one coherent local filesystem
-with atomic no-clobber hard links. Quiescent retained-path migration is required from legacy locks;
-mixed old/new binaries and network/distributed filesystems are unsupported. Digest-bound GitHub
-approval authorization by repository role/team remains Phase B.
+**Boundary:** Phase A supports one listener/worker plus simultaneous manual publishers using
+cooperative same-host locking on one coherent local filesystem with atomic no-clobber hard links.
+Quiescent retained-path migration is required from legacy state; multiple listeners, mixed old/new
+binaries, and network/distributed filesystems are unsupported. Digest-bound GitHub approval
+authorization by repository role/team remains Phase B.
 
 ### T11 — Resource and cost exhaustion
 

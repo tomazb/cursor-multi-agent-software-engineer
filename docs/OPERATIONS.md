@@ -226,28 +226,38 @@ When `githubApp.enabled` is true, `readOnlyChecks` must be true and
 `allowedRepositories` must contain at least one `owner/repo`. A disabled configuration may retain
 an empty list.
 
-Both `maswe github-webhook` and `maswe github-publish-checks <run-id>` initialize
-`.maswe/github/journals/association/<digest>/.lock-journal-v3/` and complete the root hard-link
-probe before accepting work. Per-check and per-delivery journals are created beneath the sibling
-`check-create/<digest>` and `delivery/<digest>` trees. Each journal contains `format.json` plus
-`data`, `admin`, and `admin-recovery` streams with immutable `claims`, `releases`, and `tmp`
-records. Do not prune them.
+`maswe github-webhook` probes all required journals, migrates the legacy flat delivery directory,
+recovers interrupted queue leases, and starts one worker before the listener becomes ready.
+`maswe github-publish-checks <run-id>` probes association, check-create, and per-PR publication
+journals before token or API work, but it does not scan or reclaim the listener's inbox. Each
+journal contains `format.json` plus `data`, `admin`, and `admin-recovery` streams with immutable
+`claims`, `releases`, and `tmp` records. Do not prune them.
 
-Run GitHub state only on one host and one coherent local filesystem with atomic no-clobber hard
-links. NFS, SMB, distributed FUSE, object-store mounts, cross-host use, and filesystems without
-hard-link support are unsupported. Before upgrading from legacy `associations.lock` or
-`side-effect-create-locks/*.lock`, stop every old webhook server and manual publisher. Start only
-the new binary; it publishes digest/stable-identity migration evidence and retains the legacy
-path. Mixed old/new execution is unsupported.
+Run exactly one webhook listener/worker plus simultaneous manual publishers on one host and one
+coherent local filesystem with atomic no-clobber hard links. This is not a distributed queue. NFS,
+SMB, distributed FUSE, object-store mounts, cross-host use, a second listener, and filesystems
+without hard-link support are unsupported. Before upgrading legacy locks or flat delivery state,
+stop every old webhook server and manual publisher and back up the complete `.maswe/github/` tree.
+Start one new listener; it retains digest-bound legacy evidence. Mixed old/new execution is
+unsupported.
 
 Webhook response semantics are operationally significant:
 
 - completed duplicates and intentionally unsupported events/actions return 200;
-- a live processing duplicate returns 503 so GitHub retries;
+- a same-ID/body queued or processing duplicate returns 202; a different body/event for the same
+  ID returns 409;
 - malformed headers/body return 400, forged signatures return 401, and oversized bodies return
   413;
+- durable handoff/storage failure returns 503. GitHub does not guarantee automatic redelivery, so
+  alert on this response and use operator-initiated webhook redelivery if necessary;
 - other handler failures return a generic 500 body while details are emitted only to local
   diagnostics.
+
+The 202 response is sent only after exact-byte HMAC verification, strict UTF-8/JSON normalization,
+and file-plus-directory sync of the normalized envelope and queue marker. It does not wait for
+live-head or Checks API calls. The persisted envelope contains the normalized event, event name,
+delivery ID, receive time, raw-body SHA-256, and queue lease fields only—never raw request bytes,
+signatures, headers, tokens, secrets, keys, or arbitrary error text.
 
 Every production GitHub HTTP request has a 30-second default deadline, including installation
 token, live-head, Checks API, webhook-triggered, and manual-publication calls. Rate-limit retries
@@ -255,10 +265,25 @@ remain bounded and do not create an indefinite request. Check reconciliation use
 of repository/PR/head/name/attempt and visits bounded `filter=all`, 100-item pages before creating
 a replacement.
 
-Delivery failure-suppression files (`deliveries/<id>.json.suppression.*`) are immutable audit
-markers bound to the failed lease, canonical digest, and retained artifact digests. Do not remove
-them: they keep old recovery artifacts from suppressing a newer retry. A malformed marker or
-ambiguous recovery evidence fails closed and should be preserved for diagnosis.
+Normal delivery lookup is hash-addressed beneath `inbox/state/<prefix>/<digest>/`; pending markers
+are under `inbox/queue/<prefix>/`. Startup alone scans/migrates legacy `deliveries/` files into
+`inbox/legacy/<prefix>/<digest>/`. A version-1 completed delivery becomes a terminal legacy
+tombstone. A version-1 processing record has no persisted normalized event and therefore becomes
+`awaiting-redelivery`; request redelivery rather than fabricating a payload.
+
+The single worker holds one exact 30-second lease, heartbeats every five seconds, and retries with
+exponential backoff from 250 ms capped at 30 seconds. An embedding stop waits up to five seconds by
+default; interruption leaves the lease durable for pre-listener startup recovery. Manual
+`github-publish-checks` republishes one run's checks and is not a queue repair command.
+
+Retain completed tombstones, side-effect records, migrated legacy evidence, and immutable journals
+for the lifetime of the active integration. No active-state pruning is supported because signed
+webhooks have no replay-expiry field. Monitor filesystem bytes/inodes, queue depth, oldest queued
+receive time, retry diagnostics, and journal growth; stop ingress before capacity exhaustion.
+After the new listener acknowledges traffic, rollback to an old binary or restoration of the
+pre-upgrade backup can strand accepted work. Stop traffic and roll forward with the complete state
+tree. Archive the whole tree only after permanent endpoint disablement and webhook-secret
+rotation/revocation.
 
 ## 4. Configure quality commands
 

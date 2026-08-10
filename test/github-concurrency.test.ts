@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { fork, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -60,11 +60,10 @@ function spawnStoreWorker(
     waiter!.resolve(message);
   });
   child.on("exit", (code, signal) => {
-    if (code === 0) return;
     for (const waiter of waiters.splice(0)) {
       clearTimeout(waiter.timer);
       waiter.reject(
-        new Error(`GitHub store worker ${actor} exited ${code ?? signal}`),
+        new Error(`GitHub store worker ${actor} exited ${code ?? signal} before ${waiter.type}`),
       );
     }
   });
@@ -74,21 +73,49 @@ function spawnStoreWorker(
       const index = messages.findIndex((message) => message.type === type);
       if (index >= 0) return Promise.resolve(messages.splice(index, 1)[0]!);
       return new Promise<WorkerMessage>((resolve, reject) => {
-        const timer = setTimeout(
-          () => reject(new Error(`GitHub store worker ${actor} watchdog expired`)),
-          WATCHDOG_MS,
-        );
+        const timer = setTimeout(() => {
+          const waiterIndex = waiters.findIndex((waiter) => waiter.resolve === resolve);
+          if (waiterIndex >= 0) waiters.splice(waiterIndex, 1);
+          reject(new Error(`GitHub store worker ${actor} watchdog expired`));
+        }, WATCHDOG_MS);
         waiters.push({ type, resolve, reject, timer });
       });
     },
   };
 }
 
+async function waitForExit(
+  child: ChildProcess,
+  timeoutMs = WATCHDOG_MS,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { code: child.exitCode, signal: child.signalCode };
+  }
+  return new Promise((resolve, reject) => {
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    };
+    const timer = setTimeout(() => {
+      child.off("exit", onExit);
+      reject(new Error(`GitHub store worker ${child.pid ?? "unknown"} exit watchdog expired`));
+    }, timeoutMs);
+    child.once("exit", onExit);
+  });
+}
+
 async function waitForWorkers(workers: ChildProcess[]): Promise<void> {
+  for (const child of workers) {
+    const exit = await waitForExit(child);
+    assert.deepEqual(exit, { code: 0, signal: null });
+  }
+}
+
+async function terminateWorkers(workers: ChildProcess[]): Promise<void> {
   await Promise.all(
     workers.map(async (child) => {
-      if (child.exitCode !== null || child.signalCode !== null) return;
-      await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await waitForExit(child);
     }),
   );
 }
@@ -119,8 +146,9 @@ function emptyRun(): RunRecord {
   };
 }
 
-test("concurrent check publishers serialize creates for the same key", async () => {
+test("concurrent check publishers serialize creates for the same key", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-conc-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
   const sideEffects = new GitHubSideEffectStore(root);
   let posts = 0;
   let nextId = 1;
@@ -159,7 +187,7 @@ test("concurrent check publishers serialize creates for the same key", async () 
   assert.equal(posts, 4);
 });
 
-test("separate processes concurrently binding two PRs preserve both association records", async () => {
+test("separate processes concurrently binding two PRs preserve both association records", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-lock-"));
   const barrierPath = path.join(root, "association.start");
   const first = spawnStoreWorker(root, barrierPath, "one", "association", {
@@ -167,6 +195,10 @@ test("separate processes concurrently binding two PRs preserve both association 
   });
   const second = spawnStoreWorker(root, barrierPath, "two", "association", {
     MASWE_GITHUB_PULL_REQUEST_NUMBER: "2",
+  });
+  t.after(async () => {
+    await terminateWorkers([first.child, second.child]);
+    await rm(root, { recursive: true, force: true });
   });
   await Promise.all([first.next("READY"), second.next("READY")]);
   await writeFile(barrierPath, "start\n", "utf8");
@@ -178,7 +210,7 @@ test("separate processes concurrently binding two PRs preserve both association 
   assert.equal((await index.find("owner/repo", 2))?.runId, "run-two");
 });
 
-test("two processes sharing a full check key execute exactly one create section", async () => {
+test("two processes sharing a full check key execute exactly one create section", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-check-lock-"));
   const barrierPath = path.join(root, "check-create.start");
   const createsPath = path.join(root, "creates.log");
@@ -191,6 +223,10 @@ test("two processes sharing a full check key execute exactly one create section"
   };
   const first = spawnStoreWorker(root, barrierPath, "one", "check-create", extraEnv);
   const second = spawnStoreWorker(root, barrierPath, "two", "check-create", extraEnv);
+  t.after(async () => {
+    await terminateWorkers([first.child, second.child]);
+    await rm(root, { recursive: true, force: true });
+  });
   await Promise.all([first.next("READY"), second.next("READY")]);
   await writeFile(barrierPath, "start\n", "utf8");
   await Promise.all([expectCompleted(first), expectCompleted(second)]);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { fork, type ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -95,12 +95,35 @@ function spawnWorker(
   };
 }
 
-async function waitForExit(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+async function waitForExit(
+  child: ChildProcess,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { code: child.exitCode, signal: child.signalCode };
+  }
+  return new Promise((resolve, reject) => {
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    };
+    const timer = setTimeout(() => {
+      child.off("exit", onExit);
+      reject(new Error(`GitHub journal worker ${child.pid ?? "unknown"} exit watchdog expired`));
+    }, WATCHDOG_MS);
+    child.once("exit", onExit);
+  });
 }
 
-test("two child processes enter one logical GitHub journal strictly one at a time", async () => {
+async function terminateWorkers(workers: ChildProcess[]): Promise<void> {
+  await Promise.all(
+    workers.map(async (child) => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await waitForExit(child);
+    }),
+  );
+}
+
+test("two child processes enter one logical GitHub journal strictly one at a time", async (t) => {
   const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-process-"));
   const eventsPath = path.join(githubRoot, "events.log");
   await writeFile(eventsPath, "", "utf8");
@@ -108,6 +131,10 @@ test("two child processes enter one logical GitHub journal strictly one at a tim
   await first.next((message) => message.type === "ENTER");
 
   const second = spawnWorker(githubRoot, eventsPath, "second");
+  t.after(async () => {
+    await terminateWorkers([first.child, second.child]);
+    await rm(githubRoot, { recursive: true, force: true });
+  });
   await second.next(
     (message) => message.type === "TRANSITION" && message.event === "CLAIM_PUBLISHED",
   );
@@ -122,5 +149,6 @@ test("two child processes enter one logical GitHub journal strictly one at a tim
   );
   second.release();
   await second.next((message) => message.type === "COMPLETE");
-  await Promise.all([waitForExit(first.child), waitForExit(second.child)]);
+  assert.deepEqual(await waitForExit(first.child), { code: 0, signal: null });
+  assert.deepEqual(await waitForExit(second.child), { code: 0, signal: null });
 });

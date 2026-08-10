@@ -65,6 +65,7 @@ async function writeLegacy(
     "utf8",
   );
   await writeFile(`${canonical}.staging.retained`, "retained-artifact\n", "utf8");
+  await writeFile(`${canonical}.suppression.retained`, "retained-suppression\n", "utf8");
   return canonical;
 }
 
@@ -110,7 +111,16 @@ test("startup migration turns v1 processing into awaiting-redelivery", async (t)
     hash.slice(0, 2),
     hash,
   );
-  assert.ok((await readdir(legacyDirectory)).some((name) => name.includes("staging.retained")));
+  const migratedNames = await readdir(legacyDirectory);
+  const stagingName = migratedNames.find((name) => name.includes("staging.retained"));
+  const suppressionName = migratedNames.find((name) => name.includes("suppression.retained"));
+  assert.ok(stagingName);
+  assert.ok(suppressionName);
+  assert.equal(await readFile(path.join(legacyDirectory, stagingName), "utf8"), "retained-artifact\n");
+  assert.equal(
+    await readFile(path.join(legacyDirectory, suppressionName), "utf8"),
+    "retained-suppression\n",
+  );
 });
 
 test("startup migration preserves v1 completed as terminal legacy", async (t) => {

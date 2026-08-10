@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { fork } from "node:child_process";
+import { fork, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -23,6 +23,26 @@ function checkJournalDirectory(githubRoot: string, logicalKey: string): string {
 const workerPath = fileURLToPath(
   new URL("./fixtures/github-journal-worker.ts", import.meta.url),
 );
+const WATCHDOG_MS = 10_000;
+
+async function waitForExit(
+  child: ChildProcess,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { code: child.exitCode, signal: child.signalCode };
+  }
+  return new Promise((resolve, reject) => {
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    };
+    const timer = setTimeout(() => {
+      child.off("exit", onExit);
+      reject(new Error("exited owner post-SIGKILL watchdog expired"));
+    }, WATCHDOG_MS);
+    child.once("exit", onExit);
+  });
+}
 
 async function publishThenExit(
   githubRoot: string,
@@ -43,6 +63,7 @@ async function publishThenExit(
     },
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
+  let startupError: unknown;
   await new Promise<void>((resolve, reject) => {
     let settled = false;
     const settle = (error?: Error): void => {
@@ -54,7 +75,7 @@ async function publishThenExit(
     };
     const timer = setTimeout(() => {
       settle(new Error("exited owner watchdog expired"));
-    }, 10_000);
+    }, WATCHDOG_MS);
     child.on("message", (message: { type?: string }) => {
       if (message.type !== "ENTER") return;
       settle();
@@ -63,13 +84,18 @@ async function publishThenExit(
     child.once("exit", (code, signal) => {
       settle(new Error(`exited owner terminated before ENTER: ${code ?? signal}`));
     });
+  }).catch((error) => {
+    startupError = error;
   });
-  child.kill("SIGKILL");
-  await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  const exit = await waitForExit(child);
+  if (startupError !== undefined) throw startupError;
+  assert.deepEqual(exit, { code: null, signal: "SIGKILL" });
 }
 
-test("an exited lower-ticket owner is released by its exact immutable claim", async () => {
+test("an exited lower-ticket owner is released by its exact immutable claim", async (t) => {
   const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-dead-"));
+  t.after(async () => rm(githubRoot, { recursive: true, force: true }));
   const logicalKey = "dead-lower-owner";
   const journalDirectory = checkJournalDirectory(githubRoot, logicalKey);
   await publishThenExit(githubRoot, logicalKey);
@@ -103,8 +129,9 @@ test("an exited lower-ticket owner is released by its exact immutable claim", as
   );
 });
 
-test("a conservative EPERM process probe keeps the lower owner blocking", async () => {
+test("a conservative EPERM process probe keeps the lower owner blocking", async (t) => {
   const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-eperm-"));
+  t.after(async () => rm(githubRoot, { recursive: true, force: true }));
   const logicalKey = "eperm-lower-owner";
   const journalDirectory = checkJournalDirectory(githubRoot, logicalKey);
   await mkdir(journalDirectory, { recursive: true });
@@ -135,8 +162,9 @@ test("a conservative EPERM process probe keeps the lower owner blocking", async 
   }
 });
 
-test("an indeterminate EIO process probe cannot release a GitHub lower owner", async () => {
+test("an indeterminate EIO process probe cannot release a GitHub lower owner", async (t) => {
   const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-eio-"));
+  t.after(async () => rm(githubRoot, { recursive: true, force: true }));
   const logicalKey = "eio-lower-owner";
   const journalDirectory = checkJournalDirectory(githubRoot, logicalKey);
   await mkdir(journalDirectory, { recursive: true });
@@ -180,8 +208,9 @@ test("an indeterminate EIO process probe cannot release a GitHub lower owner", a
 test(
   "a process identity mismatch cannot release a GitHub lower owner without ESRCH",
   { skip: process.platform !== "linux" },
-  async () => {
+  async (t) => {
     const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-pid-id-"));
+    t.after(async () => rm(githubRoot, { recursive: true, force: true }));
     const logicalKey = "identity-mismatch-lower-owner";
     const journalDirectory = checkJournalDirectory(githubRoot, logicalKey);
     await mkdir(journalDirectory, { recursive: true });

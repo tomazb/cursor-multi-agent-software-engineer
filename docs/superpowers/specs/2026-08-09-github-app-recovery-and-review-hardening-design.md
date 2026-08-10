@@ -2,7 +2,7 @@
 
 **Pull request:** [#25](https://github.com/tomazb/cursor-multi-agent-software-engineer/pull/25)
 **Date:** 2026-08-09
-**Status:** Approved
+**Status:** Approved; Task 11 durable-ingress amendment incorporated 2026-08-10
 
 ## Problem
 
@@ -20,8 +20,8 @@ and regression-test precision.
 
 ## Goals
 
-- Preserve same-host, multi-process access to `.maswe/github`, including a webhook server and a
-  simultaneous manual `github-publish-checks` command.
+- Preserve same-host access to `.maswe/github` for exactly one webhook listener/worker and
+  simultaneous manual `github-publish-checks` commands.
 - Replace reusable lock pathname ownership with immutable, identity-bound claims and releases.
 - Serialize every delivery mutation and run delivery recovery inside the same ownership boundary.
 - Recover legacy delivery artifacts without installing an older or unrelated lease.
@@ -41,8 +41,8 @@ and regression-test precision.
 
 ## Support boundary
 
-The GitHub state store supports concurrent processes on one coherent local filesystem with atomic
-no-clobber hard links. The canonical contributor/runtime baselines remain exact Node `24.18.0`
+The GitHub state store supports one listener plus simultaneous manual publishers on one coherent
+local filesystem with atomic no-clobber hard links. The canonical contributor/runtime baselines remain exact Node `24.18.0`
 and compatibility floor `22.22.2`. NFS, SMB, distributed FUSE, object-store mounts, and mixed
 old/new MASWE binaries are unsupported. Upgrading from the reusable lock formats requires all old
 GitHub webhook/manual publisher processes to stop before migration.
@@ -81,6 +81,7 @@ existing immutable claim protocol:
 - Association mutations use one journal.
 - Each check-run idempotency key uses a hash-addressed journal.
 - Each delivery ID uses a hash-addressed journal.
+- Each repository/PR publication generation uses a separate hash-addressed journal.
 
 The wrapper publishes a claim, waits for the smallest unreleased ticket, validates its exact claim
 and absence of its exact release immediately before protected entry, executes the callback, and
@@ -105,55 +106,39 @@ read-only ticket-zero evidence. Under the required quiescent upgrade:
 This handles dead regular-file locks, dead directory locks, and crash remnants without opening a
 successor-deletion window. Mixed old/new binaries remain explicitly unsupported.
 
-### Delivery ledger
+### Durable delivery inbox
 
-Every `claim`, `complete`, and `fail` operation acquires the delivery's journal. The delivery file
-is then ordinary state protected by immutable ownership rather than acting as the lock itself.
+Ingress verifies the HMAC over exact request bytes, strictly decodes/normalizes the JSON object,
+and writes only a canonical internal event plus event name, delivery ID, receive time, raw-body
+SHA-256, and operational lease fields. It never persists the raw body, signature, HTTP headers,
+tokens, secrets, keys, or arbitrary exception text.
 
-- `claim` reads and recovers under the journal. Completed records are terminal. Non-stale
-  processing records are live duplicates. Stale processing records receive a new lease only while
-  the journal is held.
-- `complete` verifies the exact lease, writes and syncs a complete staging record, then atomically
-  replaces the canonical processing record while still holding the journal.
-- `fail` verifies the exact lease and removes the processing record while holding the journal so
-  a retry can claim it.
-- Mutation results remain fenced by lease ID and are never discarded by the adapter.
+State is hash-addressed under `inbox/state/<prefix>/<delivery-digest>/state.json`; pending markers
+live under `inbox/queue/<prefix>/<delivery-digest>.queued`. Both the file and containing directory
+are synced before HTTP 202. Normal per-delivery operations never scan the legacy flat directory.
 
-New completion writes do not remove the canonical pathname before replacement, so they create no
-ledger absence. A crash before replacement leaves the processing canonical and complete staging;
-the next journal owner can finish it without redispatching.
-
-### Legacy delivery recovery
-
-Legacy `.staging.<attempt>` and `.reclaim.<attempt>` artifacts are recovered only while holding
-the delivery journal. Recovery parses full delivery records and groups artifacts by attempt.
-
-An artifact is eligible only when:
-
-- `deliveryId` matches the canonical delivery ID;
-- staging is `completed` and reclaim/canonical is `processing`;
-- lease IDs match and required timestamps are structurally valid; and
-- exactly one compatible lease outcome exists.
-
-With a valid processing canonical, matching completed staging may replace it. With a missing or
-invalid canonical, recovery requires a matching staging/reclaim pair. A lone staging record is
-never installed when canonical state is absent. Conflicting leases or multiple incompatible
-candidates fail closed without deleting evidence. Once a valid canonical wins, only artifacts
-proven obsolete under the journal are removed.
+One worker claims an exact 30-second lease, heartbeats every five seconds, and retries failed
+dispatch with exponential backoff from 250 ms capped at 30 seconds. Completion is an event-free
+terminal tombstone. Startup scans before listen, migrates legacy flat files, recreates missing
+queue markers, and requeues interrupted processing. Version-1 completed records become terminal
+legacy tombstones; version-1 processing records lack a normalized payload and therefore become
+`awaiting-redelivery`. All v1 artifacts are retained under hash-addressed `inbox/legacy` storage.
 
 ## Webhook behavior
 
 - Validate single-valued delivery and event headers before claiming. Arrays, missing values, and
   delivery IDs outside the safe filename grammar return HTTP 400.
 - Verify the signature before any durable state write.
-- Completed duplicates return HTTP 200. Live processing duplicates return a retryable HTTP 503.
+- Completed duplicates return HTTP 200. Same-ID/body queued or processing duplicates return HTTP
+  202, while a different event/body digest for the same ID returns HTTP 409.
 - Introduce a distinct unsupported-event/action classification. Those deliveries are completed as
   intentionally ignored and return HTTP 200; malformed/transient supported-event failures remain
   retryable failures.
-- Invalid JSON returns HTTP 400 only after exact-lease failure handling succeeds; lost ownership
-  is surfaced rather than acknowledged as success.
-- Completion rejection produces a retryable server error. Failure rejection is recorded through
-  production diagnostics.
+- Invalid UTF-8, JSON, and normalized supported-event fields return HTTP 400 without enqueue.
+- File/journal/sync handoff failure returns HTTP 503. GitHub does not guarantee automatic
+  redelivery, so operators must alert and request redelivery when necessary.
+- Remote processing occurs only after the durable acknowledgement; dispatch failure is diagnosed
+  locally and requeued under the exact lease rather than returned through the completed request.
 - The server logs internal failures locally and returns a generic HTTP 500 body. It never returns
   environment-variable names or internal exception messages to unauthenticated callers.
 - The existing body limit remains enforced with HTTP 413.
@@ -224,8 +209,9 @@ catches and exercises real filesystem or adapter behavior.
 
 ### Webhook, association, and checks
 
-- Completed duplicate success and processing duplicate retry responses.
-- Unsupported event/action success without redispatch; transient supported-event failure retries.
+- Completed duplicate 200, queued/processing duplicate 202, and same-ID conflict 409 responses.
+- Unsupported event/action success without dispatch; transient supported-event failure requeues.
+- Acknowledgement before blocked remote dispatch and exact normalized restart recovery.
 - Array/malformed headers return 400 and generic internal failures do not leak details.
 - Multiple PRs on one branch are all invalidated by push.
 - Timeout signals reach every production fetch path.

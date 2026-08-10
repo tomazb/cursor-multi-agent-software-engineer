@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -65,7 +65,7 @@ test("fetch GitHub HTTP client aborts a never-settling request at its injected d
   }
 });
 
-test("each bounded rate-limit retry receives a fresh request deadline", async () => {
+test("each bounded rate-limit retry receives a fresh request deadline", async (t) => {
   const signals: AbortSignal[] = [];
   let requestCount = 0;
   const fetchFn: typeof fetch = async (_input, init) => {
@@ -86,6 +86,7 @@ test("each bounded rate-limit retry receives a fresh request deadline", async ()
   globalThis.fetch = fetchFn;
   try {
     const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-http-retry-"));
+    t.after(async () => rm(root, { recursive: true, force: true }));
     const publisher = new CheckPublisher({
       http: createFetchGitHubHttpClient({ timeoutMs: 15, fetchFn }),
       sideEffects: new GitHubSideEffectStore(root),
