@@ -170,6 +170,24 @@ test("githubApp rejects write mode when enabled in Phase A pilot", () => {
   );
 });
 
+test("githubApp rejects unsupported fields instead of retaining inline secrets", () => {
+  assert.throws(
+    () =>
+      mergeConfigForTest({
+        githubApp: {
+          enabled: true,
+          readOnlyChecks: true,
+          webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+          appIdEnv: "MASWE_GITHUB_APP_ID",
+          privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+          allowedRepositories: ["owner/repo"],
+          inlineSecret: "must-not-survive-normalization",
+        } as never,
+      }),
+    /unsupported githubApp field.*inlineSecret/i,
+  );
+});
+
 test("githubApp rejects empty allowlist when enabled", () => {
   assert.throws(
     () =>

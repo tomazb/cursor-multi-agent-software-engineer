@@ -84,6 +84,40 @@ function mergeRole(base: RoleConfig, incoming: unknown): RoleConfig {
   };
 }
 
+function normalizeGitHubAppConfig(raw: unknown): NonNullable<MasweConfig["githubApp"]> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("githubApp must be an object when set");
+  }
+  const value = raw as Record<string, unknown>;
+  const allowed = new Set([
+    "enabled",
+    "readOnlyChecks",
+    "webhookSecretEnv",
+    "appIdEnv",
+    "privateKeyEnv",
+    "allowedRepositories",
+    "webhookHost",
+    "webhookPort",
+  ]);
+  const unsupported = Object.keys(value).find((key) => !allowed.has(key));
+  if (unsupported) throw new Error(`Unsupported githubApp field: ${unsupported}`);
+  const repositories = value.allowedRepositories;
+  return {
+    enabled: value.enabled as boolean,
+    readOnlyChecks: value.readOnlyChecks as boolean,
+    webhookSecretEnv: value.webhookSecretEnv as string,
+    appIdEnv: value.appIdEnv as string,
+    privateKeyEnv: value.privateKeyEnv as string,
+    allowedRepositories: Array.isArray(repositories)
+      ? repositories.map((repository) =>
+          typeof repository === "string" ? repository.toLowerCase() : repository,
+        ) as string[]
+      : repositories as string[],
+    ...(value.webhookHost !== undefined ? { webhookHost: value.webhookHost as string } : {}),
+    ...(value.webhookPort !== undefined ? { webhookPort: value.webhookPort as number } : {}),
+  };
+}
+
 /** Pure default migration without applying process environment overrides. */
 export function migrateConfig(raw: unknown): MasweConfig {
   const base = cloneDefaults();
@@ -107,14 +141,7 @@ export function migrateConfig(raw: unknown): MasweConfig {
     policy: { ...base.policy, ...(value.policy ?? {}) },
   };
   if (value.githubApp !== undefined) {
-    migrated.githubApp = {
-      ...value.githubApp,
-      allowedRepositories: Array.isArray(value.githubApp.allowedRepositories)
-        ? value.githubApp.allowedRepositories.map((repository) =>
-            typeof repository === "string" ? repository.toLowerCase() : repository,
-          ) as string[]
-        : value.githubApp.allowedRepositories,
-    };
+    migrated.githubApp = normalizeGitHubAppConfig(value.githubApp);
   } else {
     delete migrated.githubApp;
   }

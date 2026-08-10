@@ -382,3 +382,32 @@ test("github-webhook wires a sanitized production diagnostic before listener rea
   assert.match(diagnostics[0]!, /Authorization: Bearer \[REDACTED\]/);
   assert.doesNotMatch(diagnostics[0]!, new RegExp(credential));
 });
+
+test("github-webhook stops its worker when listener startup fails", async (t) => {
+  const { cwd } = await setupProject();
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const restoreEnvironment = installGitHubEnvironment();
+  t.after(restoreEnvironment);
+  let stopCalls = 0;
+  let capturedAdapter: GitHubAppAdapter | undefined;
+
+  await assert.rejects(
+    runCli({
+      argv: ["github-webhook", "--cwd", cwd],
+      observedNodeVersion: CANONICAL_NODE_VERSION,
+      webhookListener: async ({ adapter }) => {
+        capturedAdapter = adapter;
+        const stop = adapter.stopWebhookWorker.bind(adapter);
+        adapter.stopWebhookWorker = async (...args) => {
+          stopCalls += 1;
+          await stop(...args);
+        };
+        throw new Error("synthetic listener startup failure");
+      },
+    }),
+    /synthetic listener startup failure/,
+  );
+
+  t.after(async () => capturedAdapter?.stopWebhookWorker());
+  assert.equal(stopCalls, 1);
+});

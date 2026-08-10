@@ -45,8 +45,9 @@ test("file and directory sync failures prevent durable acknowledgement", async (
         tokenProvider: async () => "token",
         inboxOptions: {
           syncFile: async (handle, filePath) => {
+            const parts = filePath.split(path.sep);
             if (
-              (failure === "state-file" && filePath.includes("/.state.")) ||
+              (failure === "state-file" && parts.some((part) => part.startsWith(".state."))) ||
               (failure === "queue-file" && filePath.endsWith(".queued"))
             ) {
               throw new Error(`simulated ${failure} sync failure`);
@@ -54,9 +55,12 @@ test("file and directory sync failures prevent durable acknowledgement", async (
             await handle.sync();
           },
           syncDirectory: async (directoryPath) => {
+            const parts = directoryPath.split(path.sep);
+            const inboxIndex = parts.lastIndexOf("inbox");
+            const inboxChild = inboxIndex >= 0 ? parts[inboxIndex + 1] : undefined;
             if (
-              (failure === "state-directory" && directoryPath.includes("/inbox/state/")) ||
-              (failure === "queue-directory" && directoryPath.includes("/inbox/queue/"))
+              (failure === "state-directory" && inboxChild === "state") ||
+              (failure === "queue-directory" && inboxChild === "queue")
             ) {
               throw new Error(`simulated ${failure} sync failure`);
             }

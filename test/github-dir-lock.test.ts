@@ -127,14 +127,17 @@ test("two child processes enter one logical GitHub journal strictly one at a tim
   const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-process-"));
   const eventsPath = path.join(githubRoot, "events.log");
   await writeFile(eventsPath, "", "utf8");
+  const workers: ChildProcess[] = [];
   const first = spawnWorker(githubRoot, eventsPath, "first");
+  workers.push(first.child);
+  t.after(async () => {
+    await terminateWorkers(workers);
+    await rm(githubRoot, { recursive: true, force: true });
+  });
   await first.next((message) => message.type === "ENTER");
 
   const second = spawnWorker(githubRoot, eventsPath, "second");
-  t.after(async () => {
-    await terminateWorkers([first.child, second.child]);
-    await rm(githubRoot, { recursive: true, force: true });
-  });
+  workers.push(second.child);
   await second.next(
     (message) => message.type === "TRANSITION" && message.event === "CLAIM_PUBLISHED",
   );

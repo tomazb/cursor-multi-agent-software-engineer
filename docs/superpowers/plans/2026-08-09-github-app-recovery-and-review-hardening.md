@@ -191,7 +191,7 @@ git commit -m "fix: journal and recover GitHub deliveries"
 - [ ] Add an `UnsupportedGitHubWebhookError` (or equivalent discriminated result) and failing tests that distinguish unsupported event/action from malformed supported payloads and transient dispatch errors.
 - [ ] Add adapter regressions proving:
   - completed duplicate returns `200` and `duplicate: true`;
-  - live processing duplicate returns retryable `503`, not `200`;
+  - live queued/processing duplicate returns `202`, not `200`;
   - unsupported event/action is durably completed and returns `200` without dispatch;
   - supported dispatch failure calls exact-lease `fail`, then a redelivery can claim;
   - invalid JSON returns `400` only if `fail` succeeds;

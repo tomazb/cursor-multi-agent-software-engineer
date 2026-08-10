@@ -28,18 +28,19 @@ export async function createInstallationAccessToken(options: {
   privateKeyPem: string;
   installationId: number;
   http: GitHubTokenHttp;
-  /** Repository name only (without owner), per GitHub Apps API. */
-  repository?: string;
-  /** When true (Phase A), request checks write + metadata read only. */
+  /** Canonical owner/name repository identity; the API body receives the name component. */
+  repository: string;
+  /** Phase A least-privilege scope; only an explicit false opts out. */
   readOnlyChecks?: boolean;
   nowMs?: number;
 }): Promise<string> {
-  const jwt = createGitHubAppJwt(options.appId, options.privateKeyPem, options.nowMs);
-  const body: Record<string, unknown> = {};
-  if (options.repository) {
-    body.repositories = [options.repository];
+  const repositoryMatch = options.repository.match(/^[^/\s]+\/([^/\s]+)$/);
+  if (!repositoryMatch) {
+    throw new Error("GitHub repository must use the owner/name form");
   }
-  if (options.readOnlyChecks) {
+  const jwt = createGitHubAppJwt(options.appId, options.privateKeyPem, options.nowMs);
+  const body: Record<string, unknown> = { repositories: [repositoryMatch[1]!] };
+  if (options.readOnlyChecks !== false) {
     body.permissions = {
       checks: "write",
       pull_requests: "read",

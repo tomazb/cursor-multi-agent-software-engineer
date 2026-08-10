@@ -14,8 +14,7 @@ test("createInstallationAccessToken scopes checks write to one repository", asyn
     appId: "123",
     privateKeyPem: pem,
     installationId: 9,
-    repository: "repo",
-    readOnlyChecks: true,
+    repository: "owner/repo",
     http: {
       async request(method, url, options) {
         seenMethod = method;
@@ -38,4 +37,27 @@ test("createInstallationAccessToken scopes checks write to one repository", asyn
       metadata: "read",
     },
   });
+});
+
+test("createInstallationAccessToken rejects a malformed repository before requesting a token", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  let requests = 0;
+
+  await assert.rejects(
+    createInstallationAccessToken({
+      appId: "123",
+      privateKeyPem: pem,
+      installationId: 9,
+      repository: "missing-owner-name",
+      http: {
+        async request() {
+          requests += 1;
+          return { status: 201, headers: {}, body: { token: "too-broad" } };
+        },
+      },
+    }),
+    /owner\/name/,
+  );
+  assert.equal(requests, 0);
 });

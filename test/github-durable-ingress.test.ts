@@ -83,15 +83,20 @@ test("durable ingress acknowledges before a blocked downstream dispatch", async 
 
   const responsePromise = adapter.handleWebhook(signedRequest("durable-ack"));
   await dispatchReached.promise;
+  let raceTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     const response = await Promise.race([
       responsePromise,
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("ingress waited for downstream dispatch")), 250),
-      ),
+      new Promise<never>((_, reject) => {
+        raceTimer = setTimeout(
+          () => reject(new Error("ingress waited for downstream dispatch")),
+          250,
+        );
+      }),
     ]);
     assert.equal(response.status, 202);
   } finally {
+    if (raceTimer !== undefined) clearTimeout(raceTimer);
     releaseDispatch.resolve();
     await Promise.allSettled([responsePromise]);
     await adapter.waitForWebhookIdle();

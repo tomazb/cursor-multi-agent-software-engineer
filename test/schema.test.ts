@@ -27,6 +27,7 @@ type JsonSchema = {
   pattern?: string;
   enum?: unknown[];
   additionalProperties?: boolean;
+  dependentRequired?: Record<string, string[]>;
 };
 
 function resolveRef(root: JsonSchema, schema: JsonSchema): JsonSchema {
@@ -273,6 +274,31 @@ test("run records durably validate bounded pending GitHub head cancellations", a
     "old-head",
   ];
   assert.throws(() => migrateRunRecord(run), /pendingCancellationHeadShas/);
+});
+
+test("run migration rejects unsupported and malformed GitHub association fields", async () => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  assert.deepEqual(schema.properties?.github?.dependentRequired, {
+    suspensionReason: ["suspended"],
+  });
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-github-exact-"));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("schema", "check", DEFAULT_CONFIG);
+  run.github = {
+    installationId: 1,
+    repository: "owner/repo",
+    pullRequestNumber: 1,
+    baseSha: "base",
+    headSha: "head",
+    branch: "feature",
+  };
+  (run.github as unknown as Record<string, unknown>).token = "must-not-be-retained";
+  assert.throws(() => migrateRunRecord(run), /unsupported.*github.*token/i);
+  delete (run.github as unknown as Record<string, unknown>).token;
+  (run.github as unknown as Record<string, unknown>).repository = "not-a-repository";
+  assert.throws(() => migrateRunRecord(run), /github\.repository/i);
 });
 
 test("run-record schema validates optional bounded durable runtime failure metadata", async () => {

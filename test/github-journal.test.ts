@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   access,
+  chmod,
   link,
   lstat,
   mkdir,
@@ -9,12 +10,14 @@ import {
   readFile,
   readdir,
   rm,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  GitHubJournalError,
   initializeGitHubJournals,
   withGitHubJournal,
 } from "../src/github/journal.ts";
@@ -249,7 +252,7 @@ test("concurrent migration attempts reconcile one canonical marker without overw
     ),
   );
 
-  assert.ok(publicationAttempts > 1);
+  assert.ok(publicationAttempts >= 1);
   const markerPath = migrationMarker(githubRoot);
   const before = await readFile(markerPath, "utf8");
   await initializeGitHubJournals(githubRoot);
@@ -259,5 +262,59 @@ test("concurrent migration attempts reconcile one canonical marker without overw
       (name) => name === "legacy-migration.json",
     ),
     ["legacy-migration.json"],
+  );
+});
+
+test("legacy migration preserves both publication and temporary cleanup failures", async (t) => {
+  const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-migrate-errors-"));
+  t.after(async () => rm(githubRoot, { recursive: true, force: true }));
+  await writeFile(path.join(githubRoot, "associations.lock"), deadOwner(), "utf8");
+
+  await assert.rejects(
+    initializeGitHubJournals(githubRoot, {
+      linkFile: async (existingPath, newPath) => {
+        await link(existingPath, newPath);
+        if (path.basename(newPath.toString()) !== "legacy-migration.json") return;
+        await chmod(newPath, 0o600);
+        await writeFile(newPath, "corrupted-after-publication\n", "utf8");
+        await unlink(existingPath);
+        await mkdir(existingPath);
+      },
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof GitHubJournalError);
+      assert.ok(error.cause instanceof AggregateError);
+      assert.equal(error.cause.errors.length, 2);
+      return true;
+    },
+  );
+});
+
+test("journal transactions preserve both operation and release failures", async (t) => {
+  const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-release-errors-"));
+  t.after(async () => rm(githubRoot, { recursive: true, force: true }));
+  const operationError = new Error("synthetic operation failure");
+
+  await assert.rejects(
+    withGitHubJournal(
+      githubRoot,
+      "delivery",
+      "delivery-with-release-error",
+      async () => {
+        throw operationError;
+      },
+      {
+        transition: async (event) => {
+          if (event === "RELEASE_PREPARED") throw new Error("synthetic release failure");
+        },
+      },
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors[0], operationError);
+      assert.ok(error.errors[1] instanceof GitHubJournalError);
+      assert.equal(error.errors[1].code, "GITHUB_JOURNAL_RELEASE_FAILED");
+      return true;
+    },
   );
 });

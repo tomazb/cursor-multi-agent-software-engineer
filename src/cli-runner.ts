@@ -129,13 +129,12 @@ function githubAdapterForCommand(
       if (!appId || !privateKey) {
         throw new Error("GitHub App id or private key environment variables are missing");
       }
-      const repoName = repository.split("/")[1];
       return createInstallationAccessToken({
         appId,
         privateKeyPem: privateKey,
         installationId,
         http,
-        ...(repoName ? { repository: repoName } : {}),
+        repository,
         readOnlyChecks: githubApp.readOnlyChecks,
       });
     },
@@ -315,13 +314,25 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
       const adapter = githubAdapterForCommand(cwd, config, store, http);
       await adapter.initialize();
       await adapter.startWebhookWorker();
-      const { url } = await (options.webhookListener ?? listenWebhookServer)({
-        adapter,
-        host: config.githubApp.webhookHost ?? "127.0.0.1",
-        port: config.githubApp.webhookPort ?? 8787,
-        onDiagnostic: emitGitHubDiagnostic,
-      });
-      console.log(`Listening for GitHub webhooks at ${url}`);
+      try {
+        const { url } = await (options.webhookListener ?? listenWebhookServer)({
+          adapter,
+          host: config.githubApp.webhookHost ?? "127.0.0.1",
+          port: config.githubApp.webhookPort ?? 8787,
+          onDiagnostic: emitGitHubDiagnostic,
+        });
+        console.log(`Listening for GitHub webhooks at ${url}`);
+      } catch (listenerError) {
+        try {
+          await adapter.stopWebhookWorker();
+        } catch (stopError) {
+          throw new AggregateError(
+            [listenerError, stopError],
+            "GitHub listener startup and worker shutdown both failed",
+          );
+        }
+        throw listenerError;
+      }
       return;
     }
     case "github-publish-checks": {

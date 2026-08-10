@@ -215,11 +215,45 @@ export function migrateRunRecord(raw: unknown): RunRecord {
     if (!github || typeof github !== "object" || Array.isArray(github)) {
       throw new Error("Run record github association is invalid");
     }
-    const installationId = (github as Record<string, unknown>).installationId;
-    if (!Number.isSafeInteger(installationId) || Number(installationId) < 1) {
+    const association = github as Record<string, unknown>;
+    const allowed = new Set([
+      "installationId",
+      "repository",
+      "pullRequestNumber",
+      "baseSha",
+      "headSha",
+      "branch",
+      "suspended",
+      "suspensionReason",
+      "pendingCancellationHeadShas",
+    ]);
+    const unsupported = Object.keys(association).find((key) => !allowed.has(key));
+    if (unsupported) {
+      throw new Error(`Unsupported run record github field: ${unsupported}`);
+    }
+    const installationId = association.installationId;
+    if (!Number.isSafeInteger(installationId) || (installationId as number) < 1) {
       throw new Error("Run record github.installationId must be a positive integer");
     }
-    const association = github as Record<string, unknown>;
+    if (
+      typeof association.repository !== "string" ||
+      !/^[^/\s]+\/[^/\s]+$/.test(association.repository) ||
+      association.repository !== association.repository.toLowerCase()
+    ) {
+      throw new Error("Run record github.repository must be a canonical owner/repo string");
+    }
+    const pullRequestNumber = association.pullRequestNumber;
+    if (!Number.isSafeInteger(pullRequestNumber) || (pullRequestNumber as number) < 1) {
+      throw new Error("Run record github.pullRequestNumber must be a positive integer");
+    }
+    for (const key of ["baseSha", "headSha", "branch"] as const) {
+      if (typeof association[key] !== "string" || !association[key]) {
+        throw new Error(`Run record github.${key} must be a non-empty string`);
+      }
+    }
+    if (association.suspended !== undefined && typeof association.suspended !== "boolean") {
+      throw new Error("Run record github.suspended must be a boolean when set");
+    }
     if (
       association.suspensionReason !== undefined &&
       (association.suspended !== true ||

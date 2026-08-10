@@ -117,7 +117,16 @@
           "uniqueItems": true,
           "items": { "type": "string", "minLength": 1 }
         }
-      }
+      },
+      "dependentRequired": {
+        "suspensionReason": ["suspended"]
+      },
+      "allOf": [
+        {
+          "if": { "required": ["suspensionReason"] },
+          "then": { "properties": { "suspended": { "const": true } } }
+        }
+      ]
     },
     "supersedes": { "type": "string" },
     "supersededBy": { "type": "string" },

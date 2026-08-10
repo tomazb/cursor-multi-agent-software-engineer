@@ -325,6 +325,10 @@ delivery-queue repair command; use GitHub's operator-initiated webhook redeliver
 
 Roll out quiescently: stop every old listener and manual publisher, back up the complete
 `.maswe/github/` tree, start one new listener, and verify startup recovery before restoring traffic.
+Legacy journal migration requires no-follow file reads (`O_NOFOLLOW`). On Windows, a filesystem or
+Node build that cannot provide that guarantee may reject retained legacy owners or migration
+markers at startup with `GITHUB_JOURNAL_LEGACY_CHANGED`; migrate on a supported filesystem rather
+than weakening the no-follow check.
 After the new listener acknowledges traffic, do not roll an old binary onto the migrated tree and
 do not restore a pre-traffic backup, because either action can strand acknowledged queue entries.
 Stop traffic and roll forward with the complete state tree. Permanent decommission may archive the

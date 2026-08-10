@@ -568,6 +568,7 @@ async function publishMigration(
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   let created = false;
   let primaryError: unknown;
+  const cleanupErrors: unknown[] = [];
   try {
     handle = await open(temporaryPath, "wx", 0o600);
     created = true;
@@ -597,13 +598,12 @@ async function publishMigration(
     parseMigration(published, expected);
   } catch (error) {
     primaryError = error;
-    throw error;
   } finally {
     if (handle) {
       try {
         await handle.close();
       } catch (error) {
-        if (primaryError === undefined) throw error;
+        cleanupErrors.push(error);
       }
     }
     if (created) {
@@ -611,10 +611,22 @@ async function publishMigration(
         await unlink(temporaryPath);
         await syncDirectory(journalRoot);
       } catch (error) {
-        if (errno(error) !== "ENOENT" && primaryError === undefined) throw error;
+        if (errno(error) !== "ENOENT") cleanupErrors.push(error);
       }
     }
   }
+  const cleanupError =
+    cleanupErrors.length > 1
+      ? new AggregateError(cleanupErrors, "GitHub journal migration cleanup failed")
+      : cleanupErrors[0];
+  if (primaryError !== undefined && cleanupError !== undefined) {
+    throw new AggregateError(
+      [primaryError, cleanupError],
+      "GitHub journal migration and cleanup both failed",
+    );
+  }
+  if (primaryError !== undefined) throw primaryError;
+  if (cleanupError !== undefined) throw cleanupError;
 }
 
 async function migrateLegacy(
@@ -904,7 +916,9 @@ export async function withGitHubJournal<T>(
   }
 
   const started = Date.now();
+  let result: T | undefined;
   let primaryError: unknown;
+  let releaseError: GitHubJournalError | undefined;
   try {
     for (;;) {
       try {
@@ -946,28 +960,30 @@ export async function withGitHubJournal<T>(
         await sleep(pollIntervalMs);
         continue;
       }
-      return await callback();
+      result = await callback();
+      break;
     }
   } catch (error) {
     primaryError = error;
-    throw error;
   } finally {
     try {
       await publishClaimRelease(handle, publishOptions);
     } catch (error) {
-      const releaseError = publicError(
+      releaseError = publicError(
         "GITHUB_JOURNAL_RELEASE_FAILED",
         kind,
         `GitHub ${kind} journal release failed`,
         error,
       );
-      if (primaryError !== undefined) {
-        throw new AggregateError(
-          [primaryError, releaseError],
-          `GitHub ${kind} journal operation and release both failed`,
-        );
-      }
-      throw releaseError;
     }
   }
+  if (primaryError !== undefined && releaseError !== undefined) {
+    throw new AggregateError(
+      [primaryError, releaseError],
+      `GitHub ${kind} journal operation and release both failed`,
+    );
+  }
+  if (primaryError !== undefined) throw primaryError;
+  if (releaseError !== undefined) throw releaseError;
+  return result as T;
 }
