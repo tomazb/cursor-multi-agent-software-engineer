@@ -7,7 +7,6 @@ import {
   readdir,
   rename,
   unlink,
-  writeFile,
 } from "node:fs/promises";
 import path from "node:path";
 import { withGitHubJournal } from "./journal.ts";
@@ -382,6 +381,10 @@ export class GitHubDeliveryStore {
     filePath: string,
     stagingPath: string,
   ) => Promise<void>;
+  private readonly afterInitialClaimStaged?: (
+    filePath: string,
+    stagingPath: string,
+  ) => Promise<void>;
   private readonly afterFailureSuppressionPublished?: (
     filePath: string,
     suppressionPath: string,
@@ -406,6 +409,11 @@ export class GitHubDeliveryStore {
         filePath: string,
         stagingPath: string,
       ) => Promise<void>;
+      /** Test hook after an initial claim is synced, before no-clobber publication. */
+      afterInitialClaimStaged?: (
+        filePath: string,
+        stagingPath: string,
+      ) => Promise<void>;
       /** Test hook after failure suppression is durably published, before canonical removal. */
       afterFailureSuppressionPublished?: (
         filePath: string,
@@ -424,6 +432,9 @@ export class GitHubDeliveryStore {
     if (options.afterLeaseValidated) this.afterLeaseValidated = options.afterLeaseValidated;
     if (options.afterCompletionStaged) {
       this.afterCompletionStaged = options.afterCompletionStaged;
+    }
+    if (options.afterInitialClaimStaged) {
+      this.afterInitialClaimStaged = options.afterInitialClaimStaged;
     }
     if (options.afterFailureSuppressionPublished) {
       this.afterFailureSuppressionPublished = options.afterFailureSuppressionPublished;
@@ -705,7 +716,10 @@ export class GitHubDeliveryStore {
         this.staleReclaims += 1;
         this.monitor.onStaleReclaim?.(deliveryId, existing.record.leaseId);
         await this.afterLeaseValidated?.("claim-reclaim", deliveryId);
+        const attempts = await this.readArtifacts(deliveryId);
+        await this.publishFailureSuppression(deliveryId, existing, attempts);
         await unlink(this.filePath(deliveryId));
+        await this.syncDirectory(this.deliveriesDir);
       }
 
       const leaseId = randomUUID();
@@ -715,10 +729,22 @@ export class GitHubDeliveryStore {
         leaseId,
         claimedAt: new Date(nowMs).toISOString(),
       };
-      await writeFile(this.filePath(deliveryId), encodeRecord(record), {
-        encoding: "utf8",
-        flag: "wx",
-      });
+      const canonicalPath = this.filePath(deliveryId);
+      const stagingPath = `${canonicalPath}.claim-staging.${randomUUID()}`;
+      const handle = await open(stagingPath, "wx", 0o600);
+      try {
+        await handle.writeFile(encodeRecord(record), "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      try {
+        await this.afterInitialClaimStaged?.(canonicalPath, stagingPath);
+        await link(stagingPath, canonicalPath);
+      } finally {
+        await unlinkExact(stagingPath);
+      }
+      await this.syncDirectory(this.deliveriesDir);
       return { claimed: true, duplicate: false, status: "processing", leaseId };
     });
   }

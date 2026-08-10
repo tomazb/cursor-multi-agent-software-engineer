@@ -8,6 +8,7 @@ import {
   readFile,
   readdir,
   rename,
+  rm,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
@@ -134,6 +135,51 @@ test("claim, complete, and fail wait for the immutable journal protecting their 
       await pending;
     });
   }
+});
+
+test("an initial claim crash before no-clobber publication leaves no trusted partial claim", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-initial-claim-crash-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  let injectCrash = true;
+  const crashing = new GitHubDeliveryStore(root, {
+    afterInitialClaimStaged: async () => {
+      if (!injectCrash) return;
+      injectCrash = false;
+      throw new Error("simulated crash before initial claim publication");
+    },
+  });
+
+  await assert.rejects(
+    () => crashing.claim("initial-crash"),
+    /simulated crash before initial claim publication/,
+  );
+
+  const retry = await new GitHubDeliveryStore(root).claim("initial-crash");
+  assert.equal(retry.claimed, true);
+  assert.ok(retry.leaseId);
+  const entries = await readdir(path.join(root, "deliveries"));
+  assert.equal(entries.some((entry) => entry.includes("claim-staging")), false);
+});
+
+test("an initial claim rejects parent-directory sync failure without trusting success", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-initial-claim-sync-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  let syncAttempts = 0;
+  const store = new GitHubDeliveryStore(root, {
+    syncDirectory: async () => {
+      syncAttempts += 1;
+      throw new Error("simulated initial claim directory sync failure");
+    },
+  });
+
+  await assert.rejects(
+    () => store.claim("initial-sync"),
+    /simulated initial claim directory sync failure/,
+  );
+  assert.equal(syncAttempts, 1);
+  const retry = await new GitHubDeliveryStore(root).claim("initial-sync");
+  assert.equal(retry.duplicate, true);
+  assert.equal(retry.status, "processing");
 });
 
 test("claim, complete, and fail from separate processes serialize on one delivery journal", async () => {
@@ -265,6 +311,60 @@ test("a crash after durable suppression publication leaves the current lease ret
   assert.notEqual(retry.leaseId, "lease-a");
   await access(olderStaging);
   await access(olderReclaim);
+});
+
+test("stale reclaim publishes suppression before canonical removal so a crash cannot resurrect an older pair", async (t) => {
+  const deliveryId = "d-stale-suppression-crash";
+  const { root, canonical } = await deliveryFixture(deliveryId);
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  await writeRecord(canonical, processing(deliveryId, "lease-b"));
+  await writeRecord(`${canonical}.staging.older-a`, completed(deliveryId, "lease-a"));
+  await writeRecord(`${canonical}.reclaim.older-a`, processing(deliveryId, "lease-a"));
+  let injectCrash = true;
+  let suppressionPath: string | undefined;
+  const store = new GitHubDeliveryStore(root, {
+    staleProcessingMs: 1,
+    afterFailureSuppressionPublished: async (_canonical, markerPath) => {
+      suppressionPath = markerPath;
+      if (!injectCrash) return;
+      injectCrash = false;
+      throw new Error("simulated crash before stale canonical removal");
+    },
+  });
+
+  await assert.rejects(
+    () => store.claim(deliveryId, Date.parse(CLAIMED_AT) + 10_000),
+    /simulated crash before stale canonical removal/,
+  );
+  assert.equal(JSON.parse(await readFile(canonical, "utf8")).leaseId, "lease-b");
+  assert.ok(suppressionPath);
+  await access(suppressionPath);
+
+  const retry = await store.claim(deliveryId, Date.parse(CLAIMED_AT) + 20_000);
+  assert.equal(retry.claimed, true);
+  assert.notEqual(retry.leaseId, "lease-a");
+  assert.notEqual(retry.leaseId, "lease-b");
+});
+
+test("stale reclaim keeps canonical state when suppression directory sync fails", async (t) => {
+  const deliveryId = "d-stale-suppression-sync";
+  const { root, canonical } = await deliveryFixture(deliveryId);
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  await writeRecord(canonical, processing(deliveryId, "lease-b"));
+  await writeRecord(`${canonical}.staging.older-a`, completed(deliveryId, "lease-a"));
+  await writeRecord(`${canonical}.reclaim.older-a`, processing(deliveryId, "lease-a"));
+  const store = new GitHubDeliveryStore(root, {
+    staleProcessingMs: 1,
+    syncDirectory: async () => {
+      throw new Error("simulated stale suppression directory sync failure");
+    },
+  });
+
+  await assert.rejects(
+    () => store.claim(deliveryId, Date.parse(CLAIMED_AT) + 10_000),
+    /simulated stale suppression directory sync failure/,
+  );
+  assert.equal(JSON.parse(await readFile(canonical, "utf8")).leaseId, "lease-b");
 });
 
 test("fail keeps the processing canonical when suppression directory sync fails", async () => {
