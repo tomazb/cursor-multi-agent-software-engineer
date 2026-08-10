@@ -121,6 +121,7 @@ async function setup(options: {
     ...(options.associationWriteRecords
       ? { associationWriteRecords: options.associationWriteRecords }
       : {}),
+    synchronousWebhookDispatch: true,
   });
   return {
     cwd,
@@ -730,6 +731,7 @@ test("integration: push attempts later PRs before reporting an earlier invalidat
         return { status: 201, headers: {}, body: { id: nextId++ } };
       },
     },
+    synchronousWebhookDispatch: true,
   });
   const body = JSON.stringify({
     ref: "refs/heads/maswe/run-1",
@@ -1019,6 +1021,7 @@ test("integration: live-head lookup failure fails closed", async () => {
     store,
     http: failingHttp,
     tokenProvider: async () => "token",
+    synchronousWebhookDispatch: true,
   });
   await assert.rejects(
     () =>
@@ -1101,6 +1104,7 @@ test("integration: installation_repositories.removed suspends every listed repo"
       },
     },
     tokenProvider: async () => "token",
+    synchronousWebhookDispatch: true,
   });
 
   const body = JSON.stringify({

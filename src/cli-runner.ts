@@ -17,7 +17,20 @@ import { assertSupportedNodeVersion } from "./node-version.ts";
 import { Orchestrator } from "./orchestrator.ts";
 import { createRuntime } from "./runtime.ts";
 import { renderRun } from "./run-rendering.ts";
+import {
+  FAILURE_AGGREGATE_MAX_CODE_POINTS,
+  sanitizeDiagnostic,
+} from "./redaction.ts";
 import { FileRunStore } from "./store.ts";
+
+function emitGitHubDiagnostic(error: unknown): void {
+  console.error(
+    sanitizeDiagnostic(
+      error instanceof Error ? error.message : String(error),
+      FAILURE_AGGREGATE_MAX_CODE_POINTS,
+    ).text,
+  );
+}
 
 function usage(): string {
   return `Cursor Multi-Agent Software Engineer (maswe)
@@ -126,6 +139,7 @@ function githubAdapterForCommand(
         readOnlyChecks: githubApp.readOnlyChecks,
       });
     },
+    onWebhookDiagnostic: emitGitHubDiagnostic,
   });
 }
 
@@ -293,10 +307,12 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
       const http = createFetchGitHubHttpClient(options.githubHttpOptions);
       const adapter = githubAdapterForCommand(cwd, config, store, http);
       await adapter.initialize();
+      await adapter.startWebhookWorker();
       const { url } = await (options.webhookListener ?? listenWebhookServer)({
         adapter,
         host: config.githubApp.webhookHost ?? "127.0.0.1",
         port: config.githubApp.webhookPort ?? 8787,
+        onDiagnostic: emitGitHubDiagnostic,
       });
       console.log(`Listening for GitHub webhooks at ${url}`);
       return;
@@ -310,7 +326,7 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
       }
       const http = createFetchGitHubHttpClient(options.githubHttpOptions);
       const adapter = githubAdapterForCommand(cwd, config, store, http);
-      await adapter.initialize();
+      await adapter.initializeManualPublisher();
       const run = await adapter.publishChecksForRun(runId);
       console.log(has(args, "--json") ? JSON.stringify(run, null, 2) : renderRun(run));
       return;

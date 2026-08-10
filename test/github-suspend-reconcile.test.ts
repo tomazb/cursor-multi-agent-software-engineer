@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -16,9 +16,10 @@ function sign(body: string): string {
   return `sha256=${createHmac("sha256", SECRET).update(body, "utf8").digest("hex")}`;
 }
 
-test("redelivery after run-save failure still suspends the authoritative run", async () => {
+test("redelivery after run-save failure still suspends the authoritative run", async (t) => {
   process.env[SECRET_ENV] = SECRET;
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-suspend-rec-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
   const store = new FileRunStore(cwd);
   const config = mergeConfigForTest({
     runtime: { kind: "mock" },
@@ -70,6 +71,7 @@ test("redelivery after run-save failure still suspends the authoritative run", a
       },
     },
     tokenProvider: async () => "token",
+    synchronousWebhookDispatch: true,
   });
 
   const body = JSON.stringify({

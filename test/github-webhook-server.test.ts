@@ -8,7 +8,11 @@ import type {
   WebhookHandleResult,
   WebhookRequest,
 } from "../src/github/adapter.ts";
-import { createWebhookServer, type WebhookServerOptions } from "../src/github/webhook-server.ts";
+import {
+  createWebhookServer,
+  listenWebhookServer,
+  type WebhookServerOptions,
+} from "../src/github/webhook-server.ts";
 
 interface HttpResponse {
   status: number;
@@ -63,7 +67,7 @@ function dispatchWebhook(
     url: requestOptions.url ?? "/github/webhook",
     headers,
     headersDistinct,
-  }) as IncomingMessage;
+  }) as unknown as IncomingMessage;
 
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("webhook response timed out")), 1_000);
@@ -243,6 +247,21 @@ test("webhook rejects a missing signature header before adapter dispatch", async
   assert.deepEqual(fake.calls, []);
 });
 
+test("webhook forwards the exact request bytes without UTF-8 replacement", async () => {
+  const bytes = Buffer.from([0x7b, 0xff, 0x7d]);
+  const fake = recordingAdapter({
+    status: 400,
+    body: { ok: false, message: "invalid UTF-8 body" },
+  });
+  const response = await dispatchWebhook({ adapter: fake.adapter }, validHeaders, {
+    body: Readable.from([bytes]),
+  });
+
+  assert.equal(response.status, 400);
+  assert.ok(Buffer.isBuffer(fake.calls[0]?.rawBody));
+  assert.deepEqual(fake.calls[0]?.rawBody, bytes);
+});
+
 test("webhook does not read invalid-header bodies before returning 400", async () => {
   let reads = 0;
   const body = new Readable({
@@ -279,6 +298,59 @@ test("webhook keeps internal failures generic when diagnostics throw", async () 
   assert.equal(response.status, 500);
   assert.equal(response.body, JSON.stringify({ ok: false, message: "internal server error" }));
   assert.doesNotMatch(response.body, /MASWE_DIAGNOSTIC_THROW_SECRET|diagnostic failed/);
+});
+
+test("webhook does not rewrite a response after headers were sent", async () => {
+  const failure = new Error("failure after response started");
+  const diagnostics: unknown[] = [];
+  const fake = recordingAdapter();
+  fake.adapter.handleWebhook = async () => {
+    throw failure;
+  };
+  const server = createWebhookServer({
+    adapter: fake.adapter,
+    onDiagnostic: (error) => diagnostics.push(error),
+  });
+  const request = Object.assign(Readable.from([Buffer.from("{}")]), {
+    method: "POST",
+    url: "/github/webhook",
+    headers: validHeaders,
+    headersDistinct: defaultDistinctHeaders(validHeaders),
+  }) as unknown as IncomingMessage;
+  let ended = 0;
+  const response = {
+    headersSent: true,
+    writableEnded: false,
+    writeHead() {
+      assert.fail("writeHead must not run after headersSent");
+    },
+    end(this: { writableEnded: boolean }, chunk?: string | Buffer) {
+      assert.equal(chunk, undefined);
+      ended += 1;
+      this.writableEnded = true;
+    },
+  } as unknown as ServerResponse;
+
+  server.emit("request", request, response);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(ended, 1);
+  assert.deepEqual(diagnostics, [failure]);
+});
+
+test("listener removes its startup error handler and retains diagnostic handling", async () => {
+  const diagnostics: unknown[] = [];
+  const fake = recordingAdapter();
+  const { server } = await listenWebhookServer({
+    adapter: fake.adapter,
+    host: "127.0.0.1",
+    port: 0,
+    onDiagnostic: (error) => diagnostics.push(error),
+    listenServer: (_server, _port, _host, onListening) => onListening(),
+  });
+  assert.equal(server.listenerCount("error"), 1);
+  const failure = new Error("post-listen diagnostic");
+  server.emit("error", failure);
+  assert.deepEqual(diagnostics, [failure]);
 });
 
 test("webhook passes adapter-produced bad-request responses through", async () => {

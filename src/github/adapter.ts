@@ -7,11 +7,8 @@ import {
   type GitHubAssociationTransaction,
 } from "./association.ts";
 import { CheckPublisher, type GitHubHttpClient } from "./checks.ts";
-import {
-  GitHubDeliveryStore,
-  type DeliveryMutationResult,
-  type DeliveryStoreMonitor,
-} from "./delivery-store.ts";
+import { createHash } from "node:crypto";
+import { GitHubDeliveryInbox } from "./delivery-inbox.ts";
 import { normalizeGitHubWebhook } from "./normalize.ts";
 import { verifyGitHubWebhookSignature } from "./signature.ts";
 import { GitHubSideEffectStore } from "./side-effect-store.ts";
@@ -26,7 +23,7 @@ export interface WebhookRequest {
   deliveryId: string;
   eventName: string;
   signatureHeader: string | undefined;
-  rawBody: string;
+  rawBody: string | Buffer;
 }
 
 export interface WebhookHandleResult {
@@ -47,46 +44,6 @@ function parseOwnerRepo(repository: string): { owner: string; repo: string } {
 function isRepoAllowed(config: GitHubAppConfig, repository: string | undefined): boolean {
   if (!repository) return false;
   return config.allowedRepositories.includes(repository);
-}
-
-function deliveryMutationRejected(
-  operation: "completion" | "failure",
-  deliveryId: string,
-  result: Exclude<DeliveryMutationResult, { ok: true }>,
-): Error {
-  return new Error(
-    `Delivery ${operation} rejected for ${deliveryId}: ${result.reason}`,
-  );
-}
-
-function asError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
-}
-
-function preservePrimaryError(primary: unknown, cleanup: unknown): Error {
-  const primaryError = asError(primary);
-  const cleanupError = asError(cleanup);
-  try {
-    Object.defineProperty(primaryError, "deliveryCleanupError", {
-      configurable: true,
-      enumerable: false,
-      value: cleanupError,
-    });
-    if (primaryError.cause === undefined) {
-      Object.defineProperty(primaryError, "cause", {
-        configurable: true,
-        enumerable: false,
-        value: cleanupError,
-      });
-    }
-    return primaryError;
-  } catch {
-    return new AggregateError(
-      [primaryError, cleanupError],
-      primaryError.message,
-      { cause: primaryError },
-    );
-  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -124,7 +81,7 @@ export class GitHubAppAdapter {
     installationId: number,
     repository: string,
   ) => Promise<string>;
-  private readonly deliveries: GitHubDeliveryStore;
+  private readonly inbox: GitHubDeliveryInbox;
   private readonly sideEffects: GitHubSideEffectStore;
   private readonly associations: GitHubAssociationIndex;
   private readonly root: string;
@@ -132,7 +89,15 @@ export class GitHubAppAdapter {
   private readonly beforeAssociationTransaction:
     | ((deliveryId: string) => Promise<void>)
     | undefined;
-  private initialization: Promise<void> | undefined;
+  private journalInitialization: Promise<void> | undefined;
+  private inboxInitialization: Promise<void> | undefined;
+  private webhookWorkerEnabled: boolean;
+  private webhookWorker: Promise<void> | undefined;
+  private webhookWorkerTimer: ReturnType<typeof setTimeout> | undefined;
+  private webhookWorkerActive = false;
+  private readonly synchronousWebhookDispatch: boolean;
+  private readonly beforeInboxEnqueue: (() => Promise<void>) | undefined;
+  private readonly onWebhookDiagnostic: ((error: unknown) => void) | undefined;
 
   constructor(options: {
     cwd: string;
@@ -140,7 +105,14 @@ export class GitHubAppAdapter {
     store: RunStore;
     http: GitHubHttpClient;
     tokenProvider: (installationId: number, repository: string) => Promise<string>;
-    deliveryMonitor?: DeliveryStoreMonitor;
+    /** Test/embedded seam; the CLI starts recovery explicitly before listening. */
+    autoStartWebhookWorker?: boolean;
+    /** Deterministic legacy-dispatch seam used only by focused adapter tests. */
+    synchronousWebhookDispatch?: boolean;
+    /** Deterministic seam for durable handoff write/journal failures. */
+    beforeInboxEnqueue?: () => Promise<void>;
+    inboxOptions?: ConstructorParameters<typeof GitHubDeliveryInbox>[1];
+    onWebhookDiagnostic?: (error: unknown) => void;
     /** Deterministic barrier after the manual command's initial snapshot, before its fence. */
     afterManualRunLoaded?: (runId: string) => Promise<void>;
     /** Deterministic barrier before a PR association transaction is acquired. */
@@ -157,7 +129,11 @@ export class GitHubAppAdapter {
     this.beforeAssociationTransaction = options.beforeAssociationTransaction;
     const root = githubRoot(options.cwd);
     this.root = root;
-    this.deliveries = new GitHubDeliveryStore(root, options.deliveryMonitor);
+    this.inbox = new GitHubDeliveryInbox(root, options.inboxOptions);
+    this.webhookWorkerEnabled = options.autoStartWebhookWorker ?? false;
+    this.synchronousWebhookDispatch = options.synchronousWebhookDispatch ?? false;
+    this.beforeInboxEnqueue = options.beforeInboxEnqueue;
+    this.onWebhookDiagnostic = options.onWebhookDiagnostic;
     this.sideEffects = new GitHubSideEffectStore(root);
     this.associations = new GitHubAssociationIndex(
       root,
@@ -167,15 +143,41 @@ export class GitHubAppAdapter {
     );
   }
 
-  /** Fail-closed filesystem/journal preflight shared by webhook and manual publication. */
-  async initialize(): Promise<void> {
-    this.initialization ??= initializeGitHubJournals(this.root);
+  /** Fail-closed journal preflight shared by webhook and manual publication. */
+  private async initializePublicationJournals(): Promise<void> {
+    this.journalInitialization ??= (async () => {
+      await initializeGitHubJournals(this.root);
+      await withGitHubJournal(this.root, "check-create", "preflight", async () => undefined);
+      await withGitHubJournal(this.root, "publication", "preflight", async () => undefined);
+    })();
     try {
-      await this.initialization;
+      await this.journalInitialization;
     } catch (error) {
-      this.initialization = undefined;
+      this.journalInitialization = undefined;
       throw error;
     }
+  }
+
+  /**
+   * Recover durable ingress only for the listener topology. A simultaneous manual publisher
+   * preflights its own journals without reclaiming the listener's active delivery lease.
+   */
+  async initialize(): Promise<void> {
+    this.inboxInitialization ??= (async () => {
+      await this.initializePublicationJournals();
+      await this.inbox.initialize();
+    })();
+    try {
+      await this.inboxInitialization;
+    } catch (error) {
+      this.inboxInitialization = undefined;
+      throw error;
+    }
+  }
+
+  /** Fail-closed preflight for the manual check publisher's local journals. */
+  async initializeManualPublisher(): Promise<void> {
+    await this.initializePublicationJournals();
   }
 
   private githubApp(): GitHubAppConfig {
@@ -195,43 +197,34 @@ export class GitHubAppAdapter {
 
   async handleWebhook(request: WebhookRequest): Promise<WebhookHandleResult> {
     await this.initialize();
-    const app = this.githubApp();
+    this.githubApp();
     if (!request.deliveryId?.trim() || !request.eventName?.trim()) {
       return { status: 400, body: { ok: false, message: "missing delivery or event headers" } };
     }
-    if (!verifyGitHubWebhookSignature(this.webhookSecret(), request.rawBody, request.signatureHeader)) {
+    const rawBody =
+      typeof request.rawBody === "string" ? Buffer.from(request.rawBody, "utf8") : request.rawBody;
+    if (!verifyGitHubWebhookSignature(this.webhookSecret(), rawBody, request.signatureHeader)) {
       return { status: 401, body: { ok: false, message: "invalid signature" } };
     }
-
-    const claim = await this.deliveries.claim(request.deliveryId);
-    if (claim.duplicate && claim.status === "completed") {
-      return { status: 200, body: { ok: true, duplicate: true } };
+    const receivedAt = new Date().toISOString();
+    const rawBodyDigest = `sha256:${createHash("sha256").update(rawBody).digest("hex")}`;
+    let decoded: string;
+    try {
+      decoded = new TextDecoder("utf-8", { fatal: true }).decode(rawBody);
+    } catch {
+      return { status: 400, body: { ok: false, message: "invalid UTF-8 body" } };
     }
-    if (claim.duplicate && claim.status === "processing") {
-      return {
-        status: 503,
-        body: { ok: false, duplicate: true, message: "delivery already processing" },
-      };
-    }
-    if (!claim.claimed || !claim.leaseId) {
-      throw new Error(`Delivery claim returned an invalid state for ${request.deliveryId}`);
-    }
-    const leaseId = claim.leaseId;
-
     let parsed: unknown;
     try {
-      parsed = JSON.parse(request.rawBody) as unknown;
+      parsed = JSON.parse(decoded) as unknown;
     } catch {
-      const malformed = new MalformedGitHubWebhookError("invalid JSON body");
-      await this.failDelivery(request.deliveryId, leaseId, malformed);
-      return { status: 400, body: { ok: false, message: malformed.message } };
+      return { status: 400, body: { ok: false, message: "invalid JSON body" } };
     }
     if (!isRecord(parsed)) {
-      const malformed = new MalformedGitHubWebhookError(
-        "webhook payload must be a JSON object",
-      );
-      await this.failDelivery(request.deliveryId, leaseId, malformed);
-      return { status: 400, body: { ok: false, message: malformed.message } };
+      return {
+        status: 400,
+        body: { ok: false, message: "webhook payload must be a JSON object" },
+      };
     }
 
     let event: GitHubInternalEvent;
@@ -240,67 +233,167 @@ export class GitHubAppAdapter {
         deliveryId: request.deliveryId,
         eventName: request.eventName,
         payload: parsed,
+        receivedAt,
       });
     } catch (error) {
       if (error instanceof UnsupportedGitHubWebhookError) {
+        let ignored;
         try {
-          await this.completeDelivery(request.deliveryId, leaseId);
-        } catch (completionError) {
-          await this.failDelivery(request.deliveryId, leaseId, completionError);
-          throw completionError;
+          await this.beforeInboxEnqueue?.();
+          ignored = await this.inbox.completeWithoutDispatch({
+            deliveryId: request.deliveryId,
+            eventName: request.eventName,
+            receivedAt,
+            rawBodyDigest,
+          });
+        } catch {
+          return {
+            status: 503,
+            body: { ok: false, message: "durable webhook handoff unavailable" },
+          };
+        }
+        if (ignored.outcome === "conflict") {
+          return { status: 409, body: { ok: false, message: "delivery id conflict" } };
         }
         return { status: 200, body: { ok: true, message: "unsupported webhook ignored" } };
       }
       if (error instanceof MalformedGitHubWebhookError) {
-        await this.failDelivery(request.deliveryId, leaseId, error);
         return { status: 400, body: { ok: false, message: error.message } };
       }
-      await this.failDelivery(request.deliveryId, leaseId, error);
       throw error;
     }
-
+    let enqueue;
     try {
-      await this.dispatch(event, app);
-      await this.completeDelivery(request.deliveryId, leaseId);
-      return { status: 200, body: { ok: true } };
-    } catch (error) {
-      await this.failDelivery(request.deliveryId, leaseId, error);
-      throw error;
+      await this.beforeInboxEnqueue?.();
+      enqueue = await this.inbox.enqueue({
+        deliveryId: request.deliveryId,
+        eventName: request.eventName,
+        receivedAt: event.receivedAt,
+        rawBodyDigest,
+        event,
+      });
+    } catch {
+      return {
+        status: 503,
+        body: { ok: false, message: "durable webhook handoff unavailable" },
+      };
     }
-  }
-
-  private async completeDelivery(deliveryId: string, leaseId: string): Promise<void> {
-    const completed = await this.deliveries.complete(deliveryId, leaseId);
-    if (!completed.ok) {
-      throw deliveryMutationRejected("completion", deliveryId, completed);
+    if (enqueue.outcome === "conflict") {
+      return { status: 409, body: { ok: false, message: "delivery id conflict" } };
     }
-  }
-
-  private async failDelivery(
-    deliveryId: string,
-    leaseId: string,
-    primaryError: unknown,
-  ): Promise<void> {
-    let cleanupError: unknown;
-    try {
-      const failed = await this.deliveries.fail(
-        deliveryId,
-        asError(primaryError).message,
-        leaseId,
-      );
-      if (!failed.ok) {
-        cleanupError = deliveryMutationRejected("failure", deliveryId, failed);
+    if (enqueue.status === "completed" || enqueue.status === "legacy-completed") {
+      return { status: 200, body: { ok: true, duplicate: true } };
+    }
+    if (this.synchronousWebhookDispatch) {
+      const claimed = await this.inbox.claimNext();
+      if (!claimed) {
+        return { status: 202, body: { ok: true, duplicate: true } };
       }
-    } catch (error) {
-      cleanupError = error;
+      try {
+        await this.dispatch(claimed.record.event, this.githubApp());
+        await this.inbox.complete(claimed.record.deliveryId, claimed.record.leaseId);
+        return { status: 200, body: { ok: true } };
+      } catch (error) {
+        await this.inbox.retry(claimed.record.deliveryId, claimed.record.leaseId, 0);
+        throw error;
+      }
     }
-    if (cleanupError !== undefined) {
-      throw preservePrimaryError(primaryError, cleanupError);
+    if (this.webhookWorkerEnabled) this.kickWebhookWorker();
+    return {
+      status: 202,
+      body: {
+        ok: true,
+        ...(enqueue.outcome === "duplicate" ? { duplicate: true } : {}),
+      },
+    };
+  }
+
+  async startWebhookWorker(): Promise<void> {
+    await this.initialize();
+    this.webhookWorkerEnabled = true;
+    this.kickWebhookWorker();
+  }
+
+  private kickWebhookWorker(delayMs = 0): void {
+    if (!this.webhookWorkerEnabled || this.webhookWorker || this.webhookWorkerTimer) return;
+    if (delayMs > 0) {
+      this.webhookWorkerTimer = setTimeout(() => {
+        this.webhookWorkerTimer = undefined;
+        this.kickWebhookWorker();
+      }, delayMs);
+      this.webhookWorkerTimer.unref();
+      return;
+    }
+    this.webhookWorker = this.runWebhookWorker()
+      .catch((error) => this.emitWebhookDiagnostic(error))
+      .finally(() => {
+        this.webhookWorker = undefined;
+        if (this.webhookWorkerEnabled) this.kickWebhookWorker(100);
+      });
+  }
+
+  private emitWebhookDiagnostic(error: unknown): void {
+    try {
+      this.onWebhookDiagnostic?.(error);
+    } catch {
+      // Diagnostics never alter durable queue state.
+    }
+  }
+
+  private async runWebhookWorker(): Promise<void> {
+    for (;;) {
+      if (!this.webhookWorkerEnabled) return;
+      const claimed = await this.inbox.claimNext();
+      if (!claimed) return;
+      this.webhookWorkerActive = true;
+      const { deliveryId } = claimed.record;
+      const leaseId = claimed.record.leaseId;
+      const heartbeat = setInterval(() => {
+        void this.inbox
+          .heartbeat(deliveryId, leaseId)
+          .catch((error) => this.emitWebhookDiagnostic(error));
+      }, 5_000);
+      heartbeat.unref();
+      try {
+        await this.dispatch(claimed.record.event, this.githubApp());
+        await this.inbox.complete(deliveryId, leaseId);
+      } catch (error) {
+        this.emitWebhookDiagnostic(error);
+        await this.inbox.retry(deliveryId, leaseId);
+      } finally {
+        clearInterval(heartbeat);
+        this.webhookWorkerActive = false;
+      }
+    }
+  }
+
+  async waitForWebhookIdle(timeoutMs = 10_000): Promise<void> {
+    const started = Date.now();
+    for (;;) {
+      if (!this.webhookWorkerActive && (await this.inbox.pendingCount()) === 0) return;
+      if (Date.now() - started >= timeoutMs) {
+        throw new Error("Timed out waiting for GitHub webhook worker to drain");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  async stopWebhookWorker(options: { drainMs?: number } = {}): Promise<void> {
+    const drainMs = options.drainMs ?? 5_000;
+    try {
+      await this.waitForWebhookIdle(drainMs);
+    } catch {
+      // Pending state remains durable and will be recovered before the next listener starts.
+    }
+    this.webhookWorkerEnabled = false;
+    if (this.webhookWorkerTimer) {
+      clearTimeout(this.webhookWorkerTimer);
+      this.webhookWorkerTimer = undefined;
     }
   }
 
   async publishChecksForRun(runId: string): Promise<RunRecord> {
-    await this.initialize();
+    await this.initializeManualPublisher();
     const app = this.githubApp();
     const initial = await this.store.load(runId);
     if (!initial.github) {

@@ -15,6 +15,13 @@ export async function readRawBody(
   req: IncomingMessage,
   maxBytes = DEFAULT_WEBHOOK_MAX_BODY_BYTES,
 ): Promise<string> {
+  return (await readRawBodyBytes(req, maxBytes)).toString("utf8");
+}
+
+export async function readRawBodyBytes(
+  req: IncomingMessage,
+  maxBytes = DEFAULT_WEBHOOK_MAX_BODY_BYTES,
+): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req.iterator({ destroyOnReturn: false })) {
@@ -25,7 +32,7 @@ export async function readRawBody(
     }
     chunks.push(buf);
   }
-  return Buffer.concat(chunks).toString("utf8");
+  return Buffer.concat(chunks);
 }
 
 export interface WebhookServerOptions {
@@ -35,6 +42,13 @@ export interface WebhookServerOptions {
   path?: string;
   maxBodyBytes?: number;
   onDiagnostic?: (error: unknown) => void;
+  /** Deterministic listener-start seam for tests. */
+  listenServer?: (
+    server: Server,
+    port: number,
+    host: string,
+    onListening: () => void,
+  ) => void;
 }
 
 const SAFE_DELIVERY_ID = /^[A-Za-z0-9._-]+$/;
@@ -70,7 +84,7 @@ function emitDiagnostic(onDiagnostic: ((error: unknown) => void) | undefined, er
 export function createWebhookServer(options: WebhookServerOptions): Server {
   const webhookPath = options.path ?? "/github/webhook";
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_WEBHOOK_MAX_BODY_BYTES;
-  return createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     try {
       if (req.method !== "POST" || (req.url ?? "").split("?")[0] !== webhookPath) {
         res.writeHead(404, { "content-type": "application/json" });
@@ -84,7 +98,7 @@ export function createWebhookServer(options: WebhookServerOptions): Server {
         invalidWebhookHeaders(res);
         return;
       }
-      const rawBody = await readRawBody(req, maxBodyBytes);
+      const rawBody = await readRawBodyBytes(req, maxBodyBytes);
       const result = await options.adapter.handleWebhook({
         deliveryId,
         eventName,
@@ -101,10 +115,16 @@ export function createWebhookServer(options: WebhookServerOptions): Server {
         return;
       }
       emitDiagnostic(options.onDiagnostic, error);
+      if (res.headersSent) {
+        if (!res.writableEnded) res.end();
+        return;
+      }
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: false, message: "internal server error" }));
     }
   });
+  server.on("error", (error) => emitDiagnostic(options.onDiagnostic, error));
+  return server;
 }
 
 export async function listenWebhookServer(
@@ -114,8 +134,14 @@ export async function listenWebhookServer(
   const port = options.port ?? 8787;
   const server = createWebhookServer(options);
   await new Promise<void>((resolve, reject) => {
-    server.listen(port, host, () => resolve());
-    server.once("error", reject);
+    const startupError = (error: Error) => reject(error);
+    server.once("error", startupError);
+    const onListening = () => {
+      server.off("error", startupError);
+      resolve();
+    };
+    if (options.listenServer) options.listenServer(server, port, host, onListening);
+    else server.listen(port, host, onListening);
   });
   return { server, url: `http://${host}:${port}${options.path ?? "/github/webhook"}` };
 }

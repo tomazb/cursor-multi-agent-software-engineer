@@ -165,8 +165,10 @@ test("github-webhook shares one bounded client across token, live-head, and chec
           signatureHeader: sign(rawBody),
           rawBody,
         });
-        assert.equal(result.status, 200);
+        assert.equal(result.status, 202);
+        await options.adapter.waitForWebhookIdle();
       }
+      await options.adapter.stopWebhookWorker();
       return { url: "http://127.0.0.1:0/github/webhook" };
     };
 
@@ -267,4 +269,36 @@ test("github-webhook preflight failure prevents the listener and GitHub API work
 
   assert.equal(listenerCalled, false);
   assert.equal(apiCalls, 0);
+});
+
+test("github-webhook wires a sanitized production diagnostic before listener readiness", async (t) => {
+  const { cwd } = await setupProject();
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const restoreEnvironment = installGitHubEnvironment();
+  t.after(restoreEnvironment);
+  const originalError = console.error;
+  const originalLog = console.log;
+  const diagnostics: string[] = [];
+  console.error = (...values: unknown[]) => diagnostics.push(values.map(String).join(" "));
+  console.log = () => undefined;
+  t.after(() => {
+    console.error = originalError;
+    console.log = originalLog;
+  });
+  const credential = `ghp_${"a".repeat(24)}`;
+
+  await runCli({
+    argv: ["github-webhook", "--cwd", cwd],
+    observedNodeVersion: CANONICAL_NODE_VERSION,
+    webhookListener: async (options) => {
+      assert.ok(options.onDiagnostic);
+      options.onDiagnostic(new Error(`worker failed Authorization: Bearer ${credential}`));
+      await options.adapter.stopWebhookWorker();
+      return { url: "http://127.0.0.1:0/github/webhook" };
+    },
+  });
+
+  assert.equal(diagnostics.length, 1);
+  assert.match(diagnostics[0]!, /Authorization: Bearer \[REDACTED\]/);
+  assert.doesNotMatch(diagnostics[0]!, new RegExp(credential));
 });

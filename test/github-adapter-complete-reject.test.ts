@@ -1,25 +1,18 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, open, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { mergeConfigForTest } from "../src/config.ts";
 import { GitHubAppAdapter } from "../src/github/adapter.ts";
-import { GitHubDeliveryStore } from "../src/github/delivery-store.ts";
 import { FileRunStore } from "../src/store.ts";
 
-const SECRET = "adapter-complete-secret";
-const SECRET_ENV = "MASWE_TEST_GITHUB_WEBHOOK_SECRET_COMPLETE";
+const SECRET_ENV = "MASWE_TEST_COMPLETE_REJECT_SECRET";
+const SECRET = "complete-reject-secret";
 
-function sign(body: string): string {
-  return `sha256=${createHmac("sha256", SECRET).update(body, "utf8").digest("hex")}`;
-}
-
-test("adapter does not return 200 when delivery completion is rejected", async () => {
+test("file and directory sync failures prevent durable acknowledgement", async (t) => {
   process.env[SECRET_ENV] = SECRET;
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-adapter-complete-"));
-  const store = new FileRunStore(cwd);
   const config = mergeConfigForTest({
     runtime: { kind: "mock" },
     quality: { commands: [] },
@@ -27,51 +20,63 @@ test("adapter does not return 200 when delivery completion is rejected", async (
       enabled: true,
       readOnlyChecks: true,
       webhookSecretEnv: SECRET_ENV,
-      appIdEnv: "MASWE_TEST_GITHUB_APP_ID",
-      privateKeyEnv: "MASWE_TEST_GITHUB_APP_PRIVATE_KEY",
+      appIdEnv: "MASWE_TEST_APP_ID",
+      privateKeyEnv: "MASWE_TEST_PRIVATE_KEY",
       allowedRepositories: ["owner/repo"],
     },
   });
-
-  const adapter = new GitHubAppAdapter({
-    cwd,
-    config,
-    store,
-    http: {
-      async request() {
-        return { status: 200, headers: {}, body: {} };
-      },
-    },
-    tokenProvider: async () => "token",
+  const rawBody = JSON.stringify({
+    ref: "refs/heads/feature",
+    after: "sha",
+    installation: { id: 44 },
+    repository: { full_name: "owner/repo" },
   });
 
-  // Replace delivery store complete to reject after a real claim path is hard;
-  // instead spy by patching the private deliveries field.
-  const deliveries = (adapter as unknown as { deliveries: GitHubDeliveryStore }).deliveries;
-  const originalComplete = deliveries.complete.bind(deliveries);
-  deliveries.complete = async (deliveryId, leaseId) => {
-    await originalComplete(deliveryId, leaseId);
-    return { ok: false, reason: "owner_mismatch" };
-  };
+  for (const failure of ["state-file", "state-directory", "queue-file", "queue-directory"] as const) {
+    await t.test(failure, async (t) => {
+      const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-enqueue-reject-"));
+      t.after(async () => rm(cwd, { recursive: true, force: true }));
+      const adapter = new GitHubAppAdapter({
+        cwd,
+        config,
+        store: new FileRunStore(cwd),
+        http: { async request() { throw new Error("must not dispatch"); } },
+        tokenProvider: async () => "token",
+        inboxOptions: {
+          syncFile: async (handle, filePath) => {
+            if (
+              (failure === "state-file" && filePath.includes("/.state.")) ||
+              (failure === "queue-file" && filePath.endsWith(".queued"))
+            ) {
+              throw new Error(`simulated ${failure} sync failure`);
+            }
+            await handle.sync();
+          },
+          syncDirectory: async (directoryPath) => {
+            if (
+              (failure === "state-directory" && directoryPath.includes("/inbox/state/")) ||
+              (failure === "queue-directory" && directoryPath.includes("/inbox/queue/"))
+            ) {
+              throw new Error(`simulated ${failure} sync failure`);
+            }
+            const handle = await open(directoryPath, "r");
+            try {
+              await handle.sync();
+            } finally {
+              await handle.close();
+            }
+          },
+        },
+      });
 
-  const body = JSON.stringify({
-    action: "deleted",
-    installation: { id: 1 },
-  });
-  await assert.rejects(
-    () =>
-      adapter.handleWebhook({
-        deliveryId: "del-complete-reject",
-        eventName: "installation",
-        signatureHeader: sign(body),
-        rawBody: body,
-      }),
-    (error: unknown) => {
-      assert.ok(error instanceof Error);
-      assert.match(error.message, /completion rejected|owner_mismatch/i);
-      assert.ok(error.cause instanceof Error);
-      assert.match(error.cause.message, /failure rejected|already_completed/i);
-      return true;
-    },
-  );
+      const result = await adapter.handleWebhook({
+        deliveryId: `enqueue-${failure}`,
+        eventName: "push",
+        signatureHeader: `sha256=${createHmac("sha256", SECRET).update(rawBody).digest("hex")}`,
+        rawBody,
+      });
+      assert.equal(result.status, 503);
+      assert.equal(result.body.message, "durable webhook handoff unavailable");
+    });
+  }
 });
