@@ -82,6 +82,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 const MAX_PENDING_CANCELLATION_HEADS = 64;
+const WEBHOOK_QUEUE_SCAN_PAGE = 128;
+const WEBHOOK_IDLE_SCAN_MS = 30_000;
+const WEBHOOK_CURSOR_YIELD_MS = 1;
 
 function pendingCancellationHeads(
   existing: readonly string[] | undefined,
@@ -143,9 +146,13 @@ export class GitHubAppAdapter {
   private webhookWorker: Promise<void> | undefined;
   private webhookWorkerTimer: ReturnType<typeof setTimeout> | undefined;
   private webhookWorkerActive = false;
+  private webhookQueueCursor: string | undefined;
+  private webhookQueueNextAttemptAt: number | undefined;
+  private webhookWorkerNextDelayMs = 0;
   private readonly synchronousWebhookDispatch: boolean;
   private readonly beforeInboxEnqueue: (() => Promise<void>) | undefined;
   private readonly onWebhookDiagnostic: ((error: unknown) => void) | undefined;
+  private readonly onWebhookWorkerSchedule: ((delayMs: number) => void) | undefined;
 
   constructor(options: {
     cwd: string;
@@ -161,6 +168,8 @@ export class GitHubAppAdapter {
     beforeInboxEnqueue?: () => Promise<void>;
     inboxOptions?: ConstructorParameters<typeof GitHubDeliveryInbox>[1];
     onWebhookDiagnostic?: (error: unknown) => void;
+    /** Deterministic seam exposing due-aware worker sleeps. */
+    onWebhookWorkerSchedule?: (delayMs: number) => void;
     /** Deterministic barrier after the manual command's initial snapshot, before its fence. */
     afterManualRunLoaded?: (runId: string) => Promise<void>;
     /** Deterministic barrier before a PR association transaction is acquired. */
@@ -182,6 +191,7 @@ export class GitHubAppAdapter {
     this.synchronousWebhookDispatch = options.synchronousWebhookDispatch ?? false;
     this.beforeInboxEnqueue = options.beforeInboxEnqueue;
     this.onWebhookDiagnostic = options.onWebhookDiagnostic;
+    this.onWebhookWorkerSchedule = options.onWebhookWorkerSchedule;
     this.sideEffects = new GitHubSideEffectStore(root);
     this.associations = new GitHubAssociationIndex(
       root,
@@ -384,8 +394,18 @@ export class GitHubAppAdapter {
   }
 
   private kickWebhookWorker(delayMs = 0): void {
-    if (!this.webhookWorkerEnabled || this.webhookWorker || this.webhookWorkerTimer) return;
+    if (!this.webhookWorkerEnabled || this.webhookWorker) return;
+    if (this.webhookWorkerTimer) {
+      if (delayMs > 0) return;
+      clearTimeout(this.webhookWorkerTimer);
+      this.webhookWorkerTimer = undefined;
+    }
     if (delayMs > 0) {
+      try {
+        this.onWebhookWorkerSchedule?.(delayMs);
+      } catch {
+        // Test/observability hooks never alter worker scheduling.
+      }
       this.webhookWorkerTimer = setTimeout(() => {
         this.webhookWorkerTimer = undefined;
         this.kickWebhookWorker();
@@ -397,7 +417,9 @@ export class GitHubAppAdapter {
       .catch((error) => this.emitWebhookDiagnostic(error))
       .finally(() => {
         this.webhookWorker = undefined;
-        if (this.webhookWorkerEnabled) this.kickWebhookWorker(100);
+        if (this.webhookWorkerEnabled) {
+          this.kickWebhookWorker(this.webhookWorkerNextDelayMs);
+        }
       });
   }
 
@@ -412,8 +434,35 @@ export class GitHubAppAdapter {
   private async runWebhookWorker(): Promise<void> {
     for (;;) {
       if (!this.webhookWorkerEnabled) return;
-      const claimed = await this.inbox.claimNext();
-      if (!claimed) return;
+      const page = await this.inbox.claimNextPage(Date.now(), {
+        ...(this.webhookQueueCursor !== undefined
+          ? { cursor: this.webhookQueueCursor }
+          : {}),
+        limit: WEBHOOK_QUEUE_SCAN_PAGE,
+      });
+      const claimed = page.claimed;
+      if (!claimed) {
+        if (page.nextAttemptAt !== undefined) {
+          this.webhookQueueNextAttemptAt = this.webhookQueueNextAttemptAt === undefined
+            ? page.nextAttemptAt
+            : Math.min(this.webhookQueueNextAttemptAt, page.nextAttemptAt);
+        }
+        if (page.nextCursor !== undefined) {
+          this.webhookQueueCursor = page.nextCursor;
+          this.webhookWorkerNextDelayMs = WEBHOOK_CURSOR_YIELD_MS;
+          return;
+        }
+        this.webhookQueueCursor = undefined;
+        const earliest = this.webhookQueueNextAttemptAt;
+        this.webhookQueueNextAttemptAt = undefined;
+        this.webhookWorkerNextDelayMs = earliest === undefined
+          ? WEBHOOK_IDLE_SCAN_MS
+          : Math.max(1, earliest - Date.now());
+        return;
+      }
+      this.webhookQueueCursor = undefined;
+      this.webhookQueueNextAttemptAt = undefined;
+      this.webhookWorkerNextDelayMs = 0;
       this.webhookWorkerActive = true;
       const { deliveryId } = claimed.record;
       const leaseId = claimed.record.leaseId;

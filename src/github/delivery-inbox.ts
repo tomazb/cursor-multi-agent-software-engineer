@@ -48,6 +48,18 @@ export interface ClaimedInboxDelivery {
   };
 }
 
+export interface InboxClaimPage {
+  claimed?: ClaimedInboxDelivery;
+  /** Earliest retry or lease-reclaim time observed in this bounded page. */
+  nextAttemptAt?: number;
+  /** Opaque lexicographic queue cursor; absent after one complete queue cycle. */
+  nextCursor?: string;
+  scanned: number;
+}
+
+const DEFAULT_QUEUE_SCAN_PAGE = 128;
+const MAX_QUEUE_SCAN_PAGE = 256;
+
 function errno(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
 }
@@ -823,10 +835,74 @@ export class GitHubDeliveryInbox {
     return hashes;
   }
 
+  private async queuedHashPage(
+    cursor: string | undefined,
+    limit: number,
+  ): Promise<{ hashes: string[]; nextCursor?: string }> {
+    if (cursor !== undefined && !HASH_PATTERN.test(cursor)) {
+      throw new Error("Invalid GitHub durable inbox queue cursor");
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_QUEUE_SCAN_PAGE) {
+      throw new Error(`GitHub durable inbox queue page limit must be 1-${MAX_QUEUE_SCAN_PAGE}`);
+    }
+    let prefixes: string[];
+    try {
+      prefixes = (await readdir(this.queueRoot)).sort();
+    } catch (error) {
+      if (errno(error) === "ENOENT") return { hashes: [] };
+      throw error;
+    }
+    const hashes: string[] = [];
+    let hasMore = false;
+    scan: for (const prefix of prefixes) {
+      if (!/^[0-9a-f]{2}$/.test(prefix)) {
+        throw new Error("Invalid GitHub durable inbox queue entry");
+      }
+      if (cursor !== undefined && prefix < cursor.slice(0, 2)) continue;
+      const prefixPath = path.join(this.queueRoot, prefix);
+      await createDirectory(prefixPath);
+      for (const name of (await readdir(prefixPath)).sort()) {
+        const hash = name.endsWith(".queued") ? name.slice(0, -7) : "";
+        if (!HASH_PATTERN.test(hash) || !hash.startsWith(prefix)) {
+          throw new Error("Invalid GitHub durable inbox queue entry");
+        }
+        if (cursor !== undefined && hash <= cursor) continue;
+        if (hashes.length === limit) {
+          hasMore = true;
+          break scan;
+        }
+        hashes.push(hash);
+      }
+    }
+    return {
+      hashes,
+      ...(hasMore ? { nextCursor: hashes.at(-1)! } : {}),
+    };
+  }
+
   async claimNext(nowMs = Date.now()): Promise<ClaimedInboxDelivery | undefined> {
+    let cursor: string | undefined;
+    do {
+      const page = await this.claimNextPage(nowMs, {
+        ...(cursor !== undefined ? { cursor } : {}),
+      });
+      if (page.claimed) return page.claimed;
+      cursor = page.nextCursor;
+    } while (cursor !== undefined);
+    return undefined;
+  }
+
+  async claimNextPage(
+    nowMs = Date.now(),
+    options: { cursor?: string; limit?: number } = {},
+  ): Promise<InboxClaimPage> {
     await this.initialize();
     const observedQueue: Array<{ hash: string; record: InboxDeliveryRecord }> = [];
-    for (const hash of await this.queuedHashes()) {
+    const queuePage = await this.queuedHashPage(
+      options.cursor,
+      options.limit ?? DEFAULT_QUEUE_SCAN_PAGE,
+    );
+    for (const hash of queuePage.hashes) {
       const statePath = this.pathsForHash(hash).statePath;
       try {
         observedQueue.push({
@@ -846,8 +922,9 @@ export class GitHubDeliveryInbox {
         left.record.receivedAt.localeCompare(right.record.receivedAt) ||
         left.record.deliveryId.localeCompare(right.record.deliveryId),
     );
+    let nextAttemptAt: number | undefined;
     for (const { hash, record: observed } of observedQueue) {
-      const claimed = await withGitHubJournal(
+      const outcome = await withGitHubJournal(
         this.githubRoot,
         "delivery",
         observed.deliveryId,
@@ -866,13 +943,13 @@ export class GitHubDeliveryInbox {
             current.status === "processing" &&
             Date.parse(current.leaseExpiresAt!) > nowMs
           ) {
-            return undefined;
+            return { deferredUntil: Date.parse(current.leaseExpiresAt!) } as const;
           }
           if (
             current.status === "queued" &&
             Date.parse(current.nextAttemptAt!) > nowMs
           ) {
-            return undefined;
+            return { deferredUntil: Date.parse(current.nextAttemptAt!) } as const;
           }
           const leaseId = randomUUID();
           const processing: InboxDeliveryRecord = {
@@ -885,13 +962,30 @@ export class GitHubDeliveryInbox {
           delete processing.nextAttemptAt;
           await this.writeState(processing);
           return {
-            record: processing as ClaimedInboxDelivery["record"],
-          };
+            claimed: {
+              record: processing as ClaimedInboxDelivery["record"],
+            },
+          } as const;
         },
       );
-      if (claimed) return claimed;
+      if (outcome && "claimed" in outcome) {
+        return {
+          claimed: outcome.claimed,
+          scanned: queuePage.hashes.length,
+          ...(queuePage.nextCursor ? { nextCursor: queuePage.nextCursor } : {}),
+        };
+      }
+      if (outcome && "deferredUntil" in outcome) {
+        nextAttemptAt = nextAttemptAt === undefined
+          ? outcome.deferredUntil
+          : Math.min(nextAttemptAt, outcome.deferredUntil);
+      }
     }
-    return undefined;
+    return {
+      scanned: queuePage.hashes.length,
+      ...(nextAttemptAt !== undefined ? { nextAttemptAt } : {}),
+      ...(queuePage.nextCursor ? { nextCursor: queuePage.nextCursor } : {}),
+    };
   }
 
   async heartbeat(deliveryId: string, leaseId: string, nowMs = Date.now()): Promise<boolean> {

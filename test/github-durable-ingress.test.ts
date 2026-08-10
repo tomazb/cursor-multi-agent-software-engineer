@@ -28,9 +28,9 @@ function config() {
   });
 }
 
-function deferred(): { promise: Promise<void>; resolve: () => void } {
-  let resolve!: () => void;
-  const promise = new Promise<void>((settle) => {
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
     resolve = settle;
   });
   return { promise, resolve };
@@ -141,6 +141,53 @@ test("durable ingress resumes an acknowledged queued event after restart", async
   const replay = await restarted.handleWebhook(signedRequest("durable-restart"));
   assert.equal(replay.status, 200);
   assert.equal(replay.body.duplicate, true);
+});
+
+test("an idle worker sleeps until due and a new enqueue wakes it immediately", async (t) => {
+  process.env[SECRET_ENV] = SECRET;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-durable-due-aware-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const scheduled = deferred<number>();
+  const dispatchReached = deferred();
+  const adapter = new GitHubAppAdapter({
+    cwd,
+    config: config(),
+    store: new FileRunStore(cwd),
+    http: {
+      async request(method, url) {
+        if (method === "GET" && url.includes("/pulls/")) {
+          dispatchReached.resolve();
+          return {
+            status: 200,
+            headers: {},
+            body: { head: { sha: "sha-durable" }, state: "open" },
+          };
+        }
+        if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
+        return { status: 201, headers: {}, body: { id: 1 } };
+      },
+    },
+    tokenProvider: async () => "token",
+    onWebhookWorkerSchedule: (delayMs) => scheduled.resolve(delayMs),
+  } as ConstructorParameters<typeof GitHubAppAdapter>[0] & {
+    onWebhookWorkerSchedule: (delayMs: number) => void;
+  });
+  await adapter.startWebhookWorker();
+  t.after(async () => adapter.stopWebhookWorker({ drainMs: 10 }));
+  const idleDelay = await Promise.race([
+    scheduled.promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("idle worker schedule was not exposed")), 1_000)),
+  ]);
+  assert.ok(idleDelay >= 1_000, `idle worker unexpectedly polled after ${idleDelay}ms`);
+
+  assert.equal((await adapter.handleWebhook(signedRequest("due-aware-wake"))).status, 202);
+  await Promise.race([
+    dispatchReached.promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("new enqueue did not wake the idle worker")), 500)),
+  ]);
+  await adapter.waitForWebhookIdle();
 });
 
 test("queued duplicates are acknowledged and conflicting delivery bytes are rejected", async (t) => {

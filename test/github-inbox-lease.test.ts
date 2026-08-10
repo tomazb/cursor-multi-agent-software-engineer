@@ -68,6 +68,68 @@ test("retry backoff prevents an immediate redispatch", async (t) => {
   assert.equal(retry.record.attempt, 2);
 });
 
+test("bounded queue pages expose the earliest deferred retry to a cursor consumer", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-page-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const inbox = new GitHubDeliveryInbox(root);
+  await enqueue(inbox, "due-early");
+  await enqueue(inbox, "due-late");
+  const base = Date.now() + 10;
+  const early = await inbox.claimNext(base);
+  assert.equal(early?.record.deliveryId, "due-early");
+  assert.equal(await inbox.retry("due-early", early!.record.leaseId, base), true);
+  const late = await inbox.claimNext(base + 1);
+  assert.equal(late?.record.deliveryId, "due-late");
+  assert.equal(await inbox.retry("due-late", late!.record.leaseId, base + 100), true);
+
+  let cursor: string | undefined;
+  let earliest = Number.POSITIVE_INFINITY;
+  let pages = 0;
+  do {
+    const page = await inbox.claimNextPage(base + 200, {
+      ...(cursor !== undefined ? { cursor } : {}),
+      limit: 1,
+    });
+    assert.equal(page.claimed, undefined);
+    assert.ok(page.scanned <= 1);
+    if (page.nextAttemptAt !== undefined) earliest = Math.min(earliest, page.nextAttemptAt);
+    cursor = page.nextCursor;
+    pages += 1;
+    assert.ok(pages <= 4, "bounded cursor did not complete one queue cycle");
+  } while (cursor !== undefined);
+
+  assert.equal(pages, 2);
+  assert.equal(earliest, base + 250);
+
+  cursor = undefined;
+  let claimed: Awaited<ReturnType<GitHubDeliveryInbox["claimNext"]>>;
+  do {
+    const page = await inbox.claimNextPage(base + 250, {
+      ...(cursor !== undefined ? { cursor } : {}),
+      limit: 1,
+    });
+    claimed = page.claimed;
+    cursor = page.nextCursor;
+  } while (!claimed && cursor !== undefined);
+  assert.equal(claimed?.record.deliveryId, "due-early");
+});
+
+test("bounded queue pages expose a processing lease expiry without claiming it early", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-lease-page-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const inbox = new GitHubDeliveryInbox(root, { leaseMs: 1_000 });
+  await enqueue(inbox, "lease-page");
+  const base = Date.now() + 10;
+  const active = await inbox.claimNext(base);
+  assert.ok(active);
+
+  const page = await inbox.claimNextPage(base + 100, { limit: 1 });
+  assert.equal(page.claimed, undefined);
+  assert.equal(page.nextAttemptAt, base + 1_000);
+  assert.equal(page.nextCursor, undefined);
+  assert.equal(page.scanned, 1);
+});
+
 test("concurrent claimers publish exactly one processing lease", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-concurrent-"));
   t.after(async () => rm(root, { recursive: true, force: true }));
