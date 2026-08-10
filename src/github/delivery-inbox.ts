@@ -66,66 +66,112 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-const EVENT_TYPES = new Set<string>([
-  "pull_request.opened",
-  "pull_request.synchronize",
-  "pull_request.reopened",
-  "pull_request.ready_for_review",
-  "pull_request.closed",
-  "push",
-  "installation.created",
-  "installation.deleted",
-  "installation_repositories.added",
-  "installation_repositories.removed",
-  "workflow_run.completed",
-  "check_run.completed",
-  "check_suite.completed",
-]);
+function canonicalRepository(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[^/\s]+\/[^/\s]+$/.test(value) &&
+    value === value.toLowerCase()
+  );
+}
 
-function validEvent(value: unknown, deliveryId: string, receivedAt: string): value is GitHubInternalEvent {
+function validEvent(
+  value: unknown,
+  deliveryId: string,
+  receivedAt: string,
+  eventName: string,
+): value is GitHubInternalEvent {
   if (!isRecord(value)) return false;
-  const allowed = new Set([
-    "eventId",
-    "type",
-    "repository",
-    "repositories",
-    "installationId",
-    "pullRequestNumber",
-    "headSha",
-    "baseSha",
-    "branch",
-    "observeOnly",
-    "receivedAt",
-    "rawAction",
-  ]);
-  if (Object.keys(value).some((key) => !allowed.has(key))) return false;
   if (
     value.eventId !== deliveryId ||
     value.receivedAt !== receivedAt ||
-    typeof value.type !== "string" ||
-    !EVENT_TYPES.has(value.type)
+    typeof value.type !== "string"
   ) {
     return false;
   }
-  for (const key of ["repository", "headSha", "baseSha", "branch", "rawAction"] as const) {
-    if (value[key] !== undefined && (typeof value[key] !== "string" || !value[key])) return false;
+  const exactFields = (fields: string[]): boolean => {
+    const allowed = new Set(["eventId", "type", "receivedAt", ...fields]);
+    return Object.keys(value).every((key) => allowed.has(key));
+  };
+  const nonEmpty = (field: string): boolean =>
+    typeof value[field] === "string" && Boolean(value[field]);
+  const positiveInteger = (field: string): boolean =>
+    Number.isSafeInteger(value[field]) && Number(value[field]) > 0;
+
+  if (value.type.startsWith("pull_request.")) {
+    const action = value.type.slice("pull_request.".length);
+    return (
+      eventName === "pull_request" &&
+      new Set(["opened", "synchronize", "reopened", "ready_for_review", "closed"]).has(action) &&
+      exactFields([
+        "repository",
+        "installationId",
+        "pullRequestNumber",
+        "headSha",
+        "baseSha",
+        "branch",
+        "rawAction",
+      ]) &&
+      canonicalRepository(value.repository) &&
+      positiveInteger("installationId") &&
+      positiveInteger("pullRequestNumber") &&
+      nonEmpty("headSha") &&
+      nonEmpty("baseSha") &&
+      nonEmpty("branch") &&
+      value.rawAction === action
+    );
   }
-  for (const key of ["installationId", "pullRequestNumber"] as const) {
-    if (
-      value[key] !== undefined &&
-      (!Number.isSafeInteger(value[key]) || Number(value[key]) <= 0)
-    ) {
-      return false;
-    }
+  if (value.type === "push") {
+    return (
+      eventName === "push" &&
+      exactFields(["repository", "installationId", "headSha", "branch"]) &&
+      canonicalRepository(value.repository) &&
+      positiveInteger("installationId") &&
+      nonEmpty("headSha") &&
+      nonEmpty("branch")
+    );
+  }
+  if (value.type === "installation.created" || value.type === "installation.deleted") {
+    const action = value.type.slice("installation.".length);
+    return (
+      eventName === "installation" &&
+      exactFields(["installationId", "rawAction"]) &&
+      positiveInteger("installationId") &&
+      value.rawAction === action
+    );
   }
   if (
-    value.repositories !== undefined &&
-    (!Array.isArray(value.repositories) ||
-      value.repositories.some((repository) => typeof repository !== "string" || !repository))
+    value.type === "installation_repositories.added" ||
+    value.type === "installation_repositories.removed"
   ) {
-    return false;
+    const action = value.type.slice("installation_repositories.".length);
+    const repositories = value.repositories;
+    return (
+      eventName === "installation_repositories" &&
+      exactFields(["installationId", "repository", "repositories", "rawAction"]) &&
+      positiveInteger("installationId") &&
+      (value.repository === undefined || canonicalRepository(value.repository)) &&
+      Array.isArray(repositories) &&
+      repositories.every(canonicalRepository) &&
+      new Set(repositories).size === repositories.length &&
+      (repositories.length === 0 || value.repository === repositories[0]) &&
+      value.rawAction === action
+    );
   }
-  return value.observeOnly === undefined || typeof value.observeOnly === "boolean";
+  const observeEventName = new Map([
+    ["workflow_run.completed", "workflow_run"],
+    ["check_run.completed", "check_run"],
+    ["check_suite.completed", "check_suite"],
+  ]).get(value.type);
+  return (
+    observeEventName !== undefined &&
+    eventName === observeEventName &&
+    exactFields(["repository", "installationId", "headSha", "observeOnly", "rawAction"]) &&
+    canonicalRepository(value.repository) &&
+    positiveInteger("installationId") &&
+    nonEmpty("headSha") &&
+    value.observeOnly === true &&
+    value.rawAction === "completed"
+  );
 }
 
 function parseRecord(raw: string): InboxDeliveryRecord {
@@ -208,7 +254,7 @@ function parseRecord(raw: string): InboxDeliveryRecord {
     }
     return result;
   }
-  if (!validEvent(result.event, result.deliveryId, result.receivedAt)) {
+  if (!validEvent(result.event, result.deliveryId, result.receivedAt, result.eventName!)) {
     throw new Error("Invalid GitHub durable inbox event");
   }
   if (result.status === "processing") {
@@ -642,6 +688,9 @@ export class GitHubDeliveryInbox {
     event: GitHubInternalEvent;
   }): Promise<InboxEnqueueResult> {
     await this.initialize();
+    if (!validEvent(input.event, input.deliveryId, input.receivedAt, input.eventName)) {
+      throw new Error("Invalid GitHub durable inbox event");
+    }
     return withGitHubJournal(this.githubRoot, "delivery", input.deliveryId, async () => {
       const current = await this.readState(input.deliveryId);
       if (current) {

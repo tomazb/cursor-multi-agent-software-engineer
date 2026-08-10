@@ -169,6 +169,7 @@ test("normalize installation_repositories.removed keeps all canonical repositori
       repositories_removed: [
         { full_name: "Owner/One" },
         { full_name: "OWNER/Two" },
+        { full_name: "owner/one" },
       ],
     },
   });

@@ -11,6 +11,7 @@ import type {
 import {
   createWebhookServer,
   listenWebhookServer,
+  WebhookIngressDeadlineError,
   type WebhookServerOptions,
 } from "../src/github/webhook-server.ts";
 
@@ -260,6 +261,72 @@ test("webhook forwards the exact request bytes without UTF-8 replacement", async
   assert.equal(response.status, 400);
   assert.ok(Buffer.isBuffer(fake.calls[0]?.rawBody));
   assert.deepEqual(fake.calls[0]?.rawBody, bytes);
+});
+
+test("webhook returns 503 within one ingress deadline when body receipt stalls", async () => {
+  const diagnostics: unknown[] = [];
+  const body = new Readable({ read() {} });
+  const fake = recordingAdapter();
+  const started = Date.now();
+
+  const response = await dispatchWebhook(
+    {
+      adapter: fake.adapter,
+      ingressTimeoutMs: 25,
+      onDiagnostic: (error) => diagnostics.push(error),
+    },
+    validHeaders,
+    { body },
+  );
+
+  assert.equal(response.status, 503);
+  assert.ok(Date.now() - started < 500);
+  assert.deepEqual(fake.calls, []);
+  assert.equal(diagnostics.length, 1);
+  assert.equal((diagnostics[0] as WebhookIngressDeadlineError).code, "GITHUB_WEBHOOK_INGRESS_NOT_STARTED");
+  assert.equal(body.destroyed, true);
+});
+
+test("webhook ingress deadline includes the durable adapter handoff", async () => {
+  const diagnostics: unknown[] = [];
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let finishLate!: () => void;
+  const lateFinished = new Promise<void>((resolve) => { finishLate = resolve; });
+  let durable = false;
+  const fake = recordingAdapter();
+  fake.adapter.handleWebhook = async () => {
+    if (!durable) {
+      await blocked;
+      durable = true;
+      finishLate();
+      return { status: 202, body: { ok: true } };
+    }
+    return { status: 202, body: { ok: true, duplicate: true } };
+  };
+
+  const response = await dispatchWebhook(
+    {
+      adapter: fake.adapter,
+      ingressTimeoutMs: 25,
+      onDiagnostic: (error) => diagnostics.push(error),
+    },
+    validHeaders,
+  );
+
+  assert.equal(response.status, 503);
+  assert.equal(diagnostics.length, 1);
+  assert.ok(diagnostics[0] instanceof WebhookIngressDeadlineError);
+  assert.equal(
+    (diagnostics[0] as WebhookIngressDeadlineError).code,
+    "GITHUB_WEBHOOK_INGRESS_OUTCOME_UNKNOWN",
+  );
+  release();
+  await lateFinished;
+
+  const replay = await dispatchWebhook({ adapter: fake.adapter }, validHeaders);
+  assert.equal(replay.status, 202);
+  assert.equal(JSON.parse(replay.body).duplicate, true);
 });
 
 test("webhook does not read invalid-header bodies before returning 400", async () => {

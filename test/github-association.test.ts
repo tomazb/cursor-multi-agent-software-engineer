@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -100,4 +100,61 @@ test("association index finds all non-suspended branch associations in PR order"
   assert.ok(firstMatch);
   firstMatch.headSha = "mutated-snapshot";
   assert.equal((await index.find("owner/repo", 2))?.headSha, "head-two");
+});
+
+test("association index rejects two active PRs owning the same run id", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-unique-run-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  const base = {
+    runId: "run-unique",
+    installationId: 10,
+    repository: "owner/repo",
+    baseSha: "base",
+    headSha: "head",
+    branch: "maswe/shared",
+  };
+  await index.bind({ ...base, pullRequestNumber: 1 });
+
+  await assert.rejects(
+    index.bind({ ...base, pullRequestNumber: 2 }),
+    /already associated|duplicate active run/i,
+  );
+});
+
+test("association index fails closed on malformed or duplicate persisted records", async (t) => {
+  for (const corruption of ["extra-field", "duplicate-run"] as const) {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), `maswe-gh-assoc-corrupt-${corruption}-`));
+    t.after(async () => rm(cwd, { recursive: true, force: true }));
+    const githubRoot = path.join(cwd, ".maswe", "github");
+    await mkdir(githubRoot, { recursive: true });
+    const record = (pullRequestNumber: number) => ({
+      runId: "run-duplicate",
+      installationId: 10,
+      repository: "owner/repo",
+      pullRequestNumber,
+      baseSha: "base",
+      headSha: "head",
+      branch: "maswe/shared",
+      suspended: false,
+      updatedAt: "2026-08-10T00:00:00.000Z",
+    });
+    const records: Record<string, unknown> = {
+      "owner/repo#1": {
+        ...record(1),
+        ...(corruption === "extra-field" ? { token: "must-not-be-accepted" } : {}),
+      },
+      ...(corruption === "duplicate-run" ? { "owner/repo#2": record(2) } : {}),
+    };
+    await writeFile(
+      path.join(githubRoot, "associations.json"),
+      `${JSON.stringify(records)}\n`,
+      "utf8",
+    );
+
+    await assert.rejects(
+      new GitHubAssociationIndex(githubRoot).find("owner/repo", 1),
+      /Invalid GitHub association index|duplicate active run/i,
+    );
+  }
 });

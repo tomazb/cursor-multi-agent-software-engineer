@@ -40,6 +40,7 @@ export interface RunGitHubAssociation {
   headSha: string;
   branch: string;
   suspended?: boolean;
+  suspensionReason?: "pull-request-closed" | "authorization-revoked";
   /** Old heads whose published checks must be cancelled before this publication is complete. */
   pendingCancellationHeadShas?: string[];
 }

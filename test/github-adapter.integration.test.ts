@@ -536,14 +536,67 @@ test("integration: pull request close suspends the index and run association", a
 
   assert.equal(result.status, 200);
   assert.equal((await index.find("owner/repo", 9))?.suspended, true);
+  assert.equal(
+    (await index.find("owner/repo", 9))?.suspensionReason,
+    "pull-request-closed",
+  );
   assert.equal((await store.load(run.id)).github?.suspended, true);
+  assert.equal(
+    (await store.load(run.id)).github?.suspensionReason,
+    "pull-request-closed",
+  );
   assert.deepEqual(await index.findAllByRepositoryBranch("owner/repo", "maswe/run-1"), []);
   assert.equal(posts.length, 0);
 });
 
-test("integration: installation deletion suspends run records", async () => {
+test("integration: a reopened PR clears only closure suspension and republishes", async () => {
   process.env[SECRET_ENV] = SECRET;
-  const { adapter, cwd, store, posts } = await setup();
+  const { adapter, store, cwd, posts } = await setup({ liveHead: "sha-reopen" });
+  const run = await store.create("close-reopen", "req", testConfig());
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-reopen",
+    branch: "maswe/run-1",
+    suspended: false,
+  };
+  await store.save(run);
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  await index.bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-reopen",
+    branch: "maswe/run-1",
+  });
+  const closeBody = JSON.stringify(prPayload("sha-reopen", 9, "closed"));
+  await adapter.handleWebhook({
+    deliveryId: "del-close-before-reopen",
+    eventName: "pull_request",
+    signatureHeader: sign(closeBody),
+    rawBody: closeBody,
+  });
+
+  const reopenBody = JSON.stringify(prPayload("sha-reopen", 9, "reopened"));
+  assert.equal((await adapter.handleWebhook({
+    deliveryId: "del-reopen-after-close",
+    eventName: "pull_request",
+    signatureHeader: sign(reopenBody),
+    rawBody: reopenBody,
+  })).status, 200);
+
+  assert.equal((await index.find("owner/repo", 9))?.suspended, false);
+  assert.equal((await store.load(run.id)).github?.suspended, false);
+  assert.equal(posts.length, 4);
+});
+
+test("integration: installation deletion suspension cannot be cleared by reopen", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { adapter, cwd, store, posts } = await setup({ liveHead: "sha-after-suspend" });
   const run = await store.create("suspend-me", "req", testConfig());
   run.github = {
     installationId: 44,
@@ -575,9 +628,17 @@ test("integration: installation deletion suspends run records", async () => {
   });
   assert.equal(result.status, 200);
   assert.equal((await index.find("owner/repo", 9))?.suspended, true);
+  assert.equal(
+    (await index.find("owner/repo", 9))?.suspensionReason,
+    "authorization-revoked",
+  );
   assert.equal((await store.load(run.id)).github?.suspended, true);
+  assert.equal(
+    (await store.load(run.id)).github?.suspensionReason,
+    "authorization-revoked",
+  );
 
-  const syncBody = JSON.stringify(prPayload("sha-after-suspend"));
+  const syncBody = JSON.stringify(prPayload("sha-after-suspend", 9, "reopened"));
   const after = await adapter.handleWebhook({
     deliveryId: "del-after-suspend",
     eventName: "pull_request",

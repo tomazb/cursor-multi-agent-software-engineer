@@ -220,6 +220,14 @@ export function migrateRunRecord(raw: unknown): RunRecord {
       throw new Error("Run record github.installationId must be a positive integer");
     }
     const association = github as Record<string, unknown>;
+    if (
+      association.suspensionReason !== undefined &&
+      (association.suspended !== true ||
+        (association.suspensionReason !== "pull-request-closed" &&
+          association.suspensionReason !== "authorization-revoked"))
+    ) {
+      throw new Error("Run record github.suspensionReason is invalid");
+    }
     const pending = association.pendingCancellationHeadShas;
     if (pending !== undefined) {
       if (

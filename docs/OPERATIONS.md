@@ -238,6 +238,13 @@ Listener readiness also requires the configured webhook secret, App ID, and priv
 environment variables to be present. Only presence is checked; credential values and configured
 environment-variable names are not persisted or written to diagnostics.
 
+The listener defaults to loopback. An explicit `0.0.0.0` or `::` binding is an operator opt-in and
+must sit behind a TLS-terminating reverse proxy plus network admission controls. Keep signature
+verification mandatory even if the proxy restricts GitHub source ranges. Configure the proxy and
+firewall with a one MiB body ceiling, bounded connection/rate concurrency, header and body-idle
+timeouts, and an end-to-end request timeout that allows the app's eight-second ingress deadline to
+return before GitHub's ten-second cutoff. Do not trust forwarded identity or authorization headers.
+
 Run exactly one webhook listener/worker plus simultaneous manual publishers on one host and one
 coherent local filesystem with atomic no-clobber hard links. This is not a distributed queue. NFS,
 SMB, distributed FUSE, object-store mounts, cross-host use, a second listener, and filesystems
@@ -263,6 +270,11 @@ and file-plus-directory sync of the normalized envelope and queue marker. It doe
 live-head or Checks API calls. The persisted envelope contains the normalized event, event name,
 delivery ID, receive time, raw-body SHA-256, and queue lease fields only—never raw request bytes,
 signatures, headers, tokens, secrets, keys, or arbitrary error text.
+
+One sub-ten-second deadline covers body receipt through durable handoff. A body timeout destroys
+the incomplete request and reports that handoff never started. Once handoff starts, a deadline
+returns 503 with an outcome-unknown diagnostic while the local filesystem operation finishes;
+same-delivery replay reconciles either result without duplicate dispatch.
 
 Every production GitHub HTTP request has a 30-second default deadline, including installation
 token, live-head, Checks API, webhook-triggered, and manual-publication calls. Rate-limit retries

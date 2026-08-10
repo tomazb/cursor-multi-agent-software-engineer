@@ -3,11 +3,27 @@ import type { GitHubAppAdapter } from "./adapter.ts";
 
 /** Default max raw webhook body size (1 MiB). */
 export const DEFAULT_WEBHOOK_MAX_BODY_BYTES = 1_048_576;
+/** Leaves two seconds for GitHub to receive the response before its ten-second cutoff. */
+export const DEFAULT_WEBHOOK_INGRESS_TIMEOUT_MS = 8_000;
 
 export class WebhookBodyTooLargeError extends Error {
   constructor(maxBytes: number) {
     super(`Webhook body exceeds limit of ${maxBytes} bytes`);
     this.name = "WebhookBodyTooLargeError";
+  }
+}
+
+export class WebhookIngressDeadlineError extends Error {
+  readonly code: "GITHUB_WEBHOOK_INGRESS_NOT_STARTED" | "GITHUB_WEBHOOK_INGRESS_OUTCOME_UNKNOWN";
+  readonly handoffStarted: boolean;
+
+  constructor(handoffStarted: boolean) {
+    super("GitHub webhook ingress deadline exceeded");
+    this.name = "WebhookIngressDeadlineError";
+    this.handoffStarted = handoffStarted;
+    this.code = handoffStarted
+      ? "GITHUB_WEBHOOK_INGRESS_OUTCOME_UNKNOWN"
+      : "GITHUB_WEBHOOK_INGRESS_NOT_STARTED";
   }
 }
 
@@ -41,6 +57,7 @@ export interface WebhookServerOptions {
   port?: number;
   path?: string;
   maxBodyBytes?: number;
+  ingressTimeoutMs?: number;
   onDiagnostic?: (error: unknown) => void;
   /** Deterministic listener-start seam for tests. */
   listenServer?: (
@@ -84,7 +101,12 @@ function emitDiagnostic(onDiagnostic: ((error: unknown) => void) | undefined, er
 export function createWebhookServer(options: WebhookServerOptions): Server {
   const webhookPath = options.path ?? "/github/webhook";
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_WEBHOOK_MAX_BODY_BYTES;
+  const ingressTimeoutMs = options.ingressTimeoutMs ?? DEFAULT_WEBHOOK_INGRESS_TIMEOUT_MS;
+  if (!Number.isInteger(ingressTimeoutMs) || ingressTimeoutMs < 1 || ingressTimeoutMs >= 10_000) {
+    throw new Error("GitHub webhook ingress timeout must be below ten seconds");
+  }
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    let bodyAborted = false;
     try {
       if (req.method !== "POST" || (req.url ?? "").split("?")[0] !== webhookPath) {
         res.writeHead(404, { "content-type": "application/json" });
@@ -98,12 +120,33 @@ export function createWebhookServer(options: WebhookServerOptions): Server {
         invalidWebhookHeaders(res);
         return;
       }
-      const rawBody = await readRawBodyBytes(req, maxBodyBytes);
-      const result = await options.adapter.handleWebhook({
-        deliveryId,
-        eventName,
-        signatureHeader,
-        rawBody,
+      let timedOut = false;
+      let handoffStarted = false;
+      const ingress = (async () => {
+        const rawBody = await readRawBodyBytes(req, maxBodyBytes);
+        handoffStarted = true;
+        return options.adapter.handleWebhook({
+          deliveryId,
+          eventName,
+          signatureHeader,
+          rawBody,
+        });
+      })();
+      void ingress.catch((error) => {
+        if (timedOut && !bodyAborted) emitDiagnostic(options.onDiagnostic, error);
+      });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const result = await Promise.race([
+        ingress,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(new WebhookIngressDeadlineError(handoffStarted));
+          }, ingressTimeoutMs);
+          timer.unref();
+        }),
+      ]).finally(() => {
+        if (timer !== undefined) clearTimeout(timer);
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -112,6 +155,20 @@ export function createWebhookServer(options: WebhookServerOptions): Server {
         req.resume();
         res.writeHead(413, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, message: error.message }));
+        return;
+      }
+      if (error instanceof WebhookIngressDeadlineError) {
+        if (!error.handoffStarted) {
+          bodyAborted = true;
+          req.destroy();
+        }
+        emitDiagnostic(options.onDiagnostic, error);
+        if (!res.headersSent) {
+          res.writeHead(503, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: false, message: "durable webhook handoff unavailable" }));
+        } else if (!res.writableEnded) {
+          res.end();
+        }
         return;
       }
       emitDiagnostic(options.onDiagnostic, error);
@@ -123,6 +180,7 @@ export function createWebhookServer(options: WebhookServerOptions): Server {
       res.end(JSON.stringify({ ok: false, message: "internal server error" }));
     }
   });
+  server.requestTimeout = ingressTimeoutMs;
   server.on("error", (error) => emitDiagnostic(options.onDiagnostic, error));
   return server;
 }

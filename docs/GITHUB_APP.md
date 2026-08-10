@@ -201,6 +201,10 @@ The run record retains a bounded set of pending old-head cancellations until eve
 the current-head publication succeeds. A retry therefore cannot forget uncancelled checks after a
 partial Checks API failure or a later head change.
 
+Association state is exact-schema validated and permits one active PR per run ID. PR closure uses
+a distinct suspension reason, so a valid `reopened` event can reactivate it. Installation deletion
+or repository removal uses authorization suspension, which no PR event may clear.
+
 ## Approval model
 
 Initial options, in increasing assurance:

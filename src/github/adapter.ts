@@ -676,8 +676,18 @@ export class GitHubAppAdapter {
         if (error instanceof Error && /not found|missing/i.test(error.message)) continue;
         throw error;
       }
-      if (!run.github || run.github.suspended) continue;
-      run.github = { ...run.github, suspended: true };
+      if (!run.github) continue;
+      if (
+        run.github.suspended &&
+        run.github.suspensionReason === "authorization-revoked"
+      ) {
+        continue;
+      }
+      run.github = {
+        ...run.github,
+        suspended: true,
+        suspensionReason: "authorization-revoked",
+      };
       await this.store.save(run);
     }
   }
@@ -767,7 +777,13 @@ export class GitHubAppAdapter {
       await this.beforeAssociationTransaction?.(event.eventId);
       const publication = await this.associations.withTransaction(async (transaction) => {
         const association = transaction.find(repository, pullRequestNumber);
-        if (association?.suspended) return { kind: "ignore" } as const;
+        const reopeningClosure =
+          event.type === "pull_request.reopened" &&
+          association?.suspended === true &&
+          association.suspensionReason === "pull-request-closed";
+        if (association?.suspended && !reopeningClosure) {
+          return { kind: "ignore" } as const;
+        }
 
         if (event.type === "pull_request.closed") {
           const associatedRun = association
@@ -775,11 +791,19 @@ export class GitHubAppAdapter {
             : await this.findMatchingRun(repository, pullRequestNumber, event.branch);
           if (associatedRun?.github) {
             const before = structuredClone(associatedRun);
-            associatedRun.github = { ...associatedRun.github, suspended: true };
+            associatedRun.github = {
+              ...associatedRun.github,
+              suspended: true,
+              suspensionReason: "pull-request-closed",
+            };
             await this.saveAssociationMutation(before, associatedRun, transaction);
           }
           if (association) {
-            transaction.suspend(repository, pullRequestNumber);
+            transaction.suspend(
+              repository,
+              pullRequestNumber,
+              "pull-request-closed",
+            );
           } else if (associatedRun?.github) {
             transaction.bind({
               runId: associatedRun.id,
@@ -790,6 +814,7 @@ export class GitHubAppAdapter {
               headSha,
               branch: associatedRun.github.branch,
               suspended: true,
+              suspensionReason: "pull-request-closed",
             });
           }
           return { kind: "ignore" } as const;
@@ -799,7 +824,12 @@ export class GitHubAppAdapter {
           ? await this.store.load(association.runId)
           : await this.findMatchingRun(repository, pullRequestNumber, event.branch);
         if (!run) return { kind: "unassociated" } as const;
-        if (run.github?.suspended) return { kind: "ignore" } as const;
+        if (
+          run.github?.suspended &&
+          !(reopeningClosure && run.github.suspensionReason === "pull-request-closed")
+        ) {
+          return { kind: "ignore" } as const;
+        }
         const before = structuredClone(run);
         const previousHeadSha = run.github?.headSha ?? association?.headSha;
         const pendingHeadShas = pendingCancellationHeads(

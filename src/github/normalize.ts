@@ -67,8 +67,14 @@ function requireString(value: unknown, field: string): string {
 
 function requireRepository(payload: Record<string, unknown>): string {
   const repository = requireString(repositoryFullName(payload), "repository.full_name");
-  if (!repository.includes("/")) malformed("repository.full_name must use owner/repository form");
+  if (!/^[^/\s]+\/[^/\s]+$/.test(repository)) {
+    malformed("repository.full_name must use owner/repository form");
+  }
   return repository.toLowerCase();
+}
+
+function optionalRepository(payload: Record<string, unknown>): string | undefined {
+  return repositoryFullName(payload) === undefined ? undefined : requireRepository(payload);
 }
 
 function requireInstallationId(payload: Record<string, unknown>): number {
@@ -190,11 +196,13 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
       supportedAction === "removed" ? "repositories_removed" : "repositories_added";
     if (!Array.isArray(payload[listKey])) malformed(`${listKey} must be an array`);
     const listed = payload[listKey] as unknown[];
-    const repositories = listed.map((item) => {
+    const repositories = [...new Set(listed.map((item) => {
       const fullName = requireString(asRecord(item)?.full_name, `${listKey}.full_name`);
-      if (!fullName.includes("/")) malformed(`${listKey}.full_name must use owner/repository form`);
+      if (!/^[^/\s]+\/[^/\s]+$/.test(fullName)) {
+        malformed(`${listKey}.full_name must use owner/repository form`);
+      }
       return fullName.toLowerCase();
-    });
+    }))];
     return withOptional(
       {
         eventId: input.deliveryId,
@@ -206,7 +214,7 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
       },
       {
         installationId: requireInstallationId(payload),
-        repository: repositories[0] ?? repositoryFullName(payload),
+        repository: repositories[0] ?? optionalRepository(payload),
         repositories,
         rawAction: supportedAction,
       },
@@ -219,9 +227,9 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
     return withOptional(
       { eventId: input.deliveryId, type: "workflow_run.completed", receivedAt },
       {
-        repository: repositoryFullName(payload),
-        installationId: installationId(payload),
-        headSha: typeof run?.head_sha === "string" ? run.head_sha : undefined,
+        repository: requireRepository(payload),
+        installationId: requireInstallationId(payload),
+        headSha: requireString(run?.head_sha, "workflow_run.head_sha"),
         observeOnly: true,
         rawAction: supportedAction,
       },
@@ -241,9 +249,9 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
     return withOptional(
       { eventId: input.deliveryId, type: "check_run.completed", receivedAt },
       {
-        repository: repositoryFullName(payload),
-        installationId: installationId(payload),
-        headSha,
+        repository: requireRepository(payload),
+        installationId: requireInstallationId(payload),
+        headSha: requireString(headSha, "check_run.head_sha"),
         observeOnly: true,
         rawAction: supportedAction,
       },
@@ -256,9 +264,9 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
     return withOptional(
       { eventId: input.deliveryId, type: "check_suite.completed", receivedAt },
       {
-        repository: repositoryFullName(payload),
-        installationId: installationId(payload),
-        headSha: typeof suite?.head_sha === "string" ? suite.head_sha : undefined,
+        repository: requireRepository(payload),
+        installationId: requireInstallationId(payload),
+        headSha: requireString(suite?.head_sha, "check_suite.head_sha"),
         observeOnly: true,
         rawAction: supportedAction,
       },

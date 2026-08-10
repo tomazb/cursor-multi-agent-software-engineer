@@ -65,5 +65,6 @@ export interface AssociationRecord {
   headSha: string;
   branch: string;
   suspended: boolean;
+  suspensionReason?: "pull-request-closed" | "authorization-revoked";
   updatedAt: string;
 }

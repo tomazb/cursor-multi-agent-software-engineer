@@ -8,6 +8,95 @@ function associationKey(repository: string, pullRequestNumber: number): string {
   return `${repository}#${pullRequestNumber}`;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
+function parseAssociationRecords(raw: string): Record<string, AssociationRecord> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch (error) {
+    throw new Error("Invalid GitHub association index", { cause: error });
+  }
+  if (!isRecord(parsed)) throw new Error("Invalid GitHub association index");
+  const result: Record<string, AssociationRecord> = {};
+  const activeRuns = new Set<string>();
+  const requiredFields = [
+    "runId",
+    "installationId",
+    "repository",
+    "pullRequestNumber",
+    "baseSha",
+    "headSha",
+    "branch",
+    "suspended",
+    "updatedAt",
+  ];
+  const allowedFields = new Set([...requiredFields, "suspensionReason"]);
+  for (const [key, value] of Object.entries(parsed)) {
+    if (!isRecord(value)) throw new Error("Invalid GitHub association index");
+    if (
+      Object.keys(value).some((field) => !allowedFields.has(field)) ||
+      requiredFields.some((field) => !Object.hasOwn(value, field)) ||
+      typeof value.runId !== "string" ||
+      !/^[A-Za-z0-9._-]+$/.test(value.runId) ||
+      !Number.isSafeInteger(value.installationId) ||
+      Number(value.installationId) <= 0 ||
+      typeof value.repository !== "string" ||
+      !/^[^/\s]+\/[^/\s]+$/.test(value.repository) ||
+      value.repository !== value.repository.toLowerCase() ||
+      !Number.isSafeInteger(value.pullRequestNumber) ||
+      Number(value.pullRequestNumber) <= 0 ||
+      key !== associationKey(value.repository, Number(value.pullRequestNumber)) ||
+      typeof value.baseSha !== "string" ||
+      !value.baseSha ||
+      typeof value.headSha !== "string" ||
+      !value.headSha ||
+      typeof value.branch !== "string" ||
+      !value.branch ||
+      typeof value.suspended !== "boolean" ||
+      (value.suspensionReason !== undefined &&
+        (value.suspended !== true ||
+          (value.suspensionReason !== "pull-request-closed" &&
+            value.suspensionReason !== "authorization-revoked"))) ||
+      !validTimestamp(value.updatedAt)
+    ) {
+      throw new Error("Invalid GitHub association index");
+    }
+    if (!value.suspended) {
+      if (activeRuns.has(value.runId)) {
+        throw new Error("Invalid GitHub association index: duplicate active run id");
+      }
+      activeRuns.add(value.runId);
+    }
+    result[key] = value as unknown as AssociationRecord;
+  }
+  return result;
+}
+
+function assertUniqueActiveRun(
+  records: Record<string, AssociationRecord>,
+  key: string,
+  runId: string,
+  suspended: boolean,
+): void {
+  if (suspended) return;
+  const conflict = Object.entries(records).find(
+    ([candidateKey, record]) =>
+      candidateKey !== key && record.runId === runId && !record.suspended,
+  );
+  if (conflict) {
+    throw new Error(`Run ${runId} is already associated to an active pull request`);
+  }
+}
+
 type AssociationBindInput = Omit<AssociationRecord, "suspended" | "updatedAt"> & {
   suspended?: boolean;
 };
@@ -15,7 +104,11 @@ type AssociationBindInput = Omit<AssociationRecord, "suspended" | "updatedAt"> &
 export interface GitHubAssociationTransaction {
   find(repository: string, pullRequestNumber: number): AssociationRecord | undefined;
   bind(input: AssociationBindInput): AssociationRecord;
-  suspend(repository: string, pullRequestNumber: number): AssociationRecord | undefined;
+  suspend(
+    repository: string,
+    pullRequestNumber: number,
+    reason: "pull-request-closed" | "authorization-revoked",
+  ): AssociationRecord | undefined;
   onRollback(callback: () => Promise<void>): void;
 }
 
@@ -58,8 +151,7 @@ export class GitHubAssociationIndex {
   private async readAll(): Promise<Record<string, AssociationRecord>> {
     try {
       const raw = await readFile(this.filePath, "utf8");
-      const parsed = JSON.parse(raw) as Record<string, AssociationRecord>;
-      return parsed && typeof parsed === "object" ? parsed : {};
+      return parseAssociationRecords(raw);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
       throw error;
@@ -83,6 +175,9 @@ export class GitHubAssociationIndex {
           return record ? { ...record } : undefined;
         },
         bind(input) {
+          const key = associationKey(input.repository, input.pullRequestNumber);
+          const suspended = input.suspended ?? false;
+          assertUniqueActiveRun(records, key, input.runId, suspended);
           const record: AssociationRecord = {
             runId: input.runId,
             installationId: input.installationId,
@@ -91,18 +186,27 @@ export class GitHubAssociationIndex {
             baseSha: input.baseSha,
             headSha: input.headSha,
             branch: input.branch,
-            suspended: input.suspended ?? false,
+            suspended,
+            ...(input.suspensionReason !== undefined
+              ? { suspensionReason: input.suspensionReason }
+              : {}),
             updatedAt: new Date().toISOString(),
           };
-          records[associationKey(input.repository, input.pullRequestNumber)] = record;
+          parseAssociationRecords(`${JSON.stringify({ [key]: record })}\n`);
+          records[key] = record;
           dirty = true;
           return { ...record };
         },
-        suspend(repository, pullRequestNumber) {
+        suspend(repository, pullRequestNumber, reason) {
           const record = records[associationKey(repository, pullRequestNumber)];
           if (!record) return undefined;
           if (!record.suspended) {
             record.suspended = true;
+            record.suspensionReason = reason;
+            record.updatedAt = new Date().toISOString();
+            dirty = true;
+          } else if (record.suspensionReason !== reason) {
+            record.suspensionReason = reason;
             record.updatedAt = new Date().toISOString();
             dirty = true;
           }
@@ -140,24 +244,7 @@ export class GitHubAssociationIndex {
   async bind(
     input: AssociationBindInput,
   ): Promise<AssociationRecord> {
-    return this.withLock(async () => {
-      const records = await this.readAll();
-      const key = associationKey(input.repository, input.pullRequestNumber);
-      const record: AssociationRecord = {
-        runId: input.runId,
-        installationId: input.installationId,
-        repository: input.repository,
-        pullRequestNumber: input.pullRequestNumber,
-        baseSha: input.baseSha,
-        headSha: input.headSha,
-        branch: input.branch,
-        suspended: input.suspended ?? false,
-        updatedAt: new Date().toISOString(),
-      };
-      records[key] = record;
-      await this.writeAll(records);
-      return record;
-    });
+    return this.withTransaction(async (transaction) => transaction.bind(input));
   }
 
   async find(
@@ -188,6 +275,7 @@ export class GitHubAssociationIndex {
   async suspend(
     repository: string,
     pullRequestNumber: number,
+    reason: "pull-request-closed" | "authorization-revoked" = "authorization-revoked",
   ): Promise<AssociationRecord | undefined> {
     return this.withLock(async () => {
       const records = await this.readAll();
@@ -196,6 +284,11 @@ export class GitHubAssociationIndex {
       if (!record) return undefined;
       if (!record.suspended) {
         record.suspended = true;
+        record.suspensionReason = reason;
+        record.updatedAt = new Date().toISOString();
+        await this.writeAll(records);
+      } else if (record.suspensionReason !== reason) {
+        record.suspensionReason = reason;
         record.updatedAt = new Date().toISOString();
         await this.writeAll(records);
       }
@@ -212,6 +305,11 @@ export class GitHubAssociationIndex {
         if (record.installationId !== installationId) continue;
         if (!record.suspended) {
           record.suspended = true;
+          record.suspensionReason = "authorization-revoked";
+          record.updatedAt = new Date().toISOString();
+          dirty = true;
+        } else if (record.suspensionReason !== "authorization-revoked") {
+          record.suspensionReason = "authorization-revoked";
           record.updatedAt = new Date().toISOString();
           dirty = true;
         }
@@ -236,6 +334,11 @@ export class GitHubAssociationIndex {
         }
         if (!record.suspended) {
           record.suspended = true;
+          record.suspensionReason = "authorization-revoked";
+          record.updatedAt = new Date().toISOString();
+          dirty = true;
+        } else if (record.suspensionReason !== "authorization-revoked") {
+          record.suspensionReason = "authorization-revoked";
           record.updatedAt = new Date().toISOString();
           dirty = true;
         }

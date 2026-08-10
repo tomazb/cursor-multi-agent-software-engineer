@@ -239,6 +239,9 @@ authentication field.
 - Persist only the normalized event, event name, delivery ID, receive time, raw-body SHA-256, and
   operational lease fields. Raw payloads, signatures, headers, tokens, secrets, keys, and arbitrary
   exception text are excluded.
+- Keep loopback as the listener default. Explicit wildcard binding requires TLS termination,
+  network admission, one MiB proxy/application body ceilings, rate/concurrency controls, and
+  header/body/request deadlines that preserve the application's sub-ten-second response budget.
 - Acquire installation-scoped tokens only for the handling installation; tokens are not persisted.
 - Idempotency keys for check-run side effects under `.maswe/github/side-effects/`.
 - Repository allowlist; installation removal suspends associations.

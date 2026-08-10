@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -100,4 +100,40 @@ test("orphan queue markers cannot turn terminal records into processing leases",
   await writeFile(path.join(queueDirectory, `${hash}.queued`), "");
 
   assert.equal(await inbox.claimNext(Date.now() + 1), undefined);
+});
+
+test("startup rejects semantically corrupt normalized event state", async (t) => {
+  for (const corruption of ["missing-installation", "event-name-mismatch"] as const) {
+    const root = await mkdtemp(path.join(os.tmpdir(), `maswe-gh-inbox-corrupt-${corruption}-`));
+    t.after(async () => rm(root, { recursive: true, force: true }));
+    const inbox = new GitHubDeliveryInbox(root);
+    const deliveryId = `corrupt-${corruption}`;
+    const normalized: GitHubInternalEvent = corruption === "missing-installation"
+      ? {
+          eventId: deliveryId,
+          type: "installation.deleted",
+          installationId: 44,
+          receivedAt: RECEIVED_AT,
+          rawAction: "deleted",
+        }
+      : event(deliveryId);
+    await inbox.enqueue({
+      deliveryId,
+      eventName: corruption === "missing-installation" ? "installation" : "push",
+      receivedAt: RECEIVED_AT,
+      rawBodyDigest: BODY_DIGEST,
+      event: normalized,
+    });
+    const hash = createHash("sha256").update(deliveryId).digest("hex");
+    const statePath = path.join(root, "inbox", "state", hash.slice(0, 2), hash, "state.json");
+    const state = JSON.parse(await readFile(statePath, "utf8")) as {
+      eventName: string;
+      event: Record<string, unknown>;
+    };
+    if (corruption === "missing-installation") delete state.event.installationId;
+    else state.eventName = "installation";
+    await writeFile(statePath, `${JSON.stringify(state)}\n`, "utf8");
+
+    await assert.rejects(new GitHubDeliveryInbox(root).initialize(), /durable inbox event/i);
+  }
 });
