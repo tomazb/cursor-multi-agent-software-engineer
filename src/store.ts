@@ -415,7 +415,7 @@ export class FileRunStore implements RunStore {
   }
 
   private async writeRunRecord(run: RunRecord): Promise<void> {
-    const exact = migrateRunRecord(structuredClone(run));
+    const exact = migrateRunRecord(run);
     const content = `${JSON.stringify(exact, null, 2)}\n`;
     if (Buffer.byteLength(content, "utf8") > this.maxRunFileBytes) {
       throw new Error(`Run record exceeds its bounded ${this.maxRunFileBytes}-byte capacity`);
