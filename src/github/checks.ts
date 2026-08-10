@@ -280,11 +280,16 @@ export class CheckPublisher {
   async publishForHeadSha(
     run: RunRecord,
     headSha: string,
-    options: { previousHeadSha?: string } = {},
+    options: { previousHeadSha?: string; previousHeadShas?: readonly string[] } = {},
   ): Promise<{ createdOrUpdated: string[] }> {
     assertReadOnlyChecksMode(this.readOnlyChecks, "checks");
-    if (options.previousHeadSha && options.previousHeadSha !== headSha) {
-      await this.invalidatePreviousSha(options.previousHeadSha);
+    const previousHeadShas = new Set([
+      ...(options.previousHeadShas ?? []),
+      ...(options.previousHeadSha ? [options.previousHeadSha] : []),
+    ]);
+    previousHeadShas.delete(headSha);
+    for (const previousHeadSha of [...previousHeadShas].sort()) {
+      await this.invalidatePreviousSha(previousHeadSha);
     }
 
     const conclusions = buildCheckConclusions(run, headSha);

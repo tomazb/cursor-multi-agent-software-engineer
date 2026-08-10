@@ -219,6 +219,20 @@ export function migrateRunRecord(raw: unknown): RunRecord {
     if (!Number.isSafeInteger(installationId) || Number(installationId) < 1) {
       throw new Error("Run record github.installationId must be a positive integer");
     }
+    const association = github as Record<string, unknown>;
+    const pending = association.pendingCancellationHeadShas;
+    if (pending !== undefined) {
+      if (
+        !Array.isArray(pending) ||
+        pending.length < 1 ||
+        pending.length > 64 ||
+        pending.some((headSha) => typeof headSha !== "string" || !headSha) ||
+        new Set(pending).size !== pending.length ||
+        pending.includes(association.headSha)
+      ) {
+        throw new Error("Run record github.pendingCancellationHeadShas is invalid");
+      }
+    }
   }
 
   if (candidate.version === undefined) {

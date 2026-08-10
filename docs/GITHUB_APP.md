@@ -195,6 +195,9 @@ Every check run includes:
 - Conclusion: success, failure, neutral, cancelled, timed_out, or action_required.
 
 A new head SHA invalidates all previous success conclusions. The app creates or updates checks only for the SHA that was actually evaluated.
+The run record retains a bounded set of pending old-head cancellations until every cancellation and
+the current-head publication succeeds. A retry therefore cannot forget uncancelled checks after a
+partial Checks API failure or a later head change.
 
 ## Approval model
 

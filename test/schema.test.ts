@@ -249,6 +249,32 @@ test("run-record schema and runtime migration reject non-positive GitHub install
   assert.throws(() => migrateRunRecord(run), /installationId/i);
 });
 
+test("run records durably validate bounded pending GitHub head cancellations", async () => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-github-cancellation-"));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("schema", "check", DEFAULT_CONFIG);
+  run.github = {
+    installationId: 1,
+    repository: "owner/repo",
+    pullRequestNumber: 1,
+    baseSha: "base",
+    headSha: "head",
+    branch: "feature",
+  };
+  (run.github as unknown as Record<string, unknown>).pendingCancellationHeadShas = ["old-head"];
+
+  assert.doesNotThrow(() => assertMatches(schema, schema, run, "run"));
+  assert.doesNotThrow(() => migrateRunRecord(run));
+  (run.github as unknown as Record<string, unknown>).pendingCancellationHeadShas = [
+    "old-head",
+    "old-head",
+  ];
+  assert.throws(() => migrateRunRecord(run), /pendingCancellationHeadShas/);
+});
+
 test("run-record schema validates optional bounded durable runtime failure metadata", async () => {
   const schema = JSON.parse(
     await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),

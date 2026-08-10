@@ -54,6 +54,7 @@ async function setup(options: {
   let rateLimitOnce = false;
   let liveHead = options.liveHead;
   let failAll = false;
+  let failPatchForHeadOnce: string | undefined;
   let pullHeadLookups = 0;
   const http: GitHubHttpClient = {
     async request(method, url, options) {
@@ -93,10 +94,15 @@ async function setup(options: {
       }
       if (method === "PATCH") {
         const checkRunId = Number(url.match(/\/check-runs\/(\d+)$/)?.[1]);
+        const patchHeadSha = checkRunHeadShas.get(checkRunId);
+        if (patchHeadSha === failPatchForHeadOnce) {
+          failPatchForHeadOnce = undefined;
+          return { status: 500, headers: {}, body: { message: "forced patch failure" } };
+        }
         patches.push({
           url,
           body: options?.body,
-          headSha: checkRunHeadShas.get(checkRunId),
+          headSha: patchHeadSha,
         });
         return { status: 200, headers: {}, body: { id: 1 } };
       }
@@ -141,6 +147,9 @@ async function setup(options: {
     },
     setFailAll(value: boolean) {
       failAll = value;
+    },
+    failNextPatchForHead(sha: string) {
+      failPatchForHeadOnce = sha;
     },
   };
 }
@@ -336,6 +345,57 @@ test("integration: new head SHA invalidates prior success conclusions", async ()
   const loaded = await store.load(run.id);
   assert.equal(loaded.evidence?.quality, undefined);
   assert.equal(loaded.github?.headSha, "sha2");
+});
+
+test("integration: retry remembers every old head until cancellation publication succeeds", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const {
+    adapter,
+    patches,
+    store,
+    cwd,
+    setLiveHead,
+    failNextPatchForHead,
+  } = await setup({ liveHead: "sha-old" });
+  const run = await store.create("cancellation-retry", "req", testConfig());
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-old",
+    branch: "maswe/run-1",
+    suspended: false,
+  };
+  await store.save(run);
+  await new GitHubAssociationIndex(path.join(cwd, ".maswe", "github")).bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-old",
+    branch: "maswe/run-1",
+  });
+  await adapter.publishChecksForRun(run.id);
+
+  setLiveHead("sha-new");
+  failNextPatchForHead("sha-old");
+  const body = JSON.stringify(prPayload("sha-new"));
+  const request = {
+    deliveryId: "del-cancellation-retry",
+    eventName: "pull_request",
+    signatureHeader: sign(body),
+    rawBody: body,
+  };
+  await assert.rejects(adapter.handleWebhook(request), /HTTP 500/);
+  assert.equal((await store.load(run.id)).github?.headSha, "sha-new");
+
+  assert.equal((await adapter.handleWebhook(request)).status, 200);
+  assert.equal(
+    patches.filter((patch) => patch.headSha === "sha-old").length,
+    4,
+  );
 });
 
 test("integration: stale out-of-order head is ignored", async () => {

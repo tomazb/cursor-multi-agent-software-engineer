@@ -50,6 +50,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const MAX_PENDING_CANCELLATION_HEADS = 64;
+
+function pendingCancellationHeads(
+  existing: readonly string[] | undefined,
+  previousHeadSha: string | undefined,
+  currentHeadSha: string,
+): string[] {
+  const pending = new Set(existing ?? []);
+  if (previousHeadSha && previousHeadSha !== currentHeadSha) pending.add(previousHeadSha);
+  pending.delete(currentHeadSha);
+  const result = [...pending].sort();
+  if (result.length > MAX_PENDING_CANCELLATION_HEADS) {
+    throw new Error("GitHub pending check cancellation limit exceeded");
+  }
+  return result;
+}
+
 /** Match only github.com remotes (HTTPS or SSH) to owner/repo. Plain HTTP is rejected. */
 export function remoteMatchesRepository(
   remote: string | undefined,
@@ -444,10 +461,24 @@ export class GitHubAppAdapter {
           }
           const previousHeadSha = run.github.headSha || run.workspace?.headSha;
           if (!previousHeadSha) throw new Error(`Run ${runId} has no head SHA for checks`);
+          const pendingHeadShas = pendingCancellationHeads(
+            run.github.pendingCancellationHeadShas,
+            previousHeadSha,
+            liveHead,
+          );
           if (liveHead !== previousHeadSha) {
             const before = structuredClone(run);
             invalidateStaleEvidence(run, liveHead);
-            run.github = { ...run.github, headSha: liveHead };
+            run.github = {
+              ...run.github,
+              headSha: liveHead,
+              ...(pendingHeadShas.length > 0
+                ? { pendingCancellationHeadShas: pendingHeadShas }
+                : {}),
+            };
+            if (pendingHeadShas.length === 0) {
+              delete run.github.pendingCancellationHeadShas;
+            }
             await this.saveAssociationMutation(before, run, transaction);
           }
           transaction.bind({
@@ -459,7 +490,7 @@ export class GitHubAppAdapter {
             headSha: liveHead,
             branch: run.github.branch,
           });
-          return { run, previousHeadSha };
+          return { run, pendingHeadShas };
         });
         await this.publishChecks(
           publication.run,
@@ -467,9 +498,15 @@ export class GitHubAppAdapter {
           publication.run.github!.pullRequestNumber,
           liveHead,
           publication.run.github!.installationId,
-          publication.previousHeadSha,
+          publication.pendingHeadShas,
         );
-        return publication.run;
+        return this.clearPublishedCancellationHeads(
+          publication.run.id,
+          publication.run.github!.repository,
+          publication.run.github!.pullRequestNumber,
+          liveHead,
+          publication.pendingHeadShas,
+        );
       },
     );
   }
@@ -525,6 +562,50 @@ export class GitHubAppAdapter {
     }
     const attempted = structuredClone(run);
     transaction.onRollback(() => this.rollbackRunMutation(before, attempted));
+  }
+
+  private async clearPublishedCancellationHeads(
+    runId: string,
+    repository: string,
+    pullRequestNumber: number,
+    publishedHeadSha: string,
+    cancelledHeadShas: readonly string[],
+  ): Promise<RunRecord> {
+    if (cancelledHeadShas.length === 0) return this.store.load(runId);
+    const cancelled = new Set(cancelledHeadShas);
+    return this.associations.withTransaction(async (transaction) => {
+      const run = await this.store.load(runId);
+      if (
+        !run.github ||
+        run.github.repository !== repository ||
+        run.github.pullRequestNumber !== pullRequestNumber ||
+        run.github.headSha !== publishedHeadSha
+      ) {
+        throw new Error(`Run ${runId} github association changed during publication`);
+      }
+      const currentPending = run.github.pendingCancellationHeadShas ?? [];
+      const remaining = currentPending.filter((headSha) => !cancelled.has(headSha));
+      if (remaining.length !== currentPending.length) {
+        const before = structuredClone(run);
+        run.github = {
+          ...run.github,
+          ...(remaining.length > 0 ? { pendingCancellationHeadShas: remaining } : {}),
+        };
+        if (remaining.length === 0) delete run.github.pendingCancellationHeadShas;
+        await this.saveAssociationMutation(before, run, transaction);
+      }
+      transaction.bind({
+        runId: run.id,
+        installationId: run.github.installationId,
+        repository: run.github.repository,
+        pullRequestNumber: run.github.pullRequestNumber,
+        baseSha: run.github.baseSha,
+        headSha: run.github.headSha,
+        branch: run.github.branch,
+        ...(run.github.suspended !== undefined ? { suspended: run.github.suspended } : {}),
+      });
+      return run;
+    });
   }
 
   private async dispatch(event: GitHubInternalEvent, app: GitHubAppConfig): Promise<void> {
@@ -716,6 +797,11 @@ export class GitHubAppAdapter {
         if (run.github?.suspended) return { kind: "ignore" } as const;
         const before = structuredClone(run);
         const previousHeadSha = run.github?.headSha ?? association?.headSha;
+        const pendingHeadShas = pendingCancellationHeads(
+          run.github?.pendingCancellationHeadShas,
+          previousHeadSha,
+          headSha,
+        );
         invalidateStaleEvidence(run, headSha);
         run.github = {
           installationId,
@@ -725,6 +811,9 @@ export class GitHubAppAdapter {
           headSha,
           branch: event.branch ?? run.github?.branch ?? run.workspace?.branch ?? "unknown",
           suspended: false,
+          ...(pendingHeadShas.length > 0
+            ? { pendingCancellationHeadShas: pendingHeadShas }
+            : {}),
         };
         await this.saveAssociationMutation(before, run, transaction);
         transaction.bind({
@@ -736,7 +825,7 @@ export class GitHubAppAdapter {
           headSha,
           branch: run.github.branch,
         });
-        return { kind: "publish", run, previousHeadSha } as const;
+        return { kind: "publish", run, pendingHeadShas } as const;
       });
 
       if (publication.kind === "publish") {
@@ -746,7 +835,14 @@ export class GitHubAppAdapter {
           pullRequestNumber,
           headSha,
           installationId,
-          publication.previousHeadSha,
+          publication.pendingHeadShas,
+        );
+        await this.clearPublishedCancellationHeads(
+          publication.run.id,
+          repository,
+          pullRequestNumber,
+          headSha,
+          publication.pendingHeadShas,
         );
         return;
       }
@@ -824,7 +920,7 @@ export class GitHubAppAdapter {
     pullRequestNumber: number,
     headSha: string,
     installationId: number,
-    previousHeadSha?: string,
+    previousHeadShas: readonly string[] = [],
   ): Promise<void> {
     const app = this.githubApp();
     const { owner, repo } = parseOwnerRepo(repository);
@@ -838,7 +934,7 @@ export class GitHubAppAdapter {
       pullRequestNumber,
       token,
     });
-    const options = previousHeadSha && previousHeadSha !== headSha ? { previousHeadSha } : {};
+    const options = previousHeadShas.length > 0 ? { previousHeadShas } : {};
     await publisher.publishForHeadSha(run, headSha, options);
   }
 }

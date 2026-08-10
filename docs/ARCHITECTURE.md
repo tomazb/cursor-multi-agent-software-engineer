@@ -207,6 +207,12 @@ Read-only runtimes compare the fingerprint before and after execution. Any diffe
 
 Quality commands never come from model output, issue text, or PR comments.
 
+GitHub check publication uses a hash-addressed per-PR journal, separate from the short global
+association transaction. Old-head cancellation intent is also persisted on the run as a bounded
+SHA set and is cleared only after cancellation plus current-head publication completes. This keeps
+one rate-limited PR from holding the global association journal and makes partial publication
+retries deterministic.
+
 ## 4. Stage data flow
 
 ```mermaid
