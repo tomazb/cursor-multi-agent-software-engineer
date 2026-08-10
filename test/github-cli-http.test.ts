@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac, generateKeyPairSync } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import type { Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { runCli } from "../src/cli-runner.ts";
 import { mergeConfigForTest } from "../src/config.ts";
 import type { GitHubAppAdapter } from "../src/github/adapter.ts";
+import { WebhookIngressDeadlineError } from "../src/github/webhook-server.ts";
 import { CANONICAL_NODE_VERSION } from "../src/node-version.ts";
 import { FileRunStore } from "../src/store.ts";
 
@@ -80,7 +83,7 @@ function recordingFetch(liveHead = "sha-new") {
       });
     }
     if (method === "GET" && url.includes("/pulls/9")) {
-      return new Response(JSON.stringify({ head: { sha: currentLiveHead } }), {
+      return new Response(JSON.stringify({ head: { sha: currentLiveHead }, state: "open" }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -372,15 +375,89 @@ test("github-webhook wires a sanitized production diagnostic before listener rea
     observedNodeVersion: CANONICAL_NODE_VERSION,
     webhookListener: async (options) => {
       assert.ok(options.onDiagnostic);
-      options.onDiagnostic(new Error(`worker failed Authorization: Bearer ${credential}`));
+      options.onDiagnostic(Object.assign(
+        new WebhookIngressDeadlineError(true),
+        {
+          deliveryId: "safe-delivery-1",
+          eventName: "push",
+          attempt: 3,
+          detail: `Authorization: Bearer ${credential}`,
+        },
+      ));
       await options.adapter.stopWebhookWorker();
       return { url: "http://127.0.0.1:0/github/webhook" };
     },
   });
 
   assert.equal(diagnostics.length, 1);
+  assert.match(diagnostics[0]!, /GITHUB_WEBHOOK_INGRESS_OUTCOME_UNKNOWN/);
+  assert.match(diagnostics[0]!, /safe-delivery-1/);
+  assert.match(diagnostics[0]!, /event=push/);
+  assert.match(diagnostics[0]!, /attempt=3/);
+  assert.match(diagnostics[0]!, /handoffStarted=true/);
   assert.match(diagnostics[0]!, /Authorization: Bearer \[REDACTED\]/);
   assert.doesNotMatch(diagnostics[0]!, new RegExp(credential));
+});
+
+test("github-webhook handles SIGTERM and SIGINT with ordered bounded shutdown", async (t) => {
+  for (const signal of ["SIGTERM", "SIGINT"] as const) {
+    await t.test(signal, async (t) => {
+      const { cwd } = await setupProject();
+      t.after(async () => rm(cwd, { recursive: true, force: true }));
+      const restoreEnvironment = installGitHubEnvironment();
+      t.after(restoreEnvironment);
+      const signals = new EventEmitter();
+      const events: string[] = [];
+      let capturedAdapter: GitHubAppAdapter | undefined;
+      let listenerReady!: () => void;
+      const ready = new Promise<void>((resolve) => { listenerReady = resolve; });
+      const server = {
+        close(callback?: (error?: Error) => void) {
+          events.push("close-start");
+          setImmediate(() => {
+            events.push("close-done");
+            callback?.();
+          });
+          return this;
+        },
+        closeAllConnections() {
+          events.push("close-all");
+        },
+      } as unknown as Server;
+
+      const cli = runCli({
+        argv: ["github-webhook", "--cwd", cwd],
+        observedNodeVersion: CANONICAL_NODE_VERSION,
+        webhookListener: async ({ adapter }) => {
+          capturedAdapter = adapter;
+          const stop = adapter.stopWebhookWorker.bind(adapter);
+          adapter.stopWebhookWorker = async (options) => {
+            events.push(`worker-stop:${options?.drainMs ?? "default"}`);
+            await stop(options);
+          };
+          listenerReady();
+          return { url: "http://127.0.0.1:0/github/webhook", server };
+        },
+        signalSource: signals,
+        shutdownIngressMs: 50,
+        shutdownDrainMs: 50,
+      } as Parameters<typeof runCli>[0] & {
+        signalSource: EventEmitter;
+        shutdownIngressMs: number;
+        shutdownDrainMs: number;
+      });
+      t.after(async () => capturedAdapter?.stopWebhookWorker({ drainMs: 10 }));
+      await ready;
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(signals.listenerCount(signal), 1);
+      signals.emit(signal);
+      await cli;
+
+      assert.deepEqual(events, ["close-start", "close-done", "worker-stop:50"]);
+      assert.equal(signals.listenerCount("SIGTERM"), 0);
+      assert.equal(signals.listenerCount("SIGINT"), 0);
+    });
+  }
 });
 
 test("github-webhook stops its worker when listener startup fails", async (t) => {

@@ -329,7 +329,7 @@ test("webhook ingress deadline includes the durable adapter handoff", async () =
   assert.equal(JSON.parse(replay.body).duplicate, true);
 });
 
-test("webhook does not read invalid-header bodies before returning 400", async () => {
+test("webhook drains invalid-header bodies after returning 400", async () => {
   let reads = 0;
   const body = new Readable({
     read() {
@@ -338,6 +338,11 @@ test("webhook does not read invalid-header bodies before returning 400", async (
       this.push(null);
     },
   });
+  const drained = Promise.race([
+    once(body, "end"),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("invalid-header body was not drained")), 100)),
+  ]);
   const fake = recordingAdapter();
   const response = await dispatchWebhook(
     { adapter: fake.adapter },
@@ -346,7 +351,8 @@ test("webhook does not read invalid-header bodies before returning 400", async (
   );
 
   assert.equal(response.status, 400);
-  assert.equal(reads, 0);
+  await drained;
+  assert.ok(reads > 0);
   assert.deepEqual(fake.calls, []);
 });
 
@@ -429,11 +435,22 @@ test("webhook passes adapter-produced bad-request responses through", async () =
   assert.equal(fake.calls.length, 1);
 });
 
-test("webhook returns 404 outside its route", async () => {
+test("webhook returns 404 outside its route and drains the request body", async () => {
   const fake = recordingAdapter();
-  const response = await dispatchWebhook({ adapter: fake.adapter }, validHeaders, { url: "/other" });
+  const body = Readable.from([Buffer.from("ignored-route-body")]);
+  const drained = once(body, "end");
+  const response = await dispatchWebhook(
+    { adapter: fake.adapter },
+    validHeaders,
+    { url: "/other", body },
+  );
 
   assert.equal(response.status, 404);
+  await Promise.race([
+    drained,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("not-found body was not drained")), 100)),
+  ]);
   assert.equal(response.body, JSON.stringify({ ok: false, message: "not found" }));
   assert.deepEqual(fake.calls, []);
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -61,7 +61,7 @@ async function setup(t: test.TestContext, http?: GitHubHttpClient) {
     http: http ?? {
       async request(method, url) {
         if (method === "GET" && url.includes("/pulls/")) {
-          return { status: 200, headers: {}, body: { head: { sha: "sha-new" } } };
+          return { status: 200, headers: {}, body: { head: { sha: "sha-new" }, state: "open" } };
         }
         if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
         return { status: 201, headers: {}, body: { id: 1 } };
@@ -78,7 +78,7 @@ test("supported delivery is acknowledged only after durable enqueue", async (t) 
     async request(method, url) {
       requests += 1;
       if (method === "GET" && url.includes("/pulls/")) {
-        return { status: 200, headers: {}, body: { head: { sha: "sha-new" } } };
+        return { status: 200, headers: {}, body: { head: { sha: "sha-new" }, state: "open" } };
       }
       if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
       return { status: 201, headers: {}, body: { id: requests } };
@@ -102,7 +102,7 @@ test("queued and completed duplicates use 202 then 200 without redispatch", asyn
   const { adapter } = await setup(t, {
     async request(method, url) {
       if (method === "GET" && url.includes("/pulls/")) {
-        return { status: 200, headers: {}, body: { head: { sha: "sha-new" } } };
+        return { status: 200, headers: {}, body: { head: { sha: "sha-new" }, state: "open" } };
       }
       if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
       posts += 1;
@@ -169,8 +169,8 @@ test("malformed authenticated input returns 400 without inbox state", async (t) 
     signed("malformed-no-enqueue", "pull_request", { action: "synchronize" }),
   );
   assert.equal(result.status, 400);
-  const files = await readdir(path.join(cwd, ".maswe", "github", "inbox", "state"), {
-    recursive: true,
-  });
-  assert.equal(files.some((name) => name.endsWith("state.json")), false);
+  await assert.rejects(
+    access(path.join(cwd, ".maswe", "github", "inbox", "state")),
+    { code: "ENOENT" },
+  );
 });

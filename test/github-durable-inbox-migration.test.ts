@@ -83,7 +83,7 @@ test("startup migration turns v1 processing into awaiting-redelivery", async (t)
     http: {
       async request(method, url) {
         if (method === "GET" && url.includes("/pulls/")) {
-          return { status: 200, headers: {}, body: { head: { sha: "sha-legacy" } } };
+          return { status: 200, headers: {}, body: { head: { sha: "sha-legacy" }, state: "open" } };
         }
         if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
         posts += 1;

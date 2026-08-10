@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { access, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -66,7 +66,7 @@ test("durable ingress acknowledges before a blocked downstream dispatch", async 
       if (method === "GET" && url.includes("/pulls/")) {
         dispatchReached.resolve();
         await releaseDispatch.promise;
-        return { status: 200, headers: {}, body: { head: { sha: "sha-durable" } } };
+        return { status: 200, headers: {}, body: { head: { sha: "sha-durable" }, state: "open" } };
       }
       if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
       return { status: 201, headers: {}, body: { id: 1 } };
@@ -112,7 +112,7 @@ test("durable ingress resumes an acknowledged queued event after restart", async
   const http: GitHubHttpClient = {
     async request(method, url) {
       if (method === "GET" && url.includes("/pulls/")) {
-        return { status: 200, headers: {}, body: { head: { sha: "sha-durable" } } };
+        return { status: 200, headers: {}, body: { head: { sha: "sha-durable" }, state: "open" } };
       }
       if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
       posts += 1;
@@ -199,10 +199,10 @@ test("signed invalid UTF-8 authenticates exact bytes but is rejected without enq
 
   assert.equal(response.status, 400);
   assert.equal(response.body.message, "invalid UTF-8 body");
-  const files = await readdir(path.join(cwd, ".maswe", "github", "inbox", "state"), {
-    recursive: true,
-  });
-  assert.equal(files.some((name) => name.endsWith("state.json")), false);
+  await assert.rejects(
+    access(path.join(cwd, ".maswe", "github", "inbox", "state")),
+    { code: "ENOENT" },
+  );
 });
 
 test("worker stop bounds drain while preserving active durable work", async (t) => {
@@ -220,7 +220,7 @@ test("worker stop bounds drain while preserving active durable work", async (t) 
         if (method === "GET" && url.includes("/pulls/")) {
           dispatchReached.resolve();
           await releaseDispatch.promise;
-          return { status: 200, headers: {}, body: { head: { sha: "sha-durable" } } };
+          return { status: 200, headers: {}, body: { head: { sha: "sha-durable" }, state: "open" } };
         }
         if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
         return { status: 201, headers: {}, body: { id: 1 } };
@@ -302,5 +302,66 @@ test("durable handoff failures emit a local diagnostic before returning 503", as
   const response = await adapter.handleWebhook(signedRequest("durable-diagnostic"));
 
   assert.equal(response.status, 503);
-  assert.deepEqual(diagnostics, [failure]);
+  assert.equal(diagnostics.length, 1);
+  assert.deepEqual(
+    {
+      code: (diagnostics[0] as { code?: unknown }).code,
+      deliveryId: (diagnostics[0] as { deliveryId?: unknown }).deliveryId,
+      eventName: (diagnostics[0] as { eventName?: unknown }).eventName,
+      attempt: (diagnostics[0] as { attempt?: unknown }).attempt,
+      cause: (diagnostics[0] as { cause?: unknown }).cause,
+    },
+    {
+      code: "GITHUB_WEBHOOK_HANDOFF_FAILED",
+      deliveryId: "durable-diagnostic",
+      eventName: "pull_request",
+      attempt: 0,
+      cause: failure,
+    },
+  );
+});
+
+test("worker failures emit bounded delivery context for recovery", async (t) => {
+  process.env[SECRET_ENV] = SECRET;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-worker-diagnostic-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const diagnostics: unknown[] = [];
+  let resolveDiagnostic!: () => void;
+  const diagnosticReady = new Promise<void>((resolve) => { resolveDiagnostic = resolve; });
+  const adapter = new GitHubAppAdapter({
+    cwd,
+    config: config(),
+    store: new FileRunStore(cwd),
+    http: {
+      async request(method, url) {
+        if (method === "GET" && url.includes("/pulls/")) {
+          return { status: 500, headers: {}, body: {} };
+        }
+        throw new Error("unexpected worker request");
+      },
+    },
+    tokenProvider: async () => "token",
+    onWebhookDiagnostic: (error) => {
+      diagnostics.push(error);
+      if ((error as { code?: unknown }).code === "GITHUB_WEBHOOK_DISPATCH_FAILED") {
+        resolveDiagnostic();
+      }
+    },
+  });
+  await adapter.startWebhookWorker();
+  t.after(async () => adapter.stopWebhookWorker({ drainMs: 10 }));
+  assert.equal((await adapter.handleWebhook(signedRequest("worker-diagnostic"))).status, 202);
+  await Promise.race([
+    diagnosticReady,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("worker diagnostic timed out")), 2_000)),
+  ]);
+
+  const failure = diagnostics.find(
+    (diagnostic) =>
+      (diagnostic as { code?: unknown }).code === "GITHUB_WEBHOOK_DISPATCH_FAILED",
+  ) as { deliveryId?: unknown; eventName?: unknown; attempt?: unknown } | undefined;
+  assert.equal(failure?.deliveryId, "worker-diagnostic");
+  assert.equal(failure?.eventName, "pull_request");
+  assert.equal(failure?.attempt, 1);
 });

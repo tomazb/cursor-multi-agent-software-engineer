@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import type { Server } from "node:http";
 import path from "node:path";
 import { loadConfig, writeStarterConfig } from "./config.ts";
 import type { AgentRuntime, MasweConfig, RunRecord } from "./domain.ts";
@@ -23,10 +24,41 @@ import {
 } from "./redaction.ts";
 import { FileRunStore } from "./store.ts";
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function safeDiagnosticField(value: unknown, pattern: RegExp, maxLength = 128): string | undefined {
+  return typeof value === "string" && value.length <= maxLength && pattern.test(value)
+    ? value
+    : undefined;
+}
+
 function emitGitHubDiagnostic(error: unknown): void {
+  const source = isRecord(error) ? error : {};
+  const context = [
+    safeDiagnosticField(source.code, /^[A-Z0-9_]+$/)
+      ? `code=${String(source.code)}`
+      : undefined,
+    safeDiagnosticField(source.deliveryId, /^[A-Za-z0-9._-]+$/)
+      ? `delivery=${String(source.deliveryId)}`
+      : undefined,
+    safeDiagnosticField(source.eventName, /^[A-Za-z0-9._-]+$/)
+      ? `event=${String(source.eventName)}`
+      : undefined,
+    Number.isSafeInteger(source.attempt) && Number(source.attempt) >= 0
+      ? `attempt=${String(source.attempt)}`
+      : undefined,
+    typeof source.handoffStarted === "boolean"
+      ? `handoffStarted=${String(source.handoffStarted)}`
+      : undefined,
+  ].filter((value): value is string => value !== undefined);
+  const cause = source.cause instanceof Error ? source.cause.message : undefined;
+  const detail = typeof source.detail === "string" ? source.detail : undefined;
+  const message = error instanceof Error ? error.message : String(error);
   console.error(
     sanitizeDiagnostic(
-      error instanceof Error ? error.message : String(error),
+      [...context, message, cause, detail].filter(Boolean).join(" "),
       FAILURE_AGGREGATE_MAX_CODE_POINTS,
     ).text,
   );
@@ -108,7 +140,45 @@ export interface RunCliOptions {
   argv?: string[];
   observedNodeVersion?: string;
   githubHttpOptions?: FetchGitHubHttpClientOptions;
-  webhookListener?: (options: WebhookServerOptions) => Promise<{ url: string }>;
+  webhookListener?: (options: WebhookServerOptions) => Promise<{ url: string; server?: Server }>;
+  /** Injectable signal boundary for deterministic listener shutdown tests. */
+  signalSource?: {
+    once(event: "SIGTERM" | "SIGINT", listener: () => void): unknown;
+    off(event: "SIGTERM" | "SIGINT", listener: () => void): unknown;
+  };
+  shutdownIngressMs?: number;
+  shutdownDrainMs?: number;
+}
+
+async function waitForShutdownSignal(source: NonNullable<RunCliOptions["signalSource"]>): Promise<void> {
+  let settle!: () => void;
+  const signal = new Promise<void>((resolve) => { settle = resolve; });
+  const onSigterm = () => settle();
+  const onSigint = () => settle();
+  source.once("SIGTERM", onSigterm);
+  source.once("SIGINT", onSigint);
+  try {
+    await signal;
+  } finally {
+    source.off("SIGTERM", onSigterm);
+    source.off("SIGINT", onSigint);
+  }
+}
+
+async function closeServerWithin(server: Server, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const closed = new Promise<"closed">((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve("closed"));
+  });
+  const outcome = await Promise.race([
+    closed,
+    new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), timeoutMs);
+    }),
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+  if (outcome === "timeout") server.closeAllConnections?.();
 }
 
 function githubAdapterForCommand(
@@ -314,14 +384,14 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
       const adapter = githubAdapterForCommand(cwd, config, store, http);
       await adapter.initialize();
       await adapter.startWebhookWorker();
+      let listener: { url: string; server?: Server };
       try {
-        const { url } = await (options.webhookListener ?? listenWebhookServer)({
+        listener = await (options.webhookListener ?? listenWebhookServer)({
           adapter,
           host: config.githubApp.webhookHost ?? "127.0.0.1",
           port: config.githubApp.webhookPort ?? 8787,
           onDiagnostic: emitGitHubDiagnostic,
         });
-        console.log(`Listening for GitHub webhooks at ${url}`);
       } catch (listenerError) {
         try {
           await adapter.stopWebhookWorker();
@@ -332,6 +402,30 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
           );
         }
         throw listenerError;
+      }
+      console.log(`Listening for GitHub webhooks at ${listener.url}`);
+      if (listener.server) {
+        await waitForShutdownSignal(options.signalSource ?? process);
+        let closeError: unknown;
+        try {
+          await closeServerWithin(listener.server, options.shutdownIngressMs ?? 8_000);
+        } catch (error) {
+          closeError = error;
+        }
+        let workerError: unknown;
+        try {
+          await adapter.stopWebhookWorker({ drainMs: options.shutdownDrainMs ?? 5_000 });
+        } catch (error) {
+          workerError = error;
+        }
+        if (closeError !== undefined && workerError !== undefined) {
+          throw new AggregateError(
+            [closeError, workerError],
+            "GitHub listener and worker shutdown both failed",
+          );
+        }
+        if (closeError !== undefined) throw closeError;
+        if (workerError !== undefined) throw workerError;
       }
       return;
     }

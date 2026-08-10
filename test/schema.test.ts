@@ -328,6 +328,30 @@ test("run migration rejects unsupported and malformed GitHub association fields"
   assert.throws(() => migrateRunRecord(run), /github\.repository/i);
 });
 
+test("run migration and schema reject whitespace-only GitHub identity fields", async (t) => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  for (const field of ["baseSha", "headSha", "branch"] as const) {
+    await t.test(field, async () => {
+      const cwd = await mkdtemp(path.join(os.tmpdir(), `maswe-schema-github-${field}-`));
+      t.after(async () => rm(cwd, { recursive: true, force: true }));
+      const run = await new FileRunStore(cwd).create("schema", "check", DEFAULT_CONFIG);
+      run.github = {
+        installationId: 1,
+        repository: "owner/repo",
+        pullRequestNumber: 1,
+        baseSha: "base",
+        headSha: "head",
+        branch: "feature",
+        [field]: "   ",
+      };
+      assert.throws(() => assertMatches(schema, schema, run, "run"), new RegExp(field));
+      assert.throws(() => migrateRunRecord(run), new RegExp(field));
+    });
+  }
+});
+
 test("run-record schema validates optional bounded durable runtime failure metadata", async () => {
   const schema = JSON.parse(
     await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),

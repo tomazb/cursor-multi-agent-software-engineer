@@ -34,19 +34,20 @@ export async function createInstallationAccessToken(options: {
   readOnlyChecks?: boolean;
   nowMs?: number;
 }): Promise<string> {
+  if (options.readOnlyChecks === false) {
+    throw new Error("GitHub installation tokens require the read-only checks policy");
+  }
   const repositoryMatch = options.repository.match(/^[^/\s]+\/([^/\s]+)$/);
   if (!repositoryMatch) {
     throw new Error("GitHub repository must use the owner/name form");
   }
   const jwt = createGitHubAppJwt(options.appId, options.privateKeyPem, options.nowMs);
   const body: Record<string, unknown> = { repositories: [repositoryMatch[1]!] };
-  if (options.readOnlyChecks !== false) {
-    body.permissions = {
-      checks: "write",
-      pull_requests: "read",
-      metadata: "read",
-    };
-  }
+  body.permissions = {
+    checks: "write",
+    pull_requests: "read",
+    metadata: "read",
+  };
   const response = await options.http.request(
     "POST",
     `https://api.github.com/app/installations/${options.installationId}/access_tokens`,

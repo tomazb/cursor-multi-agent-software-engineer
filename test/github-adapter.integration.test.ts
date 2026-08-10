@@ -3,7 +3,7 @@ import { createHmac } from "node:crypto";
 import { access, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import { mergeConfigForTest } from "../src/config.ts";
 import { GitHubAppAdapter } from "../src/github/adapter.ts";
 import type { GitHubHttpClient } from "../src/github/checks.ts";
@@ -13,6 +13,12 @@ import { FileRunStore, type RunStore } from "../src/store.ts";
 
 const SECRET = "integration-webhook-secret";
 const SECRET_ENV = "MASWE_TEST_GITHUB_WEBHOOK_SECRET";
+const tempDirectories = new Set<string>();
+
+after(async () => {
+  await Promise.all([...tempDirectories].map((directory) =>
+    rm(directory, { recursive: true, force: true })));
+});
 
 function sign(body: string): string {
   return `sha256=${createHmac("sha256", SECRET).update(body, "utf8").digest("hex")}`;
@@ -35,6 +41,7 @@ function testConfig() {
 
 async function setup(options: {
   liveHead?: string;
+  liveState?: "open" | "closed";
   afterManualRunLoaded?: (runId: string) => Promise<void>;
   beforeAssociationTransaction?: (deliveryId: string) => Promise<void>;
   beforeCheckPost?: (headSha: string) => Promise<void>;
@@ -43,6 +50,7 @@ async function setup(options: {
 } = {}) {
   const beforeCheckPost = options.beforeCheckPost;
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-int-"));
+  tempDirectories.add(cwd);
   const store = new FileRunStore(cwd);
   const adapterStore = options.wrapStore?.(store) ?? store;
   const config = testConfig();
@@ -53,6 +61,7 @@ async function setup(options: {
   let nextId = 1;
   let rateLimitOnce = false;
   let liveHead = options.liveHead;
+  let liveState = options.liveState ?? "open";
   let failAll = false;
   let failPatchForHeadOnce: string | undefined;
   let pullHeadLookups = 0;
@@ -78,7 +87,7 @@ async function setup(options: {
         return {
           status: 200,
           headers: {},
-          body: { head: { sha: liveHead ?? "unknown" } },
+          body: { head: { sha: liveHead ?? "unknown" }, state: liveState },
         };
       }
       if (method === "GET" && url.includes("/check-runs")) {
@@ -95,7 +104,7 @@ async function setup(options: {
       if (method === "PATCH") {
         const checkRunId = Number(url.match(/\/check-runs\/(\d+)$/)?.[1]);
         const patchHeadSha = checkRunHeadShas.get(checkRunId);
-        if (patchHeadSha === failPatchForHeadOnce) {
+        if (failPatchForHeadOnce !== undefined && patchHeadSha === failPatchForHeadOnce) {
           failPatchForHeadOnce = undefined;
           return { status: 500, headers: {}, body: { message: "forced patch failure" } };
         }
@@ -141,6 +150,9 @@ async function setup(options: {
     },
     setLiveHead(sha: string) {
       liveHead = sha;
+    },
+    setLiveState(state: "open" | "closed") {
+      liveState = state;
     },
     enableRateLimitOnce() {
       rateLimitOnce = true;
@@ -410,6 +422,58 @@ test("integration: retry remembers every old head until cancellation publication
   );
 });
 
+test("integration: a 65th pending cancellation fails closed without changing durable state", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { adapter, store, cwd } = await setup({ liveHead: "sha-new" });
+  const run = await store.create("cancellation-overflow", "req", testConfig());
+  const pendingCancellationHeadShas = Array.from(
+    { length: 64 },
+    (_, index) => `retained-head-${index.toString().padStart(2, "0")}`,
+  );
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-previous",
+    branch: "maswe/run-1",
+    suspended: false,
+    pendingCancellationHeadShas,
+  };
+  await store.save(run);
+  await new GitHubAssociationIndex(path.join(cwd, ".maswe", "github")).bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-previous",
+    branch: "maswe/run-1",
+  });
+  const before = await store.load(run.id);
+  const body = JSON.stringify(prPayload("sha-new"));
+
+  await assert.rejects(
+    adapter.handleWebhook({
+      deliveryId: "del-cancellation-overflow",
+      eventName: "pull_request",
+      signatureHeader: sign(body),
+      rawBody: body,
+    }),
+    /pending check cancellation limit exceeded/i,
+  );
+
+  const after = await store.load(run.id);
+  assert.equal(after.version, before.version);
+  assert.equal(after.github?.headSha, "sha-previous");
+  assert.deepEqual(after.github?.pendingCancellationHeadShas, pendingCancellationHeadShas);
+  assert.equal(
+    (await new GitHubAssociationIndex(path.join(cwd, ".maswe", "github")).find("owner/repo", 9))
+      ?.headSha,
+    "sha-previous",
+  );
+});
+
 test("integration: stale out-of-order head is ignored", async () => {
   process.env[SECRET_ENV] = SECRET;
   const { adapter, store, setLiveHead } = await setup({ liveHead: "sha2" });
@@ -515,7 +579,10 @@ test("integration: matching local and event heads are rejected when the remote a
 
 test("integration: pull request close suspends the index and run association", async () => {
   process.env[SECRET_ENV] = SECRET;
-  const { adapter, store, cwd, posts } = await setup({ liveHead: "sha-close" });
+  const { adapter, store, cwd, posts } = await setup({
+    liveHead: "sha-close",
+    liveState: "closed",
+  });
   const run = await store.create("close", "req", testConfig());
   run.github = {
     installationId: 44,
@@ -563,7 +630,10 @@ test("integration: pull request close suspends the index and run association", a
 
 test("integration: a reopened PR clears only closure suspension and republishes", async () => {
   process.env[SECRET_ENV] = SECRET;
-  const { adapter, store, cwd, posts } = await setup({ liveHead: "sha-reopen" });
+  const { adapter, store, cwd, posts, setLiveState } = await setup({
+    liveHead: "sha-reopen",
+    liveState: "closed",
+  });
   const run = await store.create("close-reopen", "req", testConfig());
   run.github = {
     installationId: 44,
@@ -593,6 +663,7 @@ test("integration: a reopened PR clears only closure suspension and republishes"
     rawBody: closeBody,
   });
 
+  setLiveState("open");
   const reopenBody = JSON.stringify(prPayload("sha-reopen", 9, "reopened"));
   assert.equal((await adapter.handleWebhook({
     deliveryId: "del-reopen-after-close",
@@ -602,8 +673,97 @@ test("integration: a reopened PR clears only closure suspension and republishes"
   })).status, 200);
 
   assert.equal((await index.find("owner/repo", 9))?.suspended, false);
+  assert.equal((await index.find("owner/repo", 9))?.suspensionReason, undefined);
   assert.equal((await store.load(run.id)).github?.suspended, false);
+  assert.equal((await store.load(run.id)).github?.suspensionReason, undefined);
   assert.equal(posts.length, 4);
+});
+
+test("integration: delayed close cannot re-suspend a reopened live PR", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { adapter, store, cwd, posts } = await setup({
+    liveHead: "sha-lifecycle",
+    liveState: "open",
+  });
+  const run = await store.create("delayed-close", "req", testConfig());
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-lifecycle",
+    branch: "maswe/run-1",
+    suspended: false,
+  };
+  await store.save(run);
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  await index.bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-lifecycle",
+    branch: "maswe/run-1",
+  });
+  const body = JSON.stringify(prPayload("sha-lifecycle", 9, "closed"));
+
+  assert.equal((await adapter.handleWebhook({
+    deliveryId: "del-stale-close-after-reopen",
+    eventName: "pull_request",
+    signatureHeader: sign(body),
+    rawBody: body,
+  })).status, 200);
+
+  assert.equal((await index.find("owner/repo", 9))?.suspended, false);
+  assert.equal((await store.load(run.id)).github?.suspended, false);
+  assert.equal(posts.length, 0);
+});
+
+test("integration: delayed reopen cannot clear a reclosed live PR", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { adapter, store, cwd, posts } = await setup({
+    liveHead: "sha-lifecycle",
+    liveState: "closed",
+  });
+  const run = await store.create("delayed-reopen", "req", testConfig());
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-lifecycle",
+    branch: "maswe/run-1",
+    suspended: true,
+    suspensionReason: "pull-request-closed",
+  };
+  await store.save(run);
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  await index.bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-lifecycle",
+    branch: "maswe/run-1",
+    suspended: true,
+    suspensionReason: "pull-request-closed",
+  });
+  const body = JSON.stringify(prPayload("sha-lifecycle", 9, "reopened"));
+
+  assert.equal((await adapter.handleWebhook({
+    deliveryId: "del-stale-reopen-after-reclose",
+    eventName: "pull_request",
+    signatureHeader: sign(body),
+    rawBody: body,
+  })).status, 200);
+
+  assert.equal((await index.find("owner/repo", 9))?.suspended, true);
+  assert.equal((await index.find("owner/repo", 9))?.suspensionReason, "pull-request-closed");
+  assert.equal((await store.load(run.id)).github?.suspended, true);
+  assert.equal((await store.load(run.id)).github?.suspensionReason, "pull-request-closed");
+  assert.equal(posts.length, 0);
 });
 
 test("integration: installation deletion suspension cannot be cleared by reopen", async () => {
@@ -856,7 +1016,7 @@ test("integration: push attempts later PRs before reporting an earlier invalidat
           return { status: 500, headers: {}, body: {} };
         }
         if (method === "GET" && url.includes("/pulls/10")) {
-          return { status: 200, headers: {}, body: { head: { sha: "sha-push" } } };
+          return { status: 200, headers: {}, body: { head: { sha: "sha-push" }, state: "open" } };
         }
         if (method === "GET" && url.includes("/check-runs")) {
           return { status: 200, headers: {}, body: { check_runs: [] } };

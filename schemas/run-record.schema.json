@@ -105,9 +105,9 @@
           "pattern": "^[^/\\s]+/[^/\\s]+$"
         },
         "pullRequestNumber": { "type": "integer", "minimum": 1 },
-        "baseSha": { "type": "string", "minLength": 1 },
-        "headSha": { "type": "string", "minLength": 1 },
-        "branch": { "type": "string", "minLength": 1 },
+        "baseSha": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "headSha": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "branch": { "type": "string", "minLength": 1, "pattern": "\\S" },
         "suspended": { "type": "boolean" },
         "suspensionReason": {
           "enum": ["pull-request-closed", "authorization-revoked"]

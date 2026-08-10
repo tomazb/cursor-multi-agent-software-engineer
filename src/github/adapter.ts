@@ -35,6 +35,33 @@ export interface WebhookHandleResult {
   body: { ok: boolean; duplicate?: boolean; message?: string };
 }
 
+export type GitHubWebhookDiagnosticCode =
+  | "GITHUB_WEBHOOK_HANDOFF_FAILED"
+  | "GITHUB_WEBHOOK_DISPATCH_FAILED"
+  | "GITHUB_WEBHOOK_HEARTBEAT_FAILED"
+  | "GITHUB_WEBHOOK_RETRY_FAILED";
+
+/** Safe local recovery context; the arbitrary cause is never persisted. */
+export class GitHubWebhookDiagnosticError extends Error {
+  readonly code: GitHubWebhookDiagnosticCode;
+  readonly deliveryId: string;
+  readonly eventName: string;
+  readonly attempt: number;
+
+  constructor(
+    code: GitHubWebhookDiagnosticCode,
+    context: { deliveryId: string; eventName: string; attempt: number },
+    cause: unknown,
+  ) {
+    super("GitHub webhook delivery operation failed", { cause });
+    this.name = "GitHubWebhookDiagnosticError";
+    this.code = code;
+    this.deliveryId = context.deliveryId;
+    this.eventName = context.eventName;
+    this.attempt = context.attempt;
+  }
+}
+
 function githubRoot(cwd: string): string {
   return path.join(cwd, ".maswe", "github");
 }
@@ -270,7 +297,15 @@ export class GitHubAppAdapter {
             rawBodyDigest,
           });
         } catch (handoffError) {
-          this.emitWebhookDiagnostic(handoffError);
+          this.emitWebhookDiagnostic(new GitHubWebhookDiagnosticError(
+            "GITHUB_WEBHOOK_HANDOFF_FAILED",
+            {
+              deliveryId: request.deliveryId,
+              eventName: request.eventName,
+              attempt: 0,
+            },
+            handoffError,
+          ));
           return {
             status: 503,
             body: { ok: false, message: "durable webhook handoff unavailable" },
@@ -298,7 +333,15 @@ export class GitHubAppAdapter {
         event,
       });
     } catch (handoffError) {
-      this.emitWebhookDiagnostic(handoffError);
+      this.emitWebhookDiagnostic(new GitHubWebhookDiagnosticError(
+        "GITHUB_WEBHOOK_HANDOFF_FAILED",
+        {
+          deliveryId: request.deliveryId,
+          eventName: request.eventName,
+          attempt: 0,
+        },
+        handoffError,
+      ));
       return {
         status: 503,
         body: { ok: false, message: "durable webhook handoff unavailable" },
@@ -377,15 +420,43 @@ export class GitHubAppAdapter {
       const heartbeat = setInterval(() => {
         void this.inbox
           .heartbeat(deliveryId, leaseId)
-          .catch((error) => this.emitWebhookDiagnostic(error));
+          .catch((error) => this.emitWebhookDiagnostic(new GitHubWebhookDiagnosticError(
+            "GITHUB_WEBHOOK_HEARTBEAT_FAILED",
+            {
+              deliveryId,
+              eventName: claimed.record.eventName!,
+              attempt: claimed.record.attempt,
+            },
+            error,
+          )));
       }, 5_000);
       heartbeat.unref();
       try {
         await this.dispatch(claimed.record.event, this.githubApp());
         await this.inbox.complete(deliveryId, leaseId);
       } catch (error) {
-        this.emitWebhookDiagnostic(error);
-        await this.inbox.retry(deliveryId, leaseId);
+        this.emitWebhookDiagnostic(new GitHubWebhookDiagnosticError(
+          "GITHUB_WEBHOOK_DISPATCH_FAILED",
+          {
+            deliveryId,
+            eventName: claimed.record.eventName!,
+            attempt: claimed.record.attempt,
+          },
+          error,
+        ));
+        try {
+          await this.inbox.retry(deliveryId, leaseId);
+        } catch (retryError) {
+          throw new GitHubWebhookDiagnosticError(
+            "GITHUB_WEBHOOK_RETRY_FAILED",
+            {
+              deliveryId,
+              eventName: claimed.record.eventName!,
+              attempt: claimed.record.attempt,
+            },
+            retryError,
+          );
+        }
       } finally {
         clearInterval(heartbeat);
         this.webhookWorkerActive = false;
@@ -406,15 +477,23 @@ export class GitHubAppAdapter {
 
   async stopWebhookWorker(options: { drainMs?: number } = {}): Promise<void> {
     const drainMs = options.drainMs ?? 5_000;
-    try {
-      await this.waitForWebhookIdle(drainMs);
-    } catch {
-      // Pending state remains durable and will be recovered before the next listener starts.
-    }
     this.webhookWorkerEnabled = false;
     if (this.webhookWorkerTimer) {
       clearTimeout(this.webhookWorkerTimer);
       this.webhookWorkerTimer = undefined;
+    }
+    const worker = this.webhookWorker;
+    if (!worker) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        worker,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, drainMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
   }
 
@@ -446,11 +525,15 @@ export class GitHubAppAdapter {
         if (!isRepoAllowed(app, beforeLiveHead.github.repository)) {
           throw new Error(`Repository ${beforeLiveHead.github.repository} is not allowlisted`);
         }
-        const liveHead = await this.currentPullRequestHead(
+        const livePullRequest = await this.currentPullRequest(
           beforeLiveHead.github.repository,
           beforeLiveHead.github.pullRequestNumber,
           beforeLiveHead.github.installationId,
         );
+        if (livePullRequest.state !== "open") {
+          throw new Error(`Pull request ${beforeLiveHead.github.repository}#${beforeLiveHead.github.pullRequestNumber} is not open`);
+        }
+        const liveHead = livePullRequest.headSha;
         const publication = await this.associations.withTransaction(async (transaction) => {
           const run = await this.store.load(runId);
           if (!run.github) {
@@ -724,11 +807,11 @@ export class GitHubAppAdapter {
     }
   }
 
-  private async currentPullRequestHead(
+  private async currentPullRequest(
     repository: string,
     pullRequestNumber: number,
     installationId: number,
-  ): Promise<string> {
+  ): Promise<{ headSha: string; state: "open" | "closed" }> {
     const { owner, repo } = parseOwnerRepo(repository);
     const token = await this.tokenProvider(installationId, repository);
     const response = await this.http.request(
@@ -747,13 +830,19 @@ export class GitHubAppAdapter {
         `Failed to resolve current PR head for ${repository}#${pullRequestNumber}: HTTP ${response.status}`,
       );
     }
-    const head = (response.body as { head?: { sha?: string } }).head;
+    const body = response.body as { head?: { sha?: string }; state?: unknown };
+    const head = body.head;
     if (typeof head?.sha !== "string" || !head.sha) {
       throw new Error(
         `Failed to resolve current PR head for ${repository}#${pullRequestNumber}: missing head.sha`,
       );
     }
-    return head.sha;
+    if (body.state !== "open" && body.state !== "closed") {
+      throw new Error(
+        `Failed to resolve current PR state for ${repository}#${pullRequestNumber}`,
+      );
+    }
+    return { headSha: head.sha, state: body.state };
   }
 
   private async handlePullRequestEvent(event: GitHubInternalEvent): Promise<void> {
@@ -765,13 +854,22 @@ export class GitHubAppAdapter {
       throw new Error("pull_request event missing installation id");
     }
     await this.withPublicationFence(repository, pullRequestNumber, async () => {
-      const liveHead = await this.currentPullRequestHead(
+      const livePullRequest = await this.currentPullRequest(
         repository,
         pullRequestNumber,
         installationId,
       );
+      const liveHead = livePullRequest.headSha;
       if (liveHead !== headSha) {
         // Stale or out-of-order delivery: current PR head has already moved on.
+        return;
+      }
+      const expectsClosed = event.type === "pull_request.closed";
+      if (
+        (expectsClosed && livePullRequest.state !== "closed") ||
+        (!expectsClosed && livePullRequest.state !== "open")
+      ) {
+        // Same-SHA out-of-order lifecycle deliveries cannot invert the live PR state.
         return;
       }
 

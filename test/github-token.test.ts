@@ -61,3 +61,24 @@ test("createInstallationAccessToken rejects a malformed repository before reques
   );
   assert.equal(requests, 0);
 });
+
+test("createInstallationAccessToken rejects an explicit read-only policy opt-out", async () => {
+  let requests = 0;
+  await assert.rejects(
+    createInstallationAccessToken({
+      appId: "unused",
+      privateKeyPem: "must-not-be-parsed",
+      installationId: 9,
+      repository: "owner/repo",
+      readOnlyChecks: false,
+      http: {
+        async request() {
+          requests += 1;
+          return { status: 201, headers: {}, body: { token: "too-broad" } };
+        },
+      },
+    }),
+    /read-only checks policy/i,
+  );
+  assert.equal(requests, 0);
+});

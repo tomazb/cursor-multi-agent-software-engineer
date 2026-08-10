@@ -16,14 +16,22 @@ export class WebhookBodyTooLargeError extends Error {
 export class WebhookIngressDeadlineError extends Error {
   readonly code: "GITHUB_WEBHOOK_INGRESS_NOT_STARTED" | "GITHUB_WEBHOOK_INGRESS_OUTCOME_UNKNOWN";
   readonly handoffStarted: boolean;
+  readonly deliveryId: string | undefined;
+  readonly eventName: string | undefined;
+  readonly attempt = 0;
 
-  constructor(handoffStarted: boolean) {
+  constructor(
+    handoffStarted: boolean,
+    context: { deliveryId?: string; eventName?: string } = {},
+  ) {
     super("GitHub webhook ingress deadline exceeded");
     this.name = "WebhookIngressDeadlineError";
     this.handoffStarted = handoffStarted;
     this.code = handoffStarted
       ? "GITHUB_WEBHOOK_INGRESS_OUTCOME_UNKNOWN"
       : "GITHUB_WEBHOOK_INGRESS_NOT_STARTED";
+    this.deliveryId = context.deliveryId;
+    this.eventName = context.eventName;
   }
 }
 
@@ -109,6 +117,7 @@ export function createWebhookServer(options: WebhookServerOptions): Server {
     let bodyAborted = false;
     try {
       if (req.method !== "POST" || (req.url ?? "").split("?")[0] !== webhookPath) {
+        req.resume();
         res.writeHead(404, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, message: "not found" }));
         return;
@@ -117,6 +126,7 @@ export function createWebhookServer(options: WebhookServerOptions): Server {
       const eventName = singleHeader(req, "x-github-event");
       const signatureHeader = singleHeader(req, "x-hub-signature-256");
       if (!deliveryId || !eventName || !signatureHeader || !SAFE_DELIVERY_ID.test(deliveryId)) {
+        req.resume();
         invalidWebhookHeaders(res);
         return;
       }
@@ -141,7 +151,7 @@ export function createWebhookServer(options: WebhookServerOptions): Server {
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
             timedOut = true;
-            reject(new WebhookIngressDeadlineError(handoffStarted));
+            reject(new WebhookIngressDeadlineError(handoffStarted, { deliveryId, eventName }));
           }, ingressTimeoutMs);
           timer.unref();
         }),

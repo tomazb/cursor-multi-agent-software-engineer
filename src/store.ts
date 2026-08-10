@@ -240,7 +240,7 @@ export function migrateRunRecord(raw: unknown): RunRecord {
       throw new Error("Run record github.pullRequestNumber must be a positive integer");
     }
     for (const key of ["baseSha", "headSha", "branch"] as const) {
-      if (typeof association[key] !== "string" || !association[key]) {
+      if (typeof association[key] !== "string" || !association[key].trim()) {
         throw new Error(`Run record github.${key} must be a non-empty string`);
       }
     }
