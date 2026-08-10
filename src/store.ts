@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import {
+  DurableAtomicWriteOutcomeUnknownError,
   MAX_AUTHORITATIVE_FILE_BYTES,
   readBoundedOrdinaryFile,
   requireOrdinaryDirectory,
@@ -33,6 +34,11 @@ import {
   sanitizeDiagnostic,
 } from "./redaction.ts";
 import { sanitizeDurableRuntimeFailureSummary } from "./failure-diagnostics.ts";
+import {
+  exactRunRecord,
+  nonNegativeRunRecordInteger,
+  requiredRunRecordString,
+} from "./run-record-validation.ts";
 import { transition } from "./state-machine.ts";
 
 function now(): string {
@@ -199,43 +205,6 @@ const RUN_RECORD_FIELDS = new Set([
   "failure",
 ]);
 
-function exactRunRecord(
-  candidate: Record<string, unknown>,
-  version: number,
-  config: MasweConfig,
-  artifacts: ArtifactReference[],
-): RunRecord {
-  const record = {
-    schemaVersion: 1,
-    version,
-    id: candidate.id,
-    title: candidate.title,
-    request: candidate.request,
-    repositoryPath: candidate.repositoryPath,
-    state: candidate.state,
-    createdAt: candidate.createdAt,
-    updatedAt: candidate.updatedAt,
-    approvals: candidate.approvals,
-    counters: candidate.counters,
-    config,
-    artifacts,
-    events: candidate.events,
-  } as unknown as RunRecord;
-  for (const key of [
-    "workspace",
-    "evidence",
-    "github",
-    "supersedes",
-    "supersededBy",
-    "failure",
-  ] as const) {
-    if (candidate[key] !== undefined) {
-      (record as unknown as Record<string, unknown>)[key] = candidate[key];
-    }
-  }
-  return record;
-}
-
 export function migrateRunRecord(raw: unknown): RunRecord {
   if (!raw || typeof raw !== "object") {
     throw new Error("Run record is not a JSON object");
@@ -250,22 +219,69 @@ export function migrateRunRecord(raw: unknown): RunRecord {
       `Unsupported run schemaVersion ${String(candidate.schemaVersion)}; expected 1`,
     );
   }
+  if (!("config" in candidate)) {
+    throw new Error("Run record config is required");
+  }
 
-  const artifactsRaw = Array.isArray(candidate.artifacts) ? candidate.artifacts : [];
+  if (candidate.artifacts !== undefined && !Array.isArray(candidate.artifacts)) {
+    throw new Error("Run record artifacts must be an array");
+  }
+  // Schema-v1 records from the earliest release omitted artifacts and version.
+  const artifactsRaw = candidate.artifacts ?? [];
   const artifacts: ArtifactReference[] = artifactsRaw.map((item, index) => {
-    if (!item || typeof item !== "object") {
-      throw new Error(`Run artifact[${index}] is invalid`);
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`Run artifact[${index}] must be an object`);
     }
     const artifact = item as Record<string, unknown>;
-    const name = String(artifact.name ?? "");
-    if (!name) throw new Error(`Run artifact[${index}] is missing name`);
+    const allowedArtifactFields = new Set([
+      "name",
+      "logicalName",
+      "attempt",
+      "path",
+      "sha256",
+      "createdAt",
+    ]);
+    const unsupportedArtifact = Object.keys(artifact).find(
+      (key) => !allowedArtifactFields.has(key),
+    );
+    if (unsupportedArtifact) {
+      throw new Error(`Unsupported run artifact[${index}] field: ${unsupportedArtifact}`);
+    }
+    for (const field of ["name", "path", "sha256"] as const) {
+      if (!(field in artifact)) throw new Error(`Run artifact[${index}].${field} is required`);
+    }
+    const name = requiredRunRecordString(
+      artifact.name,
+      `Run artifact[${index}].name`,
+      false,
+    );
+    const logicalName = artifact.logicalName === undefined
+      ? name
+      : requiredRunRecordString(
+          artifact.logicalName,
+          `Run artifact[${index}].logicalName`,
+          false,
+        );
+    const attempt = artifact.attempt === undefined
+      ? 1
+      : nonNegativeRunRecordInteger(artifact.attempt, `Run artifact[${index}].attempt`);
+    if (attempt < 1) throw new Error(`Run artifact[${index}].attempt must be positive`);
+    const digest = requiredRunRecordString(
+      artifact.sha256,
+      `Run artifact[${index}].sha256`,
+    );
+    if (!/^[a-f0-9]{64}$/.test(digest)) {
+      throw new Error(`Run artifact[${index}].sha256 is invalid`);
+    }
     return {
       name,
-      logicalName: String(artifact.logicalName ?? name),
-      attempt: typeof artifact.attempt === "number" && artifact.attempt >= 1 ? artifact.attempt : 1,
-      path: String(artifact.path ?? ""),
-      sha256: String(artifact.sha256 ?? ""),
-      createdAt: String(artifact.createdAt ?? now()),
+      logicalName,
+      attempt,
+      path: requiredRunRecordString(artifact.path, `Run artifact[${index}].path`),
+      sha256: digest,
+      createdAt: artifact.createdAt === undefined
+        ? now()
+        : requiredRunRecordString(artifact.createdAt, `Run artifact[${index}].createdAt`),
     };
   });
 
@@ -403,7 +419,11 @@ export class FileRunStore implements RunStore {
         "run record",
         this.maxRunFileBytes,
       );
-      return migrateRunRecord(JSON.parse(raw));
+      const record = migrateRunRecord(JSON.parse(raw));
+      if (record.id !== runId) {
+        throw new Error(`Run record id ${record.id} does not match requested run id ${runId}`);
+      }
+      return record;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         const missing = new Error(`Run ${runId} not found`, { cause: error }) as NodeJS.ErrnoException;
@@ -414,18 +434,53 @@ export class FileRunStore implements RunStore {
     }
   }
 
-  private async writeRunRecord(run: RunRecord): Promise<void> {
+  private prepareRunRecord(run: RunRecord): { record: RunRecord; content: string } {
     const exact = migrateRunRecord(run);
     const content = `${JSON.stringify(exact, null, 2)}\n`;
     if (Buffer.byteLength(content, "utf8") > this.maxRunFileBytes) {
       throw new Error(`Run record exceeds its bounded ${this.maxRunFileBytes}-byte capacity`);
     }
+    return { record: exact, content };
+  }
+
+  private async writePreparedRunRecord(
+    prepared: { record: RunRecord; content: string },
+  ): Promise<void> {
     await writeDurableAtomic(
-      this.runFile(run.id),
-      content,
+      this.runFile(prepared.record.id),
+      prepared.content,
       "run record",
       this.durableOptions,
     );
+  }
+
+  private adoptRunRecord(target: RunRecord, source: RunRecord): void {
+    const mutable = target as unknown as Record<string, unknown>;
+    for (const key of Object.keys(mutable)) delete mutable[key];
+    Object.assign(mutable, source);
+  }
+
+  private async writeAndReconcile(
+    target: RunRecord,
+    prepared: { record: RunRecord; content: string },
+  ): Promise<void> {
+    try {
+      await this.writePreparedRunRecord(prepared);
+      this.adoptRunRecord(target, prepared.record);
+    } catch (error) {
+      if (error instanceof DurableAtomicWriteOutcomeUnknownError) {
+        try {
+          const observed = await this.readRunFile(prepared.record.id);
+          const observedContent = `${JSON.stringify(observed, null, 2)}\n`;
+          if (observedContent === prepared.content) {
+            this.adoptRunRecord(target, observed);
+          }
+        } catch {
+          // Preserve the original outcome-unknown error; a later retry reloads canonical state.
+        }
+      }
+      throw error;
+    }
   }
 
   /**
@@ -688,13 +743,13 @@ export class FileRunStore implements RunStore {
       events: [],
     };
     await this.withLock(run.id, async () => {
-      await this.writeRunRecord(run);
+      const prepared = this.prepareRunRecord(run);
+      await this.writeAndReconcile(run, prepared);
     });
     return run;
   }
 
   async save(run: RunRecord): Promise<void> {
-    sanitizeRunFailureState(run);
     await this.withLock(run.id, async () => {
       const onDisk = await this.readRunFile(run.id);
       if (onDisk.version !== run.version) {
@@ -702,9 +757,13 @@ export class FileRunStore implements RunStore {
           `Run ${run.id} version conflict: expected ${run.version}, on disk ${onDisk.version}`,
         );
       }
-      run.version += 1;
-      run.updatedAt = now();
-      await this.writeRunRecord(run);
+      const candidate = {
+        ...run,
+        version: run.version + 1,
+        updatedAt: now(),
+      } satisfies RunRecord;
+      const prepared = this.prepareRunRecord(candidate);
+      await this.writeAndReconcile(run, prepared);
     });
   }
 
@@ -771,12 +830,6 @@ export class FileRunStore implements RunStore {
       const relativePath = path.join(".maswe", "runs", run.id, "artifacts", fileName);
       const absolutePath = path.join(this.cwd, relativePath);
       const redacted = redactSecrets(content);
-      await writeDurableAtomic(
-        absolutePath,
-        redacted,
-        "run artifact",
-        this.durableOptions,
-      );
 
       const reference: ArtifactReference = {
         name: logicalName,
@@ -799,11 +852,17 @@ export class FileRunStore implements RunStore {
       ];
       next.version += 1;
       next.updatedAt = now();
-      await this.writeRunRecord(next);
+      // The authoritative record capacity is known before artifact publication, so a
+      // deterministic record overflow cannot leave an orphaned artifact behind.
+      const prepared = this.prepareRunRecord(next);
+      await writeDurableAtomic(
+        absolutePath,
+        redacted,
+        "run artifact",
+        this.durableOptions,
+      );
+      await this.writeAndReconcile(run, prepared);
 
-      run.version = next.version;
-      run.updatedAt = next.updatedAt;
-      run.artifacts = next.artifacts;
       return reference;
     });
   }

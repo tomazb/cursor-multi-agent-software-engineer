@@ -1287,6 +1287,72 @@ test("integration: post-rename association sync failure never rolls back a commi
   assert.equal((await store.load(run.id)).github?.suspensionReason, "pull-request-closed");
 });
 
+test("integration: close redelivery rebuilds a lost association for the exact suspended PR", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  let failDirectorySync = true;
+  const { adapter, store, cwd } = await setup({
+    liveHead: "sha-close-lost-index",
+    liveState: "closed",
+    associationWriteRecords: async (filePath, content) => writeDurableAtomic(
+      filePath,
+      content,
+      "GitHub association index",
+      {
+        syncDirectory: async () => {
+          if (failDirectorySync) {
+            failDirectorySync = false;
+            throw new Error("simulated post-rename association directory sync failure");
+          }
+        },
+      },
+    ),
+  });
+  const run = await store.create("close-lost-index", "req", testConfig());
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-close-lost-index",
+    branch: "maswe/run-1",
+    suspended: false,
+  };
+  await store.save(run);
+  const rawBody = JSON.stringify(prPayload("sha-close-lost-index", 9, "closed"));
+  const request = {
+    deliveryId: "del-close-lost-index",
+    eventName: "pull_request",
+    signatureHeader: sign(rawBody),
+    rawBody,
+  };
+
+  await assert.rejects(adapter.handleWebhook(request), /post-rename|outcome|directory sync/i);
+  assert.equal((await store.load(run.id)).github?.suspensionReason, "pull-request-closed");
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  await rm(path.join(githubRoot, "associations.json"), { force: true });
+
+  const restarted = new GitHubAppAdapter({
+    cwd,
+    config: testConfig(),
+    store: new FileRunStore(cwd),
+    http: {
+      async request() {
+        return {
+          status: 200,
+          headers: {},
+          body: { head: { sha: "sha-close-lost-index" }, state: "closed" },
+        };
+      },
+    },
+    tokenProvider: async () => "test-token",
+    synchronousWebhookDispatch: true,
+  });
+  assert.equal((await restarted.handleWebhook(request)).status, 200);
+  const recovered = await new GitHubAssociationIndex(githubRoot).find("owner/repo", 9);
+  assert.equal(recovered?.runId, run.id);
+  assert.equal(recovered?.suspensionReason, "pull-request-closed");
+});
+
 test("integration: a rejected run save that reached disk is reconciled before bind", async () => {
   process.env[SECRET_ENV] = SECRET;
   let rejectAfterSave = true;

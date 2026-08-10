@@ -26,6 +26,7 @@ export type {
 
 const DEFAULT_QUEUE_SCAN_PAGE = 128;
 const MAX_QUEUE_SCAN_PAGE = 256;
+const MAX_INBOX_STATE_BYTES = 1024 * 1024;
 
 function errno(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
@@ -77,14 +78,26 @@ function requireNoFollowFlag(noFollow: number | null | undefined): number {
 async function readOrdinaryFile(
   filePath: string,
   noFollow = requireNoFollowFlag(constants.O_NOFOLLOW),
+  afterStat?: (filePath: string) => Promise<void>,
 ): Promise<Buffer> {
   const handle = await open(filePath, constants.O_RDONLY | noFollow);
   try {
     const stat = await handle.stat();
-    if (!stat.isFile() || stat.size > 1024 * 1024) {
+    if (!stat.isFile() || stat.size > MAX_INBOX_STATE_BYTES) {
       throw new Error("GitHub durable inbox evidence is not an ordinary bounded file");
     }
-    return await handle.readFile();
+    await afterStat?.(filePath);
+    const bytes = Buffer.alloc(MAX_INBOX_STATE_BYTES + 1);
+    let total = 0;
+    while (total < bytes.length) {
+      const chunk = await handle.read(bytes, total, bytes.length - total, null);
+      if (chunk.bytesRead === 0) break;
+      total += chunk.bytesRead;
+    }
+    if (total > MAX_INBOX_STATE_BYTES) {
+      throw new Error("GitHub durable inbox evidence exceeds its bounded file limit");
+    }
+    return bytes.subarray(0, total);
   } finally {
     await handle.close();
   }
@@ -103,6 +116,7 @@ export class GitHubDeliveryInbox {
     filePath: string,
   ) => Promise<void>;
   private readonly syncDirectoryPath: (directoryPath: string) => Promise<void>;
+  private readonly afterStateStat: ((statePath: string) => Promise<void>) | undefined;
   private initialization: Promise<void> | undefined;
 
   constructor(
@@ -115,6 +129,8 @@ export class GitHubDeliveryInbox {
       ) => Promise<void>;
       syncDirectory?: (directoryPath: string) => Promise<void>;
       noFollowFlag?: number | null;
+      /** Deterministic test seam for proving bounded reads across post-stat growth. */
+      afterStateStat?: (statePath: string) => Promise<void>;
     } = {},
   ) {
     this.githubRoot = githubRoot;
@@ -128,6 +144,7 @@ export class GitHubDeliveryInbox {
     );
     this.syncFile = options.syncFile ?? (async (handle) => handle.sync());
     this.syncDirectoryPath = options.syncDirectory ?? syncDirectory;
+    this.afterStateStat = options.afterStateStat;
   }
 
   private pathsForHash(hash: string): {
@@ -199,7 +216,11 @@ export class GitHubDeliveryInbox {
           let record: InboxDeliveryRecord;
           try {
             record = parseRecord(
-              (await readOrdinaryFile(paths.statePath, this.noFollowFlag)).toString("utf8"),
+              (await readOrdinaryFile(
+                paths.statePath,
+                this.noFollowFlag,
+                this.afterStateStat,
+              )).toString("utf8"),
             );
           } catch (error) {
             if (errno(error) === "ENOENT") continue;
@@ -340,6 +361,7 @@ export class GitHubDeliveryInbox {
         (await readOrdinaryFile(
           this.paths(deliveryId).statePath,
           this.noFollowFlag,
+          this.afterStateStat,
         )).toString("utf8"),
       );
       if (record.deliveryId !== deliveryId) {
@@ -355,6 +377,12 @@ export class GitHubDeliveryInbox {
   private async writeState(record: InboxDeliveryRecord): Promise<void> {
     const hash = deliveryHash(record.deliveryId);
     const paths = this.pathsForHash(hash);
+    const content = `${JSON.stringify(record)}\n`;
+    if (Buffer.byteLength(content, "utf8") > MAX_INBOX_STATE_BYTES) {
+      throw new Error(
+        `GitHub durable inbox state exceeds its bounded ${MAX_INBOX_STATE_BYTES}-byte capacity`,
+      );
+    }
     await createDirectory(path.dirname(paths.stateDirectory));
     await this.syncDirectoryPath(this.stateRoot);
     await createDirectory(paths.stateDirectory);
@@ -363,7 +391,7 @@ export class GitHubDeliveryInbox {
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
       handle = await open(temporaryPath, "wx", 0o600);
-      await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
+      await handle.writeFile(content, "utf8");
       await this.syncFile(handle, temporaryPath);
       await handle.close();
       handle = undefined;
@@ -624,7 +652,11 @@ export class GitHubDeliveryInbox {
         observedQueue.push({
           hash,
           record: parseRecord(
-            (await readOrdinaryFile(statePath, this.noFollowFlag)).toString("utf8"),
+            (await readOrdinaryFile(
+              statePath,
+              this.noFollowFlag,
+              this.afterStateStat,
+            )).toString("utf8"),
           ),
         });
       } catch (error) {

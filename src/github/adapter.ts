@@ -664,7 +664,9 @@ export class GitHubAppAdapter {
         if (event.type === "pull_request.closed") {
           const associatedRun = association
             ? await this.store.load(association.runId)
-            : await this.findMatchingRun(repository, pullRequestNumber, event.branch);
+            : await this.findMatchingRun(repository, pullRequestNumber, event.branch, {
+              allowPullRequestClosedSuspension: true,
+            });
           if (associatedRun?.github) {
             const before = structuredClone(associatedRun);
             associatedRun.github = {
@@ -698,11 +700,17 @@ export class GitHubAppAdapter {
 
         const run = association
           ? await this.store.load(association.runId)
-          : await this.findMatchingRun(repository, pullRequestNumber, event.branch);
+          : await this.findMatchingRun(repository, pullRequestNumber, event.branch, {
+            allowPullRequestClosedSuspension: event.type === "pull_request.reopened",
+          });
         if (!run) return { kind: "unassociated" } as const;
+        const reopeningRunClosure =
+          event.type === "pull_request.reopened" &&
+          run.github?.suspended === true &&
+          run.github.suspensionReason === "pull-request-closed";
         if (
           run.github?.suspended &&
-          !(reopeningClosure && run.github.suspensionReason === "pull-request-closed")
+          !(reopeningClosure || reopeningRunClosure)
         ) {
           return { kind: "ignore" } as const;
         }
@@ -792,13 +800,18 @@ export class GitHubAppAdapter {
     repository: string,
     pullRequestNumber: number,
     branch: string | undefined,
+    options: { allowPullRequestClosedSuspension?: boolean } = {},
   ): Promise<RunRecord | undefined> {
     const runs = await this.store.list();
     const terminal = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 
     // Exact PR association on the run record wins.
     for (const run of runs) {
-      if (terminal.has(run.state) || run.github?.suspended) continue;
+      const recoverableClosure =
+        options.allowPullRequestClosedSuspension === true &&
+        run.github?.suspended === true &&
+        run.github.suspensionReason === "pull-request-closed";
+      if (terminal.has(run.state) || (run.github?.suspended && !recoverableClosure)) continue;
       if (
         run.github?.repository === repository &&
         run.github.pullRequestNumber === pullRequestNumber

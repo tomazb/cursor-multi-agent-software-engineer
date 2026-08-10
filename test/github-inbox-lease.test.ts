@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -39,6 +39,47 @@ test("inbox fails closed when no-follow queue-marker reads are unavailable", () 
   assert.throws(
     () => new GitHubDeliveryInbox("/unused", { noFollowFlag: null }),
     /non-following|no-follow|unavailable/i,
+  );
+});
+
+test("state reads detect post-stat growth instead of allocating past the bound", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-state-growth-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  let grew = false;
+  const inbox = new GitHubDeliveryInbox(root, {
+    afterStateStat: async (statePath: string) => {
+      if (grew) return;
+      grew = true;
+      await appendFile(statePath, Buffer.alloc(1_048_576, 0x20));
+    },
+  } as never);
+  await enqueue(inbox, "state-grew-after-stat");
+
+  await assert.rejects(inbox.claimNext(Date.now() + 1), /bounded|exceed|too large/i);
+});
+
+test("state writes reject oversized canonical records before publication", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-state-capacity-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const inbox = new GitHubDeliveryInbox(root);
+  const deliveryId = "oversized-state";
+  const oversized = event(deliveryId);
+  oversized.headSha = "h".repeat(1_048_576);
+
+  await assert.rejects(
+    inbox.enqueue({
+      deliveryId,
+      eventName: "push",
+      receivedAt: RECEIVED_AT,
+      rawBodyDigest: BODY_DIGEST,
+      event: oversized,
+    }),
+    /bounded|capacity|exceed|too large/i,
+  );
+  const hash = createHash("sha256").update(deliveryId).digest("hex");
+  await assert.rejects(
+    readFile(path.join(root, "inbox", "state", hash.slice(0, 2), hash, "state.json")),
+    { code: "ENOENT" },
   );
 });
 

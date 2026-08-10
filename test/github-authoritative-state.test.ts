@@ -222,6 +222,35 @@ test("run loading rejects symlinked, oversized, and non-exact top-level records"
 
     await assert.rejects(store.load(run.id), /unsupported run record field.*token/i);
   });
+
+  await t.test("missing, mistyped, and directory-mismatched required fields", async (t) => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-run-required-load-"));
+    t.after(async () => rm(cwd, { recursive: true, force: true }));
+    const store = new FileRunStore(cwd);
+    const run = await store.create("run", "required", DEFAULT_CONFIG);
+    const runPath = path.join(store.root, run.id, "run.json");
+    const valid = JSON.parse(await readFile(runPath, "utf8")) as Record<string, unknown>;
+
+    const corruptions: Array<[string, (record: Record<string, unknown>) => void]> = [
+      ["missing title", (record) => { delete record.title; }],
+      ["invalid state", (record) => { record.state = "NOT_A_STATE"; }],
+      ["invalid approvals", (record) => {
+        record.approvals = { brainstorm: "yes", design: false };
+      }],
+      ["invalid counters", (record) => {
+        record.counters = { buildVerifyCycles: 0.5, commentResolutionCycles: 0 };
+      }],
+      ["invalid events", (record) => { record.events = {}; }],
+      ["directory id mismatch", (record) => { record.id = "different-run"; }],
+      ["missing config", (record) => { delete record.config; }],
+    ];
+    for (const [label, corrupt] of corruptions) {
+      const record = structuredClone(valid);
+      corrupt(record);
+      await writeFile(runPath, `${JSON.stringify(record)}\n`, "utf8");
+      await assert.rejects(store.load(run.id), /run record|run id|requested/i, label);
+    }
+  });
 });
 
 test("run capacity rejects before publication and preserves readable prior bytes", async (t) => {
@@ -234,12 +263,62 @@ test("run capacity rejects before publication and preserves readable prior bytes
   const boundedStore = new FileRunStore(cwd, {
     maxRunFileBytes: Buffer.byteLength(retained, "utf8") + 64,
   });
+  const retainedVersion = run.version;
+  const retainedUpdatedAt = run.updatedAt;
   run.request = "x".repeat(10_000);
 
   await assert.rejects(boundedStore.save(run), /bounded|capacity|exceed/i);
 
   assert.equal(await readFile(runPath, "utf8"), retained);
   assert.equal((await boundedStore.load(run.id)).request, "retained");
+  assert.equal(run.version, retainedVersion);
+  assert.equal(run.updatedAt, retainedUpdatedAt);
+});
+
+test("artifact capacity is checked before publishing artifact bytes", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-artifact-capacity-write-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const initialStore = new FileRunStore(cwd);
+  const run = await initialStore.create("run", "retained", DEFAULT_CONFIG);
+  const retained = await readFile(path.join(initialStore.root, run.id, "run.json"), "utf8");
+  const boundedStore = new FileRunStore(cwd, {
+    maxRunFileBytes: Buffer.byteLength(retained, "utf8") + 32,
+  });
+
+  await assert.rejects(
+    boundedStore.writeArtifact(run, "capacity.md", "must not become an orphan"),
+    /bounded|capacity|exceed/i,
+  );
+  await assert.rejects(
+    readFile(
+      path.join(initialStore.root, run.id, "artifacts", "capacity.attempt-1.md"),
+      "utf8",
+    ),
+    { code: "ENOENT" },
+  );
+});
+
+test("save reconciles the caller when directory sync fails after canonical publication", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-run-save-outcome-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const initialStore = new FileRunStore(cwd);
+  const run = await initialStore.create("run", "before", DEFAULT_CONFIG);
+  let failSync = true;
+  const store = new FileRunStore(cwd, {
+    syncDirectory: async () => {
+      if (failSync) {
+        failSync = false;
+        throw new Error("simulated post-rename run directory sync failure");
+      }
+    },
+  });
+  run.request = "published despite unknown durability";
+
+  await assert.rejects(store.save(run), /published.*directory sync failed/i);
+  const canonical = await initialStore.load(run.id);
+  assert.equal(canonical.request, "published despite unknown durability");
+  assert.equal(run.version, canonical.version);
+  assert.equal(run.updatedAt, canonical.updatedAt);
 });
 
 test("authoritative atomic writes surface file and parent-directory sync failures", async (t) => {
