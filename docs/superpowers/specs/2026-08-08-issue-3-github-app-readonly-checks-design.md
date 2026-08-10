@@ -1,7 +1,7 @@
 # Design: Issue #3 Phase A — Read-only GitHub App checks
 
-**Issue:** [GitHub #3](https://github.com/tomazb/cursor-multi-agent-software-engineer/issues/3) (ROADMAP milestone v0.3 Phase A)  
-**Date:** 2026-08-08  
+**Issue:** [GitHub #3](https://github.com/tomazb/cursor-multi-agent-software-engineer/issues/3) (ROADMAP milestone v0.3 Phase A)
+**Date:** 2026-08-08
 **Status:** Implemented; durable-ingress amendments incorporated 2026-08-10
 
 ## Problem
