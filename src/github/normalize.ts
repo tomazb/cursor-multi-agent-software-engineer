@@ -190,12 +190,11 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
       supportedAction === "removed" ? "repositories_removed" : "repositories_added";
     if (!Array.isArray(payload[listKey])) malformed(`${listKey} must be an array`);
     const listed = payload[listKey] as unknown[];
-    const repositories = listed
-      .map((item) => asRecord(item)?.full_name)
-      .filter((name): name is string => typeof name === "string" && name.includes("/"));
-    if (repositories.length !== listed.length) {
-      malformed(`${listKey} entries must include full_name`);
-    }
+    const repositories = listed.map((item) => {
+      const fullName = requireString(asRecord(item)?.full_name, `${listKey}.full_name`);
+      if (!fullName.includes("/")) malformed(`${listKey}.full_name must use owner/repository form`);
+      return fullName.toLowerCase();
+    });
     return withOptional(
       {
         eventId: input.deliveryId,

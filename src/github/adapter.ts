@@ -247,7 +247,8 @@ export class GitHubAppAdapter {
             receivedAt,
             rawBodyDigest,
           });
-        } catch {
+        } catch (handoffError) {
+          this.emitWebhookDiagnostic(handoffError);
           return {
             status: 503,
             body: { ok: false, message: "durable webhook handoff unavailable" },
@@ -273,7 +274,8 @@ export class GitHubAppAdapter {
         rawBodyDigest,
         event,
       });
-    } catch {
+    } catch (handoffError) {
+      this.emitWebhookDiagnostic(handoffError);
       return {
         status: 503,
         body: { ok: false, message: "durable webhook handoff unavailable" },

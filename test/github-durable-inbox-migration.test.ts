@@ -190,3 +190,35 @@ test("startup fails closed on an unexpected durable queue entry", async (t) => {
     /Invalid GitHub durable inbox queue entry/,
   );
 });
+
+test("startup migration rejects legacy canonical records outside the v1 whitelist", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-v1-fields-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const canonical = await writeLegacy(cwd, "legacy-extra-field", "processing");
+  const parsed = JSON.parse(await readFile(canonical, "utf8")) as Record<string, unknown>;
+  parsed.rawBody = "must-not-be-trusted-or-migrated";
+  await writeFile(canonical, `${JSON.stringify(parsed)}\n`, "utf8");
+
+  await assert.rejects(
+    new GitHubDeliveryInbox(path.join(cwd, ".maswe", "github")).initialize(),
+    /Invalid legacy GitHub delivery canonical record/,
+  );
+});
+
+test("orphan queue markers cannot lease payloadless legacy migration states", async (t) => {
+  for (const status of ["processing", "completed"] as const) {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), `maswe-gh-inbox-v1-orphan-${status}-`));
+    t.after(async () => rm(cwd, { recursive: true, force: true }));
+    const deliveryId = `legacy-orphan-${status}`;
+    await writeLegacy(cwd, deliveryId, status);
+    const githubRoot = path.join(cwd, ".maswe", "github");
+    const inbox = new GitHubDeliveryInbox(githubRoot);
+    await inbox.initialize();
+    const hash = createHash("sha256").update(deliveryId).digest("hex");
+    const queueDirectory = path.join(githubRoot, "inbox", "queue", hash.slice(0, 2));
+    await mkdir(queueDirectory, { recursive: true });
+    await writeFile(path.join(queueDirectory, `${hash}.queued`), "");
+
+    assert.equal(await inbox.claimNext(Date.now() + 1), undefined);
+  }
+});

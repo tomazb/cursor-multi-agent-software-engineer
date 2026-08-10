@@ -159,7 +159,7 @@ test("normalize distinguishes an unsupported action from a malformed supported p
   );
 });
 
-test("normalize installation_repositories.removed keeps all repositories", () => {
+test("normalize installation_repositories.removed keeps all canonical repositories", () => {
   const event = normalizeGitHubWebhook({
     deliveryId: "del-5",
     eventName: "installation_repositories",
@@ -167,8 +167,8 @@ test("normalize installation_repositories.removed keeps all repositories", () =>
       action: "removed",
       installation: { id: 7 },
       repositories_removed: [
-        { full_name: "owner/one" },
-        { full_name: "owner/two" },
+        { full_name: "Owner/One" },
+        { full_name: "OWNER/Two" },
       ],
     },
   });

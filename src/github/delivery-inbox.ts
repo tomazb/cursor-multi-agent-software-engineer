@@ -230,6 +230,53 @@ function parseRecord(raw: string): InboxDeliveryRecord {
   return result;
 }
 
+function parseLegacyCanonicalRecord(
+  raw: string,
+  deliveryId: string,
+): {
+  status: "processing" | "completed";
+  claimedAt: string;
+  completedAt?: string;
+} {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    throw new Error("Invalid legacy GitHub delivery canonical record");
+  }
+  if (!isRecord(parsed)) {
+    throw new Error("Invalid legacy GitHub delivery canonical record");
+  }
+  const allowed = new Set([
+    "deliveryId",
+    "status",
+    "claimedAt",
+    "leaseId",
+    "completedAt",
+    "lastError",
+  ]);
+  if (
+    Object.keys(parsed).some((key) => !allowed.has(key)) ||
+    parsed.deliveryId !== deliveryId ||
+    (parsed.status !== "processing" && parsed.status !== "completed") ||
+    typeof parsed.leaseId !== "string" ||
+    !parsed.leaseId ||
+    !validTimestamp(parsed.claimedAt) ||
+    (parsed.lastError !== undefined && typeof parsed.lastError !== "string") ||
+    (parsed.status === "processing" && parsed.completedAt !== undefined) ||
+    (parsed.status === "completed" &&
+      (!validTimestamp(parsed.completedAt) ||
+        Date.parse(parsed.completedAt) < Date.parse(parsed.claimedAt)))
+  ) {
+    throw new Error("Invalid legacy GitHub delivery canonical record");
+  }
+  return {
+    status: parsed.status,
+    claimedAt: parsed.claimedAt,
+    ...(typeof parsed.completedAt === "string" ? { completedAt: parsed.completedAt } : {}),
+  };
+}
+
 async function syncDirectory(directoryPath: string): Promise<void> {
   const handle = await open(directoryPath, "r");
   try {
@@ -403,16 +450,18 @@ export class GitHubDeliveryInbox {
         let claimedAt = new Date().toISOString();
         let completedAt: string | undefined;
         if (group.includes(canonicalName)) {
-          const parsed = JSON.parse(await readFile(canonicalPath, "utf8")) as Record<string, unknown>;
-          if (parsed.deliveryId !== deliveryId || !validTimestamp(parsed.claimedAt)) {
-            throw new Error("Invalid legacy GitHub delivery canonical record");
+          const canonicalStat = await lstat(canonicalPath);
+          if (canonicalStat.isSymbolicLink() || !canonicalStat.isFile()) {
+            throw new Error("Legacy GitHub delivery evidence is not an ordinary file");
           }
+          const parsed = parseLegacyCanonicalRecord(
+            await readFile(canonicalPath, "utf8"),
+            deliveryId,
+          );
           claimedAt = parsed.claimedAt;
-          if (parsed.status === "completed" && validTimestamp(parsed.completedAt)) {
+          if (parsed.status === "completed") {
             status = "legacy-completed";
             completedAt = parsed.completedAt;
-          } else if (parsed.status !== "processing") {
-            throw new Error("Invalid legacy GitHub delivery status");
           }
         }
         await this.writeState({
@@ -703,7 +752,12 @@ export class GitHubDeliveryInbox {
         observed.deliveryId,
         async () => {
           const current = await this.readState(observed.deliveryId);
-          if (!current || current.status === "completed") {
+          if (
+            !current ||
+            current.status === "completed" ||
+            current.status === "awaiting-redelivery" ||
+            current.status === "legacy-completed"
+          ) {
             await this.removeQueueMarker(hash);
             return undefined;
           }

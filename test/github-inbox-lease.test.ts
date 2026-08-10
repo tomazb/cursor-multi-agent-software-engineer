@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -80,4 +81,23 @@ test("concurrent claimers publish exactly one processing lease", async (t) => {
   ]);
   assert.equal(claims.filter(Boolean).length, 1);
   assert.ok(claims.find(Boolean)?.record.leaseId);
+});
+
+test("orphan queue markers cannot turn terminal records into processing leases", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-terminal-marker-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const inbox = new GitHubDeliveryInbox(root);
+  const deliveryId = "terminal-marker";
+  await inbox.completeWithoutDispatch({
+    deliveryId,
+    eventName: "unsupported",
+    receivedAt: RECEIVED_AT,
+    rawBodyDigest: BODY_DIGEST,
+  });
+  const hash = createHash("sha256").update(deliveryId).digest("hex");
+  const queueDirectory = path.join(root, "inbox", "queue", hash.slice(0, 2));
+  await mkdir(queueDirectory, { recursive: true });
+  await writeFile(path.join(queueDirectory, `${hash}.queued`), "");
+
+  assert.equal(await inbox.claimNext(Date.now() + 1), undefined);
 });

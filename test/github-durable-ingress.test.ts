@@ -277,3 +277,25 @@ test("manual publication preflight does not recover an active webhook lease", as
   assert.equal(state.status, "processing");
   assert.equal(state.leaseId, leaseId);
 });
+
+test("durable handoff failures emit a local diagnostic before returning 503", async (t) => {
+  process.env[SECRET_ENV] = SECRET;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-durable-diagnostic-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const failure = new Error("simulated durable handoff failure");
+  const diagnostics: unknown[] = [];
+  const adapter = new GitHubAppAdapter({
+    cwd,
+    config: config(),
+    store: new FileRunStore(cwd),
+    http: { async request() { throw new Error("failed handoff must not dispatch"); } },
+    tokenProvider: async () => "token",
+    beforeInboxEnqueue: async () => { throw failure; },
+    onWebhookDiagnostic: (error) => diagnostics.push(error),
+  });
+
+  const response = await adapter.handleWebhook(signedRequest("durable-diagnostic"));
+
+  assert.equal(response.status, 503);
+  assert.deepEqual(diagnostics, [failure]);
+});
