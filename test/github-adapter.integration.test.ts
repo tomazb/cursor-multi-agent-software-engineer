@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { mkdtemp } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -206,9 +206,21 @@ function prPayload(headSha: string, number = 9, action = "synchronize") {
   };
 }
 
-test("integration: forged signature makes no state change", async () => {
+test("integration: forged signature makes no durable state change before initialization", async (t) => {
   process.env[SECRET_ENV] = SECRET;
-  const { adapter, posts } = await setup();
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-forged-preauth-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const adapter = new GitHubAppAdapter({
+    cwd,
+    config: testConfig(),
+    store: new FileRunStore(cwd),
+    http: { async request() { throw new Error("forged request must not reach GitHub"); } },
+    tokenProvider: async () => {
+      throw new Error("forged request must not create a token");
+    },
+  });
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  await assert.rejects(access(githubRoot), { code: "ENOENT" });
   const body = JSON.stringify(prPayload("sha1"));
   const result = await adapter.handleWebhook({
     deliveryId: "del-forged",
@@ -217,7 +229,7 @@ test("integration: forged signature makes no state change", async () => {
     rawBody: body,
   });
   assert.equal(result.status, 401);
-  assert.equal(posts.length, 0);
+  await assert.rejects(access(githubRoot), { code: "ENOENT" });
 });
 
 test("integration: replayed completed delivery does not duplicate checks", async () => {

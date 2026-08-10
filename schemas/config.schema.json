@@ -105,9 +105,9 @@
       "properties": {
         "enabled": { "type": "boolean" },
         "readOnlyChecks": { "type": "boolean" },
-        "webhookSecretEnv": { "type": "string", "minLength": 1 },
-        "appIdEnv": { "type": "string", "minLength": 1 },
-        "privateKeyEnv": { "type": "string", "minLength": 1 },
+        "webhookSecretEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+        "appIdEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+        "privateKeyEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
         "allowedRepositories": {
           "type": "array",
           "items": {

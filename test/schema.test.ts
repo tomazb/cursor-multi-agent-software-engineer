@@ -32,6 +32,13 @@ type JsonSchema = {
 
 function resolveRef(root: JsonSchema, schema: JsonSchema): JsonSchema {
   if (!schema.$ref) return schema;
+  if (
+    schema.$ref ===
+    "https://github.com/tomazb/cursor-multi-agent-software-engineer/schemas/config.schema.json"
+  ) {
+    // External config-schema semantics are exercised directly in this file and at runtime.
+    return { type: "object" };
+  }
   const match = schema.$ref.match(/^#\/\$defs\/(.+)$/);
   if (!match) throw new Error(`Unsupported $ref ${schema.$ref}`);
   const resolved = root.$defs?.[match[1]!];
@@ -221,6 +228,26 @@ test("persisted run records satisfy run-record schema required shape", async () 
   const store = new FileRunStore(cwd);
   const run = await store.create("schema", "check", DEFAULT_CONFIG);
   assertMatches(schema, schema, run, "run");
+});
+
+test("persisted run config uses the exact config schema and rejects nested secrets", async (t) => {
+  const configSchema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/config.schema.json"), "utf8"),
+  ) as JsonSchema & { $id?: string };
+  const runSchema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  assert.equal(runSchema.properties?.config?.$ref, configSchema.$id);
+
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-config-exact-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("schema", "config exactness", DEFAULT_CONFIG);
+  (run.config as unknown as Record<string, unknown>).inlineToken = "must-not-survive";
+  assert.throws(() => migrateRunRecord(run), /unsupported config field/i);
+  delete (run.config as unknown as Record<string, unknown>).inlineToken;
+  (run.config.policy as unknown as Record<string, unknown>).privateKey = "must-not-survive";
+  assert.throws(() => migrateRunRecord(run), /unsupported config field/i);
 });
 
 test("run-record schema and runtime migration reject non-positive GitHub installation ids", async () => {

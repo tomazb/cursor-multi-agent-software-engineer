@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -184,7 +184,7 @@ test("githubApp rejects unsupported fields instead of retaining inline secrets",
           inlineSecret: "must-not-survive-normalization",
         } as never,
       }),
-    /unsupported githubApp field.*inlineSecret/i,
+    /unsupported config field.*githubApp.*inlineSecret/i,
   );
 });
 
@@ -233,4 +233,44 @@ test("githubApp normalizes validated repository allowlist entries case-insensiti
   });
 
   assert.deepEqual(config.githubApp?.allowedRepositories, ["owner/repo"]);
+});
+
+test("project config rejects unknown fields throughout the runtime tree", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-config-exact-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  await mkdir(path.join(cwd, ".maswe"));
+  const configPath = path.join(cwd, ".maswe", "config.json");
+
+  for (const raw of [
+    { inlineToken: "top-level-secret" },
+    { runtime: { privateKey: "nested-secret" } },
+    { roles: { builder: { token: "nested-secret" } } },
+    { roles: { secretRole: { model: "nested-secret" } } },
+    { gates: { token: "nested-secret" } },
+    { quality: { privateKey: "nested-secret" } },
+    { policy: { token: "nested-secret" } },
+  ]) {
+    await writeFile(configPath, JSON.stringify(raw), "utf8");
+    await assert.rejects(loadConfig(cwd), /unsupported config field/i, JSON.stringify(raw));
+  }
+});
+
+test("GitHub credential references must be canonical environment variable names", () => {
+  for (const invalidName of ["1SECRET", "MASWE-SECRET", "MASWE SECRET", " SECRET", ""]) {
+    assert.throws(
+      () =>
+        mergeConfigForTest({
+          githubApp: {
+            enabled: true,
+            readOnlyChecks: true,
+            webhookSecretEnv: invalidName,
+            appIdEnv: "MASWE_GITHUB_APP_ID",
+            privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+            allowedRepositories: ["owner/repo"],
+          },
+        }),
+      /environment variable name/i,
+      JSON.stringify(invalidName),
+    );
+  }
 });

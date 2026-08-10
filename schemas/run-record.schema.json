@@ -45,7 +45,9 @@
         "commentResolutionCycles": { "type": "integer", "minimum": 0 }
       }
     },
-    "config": { "type": "object" },
+    "config": {
+      "$ref": "https://github.com/tomazb/cursor-multi-agent-software-engineer/schemas/config.schema.json"
+    },
     "artifacts": {
       "type": "array",
       "items": {

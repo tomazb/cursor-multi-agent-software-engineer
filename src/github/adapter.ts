@@ -219,7 +219,6 @@ export class GitHubAppAdapter {
   }
 
   async handleWebhook(request: WebhookRequest): Promise<WebhookHandleResult> {
-    await this.initialize();
     this.githubApp();
     if (!request.deliveryId?.trim() || !request.eventName?.trim()) {
       return { status: 400, body: { ok: false, message: "missing delivery or event headers" } };
@@ -262,6 +261,7 @@ export class GitHubAppAdapter {
       if (error instanceof UnsupportedGitHubWebhookError) {
         let ignored;
         try {
+          await this.initialize();
           await this.beforeInboxEnqueue?.();
           ignored = await this.inbox.completeWithoutDispatch({
             deliveryId: request.deliveryId,
@@ -288,6 +288,7 @@ export class GitHubAppAdapter {
     }
     let enqueue;
     try {
+      await this.initialize();
       await this.beforeInboxEnqueue?.();
       enqueue = await this.inbox.enqueue({
         deliveryId: request.deliveryId,
