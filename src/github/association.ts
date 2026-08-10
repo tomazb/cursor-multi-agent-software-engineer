@@ -8,6 +8,19 @@ function associationKey(repository: string, pullRequestNumber: number): string {
   return `${repository}#${pullRequestNumber}`;
 }
 
+type AssociationBindInput = Omit<AssociationRecord, "suspended" | "updatedAt"> & {
+  suspended?: boolean;
+};
+
+export interface GitHubAssociationTransaction {
+  find(repository: string, pullRequestNumber: number): AssociationRecord | undefined;
+  bind(input: AssociationBindInput): AssociationRecord;
+  suspend(repository: string, pullRequestNumber: number): AssociationRecord | undefined;
+  onRollback(callback: () => Promise<void>): void;
+}
+
+type WriteRecords = (filePath: string, content: string) => Promise<void>;
+
 async function writeAtomic(filePath: string, content: string): Promise<void> {
   const directory = path.dirname(filePath);
   await mkdir(directory, { recursive: true });
@@ -20,13 +33,15 @@ async function writeAtomic(filePath: string, content: string): Promise<void> {
 export class GitHubAssociationIndex {
   private readonly githubRoot: string;
   private readonly filePath: string;
+  private readonly writeRecords: WriteRecords;
 
   constructor(
     githubRoot: string,
-    options: { lockStaleMs?: number } = {},
+    options: { lockStaleMs?: number; writeRecords?: WriteRecords } = {},
   ) {
     this.githubRoot = githubRoot;
     this.filePath = path.join(githubRoot, "associations.json");
+    this.writeRecords = options.writeRecords ?? writeAtomic;
     void options.lockStaleMs;
   }
 
@@ -52,11 +67,78 @@ export class GitHubAssociationIndex {
   }
 
   private async writeAll(records: Record<string, AssociationRecord>): Promise<void> {
-    await writeAtomic(this.filePath, `${JSON.stringify(records, null, 2)}\n`);
+    await this.writeRecords(this.filePath, `${JSON.stringify(records, null, 2)}\n`);
+  }
+
+  async withTransaction<T>(
+    callback: (transaction: GitHubAssociationTransaction) => Promise<T>,
+  ): Promise<T> {
+    return this.withLock(async () => {
+      const records = await this.readAll();
+      let dirty = false;
+      const rollbacks: Array<() => Promise<void>> = [];
+      const transaction: GitHubAssociationTransaction = {
+        find(repository, pullRequestNumber) {
+          const record = records[associationKey(repository, pullRequestNumber)];
+          return record ? { ...record } : undefined;
+        },
+        bind(input) {
+          const record: AssociationRecord = {
+            runId: input.runId,
+            installationId: input.installationId,
+            repository: input.repository,
+            pullRequestNumber: input.pullRequestNumber,
+            baseSha: input.baseSha,
+            headSha: input.headSha,
+            branch: input.branch,
+            suspended: input.suspended ?? false,
+            updatedAt: new Date().toISOString(),
+          };
+          records[associationKey(input.repository, input.pullRequestNumber)] = record;
+          dirty = true;
+          return { ...record };
+        },
+        suspend(repository, pullRequestNumber) {
+          const record = records[associationKey(repository, pullRequestNumber)];
+          if (!record) return undefined;
+          if (!record.suspended) {
+            record.suspended = true;
+            record.updatedAt = new Date().toISOString();
+            dirty = true;
+          }
+          return { ...record };
+        },
+        onRollback(callback) {
+          rollbacks.push(callback);
+        },
+      };
+      try {
+        const result = await callback(transaction);
+        if (dirty) await this.writeAll(records);
+        return result;
+      } catch (error) {
+        const rollbackErrors: unknown[] = [];
+        for (const rollback of rollbacks.reverse()) {
+          try {
+            await rollback();
+          } catch (rollbackError) {
+            rollbackErrors.push(rollbackError);
+          }
+        }
+        if (rollbackErrors.length > 0) {
+          throw new AggregateError(
+            [error, ...rollbackErrors],
+            error instanceof Error ? error.message : "Association transaction failed",
+            { cause: error },
+          );
+        }
+        throw error;
+      }
+    });
   }
 
   async bind(
-    input: Omit<AssociationRecord, "suspended" | "updatedAt"> & { suspended?: boolean },
+    input: AssociationBindInput,
   ): Promise<AssociationRecord> {
     return this.withLock(async () => {
       const records = await this.readAll();

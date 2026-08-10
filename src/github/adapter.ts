@@ -2,7 +2,10 @@ import path from "node:path";
 import type { GitHubAppConfig, MasweConfig, RunRecord } from "../domain.ts";
 import { invalidateStaleEvidence } from "../git-workspace.ts";
 import type { RunStore } from "../store.ts";
-import { GitHubAssociationIndex } from "./association.ts";
+import {
+  GitHubAssociationIndex,
+  type GitHubAssociationTransaction,
+} from "./association.ts";
 import { CheckPublisher, type GitHubHttpClient } from "./checks.ts";
 import {
   GitHubDeliveryStore,
@@ -12,7 +15,7 @@ import {
 import { normalizeGitHubWebhook } from "./normalize.ts";
 import { verifyGitHubWebhookSignature } from "./signature.ts";
 import { GitHubSideEffectStore } from "./side-effect-store.ts";
-import { initializeGitHubJournals } from "./journal.ts";
+import { initializeGitHubJournals, withGitHubJournal } from "./journal.ts";
 import {
   MalformedGitHubWebhookError,
   UnsupportedGitHubWebhookError,
@@ -125,6 +128,10 @@ export class GitHubAppAdapter {
   private readonly sideEffects: GitHubSideEffectStore;
   private readonly associations: GitHubAssociationIndex;
   private readonly root: string;
+  private readonly afterManualRunLoaded: ((runId: string) => Promise<void>) | undefined;
+  private readonly beforeAssociationTransaction:
+    | ((deliveryId: string) => Promise<void>)
+    | undefined;
   private initialization: Promise<void> | undefined;
 
   constructor(options: {
@@ -134,17 +141,30 @@ export class GitHubAppAdapter {
     http: GitHubHttpClient;
     tokenProvider: (installationId: number, repository: string) => Promise<string>;
     deliveryMonitor?: DeliveryStoreMonitor;
+    /** Deterministic barrier after the manual command's initial snapshot, before its fence. */
+    afterManualRunLoaded?: (runId: string) => Promise<void>;
+    /** Deterministic barrier before a PR association transaction is acquired. */
+    beforeAssociationTransaction?: (deliveryId: string) => Promise<void>;
+    /** Deterministic test seam for association index commit failures. */
+    associationWriteRecords?: (filePath: string, content: string) => Promise<void>;
   }) {
     this.cwd = options.cwd;
     this.config = options.config;
     this.store = options.store;
     this.http = options.http;
     this.tokenProvider = options.tokenProvider;
+    this.afterManualRunLoaded = options.afterManualRunLoaded;
+    this.beforeAssociationTransaction = options.beforeAssociationTransaction;
     const root = githubRoot(options.cwd);
     this.root = root;
     this.deliveries = new GitHubDeliveryStore(root, options.deliveryMonitor);
     this.sideEffects = new GitHubSideEffectStore(root);
-    this.associations = new GitHubAssociationIndex(root);
+    this.associations = new GitHubAssociationIndex(
+      root,
+      options.associationWriteRecords
+        ? { writeRecords: options.associationWriteRecords }
+        : {},
+    );
   }
 
   /** Fail-closed filesystem/journal preflight shared by webhook and manual publication. */
@@ -282,26 +302,133 @@ export class GitHubAppAdapter {
   async publishChecksForRun(runId: string): Promise<RunRecord> {
     await this.initialize();
     const app = this.githubApp();
-    const run = await this.store.load(runId);
-    if (!run.github) {
+    const initial = await this.store.load(runId);
+    if (!initial.github) {
       throw new Error(`Run ${runId} has no github association`);
     }
-    if (run.github.suspended) {
-      throw new Error(`Run ${runId} github association is suspended`);
-    }
-    if (!isRepoAllowed(app, run.github.repository)) {
-      throw new Error(`Repository ${run.github.repository} is not allowlisted`);
-    }
-    const headSha = run.github.headSha || run.workspace?.headSha;
-    if (!headSha) throw new Error(`Run ${runId} has no head SHA for checks`);
-    await this.publishChecks(
-      run,
-      run.github.repository,
-      run.github.pullRequestNumber,
-      headSha,
-      run.github.installationId,
+    await this.afterManualRunLoaded?.(runId);
+    return this.withPublicationFence(
+      initial.github.repository,
+      initial.github.pullRequestNumber,
+      async () => {
+        const beforeLiveHead = await this.store.load(runId);
+        if (!beforeLiveHead.github) {
+          throw new Error(`Run ${runId} has no github association`);
+        }
+        if (
+          beforeLiveHead.github.repository !== initial.github!.repository ||
+          beforeLiveHead.github.pullRequestNumber !== initial.github!.pullRequestNumber
+        ) {
+          throw new Error(`Run ${runId} github association changed during publication`);
+        }
+        if (beforeLiveHead.github.suspended) {
+          throw new Error(`Run ${runId} github association is suspended`);
+        }
+        if (!isRepoAllowed(app, beforeLiveHead.github.repository)) {
+          throw new Error(`Repository ${beforeLiveHead.github.repository} is not allowlisted`);
+        }
+        const liveHead = await this.currentPullRequestHead(
+          beforeLiveHead.github.repository,
+          beforeLiveHead.github.pullRequestNumber,
+          beforeLiveHead.github.installationId,
+        );
+        const publication = await this.associations.withTransaction(async (transaction) => {
+          const run = await this.store.load(runId);
+          if (!run.github) {
+            throw new Error(`Run ${runId} has no github association`);
+          }
+          if (
+            run.github.repository !== beforeLiveHead.github!.repository ||
+            run.github.pullRequestNumber !== beforeLiveHead.github!.pullRequestNumber
+          ) {
+            throw new Error(`Run ${runId} github association changed during publication`);
+          }
+          if (run.github.suspended) {
+            throw new Error(`Run ${runId} github association is suspended`);
+          }
+          const previousHeadSha = run.github.headSha || run.workspace?.headSha;
+          if (!previousHeadSha) throw new Error(`Run ${runId} has no head SHA for checks`);
+          if (liveHead !== previousHeadSha) {
+            const before = structuredClone(run);
+            invalidateStaleEvidence(run, liveHead);
+            run.github = { ...run.github, headSha: liveHead };
+            await this.saveAssociationMutation(before, run, transaction);
+          }
+          transaction.bind({
+            runId: run.id,
+            installationId: run.github.installationId,
+            repository: run.github.repository,
+            pullRequestNumber: run.github.pullRequestNumber,
+            baseSha: run.github.baseSha,
+            headSha: liveHead,
+            branch: run.github.branch,
+          });
+          return { run, previousHeadSha };
+        });
+        await this.publishChecks(
+          publication.run,
+          publication.run.github!.repository,
+          publication.run.github!.pullRequestNumber,
+          liveHead,
+          publication.run.github!.installationId,
+          publication.previousHeadSha,
+        );
+        return publication.run;
+      },
     );
-    return run;
+  }
+
+  private async withPublicationFence<T>(
+    repository: string,
+    pullRequestNumber: number,
+    callback: () => Promise<T>,
+  ): Promise<T> {
+    return withGitHubJournal(
+      this.root,
+      "publication",
+      `${repository.toLowerCase()}#${pullRequestNumber}`,
+      callback,
+      { timeoutMs: 60_000 },
+    );
+  }
+
+  private async rollbackRunMutation(
+    before: RunRecord,
+    attempted: RunRecord,
+  ): Promise<void> {
+    const current = await this.store.load(before.id);
+    if (current.version === before.version) return;
+    if (current.version !== attempted.version) {
+      throw new Error(
+        `Run ${before.id} changed before association rollback: expected ${attempted.version}, on disk ${current.version}`,
+      );
+    }
+    const rollback = structuredClone(before);
+    rollback.version = current.version;
+    await this.store.save(rollback);
+  }
+
+  private async saveAssociationMutation(
+    before: RunRecord,
+    run: RunRecord,
+    transaction: GitHubAssociationTransaction,
+  ): Promise<void> {
+    try {
+      await this.store.save(run);
+    } catch (error) {
+      try {
+        await this.rollbackRunMutation(before, run);
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [error, rollbackError],
+          error instanceof Error ? error.message : "Run save failed",
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+    const attempted = structuredClone(run);
+    transaction.onRollback(() => this.rollbackRunMutation(before, attempted));
   }
 
   private async dispatch(event: GitHubInternalEvent, app: GitHubAppConfig): Promise<void> {
@@ -444,123 +571,118 @@ export class GitHubAppAdapter {
     if (installationId === undefined || installationId <= 0) {
       throw new Error("pull_request event missing installation id");
     }
-
-    const liveHead = await this.currentPullRequestHead(
-      repository,
-      pullRequestNumber,
-      installationId,
-    );
-    if (liveHead !== headSha) {
-      // Stale or out-of-order delivery: current PR head has already moved on.
-      return;
-    }
-
-    let association = await this.associations.find(repository, pullRequestNumber);
-    if (association?.suspended) return;
-
-    if (event.type === "pull_request.closed") {
-      const associatedRun = association
-        ? await this.store.load(association.runId)
-        : await this.findMatchingRun(repository, pullRequestNumber, event.branch);
-      if (associatedRun?.github) {
-        associatedRun.github = { ...associatedRun.github, suspended: true };
-        await this.store.save(associatedRun);
+    await this.withPublicationFence(repository, pullRequestNumber, async () => {
+      const liveHead = await this.currentPullRequestHead(
+        repository,
+        pullRequestNumber,
+        installationId,
+      );
+      if (liveHead !== headSha) {
+        // Stale or out-of-order delivery: current PR head has already moved on.
+        return;
       }
-      if (association) {
-        await this.associations.suspend(repository, pullRequestNumber);
-      } else if (associatedRun?.github) {
-        await this.associations.bind({
-          runId: associatedRun.id,
+
+      await this.beforeAssociationTransaction?.(event.eventId);
+      const publication = await this.associations.withTransaction(async (transaction) => {
+        const association = transaction.find(repository, pullRequestNumber);
+        if (association?.suspended) return { kind: "ignore" } as const;
+
+        if (event.type === "pull_request.closed") {
+          const associatedRun = association
+            ? await this.store.load(association.runId)
+            : await this.findMatchingRun(repository, pullRequestNumber, event.branch);
+          if (associatedRun?.github) {
+            const before = structuredClone(associatedRun);
+            associatedRun.github = { ...associatedRun.github, suspended: true };
+            await this.saveAssociationMutation(before, associatedRun, transaction);
+          }
+          if (association) {
+            transaction.suspend(repository, pullRequestNumber);
+          } else if (associatedRun?.github) {
+            transaction.bind({
+              runId: associatedRun.id,
+              installationId,
+              repository,
+              pullRequestNumber,
+              baseSha: associatedRun.github.baseSha,
+              headSha,
+              branch: associatedRun.github.branch,
+              suspended: true,
+            });
+          }
+          return { kind: "ignore" } as const;
+        }
+
+        const run = association
+          ? await this.store.load(association.runId)
+          : await this.findMatchingRun(repository, pullRequestNumber, event.branch);
+        if (!run) return { kind: "unassociated" } as const;
+        if (run.github?.suspended) return { kind: "ignore" } as const;
+        const before = structuredClone(run);
+        const previousHeadSha = run.github?.headSha ?? association?.headSha;
+        invalidateStaleEvidence(run, headSha);
+        run.github = {
           installationId,
           repository,
           pullRequestNumber,
-          baseSha: associatedRun.github.baseSha,
+          baseSha: event.baseSha ?? run.github?.baseSha ?? run.workspace?.baseSha ?? headSha,
           headSha,
-          branch: associatedRun.github.branch,
-          suspended: true,
-        });
-      }
-      return;
-    }
-
-    let run: RunRecord | undefined;
-    if (association) {
-      run = await this.store.load(association.runId);
-    } else {
-      run = await this.findMatchingRun(repository, pullRequestNumber, event.branch);
-      if (run) {
-        association = await this.associations.bind({
+          branch: event.branch ?? run.github?.branch ?? run.workspace?.branch ?? "unknown",
+          suspended: false,
+        };
+        await this.saveAssociationMutation(before, run, transaction);
+        transaction.bind({
           runId: run.id,
           installationId,
           repository,
           pullRequestNumber,
-          baseSha: event.baseSha ?? run.workspace?.baseSha ?? headSha,
+          baseSha: run.github.baseSha,
           headSha,
-          branch: event.branch ?? run.workspace?.branch ?? "unknown",
+          branch: run.github.branch,
         });
-      }
-    }
-
-    if (run) {
-      if (run.github?.suspended) return;
-      const previousHeadSha = run.github?.headSha ?? association?.headSha;
-      invalidateStaleEvidence(run, headSha);
-      run.github = {
-        installationId,
-        repository,
-        pullRequestNumber,
-        baseSha: event.baseSha ?? run.github?.baseSha ?? run.workspace?.baseSha ?? headSha,
-        headSha,
-        branch: event.branch ?? run.github?.branch ?? run.workspace?.branch ?? "unknown",
-        suspended: false,
-      };
-      await this.store.save(run);
-      await this.associations.bind({
-        runId: run.id,
-        installationId,
-        repository,
-        pullRequestNumber,
-        baseSha: run.github.baseSha,
-        headSha,
-        branch: run.github.branch,
+        return { kind: "publish", run, previousHeadSha } as const;
       });
-      await this.publishChecks(
-        run,
-        repository,
-        pullRequestNumber,
-        headSha,
-        installationId,
-        previousHeadSha,
-      );
-      return;
-    }
 
-    const synthetic: RunRecord = {
-      schemaVersion: 1,
-      version: 1,
-      id: "unassociated",
-      title: "unassociated",
-      request: "",
-      repositoryPath: this.cwd,
-      state: "PR_REVIEW",
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      approvals: { brainstorm: false, design: false },
-      counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
-      config: this.config,
-      artifacts: [],
-      events: [],
-      github: {
-        installationId,
-        repository,
-        pullRequestNumber,
-        baseSha: event.baseSha ?? headSha,
-        headSha,
-        branch: event.branch ?? "unknown",
-        suspended: false,
-      },
-    };
-    await this.publishChecks(synthetic, repository, pullRequestNumber, headSha, installationId);
+      if (publication.kind === "publish") {
+        await this.publishChecks(
+          publication.run,
+          repository,
+          pullRequestNumber,
+          headSha,
+          installationId,
+          publication.previousHeadSha,
+        );
+        return;
+      }
+      if (publication.kind === "ignore") return;
+
+      const synthetic: RunRecord = {
+        schemaVersion: 1,
+        version: 1,
+        id: "unassociated",
+        title: "unassociated",
+        request: "",
+        repositoryPath: this.cwd,
+        state: "PR_REVIEW",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        approvals: { brainstorm: false, design: false },
+        counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
+        config: this.config,
+        artifacts: [],
+        events: [],
+        github: {
+          installationId,
+          repository,
+          pullRequestNumber,
+          baseSha: event.baseSha ?? headSha,
+          headSha,
+          branch: event.branch ?? "unknown",
+          suspended: false,
+        },
+      };
+      await this.publishChecks(synthetic, repository, pullRequestNumber, headSha, installationId);
+    });
   }
 
   private async findMatchingRun(

@@ -66,7 +66,8 @@ export type ClaimOperation =
   | "queued-cancel"
   | "github-association"
   | "github-check-create"
-  | "github-delivery";
+  | "github-delivery"
+  | "github-publication";
 
 export interface ClaimProcessIdentity {
   startedAt: string;
@@ -212,6 +213,7 @@ const CLAIM_OPERATIONS: ClaimOperation[] = [
   "github-association",
   "github-check-create",
   "github-delivery",
+  "github-publication",
 ];
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;

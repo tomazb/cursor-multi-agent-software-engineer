@@ -9,7 +9,7 @@ import { GitHubAppAdapter } from "../src/github/adapter.ts";
 import type { GitHubHttpClient } from "../src/github/checks.ts";
 import { GitHubAssociationIndex } from "../src/github/association.ts";
 import { GitHubSideEffectStore } from "../src/github/side-effect-store.ts";
-import { FileRunStore } from "../src/store.ts";
+import { FileRunStore, type RunStore } from "../src/store.ts";
 
 const SECRET = "integration-webhook-secret";
 const SECRET_ENV = "MASWE_TEST_GITHUB_WEBHOOK_SECRET";
@@ -33,9 +33,18 @@ function testConfig() {
   });
 }
 
-async function setup(options: { liveHead?: string } = {}) {
+async function setup(options: {
+  liveHead?: string;
+  afterManualRunLoaded?: (runId: string) => Promise<void>;
+  beforeAssociationTransaction?: (deliveryId: string) => Promise<void>;
+  beforeCheckPost?: (headSha: string) => Promise<void>;
+  associationWriteRecords?: (filePath: string, content: string) => Promise<void>;
+  wrapStore?: (store: FileRunStore) => RunStore;
+} = {}) {
+  const beforeCheckPost = options.beforeCheckPost;
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-int-"));
   const store = new FileRunStore(cwd);
+  const adapterStore = options.wrapStore?.(store) ?? store;
   const config = testConfig();
   const posts: unknown[] = [];
   const checkRunHeadShas = new Map<number, string>();
@@ -75,9 +84,10 @@ async function setup(options: { liveHead?: string } = {}) {
         return { status: 200, headers: {}, body: { check_runs: [] } };
       }
       if (method === "POST" && url.includes("/check-runs")) {
+        const headSha = (options?.body as { head_sha?: unknown } | undefined)?.head_sha;
+        if (typeof headSha === "string") await beforeCheckPost?.(headSha);
         posts.push(options?.body);
         const id = nextId++;
-        const headSha = (options?.body as { head_sha?: unknown } | undefined)?.head_sha;
         if (typeof headSha === "string") checkRunHeadShas.set(id, headSha);
         return { status: 201, headers: {}, body: { id } };
       }
@@ -96,12 +106,21 @@ async function setup(options: { liveHead?: string } = {}) {
   const adapter = new GitHubAppAdapter({
     cwd,
     config,
-    store,
+    store: adapterStore,
     http,
     tokenProvider: async (installationId, repository) => {
       tokens.push({ installationId, repository });
       return "test-token";
     },
+    ...(options.afterManualRunLoaded
+      ? { afterManualRunLoaded: options.afterManualRunLoaded }
+      : {}),
+    ...(options.beforeAssociationTransaction
+      ? { beforeAssociationTransaction: options.beforeAssociationTransaction }
+      : {}),
+    ...(options.associationWriteRecords
+      ? { associationWriteRecords: options.associationWriteRecords }
+      : {}),
   });
   return {
     cwd,
@@ -122,6 +141,45 @@ async function setup(options: { liveHead?: string } = {}) {
     setFailAll(value: boolean) {
       failAll = value;
     },
+  };
+}
+
+function deferred(): {
+  promise: Promise<void>;
+  resolve: () => void;
+} {
+  let resolve!: () => void;
+  const promise = new Promise<void>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+async function withWatchdog<T>(
+  promise: Promise<T>,
+  milliseconds: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), milliseconds);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function twoPartyBarrier(): (identity: string) => Promise<void> {
+  const release = deferred();
+  const arrivals = new Set<string>();
+  return async (identity: string) => {
+    arrivals.add(identity);
+    if (arrivals.size === 2) release.resolve();
+    await withWatchdog(release.promise, 5_000, "association barrier timed out");
   };
 }
 
@@ -506,7 +564,7 @@ test("integration: does not steal another PR's associated run", async () => {
 test("integration: push events invalidate every matching PR association", async () => {
   process.env[SECRET_ENV] = SECRET;
   const { adapter, posts, patches, store, cwd, setLiveHead } = await setup({
-    liveHead: "sha-push",
+    liveHead: "old-first",
   });
   const firstRun = await store.create("first-push-run", "req", testConfig());
   firstRun.workspace = {
@@ -577,6 +635,7 @@ test("integration: push events invalidate every matching PR association", async 
   });
 
   await adapter.publishChecksForRun(firstRun.id);
+  setLiveHead("old-second");
   await adapter.publishChecksForRun(secondRun.id);
   const postCountBeforePush = posts.length;
 
@@ -692,6 +751,238 @@ test("integration: push attempts later PRs before reporting an earlier invalidat
 
   assert.equal((await store.load(runs[0]!.id)).github?.headSha, "old-9");
   assert.equal((await store.load(runs[1]!.id)).github?.headSha, "sha-push");
+});
+
+test("integration: a manual publisher revalidates inside the fence after a newer head wins", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const manualLoaded = deferred();
+  const releaseManual = deferred();
+  const { adapter, store, cwd, posts, setLiveHead } = await setup({
+    liveHead: "sha-old",
+    afterManualRunLoaded: async () => {
+      manualLoaded.resolve();
+      await releaseManual.promise;
+    },
+  });
+  const run = await store.create("manual-fence", "req", testConfig());
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-old",
+    branch: "maswe/run-1",
+    suspended: false,
+  };
+  await store.save(run);
+  await new GitHubAssociationIndex(path.join(cwd, ".maswe", "github")).bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-old",
+    branch: "maswe/run-1",
+  });
+
+  const manual = adapter.publishChecksForRun(run.id);
+  await withWatchdog(manualLoaded.promise, 1_000, "manual-load barrier timed out");
+  setLiveHead("sha-new");
+  const body = JSON.stringify(prPayload("sha-new"));
+  await adapter.handleWebhook({
+    deliveryId: "del-manual-fence-new-head",
+    eventName: "pull_request",
+    signatureHeader: sign(body),
+    rawBody: body,
+  });
+  releaseManual.resolve();
+  await manual;
+
+  assert.equal(
+    posts.filter((post) => (post as { head_sha?: string }).head_sha === "sha-old").length,
+    0,
+  );
+  assert.equal((await store.load(run.id)).github?.headSha, "sha-new");
+});
+
+test("integration: a blocked publication fence does not stall an unrelated pull request", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const blockedPostReached = deferred();
+  const releaseBlockedPost = deferred();
+  let blockFirstPost = true;
+  const { adapter, store, cwd } = await setup({
+    liveHead: "sha-shared",
+    beforeCheckPost: async () => {
+      if (!blockFirstPost) return;
+      blockFirstPost = false;
+      blockedPostReached.resolve();
+      await releaseBlockedPost.promise;
+    },
+  });
+  const runs = await Promise.all([
+    store.create("publication-fence-one", "req", testConfig()),
+    store.create("publication-fence-two", "req", testConfig()),
+  ]);
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  for (const [position, run] of runs.entries()) {
+    const pullRequestNumber = position + 9;
+    run.github = {
+      installationId: 44,
+      repository: "owner/repo",
+      pullRequestNumber,
+      baseSha: "base",
+      headSha: "sha-shared",
+      branch: `maswe/run-${position + 1}`,
+      suspended: false,
+    };
+    await store.save(run);
+    await index.bind({
+      runId: run.id,
+      installationId: 44,
+      repository: "owner/repo",
+      pullRequestNumber,
+      baseSha: "base",
+      headSha: "sha-shared",
+      branch: `maswe/run-${position + 1}`,
+    });
+  }
+
+  const blocked = adapter.publishChecksForRun(runs[0]!.id);
+  await blockedPostReached.promise;
+  const unrelated = adapter.publishChecksForRun(runs[1]!.id);
+  try {
+    await withWatchdog(unrelated, 5_000, "unrelated publication stalled");
+  } finally {
+    releaseBlockedPost.resolve();
+    await Promise.allSettled([blocked, unrelated]);
+  }
+});
+
+test("integration: simultaneous same-branch PRs associate one run at most once", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { adapter, store, cwd } = await setup({
+    liveHead: "sha-shared",
+    beforeAssociationTransaction: twoPartyBarrier(),
+  });
+  const run = await store.create("association-race", "req", testConfig());
+  run.workspace = {
+    baseSha: "base",
+    headSha: "sha-shared",
+    branch: "maswe/run-1",
+    fingerprint: "fp",
+    remote: "https://github.com/owner/repo.git",
+  };
+  await store.save(run);
+  const requests = [9, 10].map((pullRequestNumber) => {
+    const rawBody = JSON.stringify(prPayload("sha-shared", pullRequestNumber, "opened"));
+    return adapter.handleWebhook({
+      deliveryId: `del-association-race-${pullRequestNumber}`,
+      eventName: "pull_request",
+      signatureHeader: sign(rawBody),
+      rawBody,
+    });
+  });
+
+  await Promise.all(requests);
+
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  const associated = await Promise.all([
+    index.find("owner/repo", 9),
+    index.find("owner/repo", 10),
+  ]);
+  assert.equal(associated.filter((record) => record?.runId === run.id).length, 1);
+  assert.ok([9, 10].includes((await store.load(run.id)).github!.pullRequestNumber));
+});
+
+test("integration: association commit failure rolls back the run mutation", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { adapter, store, cwd } = await setup({
+    liveHead: "sha-rollback",
+    associationWriteRecords: async () => {
+      throw new Error("simulated association commit failure");
+    },
+  });
+  const run = await store.create("association-rollback", "req", testConfig());
+  run.workspace = {
+    baseSha: "base",
+    headSha: "sha-rollback",
+    branch: "maswe/run-1",
+    fingerprint: "fp",
+    remote: "https://github.com/owner/repo.git",
+  };
+  await store.save(run);
+  const rawBody = JSON.stringify(prPayload("sha-rollback", 9, "opened"));
+
+  await assert.rejects(
+    adapter.handleWebhook({
+      deliveryId: "del-association-commit-failure",
+      eventName: "pull_request",
+      signatureHeader: sign(rawBody),
+      rawBody,
+    }),
+    /simulated association commit failure/,
+  );
+
+  assert.equal((await store.load(run.id)).github, undefined);
+  assert.equal(
+    await new GitHubAssociationIndex(path.join(cwd, ".maswe", "github")).find(
+      "owner/repo",
+      9,
+    ),
+    undefined,
+  );
+});
+
+test("integration: a rejected run save that reached disk is reconciled before bind", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  let rejectAfterSave = true;
+  const { adapter, store, cwd } = await setup({
+    liveHead: "sha-save-rejected",
+    wrapStore: (base) => ({
+      create: base.create.bind(base),
+      load: base.load.bind(base),
+      list: base.list.bind(base),
+      applyEvent: base.applyEvent.bind(base),
+      writeArtifact: base.writeArtifact.bind(base),
+      readArtifact: base.readArtifact.bind(base),
+      async save(run) {
+        await base.save(run);
+        if (rejectAfterSave) {
+          rejectAfterSave = false;
+          throw new Error("simulated rejected save after durable write");
+        }
+      },
+    }),
+  });
+  const run = await store.create("association-save-rejected", "req", testConfig());
+  run.workspace = {
+    baseSha: "base",
+    headSha: "sha-save-rejected",
+    branch: "maswe/run-1",
+    fingerprint: "fp",
+    remote: "https://github.com/owner/repo.git",
+  };
+  await store.save(run);
+  const rawBody = JSON.stringify(prPayload("sha-save-rejected", 9, "opened"));
+
+  await assert.rejects(
+    adapter.handleWebhook({
+      deliveryId: "del-association-save-rejected",
+      eventName: "pull_request",
+      signatureHeader: sign(rawBody),
+      rawBody,
+    }),
+    /simulated rejected save after durable write/,
+  );
+
+  assert.equal((await store.load(run.id)).github, undefined);
+  assert.equal(
+    await new GitHubAssociationIndex(path.join(cwd, ".maswe", "github")).find(
+      "owner/repo",
+      9,
+    ),
+    undefined,
+  );
 });
 
 test("integration: live-head lookup failure fails closed", async () => {

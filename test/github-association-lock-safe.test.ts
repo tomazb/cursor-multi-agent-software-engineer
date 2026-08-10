@@ -59,6 +59,19 @@ test("the GitHub journal path hashes the complete logical key", async () => {
   assert.equal(scan.claims[0]!.operation, "github-delivery");
 });
 
+test("a pull request publication fence uses a distinct hash-addressed journal", async () => {
+  const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-publication-path-"));
+  const logicalKey = "owner/repo#42";
+  await withGitHubJournal(githubRoot, "publication", logicalKey, async () => undefined);
+  const digest = createHash("sha256").update(logicalKey).digest("hex");
+  const scan = await scanLockJournal(
+    path.join(githubRoot, "journals", "publication", digest),
+    "data",
+  );
+  assert.equal(scan.claims.length, 1);
+  assert.equal(scan.claims[0]!.operation, "github-publication");
+});
+
 test("a callback LockJournalError is propagated once instead of being treated as contention", async () => {
   const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-callback-"));
   const callbackError = new LockJournalError(

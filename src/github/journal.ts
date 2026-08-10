@@ -22,7 +22,11 @@ import {
   type JournalTransitionContext,
 } from "../lock-journal.ts";
 
-export type GitHubJournalKind = "association" | "check-create" | "delivery";
+export type GitHubJournalKind =
+  | "association"
+  | "check-create"
+  | "delivery"
+  | "publication";
 
 export type GitHubJournalErrorCode =
   | "GITHUB_JOURNAL_INVALID_OPTIONS"
@@ -102,11 +106,13 @@ const JOURNAL_KINDS: GitHubJournalKind[] = [
   "association",
   "check-create",
   "delivery",
+  "publication",
 ];
 const OPERATION_BY_KIND: Record<GitHubJournalKind, ClaimOperation> = {
   association: "github-association",
   "check-create": "github-check-create",
   delivery: "github-delivery",
+  publication: "github-publication",
 };
 
 function errno(error: unknown): string | undefined {

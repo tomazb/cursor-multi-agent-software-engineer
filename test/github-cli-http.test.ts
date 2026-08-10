@@ -65,6 +65,7 @@ function pullRequestBody(headSha: string): string {
 function recordingFetch(liveHead = "sha-new") {
   const calls: Array<{ method: string; url: string; signal: AbortSignal }> = [];
   let nextCheckId = 100;
+  let currentLiveHead = liveHead;
   const fetchFn: typeof fetch = async (input, init) => {
     if (!(init?.signal instanceof AbortSignal)) {
       throw new Error("GitHub CLI fetch was called without an AbortSignal");
@@ -79,7 +80,7 @@ function recordingFetch(liveHead = "sha-new") {
       });
     }
     if (method === "GET" && url.includes("/pulls/9")) {
-      return new Response(JSON.stringify({ head: { sha: liveHead } }), {
+      return new Response(JSON.stringify({ head: { sha: currentLiveHead } }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -104,7 +105,13 @@ function recordingFetch(liveHead = "sha-new") {
     }
     throw new Error(`Unexpected GitHub request: ${method} ${url}`);
   };
-  return { calls, fetchFn };
+  return {
+    calls,
+    fetchFn,
+    setLiveHead(headSha: string) {
+      currentLiveHead = headSha;
+    },
+  };
 }
 
 function installGitHubEnvironment(): () => void {
@@ -129,7 +136,7 @@ function installGitHubEnvironment(): () => void {
 test("github-webhook shares one bounded client across token, live-head, and check requests", async () => {
   const { cwd, config, store } = await setupProject();
   const restoreEnvironment = installGitHubEnvironment();
-  const { calls, fetchFn } = recordingFetch();
+  const { calls, fetchFn, setLiveHead } = recordingFetch("sha-old");
   const originalFetch = globalThis.fetch;
   const originalLog = console.log;
   globalThis.fetch = fetchFn;
@@ -150,6 +157,7 @@ test("github-webhook shares one bounded client across token, live-head, and chec
         ["cli-http-old", "sha-old"],
         ["cli-http-new", "sha-new"],
       ] as const) {
+        setLiveHead(headSha);
         const rawBody = pullRequestBody(headSha);
         const result = await options.adapter.handleWebhook({
           deliveryId,
