@@ -62,6 +62,8 @@ export interface GitHubJournalOptions {
   ) => Promise<void>;
   /** Deterministic test seam between the first and exact legacy observations. */
   afterLegacyObserved?: (legacyPath: string) => Promise<void>;
+  /** Deterministic seam for legacy-owner liveness classification. */
+  isProcessDefinitelyDead?: (pid: number) => boolean;
 }
 
 interface LegacyEvidence {
@@ -276,6 +278,7 @@ async function inspectLegacyDirectory(
   legacyPath: string,
   relativePath: string,
   before: BigIntStats,
+  isProcessDefinitelyDead: (pid: number) => boolean,
 ): Promise<LegacyEvidence> {
   const beforeIdentity = directoryIdentity(before);
   const firstEntries = (await readdir(legacyPath)).sort();
@@ -348,7 +351,7 @@ async function inspectLegacyDirectory(
     evidenceBytes,
     evidenceDigest: digest(evidenceBytes),
     state: parsed
-      ? processDefinitelyDead(parsed.pid)
+      ? isProcessDefinitelyDead(parsed.pid)
         ? "dead"
         : "live"
       : "malformed",
@@ -358,6 +361,7 @@ async function inspectLegacyDirectory(
 async function inspectLegacy(
   legacyPath: string,
   relativePath: string,
+  isProcessDefinitelyDead: (pid: number) => boolean,
 ): Promise<LegacyEvidence | undefined> {
   let stat: BigIntStats;
   try {
@@ -368,7 +372,12 @@ async function inspectLegacy(
   }
   if (stat.isSymbolicLink()) throw new Error("legacy ownership path is a symbolic link");
   if (stat.isDirectory()) {
-    return inspectLegacyDirectory(legacyPath, relativePath, stat);
+    return inspectLegacyDirectory(
+      legacyPath,
+      relativePath,
+      stat,
+      isProcessDefinitelyDead,
+    );
   }
   if (!stat.isFile()) throw new Error("legacy ownership path has an unsafe type");
   let snapshot: FileSnapshot;
@@ -385,7 +394,7 @@ async function inspectLegacy(
     evidenceBytes: snapshot.bytes,
     evidenceDigest: digest(snapshot.bytes),
     state: parsed
-      ? processDefinitelyDead(parsed.pid)
+      ? isProcessDefinitelyDead(parsed.pid)
         ? "dead"
         : "live"
       : "malformed",
@@ -584,11 +593,12 @@ async function migrateLegacy(
   options: GitHubJournalOptions,
 ): Promise<void> {
   const logicalDigest = logicalKeyDigest(logicalKey);
+  const classifyDead = options.isProcessDefinitelyDead ?? processDefinitelyDead;
   const location = legacyLocation(githubRoot, kind, logicalDigest);
   if (!location) return;
   let observed: LegacyEvidence | undefined;
   try {
-    observed = await inspectLegacy(location.path, location.relativePath);
+    observed = await inspectLegacy(location.path, location.relativePath, classifyDead);
   } catch (error) {
     throw publicError(
       "GITHUB_JOURNAL_LEGACY_CHANGED",
@@ -604,6 +614,23 @@ async function migrateLegacy(
         "GITHUB_JOURNAL_LEGACY_CHANGED",
         kind,
         `GitHub ${kind} journal migration evidence changed`,
+      );
+    }
+    return;
+  }
+  const publishedMarker = await readMarker(markerPath);
+  if (publishedMarker !== undefined) {
+    try {
+      parseMigration(
+        publishedMarker,
+        canonicalMigration(kind, logicalDigest, observed),
+      );
+    } catch (error) {
+      throw publicError(
+        "GITHUB_JOURNAL_LEGACY_CHANGED",
+        kind,
+        `GitHub ${kind} journal migration evidence changed`,
+        error,
       );
     }
     return;
@@ -626,7 +653,7 @@ async function migrateLegacy(
   await options.afterLegacyObserved?.(location.path);
   let exact: LegacyEvidence | undefined;
   try {
-    exact = await inspectLegacy(location.path, location.relativePath);
+    exact = await inspectLegacy(location.path, location.relativePath, classifyDead);
   } catch (error) {
     throw publicError(
       "GITHUB_JOURNAL_LEGACY_CHANGED",
@@ -656,7 +683,7 @@ async function migrateLegacy(
   }
   let after: LegacyEvidence | undefined;
   try {
-    after = await inspectLegacy(location.path, location.relativePath);
+    after = await inspectLegacy(location.path, location.relativePath, classifyDead);
   } catch (error) {
     throw publicError(
       "GITHUB_JOURNAL_LEGACY_CHANGED",
@@ -750,7 +777,12 @@ export async function withGitHubJournal<T>(
   callback: () => Promise<T>,
   options: GitHubJournalOptions = {},
 ): Promise<T> {
-  if (!JOURNAL_KINDS.includes(kind) || typeof logicalKey !== "string" || !logicalKey) {
+  if (
+    !JOURNAL_KINDS.includes(kind) ||
+    typeof logicalKey !== "string" ||
+    !logicalKey ||
+    (kind === "association" && logicalKey !== ASSOCIATION_KEY)
+  ) {
     throw publicError(
       "GITHUB_JOURNAL_INVALID_OPTIONS",
       kind,

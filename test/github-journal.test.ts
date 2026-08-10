@@ -8,6 +8,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  rm,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
@@ -90,6 +91,49 @@ test("dead legacy regular-file ownership publishes digest-bound immutable eviden
   );
   assert.equal(typeof marker.migrationDigest, "string");
   assert.equal(JSON.stringify(marker).includes("dead-owner"), false);
+});
+
+test("a published exact legacy marker wins over later unrelated PID reuse", async (t) => {
+  const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-pid-reuse-"));
+  t.after(async () => rm(githubRoot, { recursive: true, force: true }));
+  const legacyPath = path.join(githubRoot, "associations.lock");
+  const raw = `${JSON.stringify({
+    pid: process.pid,
+    token: "historical-owner",
+    at: "2026-08-09T10:00:00.000Z",
+  })}\n`;
+  await writeFile(legacyPath, raw, "utf8");
+
+  await initializeGitHubJournals(githubRoot, {
+    isProcessDefinitelyDead: (pid) => pid === process.pid,
+  });
+
+  await assert.doesNotReject(initializeGitHubJournals(githubRoot));
+  assert.equal(await readFile(legacyPath, "utf8"), raw);
+  await access(migrationMarker(githubRoot));
+});
+
+test("association journals reject every noncanonical logical key", async (t) => {
+  const githubRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-journal-association-key-"));
+  t.after(async () => rm(githubRoot, { recursive: true, force: true }));
+
+  await assert.rejects(
+    withGitHubJournal(
+      githubRoot,
+      "association",
+      "association",
+      async () => undefined,
+    ),
+    /association journal options are invalid/i,
+  );
+  await assert.doesNotReject(
+    withGitHubJournal(
+      githubRoot,
+      "association",
+      "associations",
+      async () => undefined,
+    ),
+  );
 });
 
 test("dead legacy directory ownership migrates without deleting the directory", async () => {
