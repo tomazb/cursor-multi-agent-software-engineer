@@ -42,6 +42,7 @@ export async function createInstallationAccessToken(options: {
   if (options.readOnlyChecks) {
     body.permissions = {
       checks: "write",
+      pull_requests: "read",
       metadata: "read",
     };
   }

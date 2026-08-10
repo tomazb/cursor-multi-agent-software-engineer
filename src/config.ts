@@ -107,7 +107,14 @@ export function migrateConfig(raw: unknown): MasweConfig {
     policy: { ...base.policy, ...(value.policy ?? {}) },
   };
   if (value.githubApp !== undefined) {
-    migrated.githubApp = value.githubApp;
+    migrated.githubApp = {
+      ...value.githubApp,
+      allowedRepositories: Array.isArray(value.githubApp.allowedRepositories)
+        ? value.githubApp.allowedRepositories.map((repository) =>
+            typeof repository === "string" ? repository.toLowerCase() : repository,
+          ) as string[]
+        : value.githubApp.allowedRepositories,
+    };
   } else {
     delete migrated.githubApp;
   }

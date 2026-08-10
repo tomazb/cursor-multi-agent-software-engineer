@@ -210,6 +210,17 @@ export function migrateRunRecord(raw: unknown): RunRecord {
   // Same type/range assertion as project config load — never apply env overrides here.
   assertConfig(migratedConfig);
 
+  const github = candidate.github;
+  if (github !== undefined) {
+    if (!github || typeof github !== "object" || Array.isArray(github)) {
+      throw new Error("Run record github association is invalid");
+    }
+    const installationId = (github as Record<string, unknown>).installationId;
+    if (!Number.isSafeInteger(installationId) || Number(installationId) < 1) {
+      throw new Error("Run record github.installationId must be a positive integer");
+    }
+  }
+
   if (candidate.version === undefined) {
     return sanitizeRunFailureState({
       ...(candidate as unknown as RunRecord),

@@ -97,7 +97,7 @@
         "branch"
       ],
       "properties": {
-        "installationId": { "type": "integer" },
+        "installationId": { "type": "integer", "minimum": 1 },
         "repository": {
           "type": "string",
           "pattern": "^[^/\\s]+/[^/\\s]+$"

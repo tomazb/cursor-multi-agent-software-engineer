@@ -222,6 +222,33 @@ test("persisted run records satisfy run-record schema required shape", async () 
   assertMatches(schema, schema, run, "run");
 });
 
+test("run-record schema and runtime migration reject non-positive GitHub installation ids", async () => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-github-installation-"));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("schema", "check", DEFAULT_CONFIG);
+  run.github = {
+    installationId: 0,
+    repository: "owner/repo",
+    pullRequestNumber: 1,
+    baseSha: "base",
+    headSha: "head",
+    branch: "feature",
+  };
+
+  assert.equal(
+    schema.properties?.github?.properties?.installationId?.minimum,
+    1,
+  );
+  assert.throws(
+    () => assertMatches(schema, schema, run, "run"),
+    /github\.installationId/,
+  );
+  assert.throws(() => migrateRunRecord(run), /installationId/i);
+});
+
 test("run-record schema validates optional bounded durable runtime failure metadata", async () => {
   const schema = JSON.parse(
     await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),

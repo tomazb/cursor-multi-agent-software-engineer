@@ -201,3 +201,18 @@ test("githubApp accepts an empty allowlist when disabled", () => {
 
   assert.deepEqual(config.githubApp?.allowedRepositories, []);
 });
+
+test("githubApp normalizes validated repository allowlist entries case-insensitively", () => {
+  const config = mergeConfigForTest({
+    githubApp: {
+      enabled: true,
+      readOnlyChecks: true,
+      webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+      appIdEnv: "MASWE_GITHUB_APP_ID",
+      privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+      allowedRepositories: ["Owner/Repo"],
+    },
+  });
+
+  assert.deepEqual(config.githubApp?.allowedRepositories, ["owner/repo"]);
+});

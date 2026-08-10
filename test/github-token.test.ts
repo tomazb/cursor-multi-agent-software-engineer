@@ -32,6 +32,10 @@ test("createInstallationAccessToken scopes checks write to one repository", asyn
   assert.equal(seenHeaders?.["content-type"], "application/json");
   assert.deepEqual(seenBody, {
     repositories: ["repo"],
-    permissions: { checks: "write", metadata: "read" },
+    permissions: {
+      checks: "write",
+      pull_requests: "read",
+      metadata: "read",
+    },
   });
 });

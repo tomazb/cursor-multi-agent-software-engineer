@@ -392,12 +392,13 @@ export class CheckPublisher {
       const checkRuns = (
         response.body as { check_runs?: Array<{ id?: number; external_id?: string }> }
       ).check_runs;
-      if (Array.isArray(checkRuns)) {
-        const match = checkRuns.find(
-          (run) => run.external_id === externalId && typeof run.id === "number",
-        );
-        if (match) return match.id;
+      if (!Array.isArray(checkRuns)) {
+        throw new Error("GitHub check-run list response check_runs is malformed");
       }
+      const match = checkRuns.find(
+        (run) => run.external_id === externalId && typeof run.id === "number",
+      );
+      if (match) return match.id;
 
       const nextLink = nextLinkFrom(response.headers);
       if (nextLink === undefined) return undefined;

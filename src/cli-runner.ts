@@ -292,6 +292,7 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
       }
       const http = createFetchGitHubHttpClient(options.githubHttpOptions);
       const adapter = githubAdapterForCommand(cwd, config, store, http);
+      await adapter.initialize();
       const { url } = await (options.webhookListener ?? listenWebhookServer)({
         adapter,
         host: config.githubApp.webhookHost ?? "127.0.0.1",
@@ -309,6 +310,7 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
       }
       const http = createFetchGitHubHttpClient(options.githubHttpOptions);
       const adapter = githubAdapterForCommand(cwd, config, store, http);
+      await adapter.initialize();
       const run = await adapter.publishChecksForRun(runId);
       console.log(has(args, "--json") ? JSON.stringify(run, null, 2) : renderRun(run));
       return;

@@ -12,6 +12,7 @@ import {
 import { normalizeGitHubWebhook } from "./normalize.ts";
 import { verifyGitHubWebhookSignature } from "./signature.ts";
 import { GitHubSideEffectStore } from "./side-effect-store.ts";
+import { initializeGitHubJournals } from "./journal.ts";
 import {
   MalformedGitHubWebhookError,
   UnsupportedGitHubWebhookError,
@@ -123,6 +124,8 @@ export class GitHubAppAdapter {
   private readonly deliveries: GitHubDeliveryStore;
   private readonly sideEffects: GitHubSideEffectStore;
   private readonly associations: GitHubAssociationIndex;
+  private readonly root: string;
+  private initialization: Promise<void> | undefined;
 
   constructor(options: {
     cwd: string;
@@ -138,9 +141,21 @@ export class GitHubAppAdapter {
     this.http = options.http;
     this.tokenProvider = options.tokenProvider;
     const root = githubRoot(options.cwd);
+    this.root = root;
     this.deliveries = new GitHubDeliveryStore(root, options.deliveryMonitor);
     this.sideEffects = new GitHubSideEffectStore(root);
     this.associations = new GitHubAssociationIndex(root);
+  }
+
+  /** Fail-closed filesystem/journal preflight shared by webhook and manual publication. */
+  async initialize(): Promise<void> {
+    this.initialization ??= initializeGitHubJournals(this.root);
+    try {
+      await this.initialization;
+    } catch (error) {
+      this.initialization = undefined;
+      throw error;
+    }
   }
 
   private githubApp(): GitHubAppConfig {
@@ -159,6 +174,7 @@ export class GitHubAppAdapter {
   }
 
   async handleWebhook(request: WebhookRequest): Promise<WebhookHandleResult> {
+    await this.initialize();
     const app = this.githubApp();
     if (!request.deliveryId?.trim() || !request.eventName?.trim()) {
       return { status: 400, body: { ok: false, message: "missing delivery or event headers" } };
@@ -264,6 +280,7 @@ export class GitHubAppAdapter {
   }
 
   async publishChecksForRun(runId: string): Promise<RunRecord> {
+    await this.initialize();
     const app = this.githubApp();
     const run = await this.store.load(runId);
     if (!run.github) {

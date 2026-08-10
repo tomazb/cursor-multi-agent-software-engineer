@@ -92,16 +92,16 @@ journal records.
 
 ## Repository permissions
 
-Phase A uses only the minimum read/check permissions needed by its implemented paths:
+Each repository-scoped Phase A installation token requests exactly these permissions:
 
 | Permission | Access | Purpose |
 |---|---|---|
 | Metadata | Read | Required by GitHub Apps |
-| Contents | Read | Resolve repository/head state; Phase A refuses Contents writes |
 | Pull requests | Read | Read PR identity and current head; Phase A refuses PR/comment writes |
-| Checks | Read and write | Create and update MASWE check runs |
-| Actions | Read | Observe workflow completion; artifact ingestion remains deferred |
-| Commit statuses | Read | Consume existing CI status when needed |
+| Checks | Write | List, create, and update MASWE check runs |
+
+Webhook subscriptions do not broaden the installation token. Phase A does not request Contents,
+Actions, Commit statuses, Issues, or pull-request write permission.
 
 Phase B may add Contents, pull-request, and Issues writes only with a separate feature gate and
 permission review. Avoid administration, secrets, environments, deployments, and organization

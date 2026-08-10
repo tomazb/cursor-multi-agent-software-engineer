@@ -221,3 +221,42 @@ test("github-publish-checks uses the command's shared bounded client", async () 
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+test("github-webhook preflight failure prevents the listener and GitHub API work", async (t) => {
+  const { cwd } = await setupProject();
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  await mkdir(githubRoot, { recursive: true });
+  await writeFile(
+    path.join(githubRoot, "associations.lock"),
+    `${JSON.stringify({
+      pid: process.pid,
+      token: "live-preflight-owner",
+      at: "2026-08-10T00:00:00.000Z",
+    })}\n`,
+    "utf8",
+  );
+  let listenerCalled = false;
+  let apiCalls = 0;
+
+  await assert.rejects(
+    runCli({
+      argv: ["github-webhook", "--cwd", cwd],
+      observedNodeVersion: CANONICAL_NODE_VERSION,
+      githubHttpOptions: {
+        fetchFn: async () => {
+          apiCalls += 1;
+          return new Response(null, { status: 500 });
+        },
+      },
+      webhookListener: async () => {
+        listenerCalled = true;
+        return { url: "http://127.0.0.1:0/github/webhook" };
+      },
+    }),
+    /journal migration is blocked/i,
+  );
+
+  assert.equal(listenerCalled, false);
+  assert.equal(apiCalls, 0);
+});

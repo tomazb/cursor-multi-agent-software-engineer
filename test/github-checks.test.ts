@@ -640,6 +640,50 @@ test("CheckPublisher stops reconciliation at a finite page ceiling", async () =>
   assert.ok(gets <= 20);
 });
 
+test("CheckPublisher fails closed when a successful list response omits check_runs", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-malformed-list-"));
+  let posts = 0;
+  const publisher = new CheckPublisher({
+    http: {
+      async request(method) {
+        if (method === "GET") {
+          return { status: 200, headers: {}, body: { total_count: 0 } };
+        }
+        if (method === "POST") posts += 1;
+        return { status: 201, headers: {}, body: { id: 1 } };
+      },
+    },
+    sideEffects: new GitHubSideEffectStore(root),
+    readOnlyChecks: true,
+    owner: "owner",
+    repo: "repo",
+    pullRequestNumber: 1,
+    token: "token",
+  });
+  const run = {
+    schemaVersion: 1,
+    version: 1,
+    id: "run-1",
+    title: "t",
+    request: "r",
+    repositoryPath: "/tmp",
+    state: "PR_REVIEW",
+    createdAt: "",
+    updatedAt: "",
+    approvals: { brainstorm: false, design: false },
+    counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
+    config: DEFAULT_CONFIG,
+    artifacts: [],
+    events: [],
+  } as RunRecord;
+
+  await assert.rejects(
+    () => publisher.publishForHeadSha(run, "sha"),
+    /check_runs.*malformed/i,
+  );
+  assert.equal(posts, 0);
+});
+
 test("CheckPublisher creates checks idempotently and invalidates prior SHA success", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-checks-"));
   const sideEffects = new GitHubSideEffectStore(root);
