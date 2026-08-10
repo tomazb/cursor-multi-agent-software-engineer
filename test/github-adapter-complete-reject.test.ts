@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { mkdtemp, open, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, open, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { mergeConfigForTest } from "../src/config.ts";
 import { GitHubAppAdapter } from "../src/github/adapter.ts";
+import { GitHubDeliveryInbox } from "../src/github/delivery-inbox.ts";
 import { FileRunStore } from "../src/store.ts";
 
 const SECRET_ENV = "MASWE_TEST_COMPLETE_REJECT_SECRET";
@@ -79,4 +80,20 @@ test("file and directory sync failures prevent durable acknowledgement", async (
       assert.equal(result.body.message, "durable webhook handoff unavailable");
     });
   }
+});
+
+test("durable inbox initialization syncs every layout parent before readiness", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-layout-sync-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  await mkdir(githubRoot, { recursive: true });
+  const synced: string[] = [];
+  await new GitHubDeliveryInbox(githubRoot, {
+    syncDirectory: async (directoryPath) => {
+      synced.push(directoryPath);
+    },
+  }).initialize();
+
+  assert.ok(synced.includes(githubRoot));
+  assert.ok(synced.includes(path.join(githubRoot, "inbox")));
 });

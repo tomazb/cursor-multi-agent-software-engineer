@@ -235,6 +235,8 @@ test("github-publish-checks uses the command's shared bounded client", async () 
 test("github-webhook preflight failure prevents the listener and GitHub API work", async (t) => {
   const { cwd } = await setupProject();
   t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const restoreEnvironment = installGitHubEnvironment();
+  t.after(restoreEnvironment);
   const githubRoot = path.join(cwd, ".maswe", "github");
   await mkdir(githubRoot, { recursive: true });
   await writeFile(
@@ -269,6 +271,37 @@ test("github-webhook preflight failure prevents the listener and GitHub API work
 
   assert.equal(listenerCalled, false);
   assert.equal(apiCalls, 0);
+});
+
+test("github-webhook requires every listener credential before readiness", async (t) => {
+  for (const [name, environmentName] of [
+    ["webhook secret", WEBHOOK_SECRET_ENV],
+    ["app id", APP_ID_ENV],
+    ["private key", PRIVATE_KEY_ENV],
+  ] as const) {
+    await t.test(name, async (t) => {
+      const { cwd } = await setupProject();
+      t.after(async () => rm(cwd, { recursive: true, force: true }));
+      const restoreEnvironment = installGitHubEnvironment();
+      t.after(restoreEnvironment);
+      delete process.env[environmentName];
+      let listenerCalled = false;
+
+      await assert.rejects(
+        runCli({
+          argv: ["github-webhook", "--cwd", cwd],
+          observedNodeVersion: CANONICAL_NODE_VERSION,
+          webhookListener: async ({ adapter }) => {
+            listenerCalled = true;
+            await adapter.stopWebhookWorker();
+            return { url: "http://127.0.0.1:0/github/webhook" };
+          },
+        }),
+        /GitHub App listener credentials are missing/,
+      );
+      assert.equal(listenerCalled, false);
+    });
+  }
 });
 
 test("github-webhook wires a sanitized production diagnostic before listener readiness", async (t) => {

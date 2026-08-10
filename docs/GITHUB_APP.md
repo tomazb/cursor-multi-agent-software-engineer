@@ -86,7 +86,9 @@ published ownership pathname is deleted, replaced, or reused. Before the webhook
 traffic, initialization probes the association, check-create, publication, and delivery journals,
 migrates legacy delivery files, recovers pending leases, and starts the single worker. Manual
 publication probes only the journals it uses and never reclaims the listener's delivery leases.
-Any required probe or migration failure is fatal before listener readiness or GitHub API work.
+The listener also verifies that all three configured credential environment variables are present
+without logging their names or values. Any required credential, probe, or migration failure is
+fatal before listener readiness or GitHub API work.
 
 Durable ingress uses a bounded two-level SHA-256 layout rather than scanning a flat delivery
 directory during normal operations:

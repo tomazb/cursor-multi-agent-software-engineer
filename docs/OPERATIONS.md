@@ -233,6 +233,10 @@ journals before token or API work, but it does not scan or reclaim the listener'
 journal contains `format.json` plus `data`, `admin`, and `admin-recovery` streams with immutable
 `claims`, `releases`, and `tmp` records. Do not prune them.
 
+Listener readiness also requires the configured webhook secret, App ID, and private-key
+environment variables to be present. Only presence is checked; credential values and configured
+environment-variable names are not persisted or written to diagnostics.
+
 Run exactly one webhook listener/worker plus simultaneous manual publishers on one host and one
 coherent local filesystem with atomic no-clobber hard links. This is not a distributed queue. NFS,
 SMB, distributed FUSE, object-store mounts, cross-host use, a second listener, and filesystems

@@ -163,6 +163,7 @@ export class GitHubAppAdapter {
    * preflights its own journals without reclaiming the listener's active delivery lease.
    */
   async initialize(): Promise<void> {
+    void this.webhookSecret();
     this.inboxInitialization ??= (async () => {
       await this.initializePublicationJournals();
       await this.inbox.initialize();
@@ -191,7 +192,7 @@ export class GitHubAppAdapter {
   private webhookSecret(): string {
     const envName = this.githubApp().webhookSecretEnv;
     const secret = process.env[envName];
-    if (!secret) throw new Error(`Missing webhook secret env ${envName}`);
+    if (!secret) throw new Error("GitHub App webhook secret is missing");
     return secret;
   }
 

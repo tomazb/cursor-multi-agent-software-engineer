@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { mergeConfigForTest } from "../src/config.ts";
 import { GitHubAppAdapter } from "../src/github/adapter.ts";
+import { GitHubDeliveryInbox } from "../src/github/delivery-inbox.ts";
 import { FileRunStore } from "../src/store.ts";
 
 const SECRET_ENV = "MASWE_TEST_INBOX_MIGRATION_SECRET";
@@ -142,4 +143,50 @@ test("startup migration preserves v1 completed as terminal legacy", async (t) =>
   assert.equal(replay.status, 200);
   assert.equal(replay.body.duplicate, true);
   assert.equal(requests, 0);
+});
+
+test("startup migration fails closed instead of overwriting conflicting retained evidence", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-v1-conflict-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const deliveryId = "legacy-conflict";
+  const canonical = await writeLegacy(cwd, deliveryId, "processing");
+  const sourceName = `${path.basename(canonical)}.staging.retained`;
+  const hash = createHash("sha256").update(deliveryId).digest("hex");
+  const legacyDirectory = path.join(
+    cwd,
+    ".maswe",
+    "github",
+    "inbox",
+    "legacy",
+    hash.slice(0, 2),
+    hash,
+  );
+  await mkdir(legacyDirectory, { recursive: true });
+  const retainedPath = path.join(legacyDirectory, sourceName);
+  await writeFile(retainedPath, "conflicting-retained-evidence\n", "utf8");
+  const adapter = new GitHubAppAdapter({
+    cwd,
+    config: config(),
+    store: new FileRunStore(cwd),
+    http: { async request() { throw new Error("migration must fail before API work"); } },
+    tokenProvider: async () => "token",
+  });
+
+  await assert.rejects(adapter.initialize(), /conflicting legacy delivery evidence/i);
+  assert.equal(await readFile(retainedPath, "utf8"), "conflicting-retained-evidence\n");
+  assert.equal(await readFile(`${canonical}.staging.retained`, "utf8"), "retained-artifact\n");
+});
+
+test("startup fails closed on an unexpected durable queue entry", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-invalid-queue-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const invalidQueueDirectory = path.join(githubRoot, "inbox", "queue", "not-a-prefix");
+  await mkdir(invalidQueueDirectory, { recursive: true });
+  await writeFile(path.join(invalidQueueDirectory, "stranded.queued"), "", "utf8");
+
+  await assert.rejects(
+    new GitHubDeliveryInbox(githubRoot).initialize(),
+    /Invalid GitHub durable inbox queue entry/,
+  );
 });

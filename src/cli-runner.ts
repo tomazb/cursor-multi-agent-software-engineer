@@ -304,6 +304,13 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
       if (!config.githubApp?.enabled) {
         throw new Error("githubApp.enabled must be true to start the webhook server");
       }
+      if (
+        !process.env[config.githubApp.webhookSecretEnv] ||
+        !process.env[config.githubApp.appIdEnv] ||
+        !process.env[config.githubApp.privateKeyEnv]
+      ) {
+        throw new Error("GitHub App listener credentials are missing");
+      }
       const http = createFetchGitHubHttpClient(options.githubHttpOptions);
       const adapter = githubAdapterForCommand(cwd, config, store, http);
       await adapter.initialize();

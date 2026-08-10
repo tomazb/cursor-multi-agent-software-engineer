@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { open, mkdir, readFile, readdir, rename, unlink } from "node:fs/promises";
+import { link, lstat, open, mkdir, readFile, readdir, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { withGitHubJournal } from "./journal.ts";
 import type { GitHubInternalEvent } from "./types.ts";
@@ -310,11 +310,15 @@ export class GitHubDeliveryInbox {
   }
 
   private async initializeOnce(): Promise<void> {
+    await createDirectory(this.inboxRoot);
+    await this.syncDirectoryPath(this.githubRoot);
     await createDirectory(this.stateRoot);
     await createDirectory(this.queueRoot);
     await createDirectory(this.legacyRoot);
+    await this.syncDirectoryPath(this.inboxRoot);
     await withGitHubJournal(this.githubRoot, "delivery", "inbox-startup", async () => {
       await this.migrateLegacyDeliveries();
+      const stateHashes = new Set<string>();
       let prefixes: string[] = [];
       try {
         prefixes = await readdir(this.stateRoot);
@@ -322,10 +326,14 @@ export class GitHubDeliveryInbox {
         if (errno(error) !== "ENOENT") throw error;
       }
       for (const prefix of prefixes.sort()) {
-        if (!/^[0-9a-f]{2}$/.test(prefix)) continue;
+        if (!/^[0-9a-f]{2}$/.test(prefix)) {
+          throw new Error("Invalid GitHub durable inbox state entry");
+        }
         const prefixPath = path.join(this.stateRoot, prefix);
         for (const hash of (await readdir(prefixPath)).sort()) {
-          if (!HASH_PATTERN.test(hash) || !hash.startsWith(prefix)) continue;
+          if (!HASH_PATTERN.test(hash) || !hash.startsWith(prefix)) {
+            throw new Error("Invalid GitHub durable inbox state entry");
+          }
           const paths = this.pathsForHash(hash);
           let record: InboxDeliveryRecord;
           try {
@@ -337,6 +345,7 @@ export class GitHubDeliveryInbox {
           if (deliveryHash(record.deliveryId) !== hash) {
             throw new Error("GitHub durable inbox hash does not match delivery id");
           }
+          stateHashes.add(hash);
           if (record.status === "processing") {
             const recovered: InboxDeliveryRecord = {
               ...record,
@@ -353,6 +362,9 @@ export class GitHubDeliveryInbox {
             await this.removeQueueMarker(hash);
           }
         }
+      }
+      for (const hash of await this.queuedHashes()) {
+        if (!stateHashes.has(hash)) await this.removeQueueMarker(hash);
       }
     });
   }
@@ -420,16 +432,41 @@ export class GitHubDeliveryInbox {
       await createDirectory(targetDirectory);
       await this.syncDirectoryPath(path.dirname(targetDirectory));
       for (const name of group) {
-        try {
-          await rename(path.join(deliveriesRoot, name), path.join(targetDirectory, name));
-        } catch (error) {
-          if (errno(error) !== "ENOENT") throw error;
-        }
+        await this.retainLegacyFile(
+          path.join(deliveriesRoot, name),
+          path.join(targetDirectory, name),
+        );
       }
       await this.syncDirectoryPath(targetDirectory);
       await this.syncDirectoryPath(deliveriesRoot);
     }
     await this.syncDirectoryPath(deliveriesRoot);
+  }
+
+  private async retainLegacyFile(sourcePath: string, targetPath: string): Promise<void> {
+    const sourceStat = await lstat(sourcePath);
+    if (sourceStat.isSymbolicLink() || !sourceStat.isFile()) {
+      throw new Error("Legacy GitHub delivery evidence is not an ordinary file");
+    }
+    try {
+      await link(sourcePath, targetPath);
+    } catch (error) {
+      if (errno(error) !== "EEXIST") throw error;
+      const targetStat = await lstat(targetPath);
+      if (targetStat.isSymbolicLink() || !targetStat.isFile()) {
+        throw new Error("Conflicting legacy delivery evidence");
+      }
+      const [sourceBytes, targetBytes] = await Promise.all([
+        readFile(sourcePath),
+        readFile(targetPath),
+      ]);
+      if (!sourceBytes.equals(targetBytes)) {
+        throw new Error("Conflicting legacy delivery evidence");
+      }
+    }
+    await this.syncDirectoryPath(path.dirname(targetPath));
+    await unlink(sourcePath);
+    await this.syncDirectoryPath(path.dirname(sourcePath));
   }
 
   private async readState(deliveryId: string): Promise<InboxDeliveryRecord | undefined> {
@@ -622,10 +659,15 @@ export class GitHubDeliveryInbox {
       throw error;
     }
     for (const prefix of prefixes.sort()) {
-      if (!/^[0-9a-f]{2}$/.test(prefix)) continue;
+      if (!/^[0-9a-f]{2}$/.test(prefix)) {
+        throw new Error("Invalid GitHub durable inbox queue entry");
+      }
       for (const name of (await readdir(path.join(this.queueRoot, prefix))).sort()) {
         const hash = name.endsWith(".queued") ? name.slice(0, -7) : "";
-        if (HASH_PATTERN.test(hash) && hash.startsWith(prefix)) hashes.push(hash);
+        if (!HASH_PATTERN.test(hash) || !hash.startsWith(prefix)) {
+          throw new Error("Invalid GitHub durable inbox queue entry");
+        }
+        hashes.push(hash);
       }
     }
     return hashes;
