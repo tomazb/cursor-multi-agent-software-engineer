@@ -68,7 +68,7 @@ function requireString(value: unknown, field: string): string {
 function requireRepository(payload: Record<string, unknown>): string {
   const repository = requireString(repositoryFullName(payload), "repository.full_name");
   if (!repository.includes("/")) malformed("repository.full_name must use owner/repository form");
-  return repository;
+  return repository.toLowerCase();
 }
 
 function requireInstallationId(payload: Record<string, unknown>): number {

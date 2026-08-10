@@ -103,6 +103,24 @@ export class GitHubAssociationIndex {
       );
   }
 
+  async suspend(
+    repository: string,
+    pullRequestNumber: number,
+  ): Promise<AssociationRecord | undefined> {
+    return this.withLock(async () => {
+      const records = await this.readAll();
+      const key = associationKey(repository, pullRequestNumber);
+      const record = records[key];
+      if (!record) return undefined;
+      if (!record.suspended) {
+        record.suspended = true;
+        record.updatedAt = new Date().toISOString();
+        await this.writeAll(records);
+      }
+      return { ...record };
+    });
+  }
+
   async suspendInstallation(installationId: number): Promise<AssociationRecord[]> {
     return this.withLock(async () => {
       const records = await this.readAll();

@@ -378,6 +378,7 @@ export class GitHubAppAdapter {
     const branch = event.branch!;
     const headSha = event.headSha!;
     const associations = await this.associations.findAllByRepositoryBranch(repository, branch);
+    const failures: unknown[] = [];
     for (const association of associations) {
       if (association.suspended) continue;
       const synthetic: GitHubInternalEvent = {
@@ -389,7 +390,17 @@ export class GitHubAppAdapter {
         repository,
         installationId: association.installationId,
       };
-      await this.handlePullRequestEvent(synthetic);
+      try {
+        await this.handlePullRequestEvent(synthetic);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `Push invalidation failed for ${failures.length} pull request association(s)`,
+      );
     }
   }
 
@@ -434,21 +445,42 @@ export class GitHubAppAdapter {
       throw new Error("pull_request event missing installation id");
     }
 
-    let association = await this.associations.find(repository, pullRequestNumber);
-    if (association?.suspended) {
+    const liveHead = await this.currentPullRequestHead(
+      repository,
+      pullRequestNumber,
+      installationId,
+    );
+    if (liveHead !== headSha) {
+      // Stale or out-of-order delivery: current PR head has already moved on.
       return;
     }
 
-    if (association?.headSha && association.headSha !== headSha) {
-      const liveHead = await this.currentPullRequestHead(
-        repository,
-        pullRequestNumber,
-        installationId,
-      );
-      if (liveHead !== headSha) {
-        // Stale out-of-order delivery: current PR head has already moved on.
-        return;
+    let association = await this.associations.find(repository, pullRequestNumber);
+    if (association?.suspended) return;
+
+    if (event.type === "pull_request.closed") {
+      const associatedRun = association
+        ? await this.store.load(association.runId)
+        : await this.findMatchingRun(repository, pullRequestNumber, event.branch);
+      if (associatedRun?.github) {
+        associatedRun.github = { ...associatedRun.github, suspended: true };
+        await this.store.save(associatedRun);
       }
+      if (association) {
+        await this.associations.suspend(repository, pullRequestNumber);
+      } else if (associatedRun?.github) {
+        await this.associations.bind({
+          runId: associatedRun.id,
+          installationId,
+          repository,
+          pullRequestNumber,
+          baseSha: associatedRun.github.baseSha,
+          headSha,
+          branch: associatedRun.github.branch,
+          suspended: true,
+        });
+      }
+      return;
     }
 
     let run: RunRecord | undefined;

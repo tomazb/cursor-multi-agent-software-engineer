@@ -31,6 +31,25 @@ test("normalize pull_request.synchronize into an internal event", () => {
   assert.equal(event.branch, "feature");
 });
 
+test("normalize validates repository shape before canonical case folding", () => {
+  const event = normalizeGitHubWebhook({
+    deliveryId: "case-fold",
+    eventName: "pull_request",
+    payload: {
+      action: "opened",
+      installation: { id: 99 },
+      repository: { full_name: "Owner/Repo" },
+      pull_request: {
+        number: 12,
+        head: { sha: "head", ref: "feature" },
+        base: { sha: "base" },
+      },
+    },
+  });
+
+  assert.equal(event.repository, "owner/repo");
+});
+
 test("normalize installation.deleted", () => {
   const event = normalizeGitHubWebhook({
     deliveryId: "del-2",

@@ -45,6 +45,7 @@ async function setup(options: { liveHead?: string } = {}) {
   let rateLimitOnce = false;
   let liveHead = options.liveHead;
   let failAll = false;
+  let pullHeadLookups = 0;
   const http: GitHubHttpClient = {
     async request(method, url, options) {
       if (failAll) {
@@ -63,6 +64,7 @@ async function setup(options: { liveHead?: string } = {}) {
         };
       }
       if (method === "GET" && url.includes("/pulls/")) {
+        pullHeadLookups += 1;
         return {
           status: 200,
           headers: {},
@@ -108,6 +110,9 @@ async function setup(options: { liveHead?: string } = {}) {
     posts,
     patches,
     tokens,
+    pullHeadLookups() {
+      return pullHeadLookups;
+    },
     setLiveHead(sha: string) {
       liveHead = sha;
     },
@@ -120,9 +125,9 @@ async function setup(options: { liveHead?: string } = {}) {
   };
 }
 
-function prPayload(headSha: string, number = 9) {
+function prPayload(headSha: string, number = 9, action = "synchronize") {
   return {
-    action: "synchronize",
+    action,
     installation: { id: 44 },
     repository: { full_name: "owner/repo" },
     pull_request: {
@@ -305,6 +310,118 @@ test("integration: stale out-of-order head is ignored", async () => {
   assert.equal((await store.load(run.id)).github?.headSha, "sha2");
 });
 
+test("integration: first-seen stale PR delivery is rejected against the live head", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { adapter, store, posts, pullHeadLookups } = await setup({ liveHead: "sha-live" });
+  const run = await store.create("first-stale", "req", testConfig());
+  run.workspace = {
+    baseSha: "base",
+    headSha: "sha-stale",
+    branch: "maswe/run-1",
+    fingerprint: "fp",
+    remote: "https://github.com/owner/repo.git",
+  };
+  await store.save(run);
+
+  const body = JSON.stringify(prPayload("sha-stale"));
+  const result = await adapter.handleWebhook({
+    deliveryId: "del-first-stale",
+    eventName: "pull_request",
+    signatureHeader: sign(body),
+    rawBody: body,
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(pullHeadLookups(), 1);
+  assert.equal((await store.load(run.id)).github, undefined);
+  assert.equal(posts.length, 0);
+});
+
+test("integration: matching local and event heads are rejected when the remote advanced", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { adapter, store, cwd, posts, pullHeadLookups } = await setup({ liveHead: "sha-live" });
+  const run = await store.create("locally-equal-stale", "req", testConfig());
+  run.workspace = {
+    baseSha: "base",
+    headSha: "sha-event",
+    branch: "maswe/run-1",
+    fingerprint: "fp",
+    remote: "https://github.com/owner/repo.git",
+  };
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-event",
+    branch: "maswe/run-1",
+    suspended: false,
+  };
+  await store.save(run);
+  await new GitHubAssociationIndex(path.join(cwd, ".maswe", "github")).bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-event",
+    branch: "maswe/run-1",
+  });
+
+  const body = JSON.stringify(prPayload("sha-event"));
+  const result = await adapter.handleWebhook({
+    deliveryId: "del-local-equals-stale",
+    eventName: "pull_request",
+    signatureHeader: sign(body),
+    rawBody: body,
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(pullHeadLookups(), 1);
+  assert.equal((await store.load(run.id)).github?.headSha, "sha-event");
+  assert.equal(posts.length, 0);
+});
+
+test("integration: pull request close suspends the index and run association", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { adapter, store, cwd, posts } = await setup({ liveHead: "sha-close" });
+  const run = await store.create("close", "req", testConfig());
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-close",
+    branch: "maswe/run-1",
+    suspended: false,
+  };
+  await store.save(run);
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  await index.bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-close",
+    branch: "maswe/run-1",
+  });
+
+  const body = JSON.stringify(prPayload("sha-close", 9, "closed"));
+  const result = await adapter.handleWebhook({
+    deliveryId: "del-close",
+    eventName: "pull_request",
+    signatureHeader: sign(body),
+    rawBody: body,
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal((await index.find("owner/repo", 9))?.suspended, true);
+  assert.equal((await store.load(run.id)).github?.suspended, true);
+  assert.deepEqual(await index.findAllByRepositoryBranch("owner/repo", "maswe/run-1"), []);
+  assert.equal(posts.length, 0);
+});
+
 test("integration: installation deletion suspends run records", async () => {
   process.env[SECRET_ENV] = SECRET;
   const { adapter, cwd, store, posts } = await setup();
@@ -402,6 +519,7 @@ test("integration: push events invalidate every matching PR association", async 
   firstRun.evidence = {
     quality: { headSha: "old-first", passed: true, at: "t" },
     verification: { headSha: "old-first", passed: true, at: "t" },
+    mergeReady: { headSha: "old-first", passed: true, at: "t" },
   };
   firstRun.github = {
     installationId: 44,
@@ -425,6 +543,7 @@ test("integration: push events invalidate every matching PR association", async 
   secondRun.evidence = {
     quality: { headSha: "old-second", passed: true, at: "t" },
     verification: { headSha: "old-second", passed: true, at: "t" },
+    mergeReady: { headSha: "old-second", passed: true, at: "t" },
   };
   secondRun.github = {
     installationId: 44,
@@ -479,8 +598,12 @@ test("integration: push events invalidate every matching PR association", async 
   const loadedSecond = await store.load(secondRun.id);
   assert.equal(loadedFirst.github?.headSha, "sha-push");
   assert.equal(loadedFirst.evidence?.quality, undefined);
+  assert.equal(loadedFirst.evidence?.verification, undefined);
+  assert.equal(loadedFirst.evidence?.mergeReady, undefined);
   assert.equal(loadedSecond.github?.headSha, "sha-push");
   assert.equal(loadedSecond.evidence?.quality, undefined);
+  assert.equal(loadedSecond.evidence?.verification, undefined);
+  assert.equal(loadedSecond.evidence?.mergeReady, undefined);
 
   assert.equal(patches.filter((patch) => patch.headSha === "old-first").length, 4);
   assert.equal(patches.filter((patch) => patch.headSha === "old-second").length, 4);
@@ -498,6 +621,77 @@ test("integration: push events invalidate every matching PR association", async 
       .length,
     0,
   );
+});
+
+test("integration: push attempts later PRs before reporting an earlier invalidation failure", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const { cwd, store } = await setup();
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  const runs = [];
+  for (const pullRequestNumber of [9, 10]) {
+    const run = await store.create(`fanout-${pullRequestNumber}`, "req", testConfig());
+    run.github = {
+      installationId: 44,
+      repository: "owner/repo",
+      pullRequestNumber,
+      baseSha: "base",
+      headSha: `old-${pullRequestNumber}`,
+      branch: "maswe/run-1",
+      suspended: false,
+    };
+    await store.save(run);
+    await index.bind({
+      runId: run.id,
+      installationId: 44,
+      repository: "owner/repo",
+      pullRequestNumber,
+      baseSha: "base",
+      headSha: `old-${pullRequestNumber}`,
+      branch: "maswe/run-1",
+    });
+    runs.push(run);
+  }
+  let nextId = 500;
+  const adapter = new GitHubAppAdapter({
+    cwd,
+    config: testConfig(),
+    store,
+    tokenProvider: async () => "token",
+    http: {
+      async request(method, url) {
+        if (method === "GET" && url.includes("/pulls/9")) {
+          return { status: 500, headers: {}, body: {} };
+        }
+        if (method === "GET" && url.includes("/pulls/10")) {
+          return { status: 200, headers: {}, body: { head: { sha: "sha-push" } } };
+        }
+        if (method === "GET" && url.includes("/check-runs")) {
+          return { status: 200, headers: {}, body: { check_runs: [] } };
+        }
+        return { status: 201, headers: {}, body: { id: nextId++ } };
+      },
+    },
+  });
+  const body = JSON.stringify({
+    ref: "refs/heads/maswe/run-1",
+    after: "sha-push",
+    installation: { id: 44 },
+    repository: { full_name: "owner/repo" },
+  });
+
+  await assert.rejects(
+    () =>
+      adapter.handleWebhook({
+        deliveryId: "del-push-partial-failure",
+        eventName: "push",
+        signatureHeader: sign(body),
+        rawBody: body,
+      }),
+    /current PR head|invalidation/i,
+  );
+
+  assert.equal((await store.load(runs[0]!.id)).github?.headSha, "old-9");
+  assert.equal((await store.load(runs[1]!.id)).github?.headSha, "sha-push");
 });
 
 test("integration: live-head lookup failure fails closed", async () => {

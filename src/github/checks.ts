@@ -307,8 +307,16 @@ export class CheckPublisher {
         this.attempt,
       );
       const existing = await this.sideEffects.get(key);
-      if (!existing) continue;
-      await this.patchCheck(existing.resourceId, {
+      const resourceId = existing?.resourceId ?? await this.reconcileExistingCheck(
+        name,
+        previousHeadSha,
+        externalIdFor(key),
+      );
+      if (resourceId === undefined) continue;
+      if (!existing) {
+        await this.sideEffects.put(key, { resourceId, kind: "check-run" });
+      }
+      await this.patchCheck(resourceId, {
         conclusion: "cancelled",
         title: "Superseded by newer head SHA",
         summary: `Invalidated because a newer head SHA was evaluated for PR #${this.pullRequestNumber}.`,

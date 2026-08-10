@@ -684,6 +684,67 @@ test("CheckPublisher fails closed when a successful list response omits check_ru
   assert.equal(posts, 0);
 });
 
+test("CheckPublisher reconciles and cancels prior-SHA checks when local side effects are missing", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-missing-prior-side-effect-"));
+  const patches: unknown[] = [];
+  let nextId = 900;
+  const publisher = new CheckPublisher({
+    http: {
+      async request(method, url, options) {
+        if (method === "GET") {
+          const parsed = new URL(url);
+          const checkName = parsed.searchParams.get("check_name")!;
+          const headSha = parsed.pathname.split("/").at(-2)!;
+          if (headSha === "sha-old") {
+            const key = `check-run:owner/repo/1/sha-old/${checkName}/1`;
+            return {
+              status: 200,
+              headers: {},
+              body: { check_runs: [{ id: nextId++, external_id: externalIdFor(key) }] },
+            };
+          }
+          return { status: 200, headers: {}, body: { check_runs: [] } };
+        }
+        if (method === "PATCH") {
+          patches.push(options?.body);
+          return { status: 200, headers: {}, body: {} };
+        }
+        return { status: 201, headers: {}, body: { id: nextId++ } };
+      },
+    },
+    sideEffects: new GitHubSideEffectStore(root),
+    readOnlyChecks: true,
+    owner: "owner",
+    repo: "repo",
+    pullRequestNumber: 1,
+    token: "token",
+  });
+  const run = {
+    schemaVersion: 1,
+    version: 1,
+    id: "run-1",
+    title: "t",
+    request: "r",
+    repositoryPath: "/tmp",
+    state: "PR_REVIEW",
+    createdAt: "",
+    updatedAt: "",
+    approvals: { brainstorm: false, design: false },
+    counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
+    config: DEFAULT_CONFIG,
+    artifacts: [],
+    events: [],
+  } as RunRecord;
+
+  await publisher.publishForHeadSha(run, "sha-new", { previousHeadSha: "sha-old" });
+
+  assert.equal(patches.length, 4);
+  assert.deepEqual(
+    patches.map((body) => (body as { conclusion?: string }).conclusion),
+    Array(4).fill("cancelled"),
+  );
+});
+
 test("CheckPublisher creates checks idempotently and invalidates prior SHA success", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-checks-"));
   const sideEffects = new GitHubSideEffectStore(root);
