@@ -135,6 +135,14 @@ function journalDirectory(
   return path.join(githubRoot, "journals", kind, logicalKeyDigest(logicalKey));
 }
 
+function journalDirectoryForDigest(
+  githubRoot: string,
+  kind: GitHubJournalKind,
+  logicalDigest: string,
+): string {
+  return path.join(githubRoot, "journals", kind, logicalDigest);
+}
+
 function publicError(
   code: GitHubJournalErrorCode,
   kind: GitHubJournalKind,
@@ -457,13 +465,13 @@ function parseMigration(
   return expected.record;
 }
 
-async function createOrValidateDirectory(directory: string): Promise<void> {
+async function createOrValidateDirectory(directory: string): Promise<boolean> {
   try {
     const stat = await lstat(directory);
     if (stat.isSymbolicLink() || !stat.isDirectory()) {
       throw new Error("GitHub journal path is not an ordinary directory");
     }
-    return;
+    return false;
   } catch (error) {
     if (errno(error) !== "ENOENT") throw error;
   }
@@ -476,24 +484,40 @@ async function createOrValidateDirectory(directory: string): Promise<void> {
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
     throw new Error("GitHub journal path is not an ordinary directory");
   }
+  return true;
 }
 
-async function prepareJournalDirectory(
+async function syncDirectory(directory: string): Promise<void> {
+  const handle = await open(directory, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function prepareJournalDirectoryForDigest(
   githubRoot: string,
   kind: GitHubJournalKind,
-  logicalKey: string,
+  logicalDigest: string,
 ): Promise<string> {
-  await mkdir(githubRoot, { recursive: true, mode: 0o700 });
+  const stateRoot = path.dirname(githubRoot);
+  if (await createOrValidateDirectory(stateRoot)) {
+    await syncDirectory(path.dirname(stateRoot));
+  }
+  if (await createOrValidateDirectory(githubRoot)) {
+    await syncDirectory(stateRoot);
+  }
   const rootStat = await lstat(githubRoot);
   if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
     throw new Error("GitHub state root is not an ordinary directory");
   }
   const journals = path.join(githubRoot, "journals");
   const kindDirectory = path.join(journals, kind);
-  const target = journalDirectory(githubRoot, kind, logicalKey);
-  await createOrValidateDirectory(journals);
-  await createOrValidateDirectory(kindDirectory);
-  await createOrValidateDirectory(target);
+  const target = journalDirectoryForDigest(githubRoot, kind, logicalDigest);
+  if (await createOrValidateDirectory(journals)) await syncDirectory(githubRoot);
+  if (await createOrValidateDirectory(kindDirectory)) await syncDirectory(journals);
+  if (await createOrValidateDirectory(target)) await syncDirectory(kindDirectory);
   return target;
 }
 
@@ -567,6 +591,7 @@ async function publishMigration(
       }
       parseMigration(existing, expected);
     }
+    await syncDirectory(journalRoot);
     const published = await readMarker(markerPath);
     if (published === undefined) throw new Error("migration marker disappeared");
     parseMigration(published, expected);
@@ -584,6 +609,7 @@ async function publishMigration(
     if (created) {
       try {
         await unlink(temporaryPath);
+        await syncDirectory(journalRoot);
       } catch (error) {
         if (errno(error) !== "ENOENT" && primaryError === undefined) throw error;
       }
@@ -595,13 +621,44 @@ async function migrateLegacy(
   githubRoot: string,
   journalRoot: string,
   kind: GitHubJournalKind,
-  logicalKey: string,
+  logicalDigest: string,
   options: GitHubJournalOptions,
 ): Promise<void> {
-  const logicalDigest = logicalKeyDigest(logicalKey);
   const classifyDead = options.isProcessDefinitelyDead ?? processDefinitelyDead;
   const location = legacyLocation(githubRoot, kind, logicalDigest);
   if (!location) return;
+  const markerPath = path.join(journalRoot, "legacy-migration.json");
+  let publishedMarker: string | undefined;
+  try {
+    publishedMarker = await readMarker(markerPath);
+  } catch (error) {
+    throw publicError(
+      "GITHUB_JOURNAL_LEGACY_CHANGED",
+      kind,
+      `GitHub ${kind} journal migration evidence changed`,
+      error,
+    );
+  }
+  if (publishedMarker !== undefined) {
+    let retained: LegacyEvidence | undefined;
+    try {
+      // Stable retained bytes and filesystem identity are marker-bound. PID liveness is not.
+      retained = await inspectLegacy(location.path, location.relativePath, () => false);
+      if (!retained) throw new Error("retained legacy ownership path is missing");
+      parseMigration(
+        publishedMarker,
+        canonicalMigration(kind, logicalDigest, retained),
+      );
+    } catch (error) {
+      throw publicError(
+        "GITHUB_JOURNAL_LEGACY_CHANGED",
+        kind,
+        `GitHub ${kind} journal migration evidence changed`,
+        error,
+      );
+    }
+    return;
+  }
   let observed: LegacyEvidence | undefined;
   try {
     observed = await inspectLegacy(location.path, location.relativePath, classifyDead);
@@ -613,32 +670,7 @@ async function migrateLegacy(
       error,
     );
   }
-  const markerPath = path.join(journalRoot, "legacy-migration.json");
   if (!observed) {
-    if ((await readMarker(markerPath)) !== undefined) {
-      throw publicError(
-        "GITHUB_JOURNAL_LEGACY_CHANGED",
-        kind,
-        `GitHub ${kind} journal migration evidence changed`,
-      );
-    }
-    return;
-  }
-  const publishedMarker = await readMarker(markerPath);
-  if (publishedMarker !== undefined) {
-    try {
-      parseMigration(
-        publishedMarker,
-        canonicalMigration(kind, logicalDigest, observed),
-      );
-    } catch (error) {
-      throw publicError(
-        "GITHUB_JOURNAL_LEGACY_CHANGED",
-        kind,
-        `GitHub ${kind} journal migration evidence changed`,
-        error,
-      );
-    }
     return;
   }
   if (observed.state === "live") {
@@ -713,9 +745,23 @@ async function initializeOne(
   logicalKey: string,
   options: GitHubJournalOptions,
 ): Promise<string> {
+  return initializeOneByDigest(
+    githubRoot,
+    kind,
+    logicalKeyDigest(logicalKey),
+    options,
+  );
+}
+
+async function initializeOneByDigest(
+  githubRoot: string,
+  kind: GitHubJournalKind,
+  logicalDigest: string,
+  options: GitHubJournalOptions,
+): Promise<string> {
   let target: string;
   try {
-    target = await prepareJournalDirectory(githubRoot, kind, logicalKey);
+    target = await prepareJournalDirectoryForDigest(githubRoot, kind, logicalDigest);
     await initializeLockJournal(
       target,
       options.linkFile ? { linkFile: options.linkFile } : {},
@@ -729,7 +775,7 @@ async function initializeOne(
       error,
     );
   }
-  await migrateLegacy(githubRoot, target, kind, logicalKey, options);
+  await migrateLegacy(githubRoot, target, kind, logicalDigest, options);
   return target;
 }
 
@@ -738,6 +784,41 @@ export async function initializeGitHubJournals(
   options: GitHubJournalOptions = {},
 ): Promise<void> {
   await initializeOne(githubRoot, "association", ASSOCIATION_KEY, options);
+}
+
+/** Migrate every retained v1 per-check lock before listener/manual readiness. */
+export async function initializeLegacyCheckCreateJournals(
+  githubRoot: string,
+  options: GitHubJournalOptions = {},
+): Promise<void> {
+  const legacyRoot = path.join(githubRoot, "side-effect-create-locks");
+  let names: string[];
+  try {
+    const stat = await lstat(legacyRoot);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error("legacy check-create root is not an ordinary directory");
+    }
+    names = (await readdir(legacyRoot)).sort();
+  } catch (error) {
+    if (errno(error) === "ENOENT") return;
+    throw publicError(
+      "GITHUB_JOURNAL_INITIALIZATION_FAILED",
+      "check-create",
+      "GitHub check-create journal initialization failed",
+      error,
+    );
+  }
+  for (const name of names) {
+    const match = name.match(/^([0-9a-f]{64})\.json\.lock$/);
+    if (!match) {
+      throw publicError(
+        "GITHUB_JOURNAL_INITIALIZATION_FAILED",
+        "check-create",
+        "GitHub check-create journal initialization failed",
+      );
+    }
+    await initializeOneByDigest(githubRoot, "check-create", match[1]!, options);
+  }
 }
 
 function validateOptions(

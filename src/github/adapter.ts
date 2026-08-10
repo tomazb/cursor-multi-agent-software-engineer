@@ -12,7 +12,11 @@ import { GitHubDeliveryInbox } from "./delivery-inbox.ts";
 import { normalizeGitHubWebhook } from "./normalize.ts";
 import { verifyGitHubWebhookSignature } from "./signature.ts";
 import { GitHubSideEffectStore } from "./side-effect-store.ts";
-import { initializeGitHubJournals, withGitHubJournal } from "./journal.ts";
+import {
+  initializeGitHubJournals,
+  initializeLegacyCheckCreateJournals,
+  withGitHubJournal,
+} from "./journal.ts";
 import {
   MalformedGitHubWebhookError,
   UnsupportedGitHubWebhookError,
@@ -164,6 +168,7 @@ export class GitHubAppAdapter {
   private async initializePublicationJournals(): Promise<void> {
     this.journalInitialization ??= (async () => {
       await initializeGitHubJournals(this.root);
+      await initializeLegacyCheckCreateJournals(this.root);
       await withGitHubJournal(this.root, "check-create", "preflight", async () => undefined);
       await withGitHubJournal(this.root, "publication", "preflight", async () => undefined);
     })();

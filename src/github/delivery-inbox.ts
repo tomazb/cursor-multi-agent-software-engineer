@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
 import { link, lstat, open, mkdir, readFile, readdir, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { withGitHubJournal } from "./journal.ts";
@@ -286,8 +287,43 @@ async function syncDirectory(directoryPath: string): Promise<void> {
   }
 }
 
-async function createDirectory(directoryPath: string): Promise<void> {
-  await mkdir(directoryPath, { recursive: true, mode: 0o700 });
+async function createDirectory(directoryPath: string): Promise<boolean> {
+  try {
+    const stat = await lstat(directoryPath);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error("GitHub durable inbox path is not an ordinary directory");
+    }
+    return false;
+  } catch (error) {
+    if (errno(error) !== "ENOENT") throw error;
+  }
+  try {
+    await mkdir(directoryPath, { mode: 0o700 });
+  } catch (error) {
+    if (errno(error) !== "EEXIST") throw error;
+  }
+  const stat = await lstat(directoryPath);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error("GitHub durable inbox path is not an ordinary directory");
+  }
+  return true;
+}
+
+async function readOrdinaryFile(filePath: string): Promise<Buffer> {
+  const noFollow = constants.O_NOFOLLOW;
+  if (typeof noFollow !== "number" || noFollow === 0) {
+    throw new Error("Non-following GitHub inbox reads are unavailable");
+  }
+  const handle = await open(filePath, constants.O_RDONLY | noFollow);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > 1024 * 1024) {
+      throw new Error("GitHub durable inbox evidence is not an ordinary bounded file");
+    }
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
 }
 
 export class GitHubDeliveryInbox {
@@ -357,6 +393,13 @@ export class GitHubDeliveryInbox {
   }
 
   private async initializeOnce(): Promise<void> {
+    const stateRoot = path.dirname(this.githubRoot);
+    if (await createDirectory(stateRoot)) {
+      await this.syncDirectoryPath(path.dirname(stateRoot));
+    }
+    if (await createDirectory(this.githubRoot)) {
+      await this.syncDirectoryPath(stateRoot);
+    }
     await createDirectory(this.inboxRoot);
     await this.syncDirectoryPath(this.githubRoot);
     await createDirectory(this.stateRoot);
@@ -377,14 +420,16 @@ export class GitHubDeliveryInbox {
           throw new Error("Invalid GitHub durable inbox state entry");
         }
         const prefixPath = path.join(this.stateRoot, prefix);
+        await createDirectory(prefixPath);
         for (const hash of (await readdir(prefixPath)).sort()) {
           if (!HASH_PATTERN.test(hash) || !hash.startsWith(prefix)) {
             throw new Error("Invalid GitHub durable inbox state entry");
           }
           const paths = this.pathsForHash(hash);
+          await createDirectory(paths.stateDirectory);
           let record: InboxDeliveryRecord;
           try {
-            record = parseRecord(await readFile(paths.statePath, "utf8"));
+            record = parseRecord((await readOrdinaryFile(paths.statePath)).toString("utf8"));
           } catch (error) {
             if (errno(error) === "ENOENT") continue;
             throw error;
@@ -420,6 +465,10 @@ export class GitHubDeliveryInbox {
     const deliveriesRoot = path.join(this.githubRoot, "deliveries");
     let names: string[];
     try {
+      const stat = await lstat(deliveriesRoot);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new Error("GitHub durable inbox path is not an ordinary directory");
+      }
       names = (await readdir(deliveriesRoot)).sort();
     } catch (error) {
       if (errno(error) === "ENOENT") return;
@@ -450,12 +499,8 @@ export class GitHubDeliveryInbox {
         let claimedAt = new Date().toISOString();
         let completedAt: string | undefined;
         if (group.includes(canonicalName)) {
-          const canonicalStat = await lstat(canonicalPath);
-          if (canonicalStat.isSymbolicLink() || !canonicalStat.isFile()) {
-            throw new Error("Legacy GitHub delivery evidence is not an ordinary file");
-          }
           const parsed = parseLegacyCanonicalRecord(
-            await readFile(canonicalPath, "utf8"),
+            (await readOrdinaryFile(canonicalPath)).toString("utf8"),
             deliveryId,
           );
           claimedAt = parsed.claimedAt;
@@ -506,8 +551,8 @@ export class GitHubDeliveryInbox {
         throw new Error("Conflicting legacy delivery evidence");
       }
       const [sourceBytes, targetBytes] = await Promise.all([
-        readFile(sourcePath),
-        readFile(targetPath),
+        readOrdinaryFile(sourcePath),
+        readOrdinaryFile(targetPath),
       ]);
       if (!sourceBytes.equals(targetBytes)) {
         throw new Error("Conflicting legacy delivery evidence");
@@ -520,7 +565,9 @@ export class GitHubDeliveryInbox {
 
   private async readState(deliveryId: string): Promise<InboxDeliveryRecord | undefined> {
     try {
-      const record = parseRecord(await readFile(this.paths(deliveryId).statePath, "utf8"));
+      const record = parseRecord(
+        (await readOrdinaryFile(this.paths(deliveryId).statePath)).toString("utf8"),
+      );
       if (record.deliveryId !== deliveryId) {
         throw new Error("GitHub durable inbox delivery id mismatch");
       }
@@ -566,7 +613,10 @@ export class GitHubDeliveryInbox {
     } catch (error) {
       if (errno(error) !== "EEXIST") throw error;
       await handle?.close().catch(() => undefined);
-      handle = await open(paths.queuePath, "r");
+      handle = await open(paths.queuePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      if (!(await handle.stat()).isFile()) {
+        throw new Error("GitHub durable inbox queue marker is not an ordinary file");
+      }
       await this.syncFile(handle, paths.queuePath);
     } finally {
       await handle?.close();
@@ -711,7 +761,9 @@ export class GitHubDeliveryInbox {
       if (!/^[0-9a-f]{2}$/.test(prefix)) {
         throw new Error("Invalid GitHub durable inbox queue entry");
       }
-      for (const name of (await readdir(path.join(this.queueRoot, prefix))).sort()) {
+      const prefixPath = path.join(this.queueRoot, prefix);
+      await createDirectory(prefixPath);
+      for (const name of (await readdir(prefixPath)).sort()) {
         const hash = name.endsWith(".queued") ? name.slice(0, -7) : "";
         if (!HASH_PATTERN.test(hash) || !hash.startsWith(prefix)) {
           throw new Error("Invalid GitHub durable inbox queue entry");
@@ -730,7 +782,7 @@ export class GitHubDeliveryInbox {
       try {
         observedQueue.push({
           hash,
-          record: parseRecord(await readFile(statePath, "utf8")),
+          record: parseRecord((await readOrdinaryFile(statePath)).toString("utf8")),
         });
       } catch (error) {
         if (errno(error) === "ENOENT") {

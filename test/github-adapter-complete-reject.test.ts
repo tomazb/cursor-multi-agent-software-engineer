@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { mkdir, mkdtemp, open, rm } from "node:fs/promises";
+import { mkdtemp, open, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -86,7 +86,6 @@ test("durable inbox initialization syncs every layout parent before readiness", 
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-layout-sync-"));
   t.after(async () => rm(cwd, { recursive: true, force: true }));
   const githubRoot = path.join(cwd, ".maswe", "github");
-  await mkdir(githubRoot, { recursive: true });
   const synced: string[] = [];
   await new GitHubDeliveryInbox(githubRoot, {
     syncDirectory: async (directoryPath) => {
@@ -94,6 +93,8 @@ test("durable inbox initialization syncs every layout parent before readiness", 
     },
   }).initialize();
 
+  assert.ok(synced.includes(cwd));
+  assert.ok(synced.includes(path.join(cwd, ".maswe")));
   assert.ok(synced.includes(githubRoot));
   assert.ok(synced.includes(path.join(githubRoot, "inbox")));
 });

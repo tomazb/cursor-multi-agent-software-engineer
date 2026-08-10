@@ -226,7 +226,8 @@ When `githubApp.enabled` is true, `readOnlyChecks` must be true and
 `allowedRepositories` must contain at least one `owner/repo`. A disabled configuration may retain
 an empty list.
 
-`maswe github-webhook` probes all required journals, migrates the legacy flat delivery directory,
+`maswe github-webhook` probes all required journals, enumerates every exact retained legacy
+per-check lock, migrates the legacy flat delivery directory,
 recovers interrupted queue leases, and starts one worker before the listener becomes ready.
 `maswe github-publish-checks <run-id>` probes association, check-create, and per-PR publication
 journals before token or API work, but it does not scan or reclaim the listener's inbox. Each

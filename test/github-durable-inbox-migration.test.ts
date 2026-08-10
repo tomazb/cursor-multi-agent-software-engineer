@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -220,5 +220,33 @@ test("orphan queue markers cannot lease payloadless legacy migration states", as
     await writeFile(path.join(queueDirectory, `${hash}.queued`), "");
 
     assert.equal(await inbox.claimNext(Date.now() + 1), undefined);
+  }
+});
+
+test("startup rejects symlinked inbox namespaces without mutating their targets", async (t) => {
+  for (const relativePath of [
+    "deliveries",
+    "inbox/state",
+    "inbox/queue",
+    "inbox/legacy",
+    "inbox/state/aa",
+    `inbox/state/aa/${"a".repeat(64)}`,
+    "inbox/queue/aa",
+  ]) {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-symlink-"));
+    const external = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-external-"));
+    t.after(async () => rm(cwd, { recursive: true, force: true }));
+    t.after(async () => rm(external, { recursive: true, force: true }));
+    const githubRoot = path.join(cwd, ".maswe", "github");
+    const linkedPath = path.join(githubRoot, relativePath);
+    await mkdir(path.dirname(linkedPath), { recursive: true });
+    await writeFile(path.join(external, "sentinel"), "unchanged\n", "utf8");
+    await symlink(external, linkedPath, "dir");
+
+    await assert.rejects(
+      new GitHubDeliveryInbox(githubRoot).initialize(),
+      /ordinary directory/i,
+    );
+    assert.equal(await readFile(path.join(external, "sentinel"), "utf8"), "unchanged\n");
   }
 });

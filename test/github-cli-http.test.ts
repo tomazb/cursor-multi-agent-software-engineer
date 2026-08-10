@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHmac, generateKeyPairSync } from "node:crypto";
+import { createHash, createHmac, generateKeyPairSync } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -267,6 +267,53 @@ test("github-webhook preflight failure prevents the listener and GitHub API work
       },
     }),
     /journal migration is blocked/i,
+  );
+
+  assert.equal(listenerCalled, false);
+  assert.equal(apiCalls, 0);
+});
+
+test("github-webhook preflights every retained per-check legacy journal before readiness", async (t) => {
+  const { cwd } = await setupProject();
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const restoreEnvironment = installGitHubEnvironment();
+  t.after(restoreEnvironment);
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const digest = createHash("sha256").update("retained-check-key").digest("hex");
+  const legacyLock = path.join(
+    githubRoot,
+    "side-effect-create-locks",
+    `${digest}.json.lock`,
+  );
+  await mkdir(legacyLock, { recursive: true });
+  await writeFile(
+    path.join(legacyLock, "owner.json"),
+    `${JSON.stringify({
+      pid: process.pid,
+      token: "live-check-preflight-owner",
+      at: "2026-08-10T00:00:00.000Z",
+    })}\n`,
+    "utf8",
+  );
+  let listenerCalled = false;
+  let apiCalls = 0;
+
+  await assert.rejects(
+    runCli({
+      argv: ["github-webhook", "--cwd", cwd],
+      observedNodeVersion: CANONICAL_NODE_VERSION,
+      githubHttpOptions: {
+        fetchFn: async () => {
+          apiCalls += 1;
+          return new Response(null, { status: 500 });
+        },
+      },
+      webhookListener: async () => {
+        listenerCalled = true;
+        return { url: "http://127.0.0.1:0/github/webhook" };
+      },
+    }),
+    /check-create journal migration is blocked/i,
   );
 
   assert.equal(listenerCalled, false);

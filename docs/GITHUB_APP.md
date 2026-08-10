@@ -84,7 +84,9 @@ Each logical association, check-create key, and delivery uses a permanent hash-a
 Claims and releases are canonical, digest-bound immutable files published with hard links. No
 published ownership pathname is deleted, replaced, or reused. Before the webhook listener accepts
 traffic, initialization probes the association, check-create, publication, and delivery journals,
-migrates legacy delivery files, recovers pending leases, and starts the single worker. Manual
+enumerates and migrates every retained legacy per-check lock by its exact digest, migrates legacy
+delivery files, recovers pending leases, and starts the single worker. Published legacy markers
+are directory-synced and bind retained stable material before later PID-liveness checks. Manual
 publication probes only the journals it uses and never reclaims the listener's delivery leases.
 The listener also verifies that all three configured credential environment variables are present
 without logging their names or values. Any required credential, probe, or migration failure is

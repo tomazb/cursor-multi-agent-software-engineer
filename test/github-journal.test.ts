@@ -108,7 +108,16 @@ test("a published exact legacy marker wins over later unrelated PID reuse", asyn
     isProcessDefinitelyDead: (pid) => pid === process.pid,
   });
 
-  await assert.doesNotReject(initializeGitHubJournals(githubRoot));
+  let postMarkerLivenessChecks = 0;
+  await assert.doesNotReject(
+    initializeGitHubJournals(githubRoot, {
+      isProcessDefinitelyDead: () => {
+        postMarkerLivenessChecks += 1;
+        throw new Error("published marker must precede PID classification");
+      },
+    }),
+  );
+  assert.equal(postMarkerLivenessChecks, 0);
   assert.equal(await readFile(legacyPath, "utf8"), raw);
   await access(migrationMarker(githubRoot));
 });
