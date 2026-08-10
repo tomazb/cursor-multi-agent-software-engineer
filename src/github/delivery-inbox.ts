@@ -27,6 +27,8 @@ export type {
 const DEFAULT_QUEUE_SCAN_PAGE = 128;
 const MAX_QUEUE_SCAN_PAGE = 256;
 const MAX_INBOX_STATE_BYTES = 1024 * 1024;
+const MAX_LEASE_ID = "00000000-0000-4000-8000-000000000000";
+const MAX_ISO_TIMESTAMP = "+275760-09-13T00:00:00.000Z";
 
 function errno(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
@@ -383,6 +385,24 @@ export class GitHubDeliveryInbox {
         `GitHub durable inbox state exceeds its bounded ${MAX_INBOX_STATE_BYTES}-byte capacity`,
       );
     }
+    if (record.status === "queued") {
+      const largestProcessing: InboxDeliveryRecord = {
+        ...record,
+        status: "processing",
+        attempt: Number.MAX_SAFE_INTEGER,
+        leaseId: MAX_LEASE_ID,
+        leaseExpiresAt: MAX_ISO_TIMESTAMP,
+      };
+      delete largestProcessing.nextAttemptAt;
+      if (
+        Buffer.byteLength(`${JSON.stringify(largestProcessing)}\n`, "utf8") >
+        MAX_INBOX_STATE_BYTES
+      ) {
+        throw new Error(
+          "GitHub durable inbox state exceeds lifecycle capacity after lease expansion",
+        );
+      }
+    }
     await createDirectory(path.dirname(paths.stateDirectory));
     await this.syncDirectoryPath(this.stateRoot);
     await createDirectory(paths.stateDirectory);
@@ -700,6 +720,9 @@ export class GitHubDeliveryInbox {
             Date.parse(current.nextAttemptAt!) > nowMs
           ) {
             return { deferredUntil: Date.parse(current.nextAttemptAt!) } as const;
+          }
+          if (current.attempt >= Number.MAX_SAFE_INTEGER) {
+            throw new Error("GitHub durable inbox delivery attempt limit is exhausted");
           }
           const leaseId = randomUUID();
           const processing: InboxDeliveryRecord = {
