@@ -1,4 +1,3 @@
-import path from "node:path";
 import type { GitHubAppConfig, MasweConfig, RunRecord } from "../domain.ts";
 import { invalidateStaleEvidence } from "../git-workspace.ts";
 import type { RunStore } from "../store.ts";
@@ -6,153 +5,54 @@ import {
   GitHubAssociationIndex,
   type GitHubAssociationTransaction,
 } from "./association.ts";
+import {
+  isRepoAllowed,
+  githubStateRoot,
+  parseOwnerRepo,
+  pendingCancellationHeads,
+  remoteMatchesRepository,
+} from "./adapter-identities.ts";
+export { remoteMatchesRepository } from "./adapter-identities.ts";
 import { CheckPublisher, type GitHubHttpClient } from "./checks.ts";
-import { createHash } from "node:crypto";
 import { GitHubDeliveryInbox } from "./delivery-inbox.ts";
-import { normalizeGitHubWebhook } from "./normalize.ts";
-import { verifyGitHubWebhookSignature } from "./signature.ts";
 import { GitHubSideEffectStore } from "./side-effect-store.ts";
 import {
   initializeGitHubJournals,
   initializeLegacyCheckCreateJournals,
   withGitHubJournal,
 } from "./journal.ts";
+import type { GitHubInternalEvent } from "./types.ts";
 import {
-  MalformedGitHubWebhookError,
-  UnsupportedGitHubWebhookError,
-  type GitHubInternalEvent,
-} from "./types.ts";
-
-export interface WebhookRequest {
-  deliveryId: string;
-  eventName: string;
-  signatureHeader: string | undefined;
-  rawBody: string | Buffer;
-}
-
-export interface WebhookHandleResult {
-  status: number;
-  body: { ok: boolean; duplicate?: boolean; message?: string };
-}
-
-export type GitHubWebhookDiagnosticCode =
-  | "GITHUB_WEBHOOK_HANDOFF_FAILED"
-  | "GITHUB_WEBHOOK_DISPATCH_FAILED"
-  | "GITHUB_WEBHOOK_HEARTBEAT_FAILED"
-  | "GITHUB_WEBHOOK_RETRY_FAILED";
-
-/** Safe local recovery context; the arbitrary cause is never persisted. */
-export class GitHubWebhookDiagnosticError extends Error {
-  readonly code: GitHubWebhookDiagnosticCode;
-  readonly deliveryId: string;
-  readonly eventName: string;
-  readonly attempt: number;
-
-  constructor(
-    code: GitHubWebhookDiagnosticCode,
-    context: { deliveryId: string; eventName: string; attempt: number },
-    cause: unknown,
-  ) {
-    super("GitHub webhook delivery operation failed", { cause });
-    this.name = "GitHubWebhookDiagnosticError";
-    this.code = code;
-    this.deliveryId = context.deliveryId;
-    this.eventName = context.eventName;
-    this.attempt = context.attempt;
-  }
-}
-
-function githubRoot(cwd: string): string {
-  return path.join(cwd, ".maswe", "github");
-}
-
-function parseOwnerRepo(repository: string): { owner: string; repo: string } {
-  const [owner, repo] = repository.split("/");
-  if (!owner || !repo) throw new Error(`Invalid repository: ${repository}`);
-  return { owner, repo };
-}
-
-function isRepoAllowed(config: GitHubAppConfig, repository: string | undefined): boolean {
-  if (!repository) return false;
-  return config.allowedRepositories.includes(repository);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-const MAX_PENDING_CANCELLATION_HEADS = 64;
-const WEBHOOK_QUEUE_SCAN_PAGE = 128;
-const WEBHOOK_IDLE_SCAN_MS = 30_000;
-const WEBHOOK_CURSOR_YIELD_MS = 1;
-
-function pendingCancellationHeads(
-  existing: readonly string[] | undefined,
-  previousHeadSha: string | undefined,
-  currentHeadSha: string,
-): string[] {
-  const pending = new Set(existing ?? []);
-  if (previousHeadSha && previousHeadSha !== currentHeadSha) pending.add(previousHeadSha);
-  pending.delete(currentHeadSha);
-  const result = [...pending].sort();
-  if (result.length > MAX_PENDING_CANCELLATION_HEADS) {
-    throw new Error("GitHub pending check cancellation limit exceeded");
-  }
-  return result;
-}
-
-/** Match only github.com remotes (HTTPS or SSH) to owner/repo. Plain HTTP is rejected. */
-export function remoteMatchesRepository(
-  remote: string | undefined,
-  repository: string,
-): boolean {
-  if (!remote) return false;
-  const trimmed = remote.trim().replace(/\.git$/i, "");
-  const https = trimmed.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)$/i);
-  if (https) {
-    return `${https[1]}/${https[2]}`.toLowerCase() === repository.toLowerCase();
-  }
-  const sshScp = trimmed.match(/^git@github\.com:([^/]+)\/([^/]+)$/i);
-  if (sshScp) {
-    return `${sshScp[1]}/${sshScp[2]}`.toLowerCase() === repository.toLowerCase();
-  }
-  const sshUrl = trimmed.match(/^ssh:\/\/git@github\.com\/([^/]+)\/([^/]+)$/i);
-  if (sshUrl) {
-    return `${sshUrl[1]}/${sshUrl[2]}`.toLowerCase() === repository.toLowerCase();
-  }
-  return false;
-}
+  prepareWebhookRequest,
+  type WebhookHandleResult,
+  type WebhookRequest,
+} from "./webhook-request.ts";
+export type { WebhookHandleResult, WebhookRequest } from "./webhook-request.ts";
+import { GitHubWebhookDiagnosticError } from "./webhook-diagnostic.ts";
+import { GitHubWebhookWorker } from "./webhook-worker.ts";
+export {
+  GitHubWebhookDiagnosticError,
+  type GitHubWebhookDiagnosticCode,
+} from "./webhook-diagnostic.ts";
 
 export class GitHubAppAdapter {
   private readonly cwd: string;
   private readonly config: MasweConfig;
   private readonly store: RunStore;
   private readonly http: GitHubHttpClient;
-  private readonly tokenProvider: (
-    installationId: number,
-    repository: string,
-  ) => Promise<string>;
+  private readonly tokenProvider: (installationId: number, repository: string) => Promise<string>;
   private readonly inbox: GitHubDeliveryInbox;
   private readonly sideEffects: GitHubSideEffectStore;
   private readonly associations: GitHubAssociationIndex;
   private readonly root: string;
   private readonly afterManualRunLoaded: ((runId: string) => Promise<void>) | undefined;
-  private readonly beforeAssociationTransaction:
-    | ((deliveryId: string) => Promise<void>)
-    | undefined;
+  private readonly beforeAssociationTransaction: ((deliveryId: string) => Promise<void>) | undefined;
   private journalInitialization: Promise<void> | undefined;
   private inboxInitialization: Promise<void> | undefined;
-  private webhookWorkerEnabled: boolean;
-  private webhookWorker: Promise<void> | undefined;
-  private webhookWorkerTimer: ReturnType<typeof setTimeout> | undefined;
-  private webhookWorkerActive = false;
-  private webhookQueueCursor: string | undefined;
-  private webhookQueueNextAttemptAt: number | undefined;
-  private webhookWorkerNextDelayMs = 0;
+  private readonly webhookWorker: GitHubWebhookWorker;
   private readonly synchronousWebhookDispatch: boolean;
   private readonly beforeInboxEnqueue: (() => Promise<void>) | undefined;
   private readonly onWebhookDiagnostic: ((error: unknown) => void) | undefined;
-  private readonly onWebhookWorkerSchedule: ((delayMs: number) => void) | undefined;
 
   constructor(options: {
     cwd: string;
@@ -184,14 +84,12 @@ export class GitHubAppAdapter {
     this.tokenProvider = options.tokenProvider;
     this.afterManualRunLoaded = options.afterManualRunLoaded;
     this.beforeAssociationTransaction = options.beforeAssociationTransaction;
-    const root = githubRoot(options.cwd);
+    const root = githubStateRoot(options.cwd);
     this.root = root;
     this.inbox = new GitHubDeliveryInbox(root, options.inboxOptions);
-    this.webhookWorkerEnabled = options.autoStartWebhookWorker ?? false;
     this.synchronousWebhookDispatch = options.synchronousWebhookDispatch ?? false;
     this.beforeInboxEnqueue = options.beforeInboxEnqueue;
     this.onWebhookDiagnostic = options.onWebhookDiagnostic;
-    this.onWebhookWorkerSchedule = options.onWebhookWorkerSchedule;
     this.sideEffects = new GitHubSideEffectStore(root);
     this.associations = new GitHubAssociationIndex(
       root,
@@ -199,6 +97,15 @@ export class GitHubAppAdapter {
         ? { writeRecords: options.associationWriteRecords }
         : {},
     );
+    this.webhookWorker = new GitHubWebhookWorker({
+      inbox: this.inbox,
+      enabled: options.autoStartWebhookWorker ?? false,
+      dispatch: (event) => this.dispatch(event, this.githubApp()),
+      onDiagnostic: (error) => this.emitWebhookDiagnostic(error),
+      ...(options.onWebhookWorkerSchedule
+        ? { onSchedule: options.onWebhookWorkerSchedule }
+        : {}),
+    });
   }
 
   /** Fail-closed journal preflight shared by webhook and manual publication. */
@@ -257,97 +164,56 @@ export class GitHubAppAdapter {
 
   async handleWebhook(request: WebhookRequest): Promise<WebhookHandleResult> {
     this.githubApp();
-    if (!request.deliveryId?.trim() || !request.eventName?.trim()) {
-      return { status: 400, body: { ok: false, message: "missing delivery or event headers" } };
-    }
-    const rawBody =
-      typeof request.rawBody === "string" ? Buffer.from(request.rawBody, "utf8") : request.rawBody;
-    if (!verifyGitHubWebhookSignature(this.webhookSecret(), rawBody, request.signatureHeader)) {
-      return { status: 401, body: { ok: false, message: "invalid signature" } };
-    }
-    const receivedAt = new Date().toISOString();
-    const rawBodyDigest = `sha256:${createHash("sha256").update(rawBody).digest("hex")}`;
-    let decoded: string;
-    try {
-      decoded = new TextDecoder("utf-8", { fatal: true }).decode(rawBody);
-    } catch {
-      return { status: 400, body: { ok: false, message: "invalid UTF-8 body" } };
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(decoded) as unknown;
-    } catch {
-      return { status: 400, body: { ok: false, message: "invalid JSON body" } };
-    }
-    if (!isRecord(parsed)) {
-      return {
-        status: 400,
-        body: { ok: false, message: "webhook payload must be a JSON object" },
-      };
-    }
-
-    let event: GitHubInternalEvent;
-    try {
-      event = normalizeGitHubWebhook({
-        deliveryId: request.deliveryId,
-        eventName: request.eventName,
-        payload: parsed,
-        receivedAt,
-      });
-    } catch (error) {
-      if (error instanceof UnsupportedGitHubWebhookError) {
-        let ignored;
-        try {
-          await this.initialize();
-          await this.beforeInboxEnqueue?.();
-          ignored = await this.inbox.completeWithoutDispatch({
-            deliveryId: request.deliveryId,
-            eventName: request.eventName,
-            receivedAt,
-            rawBodyDigest,
-          });
-        } catch (handoffError) {
-          this.emitWebhookDiagnostic(new GitHubWebhookDiagnosticError(
-            "GITHUB_WEBHOOK_HANDOFF_FAILED",
-            {
-              deliveryId: request.deliveryId,
-              eventName: request.eventName,
-              attempt: 0,
-            },
-            handoffError,
-          ));
-          return {
-            status: 503,
-            body: { ok: false, message: "durable webhook handoff unavailable" },
-          };
-        }
-        if (ignored.outcome === "conflict") {
-          return { status: 409, body: { ok: false, message: "delivery id conflict" } };
-        }
-        return { status: 200, body: { ok: true, message: "unsupported webhook ignored" } };
+    const prepared = prepareWebhookRequest(request, this.webhookSecret());
+    if (prepared.kind === "reject") return prepared.result;
+    if (prepared.kind === "unsupported") {
+      let ignored;
+      try {
+        await this.initialize();
+        await this.beforeInboxEnqueue?.();
+        ignored = await this.inbox.completeWithoutDispatch({
+          deliveryId: prepared.deliveryId,
+          eventName: prepared.eventName,
+          receivedAt: prepared.receivedAt,
+          rawBodyDigest: prepared.rawBodyDigest,
+        });
+      } catch (handoffError) {
+        this.emitWebhookDiagnostic(new GitHubWebhookDiagnosticError(
+          "GITHUB_WEBHOOK_HANDOFF_FAILED",
+          {
+            deliveryId: prepared.deliveryId,
+            eventName: prepared.eventName,
+            attempt: 0,
+          },
+          handoffError,
+        ));
+        return {
+          status: 503,
+          body: { ok: false, message: "durable webhook handoff unavailable" },
+        };
       }
-      if (error instanceof MalformedGitHubWebhookError) {
-        return { status: 400, body: { ok: false, message: error.message } };
+      if (ignored.outcome === "conflict") {
+        return { status: 409, body: { ok: false, message: "delivery id conflict" } };
       }
-      throw error;
+      return { status: 200, body: { ok: true, message: "unsupported webhook ignored" } };
     }
     let enqueue;
     try {
       await this.initialize();
       await this.beforeInboxEnqueue?.();
       enqueue = await this.inbox.enqueue({
-        deliveryId: request.deliveryId,
-        eventName: request.eventName,
-        receivedAt: event.receivedAt,
-        rawBodyDigest,
-        event,
+        deliveryId: prepared.deliveryId,
+        eventName: prepared.eventName,
+        receivedAt: prepared.event.receivedAt,
+        rawBodyDigest: prepared.rawBodyDigest,
+        event: prepared.event,
       });
     } catch (handoffError) {
       this.emitWebhookDiagnostic(new GitHubWebhookDiagnosticError(
         "GITHUB_WEBHOOK_HANDOFF_FAILED",
         {
-          deliveryId: request.deliveryId,
-          eventName: request.eventName,
+          deliveryId: prepared.deliveryId,
+          eventName: prepared.eventName,
           attempt: 0,
         },
         handoffError,
@@ -377,7 +243,7 @@ export class GitHubAppAdapter {
         throw error;
       }
     }
-    if (this.webhookWorkerEnabled) this.kickWebhookWorker();
+    this.webhookWorker.wake();
     return {
       status: 202,
       body: {
@@ -389,38 +255,7 @@ export class GitHubAppAdapter {
 
   async startWebhookWorker(): Promise<void> {
     await this.initialize();
-    this.webhookWorkerEnabled = true;
-    this.kickWebhookWorker();
-  }
-
-  private kickWebhookWorker(delayMs = 0): void {
-    if (!this.webhookWorkerEnabled || this.webhookWorker) return;
-    if (this.webhookWorkerTimer) {
-      if (delayMs > 0) return;
-      clearTimeout(this.webhookWorkerTimer);
-      this.webhookWorkerTimer = undefined;
-    }
-    if (delayMs > 0) {
-      try {
-        this.onWebhookWorkerSchedule?.(delayMs);
-      } catch {
-        // Test/observability hooks never alter worker scheduling.
-      }
-      this.webhookWorkerTimer = setTimeout(() => {
-        this.webhookWorkerTimer = undefined;
-        this.kickWebhookWorker();
-      }, delayMs);
-      this.webhookWorkerTimer.unref();
-      return;
-    }
-    this.webhookWorker = this.runWebhookWorker()
-      .catch((error) => this.emitWebhookDiagnostic(error))
-      .finally(() => {
-        this.webhookWorker = undefined;
-        if (this.webhookWorkerEnabled) {
-          this.kickWebhookWorker(this.webhookWorkerNextDelayMs);
-        }
-      });
+    this.webhookWorker.start();
   }
 
   private emitWebhookDiagnostic(error: unknown): void {
@@ -431,119 +266,12 @@ export class GitHubAppAdapter {
     }
   }
 
-  private async runWebhookWorker(): Promise<void> {
-    for (;;) {
-      if (!this.webhookWorkerEnabled) return;
-      const page = await this.inbox.claimNextPage(Date.now(), {
-        ...(this.webhookQueueCursor !== undefined
-          ? { cursor: this.webhookQueueCursor }
-          : {}),
-        limit: WEBHOOK_QUEUE_SCAN_PAGE,
-      });
-      const claimed = page.claimed;
-      if (!claimed) {
-        if (page.nextAttemptAt !== undefined) {
-          this.webhookQueueNextAttemptAt = this.webhookQueueNextAttemptAt === undefined
-            ? page.nextAttemptAt
-            : Math.min(this.webhookQueueNextAttemptAt, page.nextAttemptAt);
-        }
-        if (page.nextCursor !== undefined) {
-          this.webhookQueueCursor = page.nextCursor;
-          this.webhookWorkerNextDelayMs = WEBHOOK_CURSOR_YIELD_MS;
-          return;
-        }
-        this.webhookQueueCursor = undefined;
-        const earliest = this.webhookQueueNextAttemptAt;
-        this.webhookQueueNextAttemptAt = undefined;
-        this.webhookWorkerNextDelayMs = earliest === undefined
-          ? WEBHOOK_IDLE_SCAN_MS
-          : Math.max(1, earliest - Date.now());
-        return;
-      }
-      this.webhookQueueCursor = undefined;
-      this.webhookQueueNextAttemptAt = undefined;
-      this.webhookWorkerNextDelayMs = 0;
-      this.webhookWorkerActive = true;
-      const { deliveryId } = claimed.record;
-      const leaseId = claimed.record.leaseId;
-      const heartbeat = setInterval(() => {
-        void this.inbox
-          .heartbeat(deliveryId, leaseId)
-          .catch((error) => this.emitWebhookDiagnostic(new GitHubWebhookDiagnosticError(
-            "GITHUB_WEBHOOK_HEARTBEAT_FAILED",
-            {
-              deliveryId,
-              eventName: claimed.record.eventName!,
-              attempt: claimed.record.attempt,
-            },
-            error,
-          )));
-      }, 5_000);
-      heartbeat.unref();
-      try {
-        await this.dispatch(claimed.record.event, this.githubApp());
-        await this.inbox.complete(deliveryId, leaseId);
-      } catch (error) {
-        this.emitWebhookDiagnostic(new GitHubWebhookDiagnosticError(
-          "GITHUB_WEBHOOK_DISPATCH_FAILED",
-          {
-            deliveryId,
-            eventName: claimed.record.eventName!,
-            attempt: claimed.record.attempt,
-          },
-          error,
-        ));
-        try {
-          await this.inbox.retry(deliveryId, leaseId);
-        } catch (retryError) {
-          throw new GitHubWebhookDiagnosticError(
-            "GITHUB_WEBHOOK_RETRY_FAILED",
-            {
-              deliveryId,
-              eventName: claimed.record.eventName!,
-              attempt: claimed.record.attempt,
-            },
-            retryError,
-          );
-        }
-      } finally {
-        clearInterval(heartbeat);
-        this.webhookWorkerActive = false;
-      }
-    }
-  }
-
   async waitForWebhookIdle(timeoutMs = 10_000): Promise<void> {
-    const started = Date.now();
-    for (;;) {
-      if (!this.webhookWorkerActive && (await this.inbox.pendingCount()) === 0) return;
-      if (Date.now() - started >= timeoutMs) {
-        throw new Error("Timed out waiting for GitHub webhook worker to drain");
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
+    return this.webhookWorker.waitForIdle(timeoutMs);
   }
 
   async stopWebhookWorker(options: { drainMs?: number } = {}): Promise<void> {
-    const drainMs = options.drainMs ?? 5_000;
-    this.webhookWorkerEnabled = false;
-    if (this.webhookWorkerTimer) {
-      clearTimeout(this.webhookWorkerTimer);
-      this.webhookWorkerTimer = undefined;
-    }
-    const worker = this.webhookWorker;
-    if (!worker) return;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        worker,
-        new Promise<void>((resolve) => {
-          timer = setTimeout(resolve, drainMs);
-        }),
-      ]);
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-    }
+    return this.webhookWorker.stop(options);
   }
 
   async publishChecksForRun(runId: string): Promise<RunRecord> {
