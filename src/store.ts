@@ -460,6 +460,24 @@ export class FileRunStore implements RunStore {
     Object.assign(mutable, source);
   }
 
+  private adoptArtifactPublication(target: RunRecord, source: RunRecord): void {
+    target.version = source.version;
+    target.updatedAt = source.updatedAt;
+    target.artifacts = source.artifacts;
+  }
+
+  private async matchingCanonicalRecord(
+    prepared: { record: RunRecord; content: string },
+  ): Promise<RunRecord | undefined> {
+    try {
+      const observed = await this.readRunFile(prepared.record.id);
+      const observedContent = `${JSON.stringify(observed, null, 2)}\n`;
+      return observedContent === prepared.content ? observed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async writeAndReconcile(
     target: RunRecord,
     prepared: { record: RunRecord; content: string },
@@ -469,15 +487,8 @@ export class FileRunStore implements RunStore {
       this.adoptRunRecord(target, prepared.record);
     } catch (error) {
       if (error instanceof DurableAtomicWriteOutcomeUnknownError) {
-        try {
-          const observed = await this.readRunFile(prepared.record.id);
-          const observedContent = `${JSON.stringify(observed, null, 2)}\n`;
-          if (observedContent === prepared.content) {
-            this.adoptRunRecord(target, observed);
-          }
-        } catch {
-          // Preserve the original outcome-unknown error; a later retry reloads canonical state.
-        }
+        const observed = await this.matchingCanonicalRecord(prepared);
+        if (observed) this.adoptRunRecord(target, observed);
       }
       throw error;
     }
@@ -861,7 +872,16 @@ export class FileRunStore implements RunStore {
         "run artifact",
         this.durableOptions,
       );
-      await this.writeAndReconcile(run, prepared);
+      try {
+        await this.writePreparedRunRecord(prepared);
+        this.adoptArtifactPublication(run, prepared.record);
+      } catch (error) {
+        if (error instanceof DurableAtomicWriteOutcomeUnknownError) {
+          const observed = await this.matchingCanonicalRecord(prepared);
+          if (observed) this.adoptArtifactPublication(run, observed);
+        }
+        throw error;
+      }
 
       return reference;
     });

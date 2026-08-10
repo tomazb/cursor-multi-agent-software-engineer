@@ -321,6 +321,36 @@ test("save reconciles the caller when directory sync fails after canonical publi
   assert.equal(run.updatedAt, canonical.updatedAt);
 });
 
+test("artifact outcome reconciliation preserves pending caller mutations", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-artifact-save-outcome-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const initialStore = new FileRunStore(cwd);
+  const run = await initialStore.create("run", "before", DEFAULT_CONFIG);
+  await initialStore.writeArtifact(run, "04-builder-report.md", "first");
+  run.counters.buildVerifyCycles = 1;
+  let failRunSync = true;
+  const store = new FileRunStore(cwd, {
+    syncDirectory: async (directoryPath) => {
+      if (path.basename(directoryPath) === run.id && failRunSync) {
+        failRunSync = false;
+        throw new Error("simulated post-rename run directory sync failure");
+      }
+    },
+  });
+
+  await assert.rejects(
+    store.writeArtifact(run, "04-builder-report.md", "second"),
+    /published.*directory sync failed/i,
+  );
+  const canonical = await initialStore.load(run.id);
+  assert.equal(canonical.artifacts.at(-1)?.attempt, 2);
+  assert.equal(canonical.counters.buildVerifyCycles, 0);
+  assert.equal(run.version, canonical.version);
+  assert.equal(run.counters.buildVerifyCycles, 1);
+  await initialStore.save(run);
+  assert.equal((await initialStore.load(run.id)).counters.buildVerifyCycles, 1);
+});
+
 test("authoritative atomic writes surface file and parent-directory sync failures", async (t) => {
   for (const failure of ["file", "directory"] as const) {
     await t.test(`side-effect ${failure} sync`, async (t) => {
