@@ -1,7 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import { writeDurableAtomic, type DurableFileOptions } from "./durable-file.ts";
+import {
+  MAX_AUTHORITATIVE_FILE_BYTES,
+  readBoundedOrdinaryFile,
+  requireOrdinaryDirectory,
+  writeDurableAtomic,
+  type DurableFileOptions,
+} from "./durable-file.ts";
 import type {
   ArtifactReference,
   MasweConfig,
@@ -170,11 +176,75 @@ function sanitizeRunFailureState(run: RunRecord): RunRecord {
   return run;
 }
 
+const RUN_RECORD_FIELDS = new Set([
+  "schemaVersion",
+  "version",
+  "id",
+  "title",
+  "request",
+  "repositoryPath",
+  "state",
+  "createdAt",
+  "updatedAt",
+  "approvals",
+  "counters",
+  "config",
+  "artifacts",
+  "events",
+  "workspace",
+  "evidence",
+  "github",
+  "supersedes",
+  "supersededBy",
+  "failure",
+]);
+
+function exactRunRecord(
+  candidate: Record<string, unknown>,
+  version: number,
+  config: MasweConfig,
+  artifacts: ArtifactReference[],
+): RunRecord {
+  const record = {
+    schemaVersion: 1,
+    version,
+    id: candidate.id,
+    title: candidate.title,
+    request: candidate.request,
+    repositoryPath: candidate.repositoryPath,
+    state: candidate.state,
+    createdAt: candidate.createdAt,
+    updatedAt: candidate.updatedAt,
+    approvals: candidate.approvals,
+    counters: candidate.counters,
+    config,
+    artifacts,
+    events: candidate.events,
+  } as unknown as RunRecord;
+  for (const key of [
+    "workspace",
+    "evidence",
+    "github",
+    "supersedes",
+    "supersededBy",
+    "failure",
+  ] as const) {
+    if (candidate[key] !== undefined) {
+      (record as unknown as Record<string, unknown>)[key] = candidate[key];
+    }
+  }
+  return record;
+}
+
 export function migrateRunRecord(raw: unknown): RunRecord {
   if (!raw || typeof raw !== "object") {
     throw new Error("Run record is not a JSON object");
   }
   const candidate = raw as Record<string, unknown>;
+  const unsupported = Object.keys(candidate).find((key) => !RUN_RECORD_FIELDS.has(key));
+  if (unsupported) {
+    throw new Error(`Unsupported run record field: ${unsupported}`);
+  }
   if (candidate.schemaVersion !== 1) {
     throw new Error(
       `Unsupported run schemaVersion ${String(candidate.schemaVersion)}; expected 1`,
@@ -270,27 +340,13 @@ export function migrateRunRecord(raw: unknown): RunRecord {
     }
   }
 
-  if (candidate.version === undefined) {
-    return sanitizeRunFailureState({
-      ...(candidate as unknown as RunRecord),
-      version: 1,
-      artifacts,
-      config: migratedConfig,
-    });
-  }
-
-  if (typeof candidate.version !== "number" || candidate.version < 1) {
+  const version = candidate.version ?? 1;
+  if (!Number.isSafeInteger(version) || Number(version) < 1) {
     throw new Error("Run record version is missing or invalid (fail-closed)");
   }
-
-  return sanitizeRunFailureState({
-    ...(candidate as unknown as RunRecord),
-    config: migratedConfig,
-    artifacts:
-      artifacts.length > 0
-        ? artifacts
-        : ((candidate as unknown as RunRecord).artifacts ?? []),
-  });
+  return sanitizeRunFailureState(
+    exactRunRecord(candidate, Number(version), migratedConfig, artifacts),
+  );
 }
 
 export class FileRunStore implements RunStore {
@@ -298,10 +354,15 @@ export class FileRunStore implements RunStore {
   private readonly cwd: string;
   private readonly lockRetries: number;
   private readonly durableOptions: DurableFileOptions;
+  private readonly maxRunFileBytes: number;
 
   constructor(
     cwd: string,
-    options: { lockStaleMs?: number; lockRetries?: number } & DurableFileOptions = {},
+    options: {
+      lockStaleMs?: number;
+      lockRetries?: number;
+      maxRunFileBytes?: number;
+    } & DurableFileOptions = {},
   ) {
     this.cwd = cwd;
     this.root = path.join(cwd, ".maswe", "runs");
@@ -309,6 +370,10 @@ export class FileRunStore implements RunStore {
     void options.lockStaleMs;
     this.lockRetries = options.lockRetries ?? 50;
     this.durableOptions = options;
+    this.maxRunFileBytes = options.maxRunFileBytes ?? MAX_AUTHORITATIVE_FILE_BYTES;
+    if (!Number.isSafeInteger(this.maxRunFileBytes) || this.maxRunFileBytes < 1) {
+      throw new Error("Run record capacity must be a positive integer");
+    }
   }
 
   private runDirectory(runId: string): string {
@@ -329,8 +394,38 @@ export class FileRunStore implements RunStore {
   }
 
   private async readRunFile(runId: string): Promise<RunRecord> {
-    const raw = await readFile(this.runFile(runId), "utf8");
-    return migrateRunRecord(JSON.parse(raw));
+    try {
+      await requireOrdinaryDirectory(path.dirname(this.root), "MASWE state namespace");
+      await requireOrdinaryDirectory(this.root, "run store namespace");
+      await requireOrdinaryDirectory(this.runDirectory(runId), "run record namespace");
+      const raw = await readBoundedOrdinaryFile(
+        this.runFile(runId),
+        "run record",
+        this.maxRunFileBytes,
+      );
+      return migrateRunRecord(JSON.parse(raw));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        const missing = new Error(`Run ${runId} not found`, { cause: error }) as NodeJS.ErrnoException;
+        missing.code = "ENOENT";
+        throw missing;
+      }
+      throw error;
+    }
+  }
+
+  private async writeRunRecord(run: RunRecord): Promise<void> {
+    const exact = migrateRunRecord(structuredClone(run));
+    const content = `${JSON.stringify(exact, null, 2)}\n`;
+    if (Buffer.byteLength(content, "utf8") > this.maxRunFileBytes) {
+      throw new Error(`Run record exceeds its bounded ${this.maxRunFileBytes}-byte capacity`);
+    }
+    await writeDurableAtomic(
+      this.runFile(run.id),
+      content,
+      "run record",
+      this.durableOptions,
+    );
   }
 
   /**
@@ -593,12 +688,7 @@ export class FileRunStore implements RunStore {
       events: [],
     };
     await this.withLock(run.id, async () => {
-      await writeDurableAtomic(
-        this.runFile(run.id),
-        `${JSON.stringify(run, null, 2)}\n`,
-        "run record",
-        this.durableOptions,
-      );
+      await this.writeRunRecord(run);
     });
     return run;
   }
@@ -614,12 +704,7 @@ export class FileRunStore implements RunStore {
       }
       run.version += 1;
       run.updatedAt = now();
-      await writeDurableAtomic(
-        this.runFile(run.id),
-        `${JSON.stringify(run, null, 2)}\n`,
-        "run record",
-        this.durableOptions,
-      );
+      await this.writeRunRecord(run);
     });
   }
 
@@ -714,12 +799,7 @@ export class FileRunStore implements RunStore {
       ];
       next.version += 1;
       next.updatedAt = now();
-      await writeDurableAtomic(
-        this.runFile(run.id),
-        `${JSON.stringify(next, null, 2)}\n`,
-        "run record",
-        this.durableOptions,
-      );
+      await this.writeRunRecord(next);
 
       run.version = next.version;
       run.updatedAt = next.updatedAt;

@@ -826,8 +826,11 @@ test("CheckPublisher surfaces rate limits without recording success", async () =
       calls += 1;
       return {
         status: 403,
-        headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "9999999999" },
-        body: { message: "API rate limit exceeded" },
+        headers: {
+          "X-RaTeLiMiT-ReMaInInG": "0",
+          "X-RaTeLiMiT-ReSeT": "9999999999",
+        },
+        body: { message: "forbidden" },
       };
     },
   };

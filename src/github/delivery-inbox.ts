@@ -67,11 +67,17 @@ async function createDirectory(directoryPath: string): Promise<boolean> {
   return true;
 }
 
-async function readOrdinaryFile(filePath: string): Promise<Buffer> {
-  const noFollow = constants.O_NOFOLLOW;
+function requireNoFollowFlag(noFollow: number | null | undefined): number {
   if (typeof noFollow !== "number" || noFollow === 0) {
     throw new Error("Non-following GitHub inbox reads are unavailable");
   }
+  return noFollow;
+}
+
+async function readOrdinaryFile(
+  filePath: string,
+  noFollow = requireNoFollowFlag(constants.O_NOFOLLOW),
+): Promise<Buffer> {
   const handle = await open(filePath, constants.O_RDONLY | noFollow);
   try {
     const stat = await handle.stat();
@@ -91,6 +97,7 @@ export class GitHubDeliveryInbox {
   private readonly queueRoot: string;
   private readonly legacyRoot: string;
   private readonly leaseMs: number;
+  private readonly noFollowFlag: number;
   private readonly syncFile: (
     handle: Awaited<ReturnType<typeof open>>,
     filePath: string,
@@ -107,6 +114,7 @@ export class GitHubDeliveryInbox {
         filePath: string,
       ) => Promise<void>;
       syncDirectory?: (directoryPath: string) => Promise<void>;
+      noFollowFlag?: number | null;
     } = {},
   ) {
     this.githubRoot = githubRoot;
@@ -115,6 +123,9 @@ export class GitHubDeliveryInbox {
     this.queueRoot = path.join(this.inboxRoot, "queue");
     this.legacyRoot = path.join(this.inboxRoot, "legacy");
     this.leaseMs = options.leaseMs ?? 30_000;
+    this.noFollowFlag = requireNoFollowFlag(
+      options.noFollowFlag === undefined ? constants.O_NOFOLLOW : options.noFollowFlag,
+    );
     this.syncFile = options.syncFile ?? (async (handle) => handle.sync());
     this.syncDirectoryPath = options.syncDirectory ?? syncDirectory;
   }
@@ -187,7 +198,9 @@ export class GitHubDeliveryInbox {
           await createDirectory(paths.stateDirectory);
           let record: InboxDeliveryRecord;
           try {
-            record = parseRecord((await readOrdinaryFile(paths.statePath)).toString("utf8"));
+            record = parseRecord(
+              (await readOrdinaryFile(paths.statePath, this.noFollowFlag)).toString("utf8"),
+            );
           } catch (error) {
             if (errno(error) === "ENOENT") continue;
             throw error;
@@ -258,7 +271,7 @@ export class GitHubDeliveryInbox {
         let completedAt: string | undefined;
         if (group.includes(canonicalName)) {
           const parsed = parseLegacyCanonicalRecord(
-            (await readOrdinaryFile(canonicalPath)).toString("utf8"),
+            (await readOrdinaryFile(canonicalPath, this.noFollowFlag)).toString("utf8"),
             deliveryId,
           );
           claimedAt = parsed.claimedAt;
@@ -309,8 +322,8 @@ export class GitHubDeliveryInbox {
         throw new Error("Conflicting legacy delivery evidence");
       }
       const [sourceBytes, targetBytes] = await Promise.all([
-        readOrdinaryFile(sourcePath),
-        readOrdinaryFile(targetPath),
+        readOrdinaryFile(sourcePath, this.noFollowFlag),
+        readOrdinaryFile(targetPath, this.noFollowFlag),
       ]);
       if (!sourceBytes.equals(targetBytes)) {
         throw new Error("Conflicting legacy delivery evidence");
@@ -324,7 +337,10 @@ export class GitHubDeliveryInbox {
   private async readState(deliveryId: string): Promise<InboxDeliveryRecord | undefined> {
     try {
       const record = parseRecord(
-        (await readOrdinaryFile(this.paths(deliveryId).statePath)).toString("utf8"),
+        (await readOrdinaryFile(
+          this.paths(deliveryId).statePath,
+          this.noFollowFlag,
+        )).toString("utf8"),
       );
       if (record.deliveryId !== deliveryId) {
         throw new Error("GitHub durable inbox delivery id mismatch");
@@ -371,7 +387,7 @@ export class GitHubDeliveryInbox {
     } catch (error) {
       if (errno(error) !== "EEXIST") throw error;
       await handle?.close().catch(() => undefined);
-      handle = await open(paths.queuePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      handle = await open(paths.queuePath, constants.O_RDONLY | this.noFollowFlag);
       if (!(await handle.stat()).isFile()) {
         throw new Error("GitHub durable inbox queue marker is not an ordinary file");
       }
@@ -607,7 +623,9 @@ export class GitHubDeliveryInbox {
       try {
         observedQueue.push({
           hash,
-          record: parseRecord((await readOrdinaryFile(statePath)).toString("utf8")),
+          record: parseRecord(
+            (await readOrdinaryFile(statePath, this.noFollowFlag)).toString("utf8"),
+          ),
         });
       } catch (error) {
         if (errno(error) === "ENOENT") {

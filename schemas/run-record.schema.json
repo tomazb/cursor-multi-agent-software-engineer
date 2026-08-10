@@ -3,6 +3,7 @@
   "$id": "https://github.com/tomazb/cursor-multi-agent-software-engineer/schemas/run-record.schema.json",
   "title": "RunRecord",
   "type": "object",
+  "additionalProperties": false,
   "required": [
     "schemaVersion",
     "version",

@@ -8,9 +8,9 @@ export function githubStateRoot(cwd: string): string {
 }
 
 export function parseOwnerRepo(repository: string): { owner: string; repo: string } {
-  const [owner, repo] = repository.split("/");
-  if (!owner || !repo) throw new Error(`Invalid repository: ${repository}`);
-  return { owner, repo };
+  const match = repository.match(/^([^/\s]+)\/([^/\s]+)$/);
+  if (!match) throw new Error(`Invalid repository: ${repository}`);
+  return { owner: match[1]!, repo: match[2]! };
 }
 
 export function isRepoAllowed(

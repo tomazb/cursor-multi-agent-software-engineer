@@ -1,5 +1,7 @@
 import path from "node:path";
 import {
+  DurableAtomicWriteOutcomeUnknownError,
+  MAX_AUTHORITATIVE_FILE_BYTES,
   readBoundedOrdinaryFile,
   requireOrdinaryDirectory,
   writeDurableAtomic,
@@ -123,15 +125,24 @@ export class GitHubAssociationIndex {
   private readonly githubRoot: string;
   private readonly filePath: string;
   private readonly writeRecords: WriteRecords;
+  private readonly maxFileBytes: number;
 
   constructor(
     githubRoot: string,
-    options: { lockStaleMs?: number; writeRecords?: WriteRecords } & DurableFileOptions = {},
+    options: {
+      lockStaleMs?: number;
+      writeRecords?: WriteRecords;
+      maxFileBytes?: number;
+    } & DurableFileOptions = {},
   ) {
     this.githubRoot = githubRoot;
     this.filePath = path.join(githubRoot, "associations.json");
     this.writeRecords = options.writeRecords ?? ((filePath, content) =>
       writeDurableAtomic(filePath, content, "GitHub association index", options));
+    this.maxFileBytes = options.maxFileBytes ?? MAX_AUTHORITATIVE_FILE_BYTES;
+    if (!Number.isSafeInteger(this.maxFileBytes) || this.maxFileBytes < 1) {
+      throw new Error("GitHub association index capacity must be a positive integer");
+    }
     void options.lockStaleMs;
   }
 
@@ -148,7 +159,11 @@ export class GitHubAssociationIndex {
   private async readAll(): Promise<Record<string, AssociationRecord>> {
     try {
       await requireOrdinaryDirectory(this.githubRoot, "GitHub state namespace");
-      const raw = await readBoundedOrdinaryFile(this.filePath, "GitHub association index");
+      const raw = await readBoundedOrdinaryFile(
+        this.filePath,
+        "GitHub association index",
+        this.maxFileBytes,
+      );
       return parseAssociationRecords(raw);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
@@ -157,7 +172,13 @@ export class GitHubAssociationIndex {
   }
 
   private async writeAll(records: Record<string, AssociationRecord>): Promise<void> {
-    await this.writeRecords(this.filePath, `${JSON.stringify(records, null, 2)}\n`);
+    const content = `${JSON.stringify(records, null, 2)}\n`;
+    if (Buffer.byteLength(content, "utf8") > this.maxFileBytes) {
+      throw new Error(
+        `GitHub association index exceeds its bounded ${this.maxFileBytes}-byte capacity`,
+      );
+    }
+    await this.writeRecords(this.filePath, content);
   }
 
   async withTransaction<T>(
@@ -219,6 +240,11 @@ export class GitHubAssociationIndex {
         if (dirty) await this.writeAll(records);
         return result;
       } catch (error) {
+        if (error instanceof DurableAtomicWriteOutcomeUnknownError) {
+          // Rename already published the exact intended index. Retrying is required because the
+          // parent sync failed, but rolling back the run would create known cross-file divergence.
+          throw error;
+        }
         const rollbackErrors: unknown[] = [];
         for (const rollback of rollbacks.reverse()) {
           try {

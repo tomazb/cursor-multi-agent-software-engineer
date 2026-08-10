@@ -238,6 +238,7 @@ test("persisted run config uses the exact config schema and rejects nested secre
     await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
   ) as JsonSchema;
   assert.equal(runSchema.properties?.config?.$ref, configSchema.$id);
+  assert.equal(runSchema.additionalProperties, false);
 
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-config-exact-"));
   t.after(async () => rm(cwd, { recursive: true, force: true }));
@@ -248,6 +249,10 @@ test("persisted run config uses the exact config schema and rejects nested secre
   delete (run.config as unknown as Record<string, unknown>).inlineToken;
   (run.config.policy as unknown as Record<string, unknown>).privateKey = "must-not-survive";
   assert.throws(() => migrateRunRecord(run), /unsupported config field/i);
+  delete (run.config.policy as unknown as Record<string, unknown>).privateKey;
+  (run as unknown as Record<string, unknown>).token = "must-not-survive";
+  assert.throws(() => migrateRunRecord(run), /unsupported run record field/i);
+  assert.throws(() => assertMatches(runSchema, runSchema, run, "run"), /additionalProperties/);
 });
 
 test("run-record schema and runtime migration reject non-positive GitHub installation ids", async () => {

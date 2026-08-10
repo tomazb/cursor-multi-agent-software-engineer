@@ -35,6 +35,13 @@ async function enqueue(inbox: GitHubDeliveryInbox, deliveryId: string): Promise<
   );
 }
 
+test("inbox fails closed when no-follow queue-marker reads are unavailable", () => {
+  assert.throws(
+    () => new GitHubDeliveryInbox("/unused", { noFollowFlag: null }),
+    /non-following|no-follow|unavailable/i,
+  );
+});
+
 test("heartbeat extends a lease and stale reclaim issues one successor lease", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-heartbeat-"));
   t.after(async () => rm(root, { recursive: true, force: true }));

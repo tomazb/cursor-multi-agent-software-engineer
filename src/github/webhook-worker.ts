@@ -5,6 +5,7 @@ import { GitHubWebhookDiagnosticError } from "./webhook-diagnostic.ts";
 const QUEUE_SCAN_PAGE = 128;
 const IDLE_SCAN_MS = 30_000;
 const CURSOR_YIELD_MS = 1;
+const WORKER_FAILURE_BACKOFF_MS = 250;
 
 /** One due-aware durable-delivery worker owned by a listener adapter. */
 export class GitHubWebhookWorker {
@@ -60,7 +61,10 @@ export class GitHubWebhookWorker {
       return;
     }
     this.worker = this.run()
-      .catch((error) => this.emitDiagnostic(error))
+      .catch((error) => {
+        this.nextDelayMs = Math.max(this.nextDelayMs, WORKER_FAILURE_BACKOFF_MS);
+        this.emitDiagnostic(error);
+      })
       .finally(() => {
         this.worker = undefined;
         if (this.enabled) this.wake(this.nextDelayMs);
@@ -124,22 +128,28 @@ export class GitHubWebhookWorker {
       }, 5_000);
       heartbeat.unref();
       try {
-        await this.dispatch(claimed.record.event);
-        await this.inbox.complete(deliveryId, leaseId);
-      } catch (error) {
-        this.emitDiagnostic(new GitHubWebhookDiagnosticError(
-          "GITHUB_WEBHOOK_DISPATCH_FAILED",
-          context,
-          error,
-        ));
+        let dispatchCompleted = false;
         try {
-          await this.inbox.retry(deliveryId, leaseId);
-        } catch (retryError) {
-          throw new GitHubWebhookDiagnosticError(
-            "GITHUB_WEBHOOK_RETRY_FAILED",
+          await this.dispatch(claimed.record.event);
+          dispatchCompleted = true;
+          await this.inbox.complete(deliveryId, leaseId);
+        } catch (error) {
+          this.emitDiagnostic(new GitHubWebhookDiagnosticError(
+            dispatchCompleted
+              ? "GITHUB_WEBHOOK_COMPLETION_FAILED"
+              : "GITHUB_WEBHOOK_DISPATCH_FAILED",
             context,
-            retryError,
-          );
+            error,
+          ));
+          try {
+            await this.inbox.retry(deliveryId, leaseId);
+          } catch (retryError) {
+            throw new GitHubWebhookDiagnosticError(
+              "GITHUB_WEBHOOK_RETRY_FAILED",
+              context,
+              retryError,
+            );
+          }
         }
       } finally {
         clearInterval(heartbeat);

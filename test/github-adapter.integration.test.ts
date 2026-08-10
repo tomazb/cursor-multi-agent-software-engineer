@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test, { after } from "node:test";
 import { mergeConfigForTest } from "../src/config.ts";
+import { writeDurableAtomic } from "../src/durable-file.ts";
 import { GitHubAppAdapter } from "../src/github/adapter.ts";
 import type { GitHubHttpClient } from "../src/github/checks.ts";
 import { GitHubAssociationIndex } from "../src/github/association.ts";
@@ -1226,6 +1227,64 @@ test("integration: association commit failure rolls back the run mutation", asyn
     ),
     undefined,
   );
+});
+
+test("integration: post-rename association sync failure never rolls back a committed close", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  let failDirectorySync = true;
+  const { adapter, store, cwd } = await setup({
+    liveHead: "sha-close-outcome",
+    liveState: "closed",
+    associationWriteRecords: async (filePath, content) => writeDurableAtomic(
+      filePath,
+      content,
+      "GitHub association index",
+      {
+        syncDirectory: async () => {
+          if (failDirectorySync) {
+            failDirectorySync = false;
+            throw new Error("simulated post-rename association directory sync failure");
+          }
+        },
+      },
+    ),
+  });
+  const run = await store.create("close-outcome", "req", testConfig());
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-close-outcome",
+    branch: "maswe/run-1",
+    suspended: false,
+  };
+  await store.save(run);
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  await index.bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-close-outcome",
+    branch: "maswe/run-1",
+  });
+  const rawBody = JSON.stringify(prPayload("sha-close-outcome", 9, "closed"));
+  const request = {
+    deliveryId: "del-close-post-rename",
+    eventName: "pull_request",
+    signatureHeader: sign(rawBody),
+    rawBody,
+  };
+
+  await assert.rejects(adapter.handleWebhook(request), /post-rename|outcome|directory sync/i);
+  assert.equal((await index.find("owner/repo", 9))?.suspended, true);
+  assert.equal((await store.load(run.id)).github?.suspended, true);
+
+  assert.equal((await adapter.handleWebhook(request)).status, 200);
+  assert.equal((await index.find("owner/repo", 9))?.suspensionReason, "pull-request-closed");
+  assert.equal((await store.load(run.id)).github?.suspensionReason, "pull-request-closed");
 });
 
 test("integration: a rejected run save that reached disk is reconciled before bind", async () => {

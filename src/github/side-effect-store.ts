@@ -67,8 +67,18 @@ export class GitHubSideEffectStore {
   }
 
   async put(idempotencyKey: string, record: SideEffectRecord): Promise<void> {
-    if (!idempotencyKey || !Number.isSafeInteger(record.resourceId) || record.resourceId <= 0 ||
-      record.kind !== "check-run") {
+    if (
+      !idempotencyKey ||
+      !record ||
+      typeof record !== "object" ||
+      Array.isArray(record) ||
+      Object.keys(record).length !== 2 ||
+      !Object.hasOwn(record, "resourceId") ||
+      !Object.hasOwn(record, "kind") ||
+      !Number.isSafeInteger(record.resourceId) ||
+      record.resourceId <= 0 ||
+      record.kind !== "check-run"
+    ) {
       throw new Error("Invalid GitHub side-effect record");
     }
     await requireOrdinaryDirectory(this.githubRoot, "GitHub state namespace");
@@ -79,7 +89,11 @@ export class GitHubSideEffectStore {
     );
     await writeDurableAtomic(
       path.join(this.dir, keyToFilename(idempotencyKey)),
-      `${JSON.stringify({ idempotencyKey, ...record }, null, 2)}\n`,
+      `${JSON.stringify({
+        idempotencyKey,
+        resourceId: record.resourceId,
+        kind: "check-run",
+      }, null, 2)}\n`,
       "GitHub side-effect record",
       this.durableOptions,
     );

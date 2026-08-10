@@ -215,7 +215,7 @@ export function isRateLimited(
 ): boolean {
   if (status === 429) return true;
   if (status !== 403) return false;
-  const remaining = headers["x-ratelimit-remaining"] ?? headers["X-RateLimit-Remaining"];
+  const remaining = headerValue(headers, "x-ratelimit-remaining");
   if (remaining === "0") return true;
   const message =
     body && typeof body === "object" && "message" in body
@@ -225,11 +225,11 @@ export function isRateLimited(
 }
 
 function rateLimitDelayMs(headers: Record<string, string>, attempt: number): number {
-  const retryAfter = headers["retry-after"] ?? headers["Retry-After"];
+  const retryAfter = headerValue(headers, "retry-after");
   if (retryAfter && /^\d+$/.test(retryAfter)) {
     return Math.min(Number(retryAfter) * 1000, 30_000);
   }
-  const reset = headers["x-ratelimit-reset"] ?? headers["X-RateLimit-Reset"];
+  const reset = headerValue(headers, "x-ratelimit-reset");
   if (reset && /^\d+$/.test(reset)) {
     const until = Number(reset) * 1000 - Date.now();
     if (until > 0) return Math.min(until, 30_000);

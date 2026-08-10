@@ -12,6 +12,23 @@ import { randomUUID } from "node:crypto";
 
 export const MAX_AUTHORITATIVE_FILE_BYTES = 1024 * 1024;
 
+export interface BoundedReadOptions {
+  /** Dependency seam used to prove fail-closed behavior on platforms without O_NOFOLLOW. */
+  noFollowFlag?: number | null;
+  /** Runs after the open handle is statted; useful for detecting concurrent file growth. */
+  afterStat?: () => Promise<void>;
+}
+
+export class DurableAtomicWriteOutcomeUnknownError extends Error {
+  readonly code = "DURABLE_ATOMIC_WRITE_OUTCOME_UNKNOWN";
+  readonly published = true;
+
+  constructor(label: string, cause: unknown) {
+    super(`${label} was published but its directory sync failed`, { cause });
+    this.name = "DurableAtomicWriteOutcomeUnknownError";
+  }
+}
+
 export interface DurableFileOptions {
   syncFile?: (handle: FileHandle, filePath: string) => Promise<void>;
   syncDirectory?: (directoryPath: string) => Promise<void>;
@@ -100,6 +117,7 @@ export async function readBoundedOrdinaryFile(
   filePath: string,
   label: string,
   maxBytes = MAX_AUTHORITATIVE_FILE_BYTES,
+  options: BoundedReadOptions = {},
 ): Promise<string> {
   const before = await lstat(filePath);
   if (before.isSymbolicLink() || !before.isFile()) {
@@ -108,7 +126,12 @@ export async function readBoundedOrdinaryFile(
   if (before.size > maxBytes) {
     throw new Error(`${label} exceeds the bounded ${maxBytes}-byte limit`);
   }
-  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+  const noFollow = options.noFollowFlag === undefined
+    ? constants.O_NOFOLLOW
+    : options.noFollowFlag;
+  if (typeof noFollow !== "number" || noFollow === 0) {
+    throw new Error(`${label} cannot be read safely: no-follow support is unavailable`);
+  }
   let handle: FileHandle;
   try {
     handle = await open(filePath, constants.O_RDONLY | noFollow);
@@ -128,7 +151,18 @@ export async function readBoundedOrdinaryFile(
     if (stat.size > maxBytes) {
       throw new Error(`${label} exceeds the bounded ${maxBytes}-byte limit`);
     }
-    result = await handle.readFile("utf8");
+    await options.afterStat?.();
+    const bytes = Buffer.alloc(maxBytes + 1);
+    let total = 0;
+    while (total < bytes.length) {
+      const chunk = await handle.read(bytes, total, bytes.length - total, null);
+      if (chunk.bytesRead === 0) break;
+      total += chunk.bytesRead;
+    }
+    if (total > maxBytes) {
+      throw new Error(`${label} exceeds the bounded ${maxBytes}-byte limit`);
+    }
+    result = bytes.subarray(0, total).toString("utf8");
     const after = await lstat(filePath);
     if (after.isSymbolicLink() || !after.isFile() || !sameIdentity(stat, after)) {
       throw new Error(`${label} changed identity while reading`);
@@ -194,6 +228,9 @@ export async function writeDurableAtomic(
     } catch (error) {
       if (!isMissing(error)) cleanupErrors.push(error);
     }
+  }
+  if (primary !== undefined && published) {
+    primary = new DurableAtomicWriteOutcomeUnknownError(label, primary);
   }
   throwWithCleanup(primary, cleanupErrors, `${label} write and cleanup both failed`);
 }

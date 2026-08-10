@@ -1,6 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { remoteMatchesRepository } from "../src/github/adapter.ts";
+import { parseOwnerRepo } from "../src/github/adapter-identities.ts";
+
+test("parseOwnerRepo requires exactly one canonical owner/name separator", () => {
+  assert.deepEqual(parseOwnerRepo("owner/repo"), { owner: "owner", repo: "repo" });
+  const invalidRepositories = [
+    "owner/repo/extra",
+    "owner /repo",
+    "owner/repo ",
+    "/repo",
+    "owner/",
+  ];
+  for (const repository of invalidRepositories) {
+    assert.throws(() => parseOwnerRepo(repository), /Invalid repository/);
+  }
+});
 
 test("remoteMatchesRepository accepts only GitHub hosts", () => {
   assert.equal(
