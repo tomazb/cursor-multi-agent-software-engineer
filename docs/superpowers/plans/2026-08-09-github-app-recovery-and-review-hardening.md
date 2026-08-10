@@ -343,7 +343,7 @@ git commit -m "fix: validate webhook headers and redact failures"
 - [ ] Add JSON Schema `if/then` constraints matching `assertGitHubAppConfig` exactly.
 - [ ] Split ADR-0005 progress into v0.2 local behavior and v0.3 Phase A GitHub behavior.
 - [ ] Correct the Phase A design architecture reference from `§13` to the actual section.
-- [ ] Document immutable journal layout, hard-link probe, quiescent legacy migration, unsupported-event acknowledgement, processing-duplicate `503`, HTTP deadline, diagnostic behavior, and the same-host/coherent-filesystem support boundary.
+- [ ] Document immutable journal layout, hard-link probe, quiescent legacy migration, unsupported-event acknowledgement, processing-duplicate `202`, HTTP deadline, diagnostic behavior, and the same-host/coherent-filesystem support boundary.
 - [ ] Search docs for contradictory `mkdir`, reusable lock, or indefinite-HTTP claims and update only Phase A-relevant text.
 - [ ] Run config/schema tests and a Markdown link/reference sanity search until green.
 - [ ] Commit:
