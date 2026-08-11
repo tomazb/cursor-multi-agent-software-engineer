@@ -6,7 +6,7 @@ import path from "node:path";
 import test, { after } from "node:test";
 import { mergeConfigForTest } from "../src/config.ts";
 import { writeDurableAtomic } from "../src/durable-file.ts";
-import { GitHubAppAdapter } from "../src/github/adapter.ts";
+import { GitHubAppAdapter, type WebhookHandleResult } from "../src/github/adapter.ts";
 import type { GitHubHttpClient } from "../src/github/checks.ts";
 import { GitHubAssociationIndex } from "../src/github/association.ts";
 import { GitHubSideEffectStore } from "../src/github/side-effect-store.ts";
@@ -200,6 +200,19 @@ async function waitForInitialDeliveryRetry(): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, 300));
 }
 
+async function completeRetryableDelivery(
+  deliver: () => Promise<WebhookHandleResult>,
+): Promise<WebhookHandleResult> {
+  let response = await deliver();
+  if (response.status === 202) {
+    assert.equal(response.body.duplicate, true);
+    await waitForInitialDeliveryRetry();
+    response = await deliver();
+  }
+  assert.equal(response.status, 200);
+  return response;
+}
+
 function twoPartyBarrier(): (identity: string) => Promise<void> {
   const release = deferred();
   const arrivals = new Set<string>();
@@ -304,22 +317,12 @@ test("integration: failed delivery can be retried with the same id", async () =>
     /forced failure|HTTP 500/i,
   );
   setFailAll(false);
-  const retryable = await adapter.handleWebhook({
+  await completeRetryableDelivery(() => adapter.handleWebhook({
     deliveryId: "del-rl-retry",
     eventName: "pull_request",
     signatureHeader: sign(body),
     rawBody: body,
-  });
-  assert.equal(retryable.status, 202);
-  assert.equal(retryable.body.duplicate, true);
-  await waitForInitialDeliveryRetry();
-  const retry = await adapter.handleWebhook({
-    deliveryId: "del-rl-retry",
-    eventName: "pull_request",
-    signatureHeader: sign(body),
-    rawBody: body,
-  });
-  assert.equal(retry.status, 200);
+  }));
   assert.ok(posts.length >= 4);
 });
 
@@ -429,11 +432,7 @@ test("integration: retry remembers every old head until cancellation publication
   await assert.rejects(adapter.handleWebhook(request), /HTTP 500/);
   assert.equal((await store.load(run.id)).github?.headSha, "sha-new");
 
-  const retryable = await adapter.handleWebhook(request);
-  assert.equal(retryable.status, 202);
-  assert.equal(retryable.body.duplicate, true);
-  await waitForInitialDeliveryRetry();
-  assert.equal((await adapter.handleWebhook(request)).status, 200);
+  await completeRetryableDelivery(() => adapter.handleWebhook(request));
   assert.equal(
     patches.filter((patch) => patch.headSha === "sha-old").length,
     4,
@@ -1299,11 +1298,7 @@ test("integration: post-rename association sync failure never rolls back a commi
   assert.equal((await index.find("owner/repo", 9))?.suspended, true);
   assert.equal((await store.load(run.id)).github?.suspended, true);
 
-  const retryable = await adapter.handleWebhook(request);
-  assert.equal(retryable.status, 202);
-  assert.equal(retryable.body.duplicate, true);
-  await waitForInitialDeliveryRetry();
-  assert.equal((await adapter.handleWebhook(request)).status, 200);
+  await completeRetryableDelivery(() => adapter.handleWebhook(request));
   assert.equal((await index.find("owner/repo", 9))?.suspensionReason, "pull-request-closed");
   assert.equal((await store.load(run.id)).github?.suspensionReason, "pull-request-closed");
 });
@@ -1368,11 +1363,7 @@ test("integration: close redelivery rebuilds a lost association for the exact su
     tokenProvider: async () => "test-token",
     synchronousWebhookDispatch: true,
   });
-  const retryable = await restarted.handleWebhook(request);
-  assert.equal(retryable.status, 202);
-  assert.equal(retryable.body.duplicate, true);
-  await waitForInitialDeliveryRetry();
-  assert.equal((await restarted.handleWebhook(request)).status, 200);
+  await completeRetryableDelivery(() => restarted.handleWebhook(request));
   const recovered = await new GitHubAssociationIndex(githubRoot).find("owner/repo", 9);
   assert.equal(recovered?.runId, run.id);
   assert.equal(recovered?.suspensionReason, "pull-request-closed");
