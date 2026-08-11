@@ -4,7 +4,7 @@
 
 **Goal:** Close every valid in-scope PR #25 review finding by replacing reusable GitHub lock ownership with the immutable ticket journal, making delivery recovery and webhook acknowledgement fail closed, and hardening check reconciliation, HTTP behavior, configuration, and documentation.
 
-**Architecture:** Keep GitHub state file-backed under `.maswe/github`, but serialize each logical association, check-create key, and delivery ID through an immutable journal rooted below `.maswe/github/journals/`. A GitHub-specific wrapper adapts `src/lock-journal.ts`, performs the one-time quiescent migration from legacy reusable locks, and exposes a bounded `withGitHubJournal` callback. Delivery JSON becomes protected state rather than its own lock. The authenticated adapter remains the only webhook entry point and continues calling deterministic orchestrator/store operations; no model or provider SDK gains authority.
+**Architecture:** Keep GitHub state file-backed under `.maswe/github`, but serialize each logical association, check-create key, delivery ID, and publication fence through an immutable journal rooted below `.maswe/github/journals/`. A GitHub-specific wrapper adapts `src/lock-journal.ts`, performs the one-time quiescent migration from legacy reusable locks, and exposes a bounded `withGitHubJournal` callback. Delivery JSON becomes protected state rather than its own lock. The authenticated adapter remains the only webhook entry point and continues calling deterministic orchestrator/store operations; no model or provider SDK gains authority.
 
 **Tech Stack:** TypeScript ESM, Node core `fs`/`crypto`/`http`, global `fetch`, `node:test`, direct TypeScript execution through `--experimental-strip-types`, exact Node `24.18.0` and `22.22.2` validation.
 
@@ -85,7 +85,7 @@ git commit -m "docs: plan GitHub recovery hardening"
   - live, malformed, or changing legacy ownership fails closed;
   - concurrent migration attempts publish the same canonical marker or reconcile without overwriting it.
 - [ ] Run the new tests and confirm they fail for the intended missing adapter/migration behavior.
-- [ ] Extend `ClaimOperation` in `src/lock-journal.ts` with explicit `github-association`, `github-check-create`, and `github-delivery` operations; do not weaken record parsing.
+- [ ] Extend `ClaimOperation` in `src/lock-journal.ts` with explicit `github-association`, `github-check-create`, `github-delivery`, and `github-publication` operations; do not weaken record parsing.
 - [ ] Implement `src/github/journal.ts` with:
   - SHA-256 path mapping under `journals/<kind>/<digest>/`;
   - `initializeGitHubJournals(githubRoot)` for root filesystem probing and association migration;
@@ -279,7 +279,7 @@ git commit -m "fix: reconcile check runs with complete identity"
 
 - [ ] Write failing tests that inject a never-settling fetch and verify the request rejects after a short injected deadline with an `AbortSignal` supplied.
 - [ ] Cover token acquisition, live PR-head lookup, Checks GET/POST/PATCH, webhook publication, and manual `github-publish-checks` through the shared client.
-- [ ] Assert token POST includes `content-type: application/json`, repository scoping, and only `checks: write` plus `metadata: read` permissions.
+- [ ] Assert token POST includes `content-type: application/json`, repository scoping, and exactly `metadata: read`, `pull_requests: read`, and `checks: write` permissions.
 - [ ] Add `signal?: AbortSignal` only if needed on `GitHubHttpClient`; prefer applying the deadline inside the shared fetch client so every caller inherits it.
 - [ ] Implement `createFetchGitHubHttpClient({ timeoutMs, fetchFn })` with a finite production default, per-attempt signal, and timer cleanup in `finally`. Preserve a caller signal only through safe signal composition.
 - [ ] Ensure each bounded rate-limit retry gets its own deadline and the total retry count remains finite.

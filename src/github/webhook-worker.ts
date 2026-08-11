@@ -17,6 +17,7 @@ export class GitHubWebhookWorker {
   private worker: Promise<void> | undefined;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private active = false;
+  private immediateWakePending = false;
   private queueCursor: string | undefined;
   private queueNextAttemptAt: number | undefined;
   private nextDelayMs = 0;
@@ -41,7 +42,11 @@ export class GitHubWebhookWorker {
   }
 
   wake(delayMs = 0): void {
-    if (!this.enabled || this.worker) return;
+    if (!this.enabled) return;
+    if (this.worker) {
+      if (delayMs <= 0) this.immediateWakePending = true;
+      return;
+    }
     if (this.timer) {
       if (delayMs > 0) return;
       clearTimeout(this.timer);
@@ -66,8 +71,10 @@ export class GitHubWebhookWorker {
         this.emitDiagnostic(error);
       })
       .finally(() => {
+        const wakeImmediately = this.immediateWakePending;
+        this.immediateWakePending = false;
         this.worker = undefined;
-        if (this.enabled) this.wake(this.nextDelayMs);
+        if (this.enabled) this.wake(wakeImmediately ? 0 : this.nextDelayMs);
       });
   }
 

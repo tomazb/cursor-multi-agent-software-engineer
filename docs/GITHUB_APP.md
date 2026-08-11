@@ -135,7 +135,7 @@ permissions in the initial release.
 
 Subscribe to:
 
-- `pull_request`: opened, synchronize, reopened, closed, ready_for_review, converted_to_draft.
+- `pull_request`: opened, synchronize, reopened, closed, ready_for_review.
 - `pull_request_review`: submitted, edited, dismissed.
 - `pull_request_review_comment`: created, edited, deleted.
 - `pull_request_review_thread`: resolved, unresolved where available.

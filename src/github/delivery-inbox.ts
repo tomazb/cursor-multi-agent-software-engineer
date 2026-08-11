@@ -436,6 +436,7 @@ export class GitHubDeliveryInbox {
     } catch (error) {
       if (errno(error) !== "EEXIST") throw error;
       await handle?.close().catch(() => undefined);
+      handle = undefined;
       handle = await open(paths.queuePath, constants.O_RDONLY | this.noFollowFlag);
       if (!(await handle.stat()).isFile()) {
         throw new Error("GitHub durable inbox queue marker is not an ordinary file");

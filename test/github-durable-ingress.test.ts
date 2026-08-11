@@ -79,7 +79,7 @@ test("durable ingress acknowledges before a blocked downstream dispatch", async 
     http,
     tokenProvider: async () => "token",
     autoStartWebhookWorker: true,
-  } as ConstructorParameters<typeof GitHubAppAdapter>[0]);
+  });
 
   const responsePromise = adapter.handleWebhook(signedRequest("durable-ack"));
   await dispatchReached.promise;
@@ -169,8 +169,6 @@ test("an idle worker sleeps until due and a new enqueue wakes it immediately", a
     },
     tokenProvider: async () => "token",
     onWebhookWorkerSchedule: (delayMs) => scheduled.resolve(delayMs),
-  } as ConstructorParameters<typeof GitHubAppAdapter>[0] & {
-    onWebhookWorkerSchedule: (delayMs: number) => void;
   });
   await adapter.startWebhookWorker();
   t.after(async () => adapter.stopWebhookWorker({ drainMs: 10 }));
@@ -432,4 +430,92 @@ test("worker failures emit bounded delivery context for recovery", async (t) => 
   assert.equal(failure?.deliveryId, "worker-diagnostic");
   assert.equal(failure?.eventName, "pull_request");
   assert.equal(failure?.attempt, 1);
+});
+
+test("synchronous dispatch failure schedules retry from the failure time", async (t) => {
+  process.env[SECRET_ENV] = SECRET;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-sync-retry-clock-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const adapter = new GitHubAppAdapter({
+    cwd,
+    config: config(),
+    store: new FileRunStore(cwd),
+    http: {
+      async request() {
+        return { status: 500, headers: {}, body: {} };
+      },
+    },
+    tokenProvider: async () => "token",
+    synchronousWebhookDispatch: true,
+  });
+  const retryStartedAt = Date.now();
+
+  await assert.rejects(
+    adapter.handleWebhook(signedRequest("sync-retry-clock")),
+    /Failed to resolve current PR head.*HTTP 500/,
+  );
+
+  const hash = createHash("sha256").update("sync-retry-clock").digest("hex");
+  const record = JSON.parse(
+    await readFile(
+      path.join(
+        cwd,
+        ".maswe",
+        "github",
+        "inbox",
+        "state",
+        hash.slice(0, 2),
+        hash,
+        "state.json",
+      ),
+      "utf8",
+    ),
+  ) as { nextAttemptAt?: string };
+  assert.ok(record.nextAttemptAt);
+  assert.ok(
+    Date.parse(record.nextAttemptAt) >= retryStartedAt + 200,
+    `retry was scheduled from an epoch-era clock: ${record.nextAttemptAt}`,
+  );
+});
+
+test("queue-marker reopen failure is not masked by closing the original handle twice", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-queue-marker-reopen-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  let closeCalls = 0;
+  const inbox = new GitHubDeliveryInbox(root, {
+    syncFile: async (handle, filePath) => {
+      if (!filePath.endsWith(".queued")) {
+        await handle.sync();
+        return;
+      }
+      const close = handle.close.bind(handle);
+      handle.close = async () => {
+        closeCalls += 1;
+        if (closeCalls > 1) throw new Error("queue marker handle closed twice");
+        await close();
+      };
+      await rm(filePath, { force: true });
+      throw Object.assign(new Error("simulated queue marker collision"), { code: "EEXIST" });
+    },
+  });
+
+  await assert.rejects(
+    inbox.enqueue({
+      deliveryId: "queue-marker-reopen",
+      eventName: "push",
+      receivedAt: "2026-08-11T00:00:00.000Z",
+      rawBodyDigest: `sha256:${"c".repeat(64)}`,
+      event: {
+        eventId: "queue-marker-reopen",
+        type: "push",
+        repository: "owner/repo",
+        installationId: 44,
+        headSha: "head",
+        branch: "feature",
+        receivedAt: "2026-08-11T00:00:00.000Z",
+      },
+    }),
+    { code: "ENOENT" },
+  );
+  assert.equal(closeCalls, 1);
 });

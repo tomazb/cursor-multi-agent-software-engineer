@@ -3,6 +3,53 @@ import test from "node:test";
 import type { GitHubDeliveryInbox } from "../src/github/delivery-inbox.ts";
 import { GitHubWebhookWorker } from "../src/github/webhook-worker.ts";
 
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+test("an immediate wake requested during a scan runs before the existing delay", async (t) => {
+  const firstScanStarted = deferred();
+  const releaseFirstScan = deferred();
+  const secondScanStarted = deferred();
+  let claimCalls = 0;
+  const inbox = {
+    async claimNextPage() {
+      claimCalls += 1;
+      if (claimCalls === 1) {
+        firstScanStarted.resolve();
+        await releaseFirstScan.promise;
+      } else if (claimCalls === 2) {
+        secondScanStarted.resolve();
+      }
+      return { scanned: 0 };
+    },
+    async pendingCount() {
+      return 0;
+    },
+  } as unknown as GitHubDeliveryInbox;
+  const worker = new GitHubWebhookWorker({
+    inbox,
+    dispatch: async () => undefined,
+  });
+  t.after(async () => worker.stop({ drainMs: 0 }));
+
+  worker.start();
+  await firstScanStarted.promise;
+  worker.wake(0);
+  releaseFirstScan.resolve();
+
+  await Promise.race([
+    secondScanStarted.promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("active worker lost its immediate wake")), 250)),
+  ]);
+  assert.equal(claimCalls, 2);
+});
+
 test("retry persistence failure backs off before another queue scan", async (t) => {
   let claimCalls = 0;
   let resolveScheduled!: (delayMs: number) => void;
@@ -166,7 +213,11 @@ test("durable completion failure is not mislabeled as dispatch failure", async (
   t.after(async () => worker.stop({ drainMs: 0 }));
 
   worker.start();
-  await scheduled;
+  await Promise.race([
+    scheduled,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("completion failure schedule was not exposed")), 1_000)),
+  ]);
 
   assert.equal(diagnostics.some(({ code }) => code === "GITHUB_WEBHOOK_DISPATCH_FAILED"), false);
   assert.equal(diagnostics.some(({ code }) => code === "GITHUB_WEBHOOK_COMPLETION_FAILED"), true);

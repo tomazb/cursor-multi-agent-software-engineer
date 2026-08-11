@@ -239,7 +239,7 @@ export class GitHubAppAdapter {
         await this.inbox.complete(claimed.record.deliveryId, claimed.record.leaseId);
         return { status: 200, body: { ok: true } };
       } catch (error) {
-        await this.inbox.retry(claimed.record.deliveryId, claimed.record.leaseId, 0);
+        await this.inbox.retry(claimed.record.deliveryId, claimed.record.leaseId);
         throw error;
       }
     }

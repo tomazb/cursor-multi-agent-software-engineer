@@ -95,6 +95,7 @@ Hard rules:
 | Event | Behavior |
 |-------|----------|
 | `pull_request` opened/synchronize/reopened/ready_for_review | Associate; refresh head SHA; invalidate evidence via existing sync path when a run exists; republish/cancel checks |
+| `pull_request` closed | Suspend the exact PR association and its run without publishing replacement checks |
 | `push` (PR head branch) | Same invalidation when not covered by synchronize |
 | `check_run` / `check_suite` / `workflow_run` | Observe only → neutral summaries; no orchestration authority |
 | `installation` / `installation_repositories` | Update allowlist; suspend associations on removal |
