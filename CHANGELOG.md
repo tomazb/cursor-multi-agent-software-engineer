@@ -28,6 +28,9 @@ The project follows semantic versioning once a public release process is establi
   installation tokens for unassociated PRs, delivery complete-after-success, exact PR association
   matching, scoped checks tokens, PATCH without `head_sha`, webhook body limits, rate-limit
   backoff, push invalidation, out-of-order SHA rejection, and association index locking.
+- GitHub delivery-ID validation at every ingress boundary, with malformed IDs rejected before
+  durable mutation and malformed installation-token responses using the stable
+  `Installation token response missing token` error.
 - `policy.doctorProbeTimeoutMs` configuration contract (default `60_000`, integer bounds
   `1_000..300_000`) with fail-closed validation and schema coverage.
 - Typed doctor check codes across runtimes plus CLI `maswe doctor --json` output of full

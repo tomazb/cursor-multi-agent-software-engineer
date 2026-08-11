@@ -1,5 +1,7 @@
 # Issue #3 Phase A: Read-only GitHub App checks — Implementation Plan
 
+> **Historical plan:** This 2026-08-08 proposal is superseded by the [2026-08-09 GitHub App recovery and review hardening plan](2026-08-09-github-app-recovery-and-review-hardening.md). The file map and task checklists below describe the original proposal at that point in time; they are not a statement of current implementation status.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. TDD. Commit after each task.
 
 **Goal:** Ship read-only MASWE check runs bound to exact PR head SHAs via an authenticated webhook adapter that calls public orchestrator operations only.
