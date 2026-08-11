@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -41,6 +41,34 @@ test("inbox fails closed when no-follow queue-marker reads are unavailable", () 
     () => new GitHubDeliveryInbox("/unused", { noFollowFlag: null }),
     /non-following|no-follow|unavailable/i,
   );
+});
+
+test("direct inbox ingress rejects unsafe delivery ids before initialization", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-invalid-delivery-id-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const inbox = new GitHubDeliveryInbox(root);
+  const deliveryId = "unsafe/id";
+
+  await assert.rejects(
+    inbox.enqueue({
+      deliveryId,
+      eventName: "push",
+      receivedAt: RECEIVED_AT,
+      rawBodyDigest: BODY_DIGEST,
+      event: event(deliveryId),
+    }),
+    { message: "Invalid GitHub delivery id" },
+  );
+  await assert.rejects(
+    inbox.completeWithoutDispatch({
+      deliveryId,
+      eventName: "push",
+      receivedAt: RECEIVED_AT,
+      rawBodyDigest: BODY_DIGEST,
+    }),
+    { message: "Invalid GitHub delivery id" },
+  );
+  await assert.rejects(access(path.join(root, "inbox")), { code: "ENOENT" });
 });
 
 test("state reads detect post-stat growth instead of allocating past the bound", async (t) => {

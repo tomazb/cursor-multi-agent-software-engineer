@@ -1,4 +1,5 @@
 import type { GitHubInternalEvent } from "./types.ts";
+import { isSafeGitHubDeliveryId } from "./delivery-id.ts";
 
 export const STATE_FORMAT = 2;
 export const RECORD_KIND = "github-delivery-inbox";
@@ -176,8 +177,7 @@ export function parseRecord(raw: string): InboxDeliveryRecord {
     !isRecord(parsed) ||
     parsed.format !== STATE_FORMAT ||
     parsed.record !== RECORD_KIND ||
-    typeof parsed.deliveryId !== "string" ||
-    !/^[A-Za-z0-9._-]+$/.test(parsed.deliveryId) ||
+    !isSafeGitHubDeliveryId(parsed.deliveryId) ||
     !validTimestamp(parsed.receivedAt) ||
     (parsed.status !== "queued" &&
       parsed.status !== "processing" &&

@@ -4,6 +4,7 @@ import { link, lstat, open, mkdir, readFile, readdir, rename, unlink } from "nod
 import path from "node:path";
 import { withGitHubJournal } from "./journal.ts";
 import type { GitHubInternalEvent } from "./types.ts";
+import { isSafeGitHubDeliveryId } from "./delivery-id.ts";
 import {
   HASH_PATTERN,
   RECORD_KIND,
@@ -276,7 +277,7 @@ export class GitHubDeliveryInbox {
         : separator > 0
           ? name.slice(0, separator)
           : "";
-      if (!/^[A-Za-z0-9._-]+$/.test(deliveryId)) {
+      if (!isSafeGitHubDeliveryId(deliveryId)) {
         throw new Error("Invalid legacy GitHub delivery filename");
       }
       const group = groups.get(deliveryId) ?? [];
@@ -463,6 +464,9 @@ export class GitHubDeliveryInbox {
     rawBodyDigest: string;
     event: GitHubInternalEvent;
   }): Promise<InboxEnqueueResult> {
+    if (!isSafeGitHubDeliveryId(input.deliveryId)) {
+      throw new Error("Invalid GitHub delivery id");
+    }
     await this.initialize();
     if (!validEvent(input.event, input.deliveryId, input.receivedAt, input.eventName)) {
       throw new Error("Invalid GitHub durable inbox event");
@@ -526,6 +530,9 @@ export class GitHubDeliveryInbox {
     receivedAt: string;
     rawBodyDigest: string;
   }): Promise<InboxEnqueueResult> {
+    if (!isSafeGitHubDeliveryId(input.deliveryId)) {
+      throw new Error("Invalid GitHub delivery id");
+    }
     await this.initialize();
     return withGitHubJournal(this.githubRoot, "delivery", input.deliveryId, async () => {
       const current = await this.readState(input.deliveryId);

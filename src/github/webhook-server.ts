@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { GitHubAppAdapter } from "./adapter.ts";
+import { isSafeGitHubDeliveryId } from "./delivery-id.ts";
 
 /** Default max raw webhook body size (1 MiB). */
 export const DEFAULT_WEBHOOK_MAX_BODY_BYTES = 1_048_576;
@@ -76,7 +77,6 @@ export interface WebhookServerOptions {
   ) => void;
 }
 
-const SAFE_DELIVERY_ID = /^[A-Za-z0-9._-]+$/;
 const safeDiagnostic = (_error: unknown): void => undefined;
 
 function singleHeader(req: IncomingMessage, name: string): string | undefined {
@@ -125,7 +125,7 @@ export function createWebhookServer(options: WebhookServerOptions): Server {
       const deliveryId = singleHeader(req, "x-github-delivery");
       const eventName = singleHeader(req, "x-github-event");
       const signatureHeader = singleHeader(req, "x-hub-signature-256");
-      if (!deliveryId || !eventName || !signatureHeader || !SAFE_DELIVERY_ID.test(deliveryId)) {
+      if (!deliveryId || !eventName || !signatureHeader || !isSafeGitHubDeliveryId(deliveryId)) {
         req.resume();
         invalidWebhookHeaders(res);
         return;

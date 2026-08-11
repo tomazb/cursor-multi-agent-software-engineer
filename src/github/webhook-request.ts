@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isSafeGitHubDeliveryId } from "./delivery-id.ts";
 import { normalizeGitHubWebhook } from "./normalize.ts";
 import { verifyGitHubWebhookSignature } from "./signature.ts";
 import {
@@ -46,13 +47,24 @@ export function prepareWebhookRequest(
   request: WebhookRequest,
   webhookSecret: string,
 ): PreparedWebhookRequest {
-  if (!request.deliveryId?.trim() || !request.eventName?.trim()) {
+  if (
+    typeof request.deliveryId !== "string" ||
+    !request.deliveryId.trim() ||
+    typeof request.eventName !== "string" ||
+    !request.eventName.trim()
+  ) {
     return {
       kind: "reject",
       result: {
         status: 400,
         body: { ok: false, message: "missing delivery or event headers" },
       },
+    };
+  }
+  if (!isSafeGitHubDeliveryId(request.deliveryId)) {
+    return {
+      kind: "reject",
+      result: { status: 400, body: { ok: false, message: "invalid delivery id" } },
     };
   }
   const rawBody = typeof request.rawBody === "string"

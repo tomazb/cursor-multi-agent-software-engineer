@@ -157,11 +157,11 @@ test("webhook rejects a repeated signature header before adapter dispatch", asyn
   assert.deepEqual(fake.calls, []);
 });
 
-test("webhook rejects an unsafe delivery filename before adapter dispatch", async () => {
+test("webhook rejects an unsafe delivery id before adapter dispatch", async () => {
   const fake = recordingAdapter();
   const response = await dispatchWebhook(
     { adapter: fake.adapter },
-    { ...validHeaders, "x-github-delivery": "../../outside" },
+    { ...validHeaders, "x-github-delivery": "unsafe/id" },
   );
 
   assert.equal(response.status, 400);

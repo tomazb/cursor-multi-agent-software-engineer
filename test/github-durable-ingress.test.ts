@@ -252,6 +252,27 @@ test("signed invalid UTF-8 authenticates exact bytes but is rejected without enq
   );
 });
 
+test("signed direct adapter ingress rejects unsafe delivery ids without durable mutation", async (t) => {
+  process.env[SECRET_ENV] = SECRET;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-durable-invalid-delivery-id-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const adapter = new GitHubAppAdapter({
+    cwd,
+    config: config(),
+    store: new FileRunStore(cwd),
+    http: { async request() { throw new Error("invalid input must not dispatch"); } },
+    tokenProvider: async () => "token",
+  });
+
+  const response = await adapter.handleWebhook(signedRequest("unsafe/id"));
+
+  assert.equal(response.status, 400);
+  await assert.rejects(
+    access(path.join(cwd, ".maswe", "github", "inbox", "state")),
+    { code: "ENOENT" },
+  );
+});
+
 test("worker stop bounds drain while preserving active durable work", async (t) => {
   process.env[SECRET_ENV] = SECRET;
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-durable-drain-"));
