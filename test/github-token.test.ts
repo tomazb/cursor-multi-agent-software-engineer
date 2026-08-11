@@ -82,3 +82,35 @@ test("createInstallationAccessToken rejects an explicit read-only policy opt-out
   );
   assert.equal(requests, 0);
 });
+
+test("createInstallationAccessToken rejects malformed successful token responses", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  const malformedBodies: Array<[string, unknown]> = [
+    ["null", null],
+    ["a primitive", "not-an-object"],
+    ["an array", []],
+    ["a response without a token", {}],
+    ["an empty token", { token: "" }],
+  ];
+
+  for (const [description, body] of malformedBodies) {
+    await assert.rejects(
+      createInstallationAccessToken({
+        appId: "123",
+        privateKeyPem: pem,
+        installationId: 9,
+        repository: "owner/repo",
+        http: {
+          async request() {
+            return { status: 201, headers: {}, body };
+          },
+        },
+      }),
+      (error: unknown) => {
+        assert.equal((error as Error).message, "Installation token response missing token", description);
+        return true;
+      },
+    );
+  }
+});

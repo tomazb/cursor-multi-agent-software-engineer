@@ -64,9 +64,13 @@ export async function createInstallationAccessToken(options: {
   if (response.status < 200 || response.status >= 300) {
     throw new Error(`Failed to create installation token: HTTP ${response.status}`);
   }
-  const tokenBody = response.body as { token?: string };
-  if (typeof tokenBody.token !== "string" || !tokenBody.token) {
+  const tokenBody = response.body;
+  if (tokenBody === null || typeof tokenBody !== "object" || Array.isArray(tokenBody)) {
     throw new Error("Installation token response missing token");
   }
-  return tokenBody.token;
+  const token = (tokenBody as { token?: unknown }).token;
+  if (typeof token !== "string" || !token) {
+    throw new Error("Installation token response missing token");
+  }
+  return token;
 }
