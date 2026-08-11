@@ -11,6 +11,24 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => voi
   return { promise, resolve };
 }
 
+async function withWatchdog<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 test("an immediate wake requested during a scan runs before the existing delay", async (t) => {
   const firstScanStarted = deferred();
   const releaseFirstScan = deferred();
@@ -42,11 +60,11 @@ test("an immediate wake requested during a scan runs before the existing delay",
   worker.wake(0);
   releaseFirstScan.resolve();
 
-  await Promise.race([
+  await withWatchdog(
     secondScanStarted.promise,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("active worker lost its immediate wake")), 250)),
-  ]);
+    250,
+    "active worker lost its immediate wake",
+  );
   assert.equal(claimCalls, 2);
 });
 
@@ -109,11 +127,11 @@ test("retry persistence failure backs off before another queue scan", async (t) 
   t.after(async () => worker.stop({ drainMs: 0 }));
 
   worker.start();
-  const delayMs = await Promise.race([
+  const delayMs = await withWatchdog(
     scheduled,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("worker retry backoff was not scheduled")), 1_000)),
-  ]);
+    1_000,
+    "worker retry backoff was not scheduled",
+  );
 
   assert.equal(claimCalls, 1, "retry persistence failure rescanned before backoff");
   assert.ok(delayMs >= 250, `retry persistence failure scheduled only ${delayMs}ms backoff`);
@@ -143,11 +161,11 @@ test("claim failure backs off before another queue scan", async (t) => {
   t.after(async () => worker.stop({ drainMs: 0 }));
 
   worker.start();
-  const delayMs = await Promise.race([
+  const delayMs = await withWatchdog(
     scheduled,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("worker scan backoff was not scheduled")), 1_000)),
-  ]);
+    1_000,
+    "worker scan backoff was not scheduled",
+  );
 
   assert.equal(claimCalls, 1, "failed queue scan repeated before backoff");
   assert.ok(delayMs >= 250, `queue scan failure scheduled only ${delayMs}ms backoff`);
@@ -213,11 +231,11 @@ test("durable completion failure is not mislabeled as dispatch failure", async (
   t.after(async () => worker.stop({ drainMs: 0 }));
 
   worker.start();
-  await Promise.race([
+  await withWatchdog(
     scheduled,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("completion failure schedule was not exposed")), 1_000)),
-  ]);
+    1_000,
+    "completion failure schedule was not exposed",
+  );
 
   assert.equal(diagnostics.some(({ code }) => code === "GITHUB_WEBHOOK_DISPATCH_FAILED"), false);
   assert.equal(diagnostics.some(({ code }) => code === "GITHUB_WEBHOOK_COMPLETION_FAILED"), true);
