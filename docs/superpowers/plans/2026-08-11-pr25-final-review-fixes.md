@@ -67,4 +67,3 @@
 - [ ] Run a fresh CodeRabbit committed-diff review against `main`; resolve every valid Critical/Major finding.
 - [ ] Fast-forward the existing PR branch, push, wait for GitHub checks, and re-fetch review threads.
 - [ ] Reply to and resolve any addressed in-scope threads; explain rejected or out-of-scope findings.
-
