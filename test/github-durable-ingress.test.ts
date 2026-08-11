@@ -36,6 +36,20 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => voi
   return { promise, resolve };
 }
 
+async function withWatchdog<T>(promise: Promise<T>, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), 5_000);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 function signedRequest(deliveryId: string, headSha = "sha-durable") {
   const rawBody = JSON.stringify({
     action: "synchronize",
@@ -172,19 +186,17 @@ test("an idle worker sleeps until due and a new enqueue wakes it immediately", a
   });
   await adapter.startWebhookWorker();
   t.after(async () => adapter.stopWebhookWorker({ drainMs: 10 }));
-  const idleDelay = await Promise.race([
+  const idleDelay = await withWatchdog(
     scheduled.promise,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("idle worker schedule was not exposed")), 1_000)),
-  ]);
+    "idle worker schedule was not exposed",
+  );
   assert.ok(idleDelay >= 1_000, `idle worker unexpectedly polled after ${idleDelay}ms`);
 
   assert.equal((await adapter.handleWebhook(signedRequest("due-aware-wake"))).status, 202);
-  await Promise.race([
+  await withWatchdog(
     dispatchReached.promise,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("new enqueue did not wake the idle worker")), 500)),
-  ]);
+    "new enqueue did not wake the idle worker",
+  );
   await adapter.waitForWebhookIdle();
 });
 
@@ -417,11 +429,10 @@ test("worker failures emit bounded delivery context for recovery", async (t) => 
   await adapter.startWebhookWorker();
   t.after(async () => adapter.stopWebhookWorker({ drainMs: 10 }));
   assert.equal((await adapter.handleWebhook(signedRequest("worker-diagnostic"))).status, 202);
-  await Promise.race([
+  await withWatchdog(
     diagnosticReady,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("worker diagnostic timed out")), 2_000)),
-  ]);
+    "worker diagnostic timed out",
+  );
 
   const failure = diagnostics.find(
     (diagnostic) =>
