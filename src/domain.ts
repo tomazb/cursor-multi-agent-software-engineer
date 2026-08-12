@@ -19,6 +19,32 @@ export interface RoleConfig {
   permissions: PermissionMode;
 }
 
+export interface GitHubAppConfig {
+  enabled: boolean;
+  /** Phase A pilot requires true; write side effects are deferred. */
+  readOnlyChecks: boolean;
+  webhookSecretEnv: string;
+  appIdEnv: string;
+  privateKeyEnv: string;
+  /** Empty deny-all when enabled; must contain at least one owner/repo. */
+  allowedRepositories: string[];
+  webhookHost?: string;
+  webhookPort?: number;
+}
+
+export interface RunGitHubAssociation {
+  installationId: number;
+  repository: string;
+  pullRequestNumber: number;
+  baseSha: string;
+  headSha: string;
+  branch: string;
+  suspended?: boolean;
+  suspensionReason?: "pull-request-closed" | "authorization-revoked";
+  /** Old heads whose published checks must be cancelled before this publication is complete. */
+  pendingCancellationHeadShas?: string[];
+}
+
 export interface MasweConfig {
   version: 1;
   runtime: {
@@ -51,6 +77,7 @@ export interface MasweConfig {
     maxRunDurationMs?: number;
     allowedPathGlobs: string[];
   };
+  githubApp?: GitHubAppConfig;
 }
 
 export const WORKFLOW_STATES = [
@@ -198,6 +225,7 @@ export interface RunRecord {
   events: WorkflowEvent[];
   workspace?: RunWorkspace;
   evidence?: RunEvidence;
+  github?: RunGitHubAssociation;
   supersedes?: string;
   supersededBy?: string;
   failure?: RunFailure;

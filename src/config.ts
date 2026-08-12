@@ -73,39 +73,146 @@ function cloneDefaults(): MasweConfig {
   return structuredClone(DEFAULT_CONFIG);
 }
 
-function mergeRole(base: RoleConfig, incoming: unknown): RoleConfig {
-  if (!incoming || typeof incoming !== "object") return base;
-  const value = incoming as Partial<RoleConfig>;
+function exactObject(
+  raw: unknown,
+  label: string,
+  allowed: readonly string[],
+): Record<string, unknown> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const value = raw as Record<string, unknown>;
+  const allowedSet = new Set(allowed);
+  const unsupported = Object.keys(value).find((key) => !allowedSet.has(key));
+  if (unsupported) {
+    throw new Error(`Unsupported config field: ${label}.${unsupported}`);
+  }
+  return value;
+}
+
+function optionalExactObject(
+  raw: unknown,
+  label: string,
+  allowed: readonly string[],
+): Record<string, unknown> {
+  return raw === undefined ? {} : exactObject(raw, label, allowed);
+}
+
+function mergeRole(base: RoleConfig, incoming: unknown, label: string): RoleConfig {
+  if (incoming === undefined) return base;
+  const value = exactObject(incoming, label, [
+    "model",
+    "fallbackModels",
+    "reasoning",
+    "permissions",
+  ]) as Partial<RoleConfig>;
   const fallbackModels = value.fallbackModels ?? base.fallbackModels;
   return {
-    ...base,
-    ...value,
+    model: value.model ?? base.model,
+    reasoning: value.reasoning ?? base.reasoning,
+    permissions: value.permissions ?? base.permissions,
     ...(fallbackModels ? { fallbackModels } : {}),
+  };
+}
+
+function normalizeGitHubAppConfig(raw: unknown): NonNullable<MasweConfig["githubApp"]> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("githubApp must be an object when set");
+  }
+  const value = exactObject(raw, "githubApp", [
+    "enabled",
+    "readOnlyChecks",
+    "webhookSecretEnv",
+    "appIdEnv",
+    "privateKeyEnv",
+    "allowedRepositories",
+    "webhookHost",
+    "webhookPort",
+  ]);
+  const repositories = value.allowedRepositories;
+  return {
+    enabled: value.enabled as boolean,
+    readOnlyChecks: value.readOnlyChecks as boolean,
+    webhookSecretEnv: value.webhookSecretEnv as string,
+    appIdEnv: value.appIdEnv as string,
+    privateKeyEnv: value.privateKeyEnv as string,
+    allowedRepositories: Array.isArray(repositories)
+      ? repositories.map((repository) =>
+          typeof repository === "string" ? repository.toLowerCase() : repository,
+        ) as string[]
+      : repositories as string[],
+    ...(value.webhookHost !== undefined ? { webhookHost: value.webhookHost as string } : {}),
+    ...(value.webhookPort !== undefined ? { webhookPort: value.webhookPort as number } : {}),
   };
 }
 
 /** Pure default migration without applying process environment overrides. */
 export function migrateConfig(raw: unknown): MasweConfig {
   const base = cloneDefaults();
-  if (!raw || typeof raw !== "object") return base;
-  const value = raw as Partial<MasweConfig>;
+  if (raw === undefined || raw === null) return base;
+  const value = exactObject(raw, "config", [
+    "version",
+    "runtime",
+    "roles",
+    "gates",
+    "quality",
+    "policy",
+    "githubApp",
+  ]);
+  const runtime = optionalExactObject(value.runtime, "runtime", [
+    "kind",
+    "command",
+    "outputFormat",
+  ]);
+  const roles = optionalExactObject(value.roles, "roles", [
+    "brainstormer",
+    "designer",
+    "builder",
+    "verifier",
+    "prResolver",
+  ]);
+  const gates = optionalExactObject(value.gates, "gates", [
+    "requireBrainstormApproval",
+    "requireDesignApproval",
+    "requireCiPass",
+    "requireVerifierPass",
+  ]);
+  const quality = optionalExactObject(value.quality, "quality", ["commands"]);
+  const policy = optionalExactObject(value.policy, "policy", [
+    "rejectModelFallback",
+    "maxBuildVerifyCycles",
+    "maxCommentResolutionCycles",
+    "allowDirtyWorkspace",
+    "useIsolatedWorktree",
+    "trustManagedWorktrees",
+    "promptTransport",
+    "commandTimeoutMs",
+    "roleTimeoutMs",
+    "doctorProbeTimeoutMs",
+    "maxRunDurationMs",
+    "allowedPathGlobs",
+  ]);
 
-  return {
-    ...base,
-    ...value,
+  const migrated: MasweConfig = {
     version: 1,
-    runtime: { ...base.runtime, ...(value.runtime ?? {}) },
+    runtime: { ...base.runtime, ...runtime } as MasweConfig["runtime"],
     roles: {
-      brainstormer: mergeRole(base.roles.brainstormer, value.roles?.brainstormer),
-      designer: mergeRole(base.roles.designer, value.roles?.designer),
-      builder: mergeRole(base.roles.builder, value.roles?.builder),
-      verifier: mergeRole(base.roles.verifier, value.roles?.verifier),
-      prResolver: mergeRole(base.roles.prResolver, value.roles?.prResolver),
+      brainstormer: mergeRole(base.roles.brainstormer, roles.brainstormer, "roles.brainstormer"),
+      designer: mergeRole(base.roles.designer, roles.designer, "roles.designer"),
+      builder: mergeRole(base.roles.builder, roles.builder, "roles.builder"),
+      verifier: mergeRole(base.roles.verifier, roles.verifier, "roles.verifier"),
+      prResolver: mergeRole(base.roles.prResolver, roles.prResolver, "roles.prResolver"),
     },
-    gates: { ...base.gates, ...(value.gates ?? {}) },
-    quality: { ...base.quality, ...(value.quality ?? {}) },
-    policy: { ...base.policy, ...(value.policy ?? {}) },
+    gates: { ...base.gates, ...gates } as MasweConfig["gates"],
+    quality: { ...base.quality, ...quality } as MasweConfig["quality"],
+    policy: { ...base.policy, ...policy } as MasweConfig["policy"],
   };
+  if (value.githubApp !== undefined) {
+    migrated.githubApp = normalizeGitHubAppConfig(value.githubApp);
+  } else {
+    delete migrated.githubApp;
+  }
+  return migrated;
 }
 
 /** Project config load path: migrate defaults then apply environment overrides. */
@@ -134,6 +241,52 @@ function applyEnvironment(config: MasweConfig): MasweConfig {
 
 /** Fail-closed validation shared by project config load and persisted run migration. */
 export function assertConfig(config: MasweConfig): void {
+  exactObject(config, "config", [
+    "version",
+    "runtime",
+    "roles",
+    "gates",
+    "quality",
+    "policy",
+    "githubApp",
+  ]);
+  exactObject(config.runtime, "runtime", ["kind", "command", "outputFormat"]);
+  const roles = exactObject(config.roles, "roles", [
+    "brainstormer",
+    "designer",
+    "builder",
+    "verifier",
+    "prResolver",
+  ]);
+  for (const role of Object.keys(roles)) {
+    exactObject(roles[role], `roles.${role}`, [
+      "model",
+      "fallbackModels",
+      "reasoning",
+      "permissions",
+    ]);
+  }
+  exactObject(config.gates, "gates", [
+    "requireBrainstormApproval",
+    "requireDesignApproval",
+    "requireCiPass",
+    "requireVerifierPass",
+  ]);
+  exactObject(config.quality, "quality", ["commands"]);
+  exactObject(config.policy, "policy", [
+    "rejectModelFallback",
+    "maxBuildVerifyCycles",
+    "maxCommentResolutionCycles",
+    "allowDirtyWorkspace",
+    "useIsolatedWorktree",
+    "trustManagedWorktrees",
+    "promptTransport",
+    "commandTimeoutMs",
+    "roleTimeoutMs",
+    "doctorProbeTimeoutMs",
+    "maxRunDurationMs",
+    "allowedPathGlobs",
+  ]);
   const runtimes: RuntimeKind[] = ["mock", "cursor-cli", "cursor-sdk"];
   if (!runtimes.includes(config.runtime.kind)) {
     throw new Error(`Unsupported runtime.kind: ${config.runtime.kind}`);
@@ -227,6 +380,70 @@ export function assertConfig(config: MasweConfig): void {
     !config.policy.allowedPathGlobs.every((glob) => typeof glob === "string" && glob.trim().length > 0)
   ) {
     throw new Error("policy.allowedPathGlobs must contain at least one glob");
+  }
+  if (config.githubApp !== undefined) {
+    assertGitHubAppConfig(config.githubApp);
+  }
+}
+
+function assertGitHubAppConfig(githubApp: MasweConfig["githubApp"]): void {
+  if (!githubApp || typeof githubApp !== "object") {
+    throw new Error("githubApp must be an object when set");
+  }
+  if (typeof githubApp.enabled !== "boolean") {
+    throw new Error("githubApp.enabled must be a boolean");
+  }
+  if (typeof githubApp.readOnlyChecks !== "boolean") {
+    throw new Error("githubApp.readOnlyChecks must be a boolean");
+  }
+  if (githubApp.enabled && githubApp.readOnlyChecks !== true) {
+    throw new Error(
+      "githubApp.readOnlyChecks must be true when githubApp.enabled is true (Phase A pilot)",
+    );
+  }
+  exactObject(githubApp, "githubApp", [
+    "enabled",
+    "readOnlyChecks",
+    "webhookSecretEnv",
+    "appIdEnv",
+    "privateKeyEnv",
+    "allowedRepositories",
+    "webhookHost",
+    "webhookPort",
+  ]);
+  for (const key of ["webhookSecretEnv", "appIdEnv", "privateKeyEnv"] as const) {
+    if (typeof githubApp[key] !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(githubApp[key])) {
+      throw new Error(`githubApp.${key} must be a canonical environment variable name`);
+    }
+  }
+  if (
+    !Array.isArray(githubApp.allowedRepositories) ||
+    !githubApp.allowedRepositories.every(
+      (repo) => typeof repo === "string" && /^[^/\s]+\/[^/\s]+$/.test(repo),
+    )
+  ) {
+    throw new Error(
+      "githubApp.allowedRepositories must be an array of owner/repo strings",
+    );
+  }
+  if (githubApp.enabled && githubApp.allowedRepositories.length < 1) {
+    throw new Error(
+      "githubApp.allowedRepositories must contain at least one repository when enabled",
+    );
+  }
+  if (
+    githubApp.webhookHost !== undefined &&
+    (typeof githubApp.webhookHost !== "string" || !githubApp.webhookHost.trim())
+  ) {
+    throw new Error("githubApp.webhookHost must be a non-empty string when set");
+  }
+  if (
+    githubApp.webhookPort !== undefined &&
+    (!Number.isInteger(githubApp.webhookPort) ||
+      githubApp.webhookPort < 1 ||
+      githubApp.webhookPort > 65535)
+  ) {
+    throw new Error("githubApp.webhookPort must be an integer between 1 and 65535 when set");
   }
 }
 

@@ -3,13 +3,16 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
-import type { RuntimeFailureCode } from "../src/domain.ts";
+import type { MasweConfig, RuntimeFailureCode } from "../src/domain.ts";
 import { FileRunStore, migrateRunRecord } from "../src/store.ts";
 import os from "node:os";
 
 type JsonSchema = {
   $ref?: string;
   $defs?: Record<string, JsonSchema>;
+  allOf?: JsonSchema[];
+  if?: JsonSchema;
+  then?: JsonSchema;
   required?: string[];
   properties?: Record<string, JsonSchema>;
   items?: JsonSchema;
@@ -19,14 +22,23 @@ type JsonSchema = {
   maximum?: number;
   minLength?: number;
   maxLength?: number;
+  minItems?: number;
   maxItems?: number;
   pattern?: string;
   enum?: unknown[];
   additionalProperties?: boolean;
+  dependentRequired?: Record<string, string[]>;
 };
 
 function resolveRef(root: JsonSchema, schema: JsonSchema): JsonSchema {
   if (!schema.$ref) return schema;
+  if (
+    schema.$ref ===
+    "https://github.com/tomazb/cursor-multi-agent-software-engineer/schemas/config.schema.json"
+  ) {
+    // External config-schema semantics are exercised directly in this file and at runtime.
+    return { type: "object" };
+  }
   const match = schema.$ref.match(/^#\/\$defs\/(.+)$/);
   if (!match) throw new Error(`Unsupported $ref ${schema.$ref}`);
   const resolved = root.$defs?.[match[1]!];
@@ -36,6 +48,20 @@ function resolveRef(root: JsonSchema, schema: JsonSchema): JsonSchema {
 
 function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, label: string): void {
   const effective = resolveRef(root, schema);
+  for (const child of effective.allOf ?? []) {
+    assertMatches(root, child, value, `${label}.allOf`);
+  }
+  if (effective.if && effective.then) {
+    let conditionMatches = true;
+    try {
+      assertMatches(root, effective.if, value, `${label}.if`);
+    } catch {
+      conditionMatches = false;
+    }
+    if (conditionMatches) {
+      assertMatches(root, effective.then, value, `${label}.then`);
+    }
+  }
   if (effective.const !== undefined) {
     assert.equal(value, effective.const, `${label} const`);
   }
@@ -48,6 +74,12 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
     const obj = value as Record<string, unknown>;
     for (const key of effective.required ?? []) {
       assert.ok(Object.hasOwn(obj, key), `${label}.${key} required`);
+    }
+    for (const [key, dependencies] of Object.entries(effective.dependentRequired ?? {})) {
+      if (!Object.hasOwn(obj, key)) continue;
+      for (const dependency of dependencies) {
+        assert.ok(Object.hasOwn(obj, dependency), `${label}.${dependency} dependentRequired`);
+      }
     }
     for (const [key, child] of Object.entries(effective.properties ?? {})) {
       if (Object.hasOwn(obj, key)) {
@@ -65,6 +97,12 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
   }
   if (effective.type === "array") {
     assert.ok(Array.isArray(value), label);
+    if (effective.minItems !== undefined) {
+      assert.ok(
+        (value as unknown[]).length >= effective.minItems,
+        `${label} minItems`,
+      );
+    }
     if (effective.maxItems !== undefined) {
       assert.ok(
         (value as unknown[]).length <= effective.maxItems,
@@ -101,6 +139,28 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
   }
 }
 
+async function loadConfigSchema(): Promise<JsonSchema> {
+  return JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/config.schema.json"), "utf8"),
+  ) as JsonSchema;
+}
+
+function configWithGitHubApp(
+  overrides: Partial<NonNullable<MasweConfig["githubApp"]>> = {},
+): MasweConfig {
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.githubApp = {
+    enabled: true,
+    readOnlyChecks: true,
+    webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+    appIdEnv: "MASWE_GITHUB_APP_ID",
+    privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+    allowedRepositories: ["owner/repo"],
+    ...overrides,
+  };
+  return config;
+}
+
 test("schema assertion rejects fractional values for integer fields", () => {
   const integerSchema = { type: "integer" };
 
@@ -110,11 +170,67 @@ test("schema assertion rejects fractional values for integer fields", () => {
   );
 });
 
+test("schema assertion enforces dependent required object properties", () => {
+  const schema: JsonSchema = {
+    type: "object",
+    properties: {
+      suspensionReason: { type: "string" },
+      suspended: { type: "boolean" },
+    },
+    dependentRequired: {
+      suspensionReason: ["suspended"],
+    },
+  };
+
+  assert.throws(
+    () => assertMatches(schema, schema, { suspensionReason: "closed" }, "github"),
+    /github\.suspended dependentRequired/,
+  );
+});
+
 test("DEFAULT_CONFIG satisfies config JSON schema required shape", async () => {
   const schema = JSON.parse(
     await readFile(path.join(process.cwd(), "schemas/config.schema.json"), "utf8"),
   ) as JsonSchema;
   assertMatches(schema, schema, DEFAULT_CONFIG, "config");
+});
+
+test("config schema rejects enabled GitHub App write mode", async () => {
+  const schema = await loadConfigSchema();
+  const config = configWithGitHubApp({ readOnlyChecks: false });
+
+  assert.throws(
+    () => assertMatches(schema, schema, config, "config.githubApp.write-mode"),
+    /const/,
+  );
+});
+
+test("config schema rejects an enabled GitHub App with an empty allowlist", async () => {
+  const schema = await loadConfigSchema();
+  const config = configWithGitHubApp({ allowedRepositories: [] });
+
+  assert.throws(
+    () => assertMatches(schema, schema, config, "config.githubApp.empty-allowlist"),
+    /minItems/,
+  );
+});
+
+test("config schema accepts an enabled read-only GitHub App with an allowed repository", async () => {
+  const schema = await loadConfigSchema();
+  const config = configWithGitHubApp();
+
+  assert.doesNotThrow(() =>
+    assertMatches(schema, schema, config, "config.githubApp.enabled"),
+  );
+});
+
+test("config schema accepts a disabled GitHub App with an empty allowlist", async () => {
+  const schema = await loadConfigSchema();
+  const config = configWithGitHubApp({ enabled: false, allowedRepositories: [] });
+
+  assert.doesNotThrow(() =>
+    assertMatches(schema, schema, config, "config.githubApp.disabled"),
+  );
 });
 
 test("config schema requires the normalized doctor probe timeout", async () => {
@@ -128,14 +244,145 @@ test("config schema requires the normalized doctor probe timeout", async () => {
   );
 });
 
-test("persisted run records satisfy run-record schema required shape", async () => {
+test("persisted run records satisfy run-record schema required shape", async (t) => {
   const schema = JSON.parse(
     await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
   ) as JsonSchema;
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
   const store = new FileRunStore(cwd);
   const run = await store.create("schema", "check", DEFAULT_CONFIG);
   assertMatches(schema, schema, run, "run");
+});
+
+test("persisted run config uses the exact config schema and rejects nested secrets", async (t) => {
+  const configSchema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/config.schema.json"), "utf8"),
+  ) as JsonSchema & { $id?: string };
+  const runSchema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  assert.equal(runSchema.properties?.config?.$ref, configSchema.$id);
+  assert.equal(runSchema.additionalProperties, false);
+
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-config-exact-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("schema", "config exactness", DEFAULT_CONFIG);
+  (run.config as unknown as Record<string, unknown>).inlineToken = "must-not-survive";
+  assert.throws(() => migrateRunRecord(run), /unsupported config field/i);
+  delete (run.config as unknown as Record<string, unknown>).inlineToken;
+  (run.config.policy as unknown as Record<string, unknown>).privateKey = "must-not-survive";
+  assert.throws(() => migrateRunRecord(run), /unsupported config field/i);
+  delete (run.config.policy as unknown as Record<string, unknown>).privateKey;
+  (run as unknown as Record<string, unknown>).token = "must-not-survive";
+  assert.throws(() => migrateRunRecord(run), /unsupported run record field/i);
+  assert.throws(() => assertMatches(runSchema, runSchema, run, "run"), /additionalProperties/);
+});
+
+test("run-record schema and runtime migration reject non-positive GitHub installation ids", async (t) => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-github-installation-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("schema", "check", DEFAULT_CONFIG);
+  run.github = {
+    installationId: 0,
+    repository: "owner/repo",
+    pullRequestNumber: 1,
+    baseSha: "base",
+    headSha: "head",
+    branch: "feature",
+  };
+
+  assert.equal(
+    schema.properties?.github?.properties?.installationId?.minimum,
+    1,
+  );
+  assert.throws(
+    () => assertMatches(schema, schema, run, "run"),
+    /github\.installationId/,
+  );
+  assert.throws(() => migrateRunRecord(run), /installationId/i);
+});
+
+test("run records durably validate bounded pending GitHub head cancellations", async (t) => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-github-cancellation-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("schema", "check", DEFAULT_CONFIG);
+  run.github = {
+    installationId: 1,
+    repository: "owner/repo",
+    pullRequestNumber: 1,
+    baseSha: "base",
+    headSha: "head",
+    branch: "feature",
+  };
+  (run.github as unknown as Record<string, unknown>).pendingCancellationHeadShas = ["old-head"];
+
+  assert.doesNotThrow(() => assertMatches(schema, schema, run, "run"));
+  assert.doesNotThrow(() => migrateRunRecord(run));
+  (run.github as unknown as Record<string, unknown>).pendingCancellationHeadShas = [
+    "old-head",
+    "old-head",
+  ];
+  assert.throws(() => migrateRunRecord(run), /pendingCancellationHeadShas/);
+});
+
+test("run migration rejects unsupported and malformed GitHub association fields", async (t) => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  assert.deepEqual(schema.properties?.github?.dependentRequired, {
+    suspensionReason: ["suspended"],
+  });
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-github-exact-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("schema", "check", DEFAULT_CONFIG);
+  run.github = {
+    installationId: 1,
+    repository: "owner/repo",
+    pullRequestNumber: 1,
+    baseSha: "base",
+    headSha: "head",
+    branch: "feature",
+  };
+  (run.github as unknown as Record<string, unknown>).token = "must-not-be-retained";
+  assert.throws(() => migrateRunRecord(run), /unsupported.*github.*token/i);
+  delete (run.github as unknown as Record<string, unknown>).token;
+  (run.github as unknown as Record<string, unknown>).repository = "not-a-repository";
+  assert.throws(() => migrateRunRecord(run), /github\.repository/i);
+});
+
+test("run migration and schema reject whitespace-only GitHub identity fields", async (t) => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  for (const field of ["baseSha", "headSha", "branch"] as const) {
+    await t.test(field, async () => {
+      const cwd = await mkdtemp(path.join(os.tmpdir(), `maswe-schema-github-${field}-`));
+      t.after(async () => rm(cwd, { recursive: true, force: true }));
+      const run = await new FileRunStore(cwd).create("schema", "check", DEFAULT_CONFIG);
+      run.github = {
+        installationId: 1,
+        repository: "owner/repo",
+        pullRequestNumber: 1,
+        baseSha: "base",
+        headSha: "head",
+        branch: "feature",
+        [field]: "   ",
+      };
+      assert.throws(() => assertMatches(schema, schema, run, "run"), new RegExp(field));
+      assert.throws(() => migrateRunRecord(run), new RegExp(field));
+    });
+  }
 });
 
 test("run-record schema validates optional bounded durable runtime failure metadata", async () => {

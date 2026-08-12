@@ -220,6 +220,88 @@ Cursor CLI assistant extraction and terminal markers:
 - Marker validation rejects quoted examples, embedded tokens, duplicates, conflicts, non-final markers, and content after a marker. Operator-visible messages name the violated contract and logical line number without dumping full model output.
 - Authenticated validation for the earlier JSON-marker repair used Cursor CLI `2026.07.23-e383d2b` on Linux. A new exact-head external validation is required after the Thermos blocker repairs; do not infer broader provider or platform coverage.
 
+### GitHub App Phase A operations
+
+When `githubApp.enabled` is true, `readOnlyChecks` must be true and
+`allowedRepositories` must contain at least one `owner/repo`. A disabled configuration may retain
+an empty list.
+
+`maswe github-webhook` probes all required journals, enumerates every exact retained legacy
+per-check lock, migrates the legacy flat delivery directory,
+recovers interrupted queue leases, and starts one worker before the listener becomes ready.
+`maswe github-publish-checks <run-id>` probes association, check-create, and per-PR publication
+journals before token or API work, but it does not scan or reclaim the listener's inbox. Each
+journal contains `format.json` plus `data`, `admin`, and `admin-recovery` streams with immutable
+`claims`, `releases`, and `tmp` records. Do not prune them.
+
+Listener readiness also requires the configured webhook secret, App ID, and private-key
+environment variables to be present. Only presence is checked; credential values and configured
+environment-variable names are not persisted or written to diagnostics.
+
+The listener defaults to loopback. An explicit `0.0.0.0` or `::` binding is an operator opt-in and
+must sit behind a TLS-terminating reverse proxy plus network admission controls. Keep signature
+verification mandatory even if the proxy restricts GitHub source ranges. Configure the proxy and
+firewall with a one MiB body ceiling, bounded connection/rate concurrency, header and body-idle
+timeouts, and an end-to-end request timeout that allows the app's eight-second ingress deadline to
+return before GitHub's ten-second cutoff. Do not trust forwarded identity or authorization headers.
+
+Run exactly one webhook listener/worker plus simultaneous manual publishers on one host and one
+coherent local filesystem with atomic no-clobber hard links. This is not a distributed queue. NFS,
+SMB, distributed FUSE, object-store mounts, cross-host use, a second listener, and filesystems
+without hard-link support are unsupported. Before upgrading legacy locks or flat delivery state,
+stop every old webhook server and manual publisher and back up the complete `.maswe/github/` tree.
+Start one new listener; it retains digest-bound legacy evidence. Mixed old/new execution is
+unsupported.
+
+Webhook response semantics are operationally significant:
+
+- completed duplicates and intentionally unsupported events/actions return 200;
+- a same-ID/body queued or processing duplicate returns 202; a different body/event for the same
+  ID returns 409;
+- malformed headers/body return 400, forged signatures return 401, and oversized bodies return
+  413;
+- durable handoff/storage failure returns 503. GitHub does not guarantee automatic redelivery, so
+  alert on this response and use operator-initiated webhook redelivery if necessary;
+- other handler failures return a generic 500 body while details are emitted only to local
+  diagnostics.
+
+The 202 response is sent only after exact-byte HMAC verification, strict UTF-8/JSON normalization,
+and file-plus-directory sync of the normalized envelope and queue marker. It does not wait for
+live-head or Checks API calls. The persisted envelope contains the normalized event, event name,
+delivery ID, receive time, raw-body SHA-256, and queue lease fields only—never raw request bytes,
+signatures, headers, tokens, secrets, keys, or arbitrary error text.
+
+One sub-ten-second deadline covers body receipt through durable handoff. A body timeout destroys
+the incomplete request and reports that handoff never started. Once handoff starts, a deadline
+returns 503 with an outcome-unknown diagnostic while the local filesystem operation finishes;
+same-delivery replay reconciles either result without duplicate dispatch.
+
+Every production GitHub HTTP request has a 30-second default deadline, including installation
+token, live-head, Checks API, webhook-triggered, and manual-publication calls. Rate-limit retries
+remain bounded and do not create an indefinite request. Check reconciliation uses the full digest
+of repository/PR/head/name/attempt and visits bounded `filter=all`, 100-item pages before creating
+a replacement.
+
+Normal delivery lookup is hash-addressed beneath `inbox/state/<prefix>/<digest>/`; pending markers
+are under `inbox/queue/<prefix>/`. Startup alone scans/migrates legacy `deliveries/` files into
+`inbox/legacy/<prefix>/<digest>/`. A version-1 completed delivery becomes a terminal legacy
+tombstone. A version-1 processing record has no persisted normalized event and therefore becomes
+`awaiting-redelivery`; request redelivery rather than fabricating a payload.
+
+The single worker holds one exact 30-second lease, heartbeats every five seconds, and retries with
+exponential backoff from 250 ms capped at 30 seconds. An embedding stop waits up to five seconds by
+default; interruption leaves the lease durable for pre-listener startup recovery. Manual
+`github-publish-checks` republishes one run's checks and is not a queue repair command.
+
+Retain completed tombstones, side-effect records, migrated legacy evidence, and immutable journals
+for the lifetime of the active integration. No active-state pruning is supported because signed
+webhooks have no replay-expiry field. Monitor filesystem bytes/inodes, queue depth, oldest queued
+receive time, retry diagnostics, and journal growth; stop ingress before capacity exhaustion.
+After the new listener acknowledges traffic, rollback to an old binary or restoration of the
+pre-upgrade backup can strand accepted work. Stop traffic and roll forward with the complete state
+tree. Archive the whole tree only after permanent endpoint disablement and webhook-secret
+rotation/revocation.
+
 ## 4. Configure quality commands
 
 Replace starter commands with commands that are authoritative for the target repository, for example:

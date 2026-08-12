@@ -8,6 +8,29 @@ The project follows semantic versioning once a public release process is establi
 
 ### Added
 
+- GitHub App Phase A read-only pilot (`src/github/`): webhook signature verification,
+  `X-GitHub-Delivery` deduplication, event normalization, PR/run association, SHA-bound check
+  publishing for four MASWE checks, installation suspension, and CLI commands
+  `maswe github-webhook` / `maswe github-publish-checks`.
+- Optional `githubApp` config (enabled only with `readOnlyChecks: true`) and `RunRecord.github`
+  association fields with schema and artifact-contract updates.
+- Integration coverage for forged signatures, delivery replay, stale SHA invalidation, rate limits,
+  and installation removal.
+- Immutable hash-addressed GitHub association, check-create, and delivery journals with startup
+  hard-link probing, quiescent retained-path legacy migration, and same-host coherent-filesystem
+  support boundaries.
+- Retained migration of legacy delivery/recovery evidence, full-digest check identity, bounded
+  paginated reconciliation, and a 30-second default deadline per GitHub HTTP request.
+- Hash-addressed normalized webhook inbox with file/directory-synced acknowledgement, exact leases,
+  heartbeat/backoff, pre-listener restart recovery, terminal tombstones, and quiescent migration of
+  legacy delivery evidence without persisting raw bodies or credentials.
+- Review hardening for Phase A: canonical `03-specification-and-design.md` check binding, real
+  installation tokens for unassociated PRs, delivery complete-after-success, exact PR association
+  matching, scoped checks tokens, PATCH without `head_sha`, webhook body limits, rate-limit
+  backoff, push invalidation, out-of-order SHA rejection, and association index locking.
+- GitHub delivery-ID validation at every ingress boundary, with malformed IDs rejected before
+  durable mutation and malformed installation-token responses using the stable
+  `Installation token response missing token` error.
 - `policy.doctorProbeTimeoutMs` configuration contract (default `60_000`, integer bounds
   `1_000..300_000`) with fail-closed validation and schema coverage.
 - Typed doctor check codes across runtimes plus CLI `maswe doctor --json` output of full
@@ -49,6 +72,13 @@ The project follows semantic versioning once a public release process is establi
   the active version, supported range, canonical baseline, and an optional NVM recovery command.
 - Cursor CLI doctor probe timeout now uses `policy.doctorProbeTimeoutMs` instead of the former
   implicit 5-second cap (`Math.min(5_000, commandTimeoutMs)`).
+- Phase A webhook acknowledgement now returns 202 only after durable normalized handoff, 200 for
+  completed/unsupported deliveries, 202 for same-ID queued/processing duplicates, 409 for a
+  same-ID content conflict, and 503 for handoff failure. Internal failures emit sanitized local
+  diagnostics and expose only a generic HTTP 500 body.
+- Enabled `githubApp` JSON Schema validation now matches runtime policy by requiring
+  `readOnlyChecks: true` and at least one allowed repository; disabled configuration may retain an
+  empty repository list.
 - Cursor CLI doctor classification now separates executable-unavailable, version-check failures,
   catalogue failures, role-resolution failures, skipped-prerequisite failures, probe invocation
   failures, probe transport timeouts, cleanup failures, and doctor unexpected errors.
@@ -116,7 +146,7 @@ The project follows semantic versioning once a public release process is establi
 
 ### Planned
 
-- GitHub App webhooks, check runs, and review-thread automation.
+- GitHub App Phase B: push/PR writes, review-thread replies, digest-bound GitHub approvals, Actions artifact ingestion.
 - SQLite and PostgreSQL stores.
 - Remote control-plane API and MCP server.
 

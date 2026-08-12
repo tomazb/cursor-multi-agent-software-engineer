@@ -1,6 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
+import {
+  DurableAtomicWriteOutcomeUnknownError,
+  MAX_AUTHORITATIVE_FILE_BYTES,
+  readBoundedOrdinaryFile,
+  requireOrdinaryDirectory,
+  writeDurableAtomic,
+  type DurableFileOptions,
+} from "./durable-file.ts";
 import type {
   ArtifactReference,
   MasweConfig,
@@ -26,6 +34,11 @@ import {
   sanitizeDiagnostic,
 } from "./redaction.ts";
 import { sanitizeDurableRuntimeFailureSummary } from "./failure-diagnostics.ts";
+import {
+  exactRunRecord,
+  nonNegativeRunRecordInteger,
+  requiredRunRecordString,
+} from "./run-record-validation.ts";
 import { transition } from "./state-machine.ts";
 
 function now(): string {
@@ -43,14 +56,6 @@ function sha256(content: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function writeAtomic(filePath: string, content: string): Promise<void> {
-  const directory = path.dirname(filePath);
-  await mkdir(directory, { recursive: true });
-  const tempPath = path.join(directory, `.${path.basename(filePath)}.${randomUUID()}.tmp`);
-  await writeFile(tempPath, content, "utf8");
-  await rename(tempPath, filePath);
 }
 
 interface LockMeta {
@@ -177,32 +182,106 @@ function sanitizeRunFailureState(run: RunRecord): RunRecord {
   return run;
 }
 
+const RUN_RECORD_FIELDS = new Set([
+  "schemaVersion",
+  "version",
+  "id",
+  "title",
+  "request",
+  "repositoryPath",
+  "state",
+  "createdAt",
+  "updatedAt",
+  "approvals",
+  "counters",
+  "config",
+  "artifacts",
+  "events",
+  "workspace",
+  "evidence",
+  "github",
+  "supersedes",
+  "supersededBy",
+  "failure",
+]);
+
 export function migrateRunRecord(raw: unknown): RunRecord {
   if (!raw || typeof raw !== "object") {
     throw new Error("Run record is not a JSON object");
   }
   const candidate = raw as Record<string, unknown>;
+  const unsupported = Object.keys(candidate).find((key) => !RUN_RECORD_FIELDS.has(key));
+  if (unsupported) {
+    throw new Error(`Unsupported run record field: ${unsupported}`);
+  }
   if (candidate.schemaVersion !== 1) {
     throw new Error(
       `Unsupported run schemaVersion ${String(candidate.schemaVersion)}; expected 1`,
     );
   }
+  if (!("config" in candidate)) {
+    throw new Error("Run record config is required");
+  }
 
-  const artifactsRaw = Array.isArray(candidate.artifacts) ? candidate.artifacts : [];
+  if (candidate.artifacts !== undefined && !Array.isArray(candidate.artifacts)) {
+    throw new Error("Run record artifacts must be an array");
+  }
+  // Schema-v1 records from the earliest release omitted artifacts and version.
+  const artifactsRaw = candidate.artifacts ?? [];
   const artifacts: ArtifactReference[] = artifactsRaw.map((item, index) => {
-    if (!item || typeof item !== "object") {
-      throw new Error(`Run artifact[${index}] is invalid`);
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`Run artifact[${index}] must be an object`);
     }
     const artifact = item as Record<string, unknown>;
-    const name = String(artifact.name ?? "");
-    if (!name) throw new Error(`Run artifact[${index}] is missing name`);
+    const allowedArtifactFields = new Set([
+      "name",
+      "logicalName",
+      "attempt",
+      "path",
+      "sha256",
+      "createdAt",
+    ]);
+    const unsupportedArtifact = Object.keys(artifact).find(
+      (key) => !allowedArtifactFields.has(key),
+    );
+    if (unsupportedArtifact) {
+      throw new Error(`Unsupported run artifact[${index}] field: ${unsupportedArtifact}`);
+    }
+    for (const field of ["name", "path", "sha256"] as const) {
+      if (!(field in artifact)) throw new Error(`Run artifact[${index}].${field} is required`);
+    }
+    const name = requiredRunRecordString(
+      artifact.name,
+      `Run artifact[${index}].name`,
+      false,
+    );
+    const logicalName = artifact.logicalName === undefined
+      ? name
+      : requiredRunRecordString(
+          artifact.logicalName,
+          `Run artifact[${index}].logicalName`,
+          false,
+        );
+    const attempt = artifact.attempt === undefined
+      ? 1
+      : nonNegativeRunRecordInteger(artifact.attempt, `Run artifact[${index}].attempt`);
+    if (attempt < 1) throw new Error(`Run artifact[${index}].attempt must be positive`);
+    const digest = requiredRunRecordString(
+      artifact.sha256,
+      `Run artifact[${index}].sha256`,
+    );
+    if (!/^[a-f0-9]{64}$/.test(digest)) {
+      throw new Error(`Run artifact[${index}].sha256 is invalid`);
+    }
     return {
       name,
-      logicalName: String(artifact.logicalName ?? name),
-      attempt: typeof artifact.attempt === "number" && artifact.attempt >= 1 ? artifact.attempt : 1,
-      path: String(artifact.path ?? ""),
-      sha256: String(artifact.sha256 ?? ""),
-      createdAt: String(artifact.createdAt ?? now()),
+      logicalName,
+      attempt,
+      path: requiredRunRecordString(artifact.path, `Run artifact[${index}].path`),
+      sha256: digest,
+      createdAt: artifact.createdAt === undefined
+        ? now()
+        : requiredRunRecordString(artifact.createdAt, `Run artifact[${index}].createdAt`),
     };
   });
 
@@ -210,43 +289,107 @@ export function migrateRunRecord(raw: unknown): RunRecord {
   // Same type/range assertion as project config load — never apply env overrides here.
   assertConfig(migratedConfig);
 
-  if (candidate.version === undefined) {
-    return sanitizeRunFailureState({
-      ...(candidate as unknown as RunRecord),
-      version: 1,
-      artifacts,
-      config: migratedConfig,
-    });
+  const github = candidate.github;
+  if (github !== undefined) {
+    if (!github || typeof github !== "object" || Array.isArray(github)) {
+      throw new Error("Run record github association is invalid");
+    }
+    const association = github as Record<string, unknown>;
+    const allowed = new Set([
+      "installationId",
+      "repository",
+      "pullRequestNumber",
+      "baseSha",
+      "headSha",
+      "branch",
+      "suspended",
+      "suspensionReason",
+      "pendingCancellationHeadShas",
+    ]);
+    const unsupported = Object.keys(association).find((key) => !allowed.has(key));
+    if (unsupported) {
+      throw new Error(`Unsupported run record github field: ${unsupported}`);
+    }
+    const installationId = association.installationId;
+    if (!Number.isSafeInteger(installationId) || (installationId as number) < 1) {
+      throw new Error("Run record github.installationId must be a positive integer");
+    }
+    if (
+      typeof association.repository !== "string" ||
+      !/^[^/\s]+\/[^/\s]+$/.test(association.repository) ||
+      association.repository !== association.repository.toLowerCase()
+    ) {
+      throw new Error("Run record github.repository must be a canonical owner/repo string");
+    }
+    const pullRequestNumber = association.pullRequestNumber;
+    if (!Number.isSafeInteger(pullRequestNumber) || (pullRequestNumber as number) < 1) {
+      throw new Error("Run record github.pullRequestNumber must be a positive integer");
+    }
+    for (const key of ["baseSha", "headSha", "branch"] as const) {
+      if (typeof association[key] !== "string" || !association[key].trim()) {
+        throw new Error(`Run record github.${key} must be a non-empty string`);
+      }
+    }
+    if (association.suspended !== undefined && typeof association.suspended !== "boolean") {
+      throw new Error("Run record github.suspended must be a boolean when set");
+    }
+    if (
+      association.suspensionReason !== undefined &&
+      (association.suspended !== true ||
+        (association.suspensionReason !== "pull-request-closed" &&
+          association.suspensionReason !== "authorization-revoked"))
+    ) {
+      throw new Error("Run record github.suspensionReason is invalid");
+    }
+    const pending = association.pendingCancellationHeadShas;
+    if (pending !== undefined) {
+      if (
+        !Array.isArray(pending) ||
+        pending.length < 1 ||
+        pending.length > 64 ||
+        pending.some((headSha) => typeof headSha !== "string" || !headSha) ||
+        new Set(pending).size !== pending.length ||
+        pending.includes(association.headSha)
+      ) {
+        throw new Error("Run record github.pendingCancellationHeadShas is invalid");
+      }
+    }
   }
 
-  if (typeof candidate.version !== "number" || candidate.version < 1) {
+  const version = candidate.version ?? 1;
+  if (!Number.isSafeInteger(version) || Number(version) < 1) {
     throw new Error("Run record version is missing or invalid (fail-closed)");
   }
-
-  return sanitizeRunFailureState({
-    ...(candidate as unknown as RunRecord),
-    config: migratedConfig,
-    artifacts:
-      artifacts.length > 0
-        ? artifacts
-        : ((candidate as unknown as RunRecord).artifacts ?? []),
-  });
+  return sanitizeRunFailureState(
+    exactRunRecord(candidate, Number(version), migratedConfig, artifacts),
+  );
 }
 
 export class FileRunStore implements RunStore {
   readonly root: string;
   private readonly cwd: string;
   private readonly lockRetries: number;
+  private readonly durableOptions: DurableFileOptions;
+  private readonly maxRunFileBytes: number;
 
   constructor(
     cwd: string,
-    options: { lockStaleMs?: number; lockRetries?: number } = {},
+    options: {
+      lockStaleMs?: number;
+      lockRetries?: number;
+      maxRunFileBytes?: number;
+    } & DurableFileOptions = {},
   ) {
     this.cwd = cwd;
     this.root = path.join(cwd, ".maswe", "runs");
     // lockStaleMs retained for API compatibility; reclaim is ownership/PID based, not age based.
     void options.lockStaleMs;
     this.lockRetries = options.lockRetries ?? 50;
+    this.durableOptions = options;
+    this.maxRunFileBytes = options.maxRunFileBytes ?? MAX_AUTHORITATIVE_FILE_BYTES;
+    if (!Number.isSafeInteger(this.maxRunFileBytes) || this.maxRunFileBytes < 1) {
+      throw new Error("Run record capacity must be a positive integer");
+    }
   }
 
   private runDirectory(runId: string): string {
@@ -267,8 +410,88 @@ export class FileRunStore implements RunStore {
   }
 
   private async readRunFile(runId: string): Promise<RunRecord> {
-    const raw = await readFile(this.runFile(runId), "utf8");
-    return migrateRunRecord(JSON.parse(raw));
+    try {
+      await requireOrdinaryDirectory(path.dirname(this.root), "MASWE state namespace");
+      await requireOrdinaryDirectory(this.root, "run store namespace");
+      await requireOrdinaryDirectory(this.runDirectory(runId), "run record namespace");
+      const raw = await readBoundedOrdinaryFile(
+        this.runFile(runId),
+        "run record",
+        this.maxRunFileBytes,
+      );
+      const record = migrateRunRecord(JSON.parse(raw));
+      if (record.id !== runId) {
+        throw new Error(`Run record id ${record.id} does not match requested run id ${runId}`);
+      }
+      return record;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        const missing = new Error(`Run ${runId} not found`, { cause: error }) as NodeJS.ErrnoException;
+        missing.code = "ENOENT";
+        throw missing;
+      }
+      throw error;
+    }
+  }
+
+  private prepareRunRecord(run: RunRecord): { record: RunRecord; content: string } {
+    const exact = migrateRunRecord(run);
+    const content = `${JSON.stringify(exact, null, 2)}\n`;
+    if (Buffer.byteLength(content, "utf8") > this.maxRunFileBytes) {
+      throw new Error(`Run record exceeds its bounded ${this.maxRunFileBytes}-byte capacity`);
+    }
+    return { record: exact, content };
+  }
+
+  private async writePreparedRunRecord(
+    prepared: { record: RunRecord; content: string },
+  ): Promise<void> {
+    await writeDurableAtomic(
+      this.runFile(prepared.record.id),
+      prepared.content,
+      "run record",
+      this.durableOptions,
+    );
+  }
+
+  private adoptRunRecord(target: RunRecord, source: RunRecord): void {
+    const mutable = target as unknown as Record<string, unknown>;
+    for (const key of Object.keys(mutable)) delete mutable[key];
+    Object.assign(mutable, source);
+  }
+
+  private adoptArtifactPublication(target: RunRecord, source: RunRecord): void {
+    target.version = source.version;
+    target.updatedAt = source.updatedAt;
+    target.artifacts = source.artifacts;
+  }
+
+  private async matchingCanonicalRecord(
+    prepared: { record: RunRecord; content: string },
+  ): Promise<RunRecord | undefined> {
+    try {
+      const observed = await this.readRunFile(prepared.record.id);
+      const observedContent = `${JSON.stringify(observed, null, 2)}\n`;
+      return observedContent === prepared.content ? observed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async writeAndReconcile(
+    target: RunRecord,
+    prepared: { record: RunRecord; content: string },
+  ): Promise<void> {
+    try {
+      await this.writePreparedRunRecord(prepared);
+      this.adoptRunRecord(target, prepared.record);
+    } catch (error) {
+      if (error instanceof DurableAtomicWriteOutcomeUnknownError) {
+        const observed = await this.matchingCanonicalRecord(prepared);
+        if (observed) this.adoptRunRecord(target, observed);
+      }
+      throw error;
+    }
   }
 
   /**
@@ -531,13 +754,13 @@ export class FileRunStore implements RunStore {
       events: [],
     };
     await this.withLock(run.id, async () => {
-      await writeAtomic(this.runFile(run.id), `${JSON.stringify(run, null, 2)}\n`);
+      const prepared = this.prepareRunRecord(run);
+      await this.writeAndReconcile(run, prepared);
     });
     return run;
   }
 
   async save(run: RunRecord): Promise<void> {
-    sanitizeRunFailureState(run);
     await this.withLock(run.id, async () => {
       const onDisk = await this.readRunFile(run.id);
       if (onDisk.version !== run.version) {
@@ -545,9 +768,13 @@ export class FileRunStore implements RunStore {
           `Run ${run.id} version conflict: expected ${run.version}, on disk ${onDisk.version}`,
         );
       }
-      run.version += 1;
-      run.updatedAt = now();
-      await writeAtomic(this.runFile(run.id), `${JSON.stringify(run, null, 2)}\n`);
+      const candidate = {
+        ...run,
+        version: run.version + 1,
+        updatedAt: now(),
+      } satisfies RunRecord;
+      const prepared = this.prepareRunRecord(candidate);
+      await this.writeAndReconcile(run, prepared);
     });
   }
 
@@ -614,10 +841,6 @@ export class FileRunStore implements RunStore {
       const relativePath = path.join(".maswe", "runs", run.id, "artifacts", fileName);
       const absolutePath = path.join(this.cwd, relativePath);
       const redacted = redactSecrets(content);
-      await mkdir(path.dirname(absolutePath), { recursive: true });
-      const tempPath = `${absolutePath}.${randomUUID()}.tmp`;
-      await writeFile(tempPath, redacted, "utf8");
-      await rename(tempPath, absolutePath);
 
       const reference: ArtifactReference = {
         name: logicalName,
@@ -640,11 +863,26 @@ export class FileRunStore implements RunStore {
       ];
       next.version += 1;
       next.updatedAt = now();
-      await writeAtomic(this.runFile(run.id), `${JSON.stringify(next, null, 2)}\n`);
+      // The authoritative record capacity is known before artifact publication, so a
+      // deterministic record overflow cannot leave an orphaned artifact behind.
+      const prepared = this.prepareRunRecord(next);
+      await writeDurableAtomic(
+        absolutePath,
+        redacted,
+        "run artifact",
+        this.durableOptions,
+      );
+      try {
+        await this.writePreparedRunRecord(prepared);
+        this.adoptArtifactPublication(run, prepared.record);
+      } catch (error) {
+        if (error instanceof DurableAtomicWriteOutcomeUnknownError) {
+          const observed = await this.matchingCanonicalRecord(prepared);
+          if (observed) this.adoptArtifactPublication(run, observed);
+        }
+        throw error;
+      }
 
-      run.version = next.version;
-      run.updatedAt = next.updatedAt;
-      run.artifacts = next.artifacts;
       return reference;
     });
   }

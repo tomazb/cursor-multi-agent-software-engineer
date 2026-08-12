@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -119,6 +119,158 @@ test("doctorProbeTimeoutMs accepts explicit bounds and rejects invalid values", 
       () => mergeConfigForTest({ policy: { doctorProbeTimeoutMs: value } }),
       /doctorProbeTimeoutMs/i,
       String(value),
+    );
+  }
+});
+
+test("githubApp is optional and omitted by default", () => {
+  const config = mergeConfigForTest({});
+  assert.equal(config.githubApp, undefined);
+});
+
+test("githubApp accepts enabled read-only pilot config", () => {
+  const config = mergeConfigForTest({
+    githubApp: {
+      enabled: true,
+      readOnlyChecks: true,
+      webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+      appIdEnv: "MASWE_GITHUB_APP_ID",
+      privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+      allowedRepositories: ["owner/repo"],
+      webhookHost: "127.0.0.1",
+      webhookPort: 8787,
+    },
+  });
+  assert.deepEqual(config.githubApp, {
+    enabled: true,
+    readOnlyChecks: true,
+    webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+    appIdEnv: "MASWE_GITHUB_APP_ID",
+    privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+    allowedRepositories: ["owner/repo"],
+    webhookHost: "127.0.0.1",
+    webhookPort: 8787,
+  });
+});
+
+test("githubApp rejects write mode when enabled in Phase A pilot", () => {
+  assert.throws(
+    () =>
+      mergeConfigForTest({
+        githubApp: {
+          enabled: true,
+          readOnlyChecks: false,
+          webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+          appIdEnv: "MASWE_GITHUB_APP_ID",
+          privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+          allowedRepositories: ["owner/repo"],
+        },
+      }),
+    /readOnlyChecks/,
+  );
+});
+
+test("githubApp rejects unsupported fields instead of retaining inline secrets", () => {
+  assert.throws(
+    () =>
+      mergeConfigForTest({
+        githubApp: {
+          enabled: true,
+          readOnlyChecks: true,
+          webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+          appIdEnv: "MASWE_GITHUB_APP_ID",
+          privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+          allowedRepositories: ["owner/repo"],
+          inlineSecret: "must-not-survive-normalization",
+        } as never,
+      }),
+    /unsupported config field.*githubApp.*inlineSecret/i,
+  );
+});
+
+test("githubApp rejects empty allowlist when enabled", () => {
+  assert.throws(
+    () =>
+      mergeConfigForTest({
+        githubApp: {
+          enabled: true,
+          readOnlyChecks: true,
+          webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+          appIdEnv: "MASWE_GITHUB_APP_ID",
+          privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+          allowedRepositories: [],
+        },
+      }),
+    /allowedRepositories/,
+  );
+});
+
+test("githubApp accepts an empty allowlist when disabled", () => {
+  const config = mergeConfigForTest({
+    githubApp: {
+      enabled: false,
+      readOnlyChecks: false,
+      webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+      appIdEnv: "MASWE_GITHUB_APP_ID",
+      privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+      allowedRepositories: [],
+    },
+  });
+
+  assert.deepEqual(config.githubApp?.allowedRepositories, []);
+});
+
+test("githubApp normalizes validated repository allowlist entries case-insensitively", () => {
+  const config = mergeConfigForTest({
+    githubApp: {
+      enabled: true,
+      readOnlyChecks: true,
+      webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+      appIdEnv: "MASWE_GITHUB_APP_ID",
+      privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+      allowedRepositories: ["Owner/Repo"],
+    },
+  });
+
+  assert.deepEqual(config.githubApp?.allowedRepositories, ["owner/repo"]);
+});
+
+test("project config rejects unknown fields throughout the runtime tree", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-config-exact-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  await mkdir(path.join(cwd, ".maswe"));
+  const configPath = path.join(cwd, ".maswe", "config.json");
+
+  for (const raw of [
+    { inlineToken: "top-level-secret" },
+    { runtime: { privateKey: "nested-secret" } },
+    { roles: { builder: { token: "nested-secret" } } },
+    { roles: { secretRole: { model: "nested-secret" } } },
+    { gates: { token: "nested-secret" } },
+    { quality: { privateKey: "nested-secret" } },
+    { policy: { token: "nested-secret" } },
+  ]) {
+    await writeFile(configPath, JSON.stringify(raw), "utf8");
+    await assert.rejects(loadConfig(cwd), /unsupported config field/i, JSON.stringify(raw));
+  }
+});
+
+test("GitHub credential references must be canonical environment variable names", () => {
+  for (const invalidName of ["1SECRET", "MASWE-SECRET", "MASWE SECRET", " SECRET", ""]) {
+    assert.throws(
+      () =>
+        mergeConfigForTest({
+          githubApp: {
+            enabled: true,
+            readOnlyChecks: true,
+            webhookSecretEnv: invalidName,
+            appIdEnv: "MASWE_GITHUB_APP_ID",
+            privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+            allowedRepositories: ["owner/repo"],
+          },
+        }),
+      /environment variable name/i,
+      JSON.stringify(invalidName),
     );
   }
 });

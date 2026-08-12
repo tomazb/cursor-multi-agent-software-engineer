@@ -43,16 +43,25 @@ Status: implemented.
 
 ## v0.3 — GitHub App pilot
 
-- GitHub App installation and webhook service.
-- Signature verification and delivery deduplication.
-- PR/head-SHA-bound run association.
-- Read-only MASWE check runs.
+Status: **Phase A (read-only checks) implemented**; Phase B remaining on issue #3.
+
+### Phase A (done)
+
+- GitHub App webhook service in `src/github/` (`maswe github-webhook`).
+- Signature verification and `X-GitHub-Delivery` deduplication.
+- PR/head-SHA-bound run association (`RunRecord.github` + association index).
+- Read-only MASWE check runs (four named checks; review-resolution stays `neutral`).
+- Check invalidation on new head SHA.
+- Integration tests for replay, forged signature, stale SHA, rate limit, and installation suspension.
+
+### Phase B (remaining)
+
 - Authenticated approval comments or labels.
 - Deterministic branch push and PR creation.
 - Review comment ingestion and evidence replies.
 - Human-approved resolver edits for pilot repositories.
-- Check invalidation on new commits.
 - GitHub Actions artifact ingestion.
+- Optional monorepo extraction to `apps/` / `packages/` with the v0.4 control plane.
 
 ## v0.4 — Durable control plane
 

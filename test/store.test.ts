@@ -30,6 +30,18 @@ test("writeArtifact keeps attempt history and logical latest pointer", async () 
   assert.match(content ?? "", /attempt two/);
 });
 
+test("writeArtifact preserves pending caller mutations for the following run save", async () => {
+  const store = await tempStore();
+  const run = await store.create("t", "r", DEFAULT_CONFIG);
+  run.counters.buildVerifyCycles = 1;
+
+  await store.writeArtifact(run, "04-builder-report.md", "BUILD_COMPLETE");
+
+  assert.equal(run.counters.buildVerifyCycles, 1);
+  await store.save(run);
+  assert.equal((await store.load(run.id)).counters.buildVerifyCycles, 1);
+});
+
 test("readArtifact fails closed when digest does not match file bytes", async () => {
   const store = await tempStore();
   const run = await store.create("t", "r", DEFAULT_CONFIG);

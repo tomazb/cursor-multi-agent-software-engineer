@@ -207,6 +207,12 @@ Read-only runtimes compare the fingerprint before and after execution. Any diffe
 
 Quality commands never come from model output, issue text, or PR comments.
 
+GitHub check publication uses a hash-addressed per-PR journal, separate from the short global
+association transaction. Old-head cancellation intent is also persisted on the run as a bounded
+SHA set and is cleared only after cancellation plus current-head publication completes. This keeps
+one rate-limited PR from holding the global association journal and makes partial publication
+retries deterministic.
+
 ## 4. Stage data flow
 
 ```mermaid
@@ -285,18 +291,35 @@ The CLI can run in CI against an existing checkout. Approval and GitHub event wi
 
 A service will own durable runs and workers, use PostgreSQL, issue idempotent jobs, launch Cursor cloud or self-hosted agents, receive GitHub webhooks, and expose HTTP/MCP interfaces.
 
-## 8. GitHub architecture — planned
+## 8. GitHub architecture — Phase A implemented
 
-The GitHub App will:
+Phase A (read-only checks) lives in `src/github/` and calls public orchestrator/store operations through `GitHubAppAdapter`. It:
 
-- Receive pull request, review, review comment/thread, push, and check events.
-- De-duplicate deliveries by webhook delivery ID.
-- Bind every verification result to the exact PR head SHA.
-- Create separate check runs for specification compliance, independent verification, and comment resolution.
-- Post evidence-based replies but resolve threads only after CI and verification pass.
-- Use installation tokens with least-privilege repository permissions.
+- Receives pull request, push, installation, and observe-only check/workflow events.
+- Verifies `X-Hub-Signature-256` over the exact bytes, strictly normalizes the JSON object, and
+  file/directory-syncs a hash-addressed normalized inbox envelope before returning 202. Completed
+  duplicates return 200, queued/processing duplicates return 202, and same-ID content conflicts
+  return 409. One lease worker recovers durable pending work before listener readiness.
+- Binds runs to repository/PR/head SHA via github.com HTTPS/SSH remotes only; invalidates local evidence when head SHA changes; fails closed when live-head lookup errors.
+- Creates separate check runs for specification compliance, deterministic quality, independent
+  verification, and review-comment resolution (resolution remains `neutral` until Phase B).
+  `external_id` hashes the complete idempotency key; missing local records reconcile through
+  bounded `filter=all`/100-item pagination before create. Concurrent mutations use hash-addressed
+  immutable ticket journals rather than reusable ownership paths.
+- Uses installation tokens with least privilege; `githubApp.readOnlyChecks: true` refuses Contents/PR/comment write APIs.
+- Suspends every repository listed on installation removal events, reconciles already-suspended index entries into run records, and surfaces non-missing run-save failures.
+- Initializes every journal needed by each command before accepting webhook/manual work, applies a
+  30-second deadline per GitHub HTTP request, and sends generic HTTP 500 responses while retaining
+  sanitized local diagnostics. Manual publication never reclaims the listener's inbox leases.
 
-See `docs/GITHUB_APP.md`.
+GitHub journals live beneath
+`.maswe/github/journals/{association,check-create,delivery,publication}/<logical-key-sha256>/.lock-journal-v3/`
+and use the same claims/releases/tmp layout as local journals. The Phase A concurrency boundary is
+one listener plus simultaneous manual publishers on one host and one coherent local filesystem
+with atomic no-clobber hard links. Legacy association/check-create/delivery migration requires all
+old processes to stop, retains legacy evidence, and does not support mixed old/new binaries.
+
+Phase B adds push/PR writes, comment replies, and digest-bound GitHub approvals. See `docs/GITHUB_APP.md`.
 
 ## 9. Consistency and concurrency
 
@@ -445,7 +468,7 @@ GitHub input (future)
   before persistence, but typed SDK-specific metadata requires a separate adapter lifecycle/test
   seam change.
 - Reasoning effort is stored but not translated into provider-specific SDK parameters.
-- GitHub App check runs and authenticated PR automation remain v0.3+.
+- GitHub App Phase A read-only check runs are implemented in `src/github/`; push/PR writes, comment replies, and digest-bound GitHub approvals remain Phase B (issue #3).
 
 Closed in v0.2: branch/worktree manager, git SHA persistence on the run record, atomic file-store writes with optimistic versioning, artifact digest revalidation, attempt history, secret redaction, stdin prompt transport, budgets/timeouts, retry/supersede recovery, and governed Node runtime enforcement.
 

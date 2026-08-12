@@ -223,19 +223,41 @@ authentication field.
 - Quality, verification, and merge-ready evidence records bind to the evaluated git **head SHA**.
 - Head-SHA movement after a successful stage invalidates stale evidence before merge-ready.
 
-**Gap:** Digests and evidence are not yet cryptographically signed, and remote GitHub check-run automation remains a later milestone. Production GitHub integration must continue to invalidate verification on every head-SHA change.
+**Gap:** Digests and evidence are not yet cryptographically signed. Phase A mirrors SHA-bound evidence into GitHub Checks; Phase B still owns push/PR writes and comment replies.
 
 ### T10 — Webhook replay or forged GitHub event
 
-**Future threat:** An attacker replays a review or approval event.
+**Threat:** An attacker replays or forges a GitHub webhook delivery.
 
-**Planned controls:**
+**Controls (Phase A):**
 
-- Verify GitHub webhook signatures.
-- Store delivery IDs and reject duplicates.
-- Use installation-scoped tokens.
-- Authorize approvals by repository role/team.
-- Use idempotency keys for side effects.
+- Verify `X-Hub-Signature-256` against the raw body (timing-safe); reject without state change.
+- After exact-byte HMAC and strict UTF-8/JSON normalization, persist a lease-fenced normalized
+  envelope under an immutable per-delivery journal. Completed duplicates return 200 without
+  repeating side effects, queued/processing duplicates return 202, and same-ID digest conflicts
+  return 409. Unsupported events are durably completed and acknowledged 200.
+- Persist only the normalized event, event name, delivery ID, receive time, raw-body SHA-256, and
+  operational lease fields. Raw payloads, signatures, headers, tokens, secrets, keys, and arbitrary
+  exception text are excluded.
+- Keep loopback as the listener default. Explicit wildcard binding requires TLS termination,
+  network admission, one MiB proxy/application body ceilings, rate/concurrency controls, and
+  header/body/request deadlines that preserve the application's sub-ten-second response budget.
+- Acquire installation-scoped tokens only for the handling installation; tokens are not persisted.
+- Idempotency keys for check-run side effects under `.maswe/github/side-effects/`.
+- Repository allowlist; installation removal suspends associations.
+- Generic HTTP 500 responses contain no internal error text; internal failures go only to the local
+  diagnostic callback. Every production GitHub HTTP request has a 30-second default deadline.
+- Full-digest `external_id` values bind repository, PR, head SHA, check name, and attempt; bounded
+  paginated reconciliation searches all advertised check pages before a replacement create.
+- Startup migrates legacy delivery artifacts into hash-addressed retained evidence and recovers
+  pending queue state before the listener accepts traffic. Active tombstones/journals are not
+  silently pruned because removing replay evidence could re-enable a signed delivery.
+
+**Boundary:** Phase A supports one listener/worker plus simultaneous manual publishers using
+cooperative same-host locking on one coherent local filesystem with atomic no-clobber hard links.
+Quiescent retained-path migration is required from legacy state; multiple listeners, mixed old/new
+binaries, and network/distributed filesystems are unsupported. Digest-bound GitHub approval
+authorization by repository role/team remains Phase B.
 
 ### T11 — Resource and cost exhaustion
 

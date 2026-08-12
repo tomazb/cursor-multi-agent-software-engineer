@@ -28,4 +28,17 @@ Models may edit an isolated workspace and propose messages. Deterministic integr
 
 ## Local progress (v0.2)
 
-`src/git-workspace.ts` owns local branch/worktree creation, deterministic commits, and change-scope checks. Push, PR creation, check runs, and webhook ingestion remain v0.3+.
+`src/git-workspace.ts` owns local branch/worktree creation, deterministic commits, and change-scope
+checks.
+
+## GitHub progress (v0.3 Phase A)
+
+`src/github/` owns authenticated webhook intake and SHA-bound Checks API publication without
+Contents, pull-request, or comment writes. File-backed GitHub mutations are serialized through
+immutable, hash-addressed ticket journals. Exact request bytes are authenticated and normalized;
+only the normalized event envelope and raw-body digest are file/directory-synced before an HTTP 202
+acknowledgement. One lease worker recovers pending work before listener readiness, while a
+simultaneous manual publisher uses a separate per-PR publication journal and never reclaims inbox
+leases. Check identity covers the complete repository/PR/head/name/attempt key, and reconciliation
+is bounded and paginated. Tokens request only Checks write, Pull requests read, and Metadata read.
+Push, PR creation, comment replies, and thread resolution remain Phase B.
