@@ -1,6 +1,6 @@
 # Contributing
 
-Thank you for improving Cursor Multi-Agent Software Engineer.
+Thank you for improving Multi-Agent Software Engineer (MASWE).
 
 ## Before opening a change
 
@@ -22,9 +22,13 @@ Create a focused branch and keep commits reviewable. Tests should cover the stat
 - Explain the problem and the chosen solution.
 - Link requirements or issue IDs.
 - List commands executed and their results.
-- Call out security, migration, compatibility, and configuration effects.
+- Call out migration, compatibility, configuration, and trust-boundary effects.
 - Update README and operational documentation when user behavior changes.
 - Do not combine unrelated refactors with a feature or bug fix.
+
+## Product-scope claims
+
+The current implementation supports `mock`, `cursor-cli`, and `cursor-sdk`. Multi-harness execution is an approved future direction under Issues #31 and #32, but it is not implemented. Contributions must not advertise a harness as supported until its governed adapter and conformance evidence are merged.
 
 ## Design constraints
 
@@ -32,9 +36,9 @@ Create a focused branch and keep commits reviewable. Tests should cover the stat
 - Deterministic tools own tests, builds, git publishing, and merge gates.
 - A resolver cannot verify its own edits.
 - Read-only stages must remain mechanically checked.
-- Runtime adapters must implement the `AgentRuntime` interface and keep SDK details isolated.
+- Runtime adapters must implement the current `AgentRuntime` interface and keep SDK details isolated.
 - Existing artifact names and state values are public contracts; changing them requires a migration plan.
 
-## Reporting security issues
+## Reporting vulnerabilities
 
 Do not open a public issue for a vulnerability. Follow [SECURITY.md](SECURITY.md).
