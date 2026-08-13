@@ -7,8 +7,8 @@ The active Node runtime must satisfy `>=22.22.2 <23 || >=24.18.0 <25` before nor
 With NVM:
 
 ```bash
-git clone https://github.com/tomazb/cursor-multi-agent-software-engineer.git
-cd cursor-multi-agent-software-engineer
+git clone https://github.com/tomazb/multi-agent-software-engineer.git
+cd multi-agent-software-engineer
 nvm install
 nvm use
 npm install
@@ -16,6 +16,19 @@ npm run check
 npm run build
 npm link
 ```
+
+For an existing checkout created before the repository rename:
+
+```bash
+git remote set-url origin git@github.com:tomazb/multi-agent-software-engineer.git
+git remote -v
+git fetch origin --prune
+```
+
+Review external CI, Cursor Cloud projects, GitHub App allowlists, webhook deployments, bookmarks,
+and scripts that may store the former full repository name. Issue #34 tracks stable repository
+identity and governed rename reconciliation for persisted MASWE GitHub associations. Do not
+hand-edit `.maswe` run records, association indexes, or immutable journals.
 
 With another environment manager, select a supported Node binary and run the same npm commands. Normal installation and repository scripts reject unsupported versions through package engines, `engine-strict`, and the dependency-free guard. Direct CLI execution applies the same policy before repository or durable-state actions.
 
@@ -51,6 +64,10 @@ The optional SDK runtime additionally requires:
 npm install @cursor/sdk
 export CURSOR_API_KEY="cursor_..."
 ```
+
+The currently implemented runtime kinds are `mock`, `cursor-cli`, and `cursor-sdk`. Claude Code,
+Codex CLI, GitHub Copilot CLI, and OpenCode are planned targets under Issues #31 and #32; do not
+configure them as runtime kinds before their governed adapters are implemented.
 
 ## 2. Initialize a project
 

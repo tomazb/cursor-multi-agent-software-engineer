@@ -104,25 +104,41 @@ test("symlinked CLI entrypoint executes instead of being mistaken for an import"
   }
 });
 
-test("active package, plugin, README, and CLI identity use the renamed repository", async () => {
-  const packageJson = JSON.parse(await readFile(path.join(process.cwd(), "package.json"), "utf8")) as Record<string, unknown>;
-  const lock = JSON.parse(await readFile(path.join(process.cwd(), "package-lock.json"), "utf8")) as Record<string, unknown>;
-  const plugin = JSON.parse(await readFile(path.join(process.cwd(), ".cursor-plugin/plugin.json"), "utf8")) as Record<string, unknown>;
+test("active package, plugin, documentation, and CLI identity use the renamed repository", async () => {
+  const packageJson = JSON.parse(
+    await readFile(path.join(process.cwd(), "package.json"), "utf8"),
+  ) as Record<string, unknown>;
+  const lock = JSON.parse(
+    await readFile(path.join(process.cwd(), "package-lock.json"), "utf8"),
+  ) as Record<string, unknown>;
+  const plugin = JSON.parse(
+    await readFile(path.join(process.cwd(), ".cursor-plugin/plugin.json"), "utf8"),
+  ) as Record<string, unknown>;
   const readme = await readFile(path.join(process.cwd(), "README.md"), "utf8");
-  const cli = await readFile(path.join(process.cwd(), "src/cli-runner.ts"), "utf8");
+  const operations = await readFile(path.join(process.cwd(), "docs/OPERATIONS.md"), "utf8");
+  const prd = await readFile(path.join(process.cwd(), "docs/PRD.md"), "utf8");
+  const cliResult = await spawnFileCaptured(
+    process.execPath,
+    ["--experimental-strip-types", cliPath, "help"],
+    { cwd: process.cwd(), timeoutMs: 5_000 },
+  );
 
   assert.equal(packageJson.name, "multi-agent-software-engineer");
-  assert.equal(lock.name, "multi-agent-software-engineer");
+  assert.equal(lock.name, packageJson.name);
   assert.equal(
     (lock.packages as Record<string, Record<string, unknown>>)[""]?.name,
-    "multi-agent-software-engineer",
+    packageJson.name,
   );
   assert.equal(plugin.name, "multi-agent-software-engineer");
   assert.equal(plugin.homepage, `https://github.com/${canonicalRepository}`);
   assert.equal(plugin.repository, `https://github.com/${canonicalRepository}`);
   assert.equal(readme.includes(formerRepository), false);
   assert.match(readme, /https:\/\/github\.com\/tomazb\/multi-agent-software-engineer\.git/);
-  assert.match(cli, /Multi-Agent Software Engineer \(maswe\)/);
+  assert.match(operations, /https:\/\/github\.com\/tomazb\/multi-agent-software-engineer\.git/);
+  assert.equal(operations.includes(`https://github.com/${formerRepository}.git`), false);
+  assert.match(prd, /\*\*Multi-Agent Software Engineer \(MASWE\)\*\*/);
+  assert.equal(cliResult.code, 0, cliResult.stderr);
+  assert.match(cliResult.stdout, /^Multi-Agent Software Engineer \(maswe\)$/m);
 });
 
 test("pre-rename schema identifiers remain stable compatibility namespaces", async () => {
