@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/tomazb/cursor-multi-agent-software-engineer/schemas/config.schema.json",
+  "$id": "https://github.com/tomazb/multi-agent-software-engineer/schemas/config.schema.json",
   "title": "MasweConfig",
   "type": "object",
   "additionalProperties": false,
