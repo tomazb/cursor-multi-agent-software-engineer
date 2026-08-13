@@ -1,6 +1,6 @@
 ---
 name: maswe
-description: Use when the user explicitly asks to start, inspect, approve, resume, or operate a Cursor Multi-Agent Software Engineer workflow. This skill delegates durable state and model routing to the repository's `maswe` CLI rather than simulating the workflow in one chat.
+description: Use when the user explicitly asks to start, inspect, approve, resume, or operate a Multi-Agent Software Engineer (MASWE) workflow. This skill delegates durable state and model routing to the repository's `maswe` CLI rather than simulating the workflow in one chat.
 disable-model-invocation: true
 ---
 
@@ -14,8 +14,10 @@ Use this skill only for explicit MASWE workflow operations.
 2. Look for `.maswe/config.json` or `devflow.config.json`.
 3. Confirm the `maswe` executable is available with `maswe help`.
 4. If it is not globally available and this repository is open, use `npm run dev -- <command>` after dependencies are installed.
-5. Confirm Superpowers is installed. If not, instruct the user to run `/add-plugin superpowers` in Cursor.
+5. For the current `cursor-cli` or `cursor-sdk` runtimes, confirm Superpowers is installed in Cursor. If not, instruct the user to run `/add-plugin superpowers` in Cursor.
 6. Before a real model run, use `maswe doctor` and surface failures rather than bypassing them.
+
+Current released runtime kinds are `mock`, `cursor-cli`, and `cursor-sdk`. Claude Code, Codex CLI, GitHub Copilot CLI, and OpenCode support is planned under Issues #31 and #32 and must not be assumed.
 
 ## Operating rules
 
