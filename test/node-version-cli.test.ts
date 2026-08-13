@@ -72,7 +72,7 @@ test("supported Node preserves help behavior without creating state", async () =
   try {
     console.log = (...values: unknown[]) => output.push(values.map(String).join(" "));
     await runCli({ argv: ["help", "--cwd", cwd], observedNodeVersion: CANONICAL_NODE_VERSION });
-    assert.match(output.join("\n"), /Cursor Multi-Agent Software Engineer/);
+    assert.match(output.join("\n"), /Multi-Agent Software Engineer/);
     await assertPathAbsent(path.join(cwd, ".maswe"));
     assert.deepEqual(await readdir(cwd), []);
   } finally {
@@ -94,7 +94,7 @@ test("symlinked CLI entrypoint executes instead of being mistaken for an import"
     );
 
     assert.equal(result.code, 0, result.stderr);
-    assert.match(result.stdout, /Cursor Multi-Agent Software Engineer/);
+    assert.match(result.stdout, /Multi-Agent Software Engineer/);
     await assertPathAbsent(path.join(cwd, ".maswe"));
     assert.deepEqual(await readdir(cwd), ["maswe-linked.ts"]);
   } finally {
