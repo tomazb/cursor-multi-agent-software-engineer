@@ -1,7 +1,7 @@
 {
-  "name": "cursor-multi-agent-software-engineer",
+  "name": "multi-agent-software-engineer",
   "version": "0.2.0",
-  "description": "A durable, model-configurable software delivery orchestrator for Cursor and Superpowers.",
+  "description": "A durable, model-configurable software delivery orchestrator with Cursor-first execution and a governed multi-harness roadmap.",
   "type": "module",
   "private": true,
   "bin": {
@@ -46,5 +46,13 @@
     "@types/node": "^26.2.0",
     "typescript": "^7.0.2"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tomazb/multi-agent-software-engineer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tomazb/multi-agent-software-engineer/issues"
+  },
+  "homepage": "https://github.com/tomazb/multi-agent-software-engineer#readme",
   "license": "MIT"
 }
