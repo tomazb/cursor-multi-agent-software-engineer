@@ -1,15 +1,16 @@
 {
-  "name": "cursor-multi-agent-software-engineer",
+  "name": "multi-agent-software-engineer",
   "displayName": "Multi-Agent Software Engineer",
   "version": "0.1.0",
-  "description": "Drive a durable brainstorm, design, build, CI, independent verification, and scoped PR review workflow from Cursor.",
+  "description": "Cursor integration for MASWE's durable brainstorm, design, build, verification, and governed PR workflow.",
   "author": {
     "name": "tomazb"
   },
-  "homepage": "https://github.com/tomazb/cursor-multi-agent-software-engineer",
-  "repository": "https://github.com/tomazb/cursor-multi-agent-software-engineer",
+  "homepage": "https://github.com/tomazb/multi-agent-software-engineer",
+  "repository": "https://github.com/tomazb/multi-agent-software-engineer",
   "license": "MIT",
   "keywords": [
+    "maswe",
     "cursor",
     "multi-agent",
     "orchestration",

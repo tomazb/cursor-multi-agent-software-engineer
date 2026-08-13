@@ -65,7 +65,7 @@ function emitGitHubDiagnostic(error: unknown): void {
 }
 
 function usage(): string {
-  return `Cursor Multi-Agent Software Engineer (maswe)
+  return `Multi-Agent Software Engineer (maswe)
 
 Usage:
   maswe init [--force]

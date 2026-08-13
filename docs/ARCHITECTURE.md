@@ -10,6 +10,10 @@ MASWE is an **orchestrator-first system with a thin Cursor plugin**.
 - Deterministic project commands decide test/build health.
 - GitHub becomes the remote event and merge-control surface in a later milestone.
 
+This document describes the currently implemented Cursor-first architecture. The owner-approved
+harness-neutral evolution is tracked by Issues #31 and #32 and becomes normative only through
+MH-00. No external harness adapter is implemented in the current architecture.
+
 This prevents a single parent model from becoming an implicit, long-lived workflow engine.
 
 ## 2. System context

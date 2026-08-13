@@ -22,6 +22,10 @@ MASWE must prevent untrusted requests, model output, repository content, and PR 
 - Feature requests, repository text, dependency code, and PR comments may be malicious.
 - A model may misunderstand policy, hallucinate evidence, or follow prompt injection.
 
+The current execution dependencies are Cursor CLI and optional Cursor SDK. Future harnesses remain
+external dependencies whose output and metadata are untrusted, but their exact capability,
+permission, and identity contracts are governed by MH-00/#32 and are not implemented yet.
+
 ## Threats and controls
 
 ### T1 — Prompt injection from repository content

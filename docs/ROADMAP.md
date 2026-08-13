@@ -2,6 +2,8 @@
 
 The roadmap prioritizes a trustworthy local workflow before hosted autonomy.
 
+The current implementation is Cursor-first. The repository and product scope now target a future harness-neutral MASWE control plane under Issues #31 and #32; planned support must not be read as implemented support.
+
 ## v0.1 — Local foundation
 
 Status: implemented in the initial repository bootstrap.
@@ -43,7 +45,7 @@ Status: implemented.
 
 ## v0.3 — GitHub App pilot
 
-Status: **Phase A (read-only checks) implemented**; Phase B remaining on issue #3.
+Status: **Phase A (read-only checks) implemented**; Phase B remaining on Issue #3 and gated by Issue #27.
 
 ### Phase A (done)
 
@@ -63,13 +65,40 @@ Status: **Phase A (read-only checks) implemented**; Phase B remaining on issue #
 - GitHub Actions artifact ingestion.
 - Optional monorepo extraction to `apps/` / `packages/` with the v0.4 control plane.
 
-## v0.4 — Durable control plane
+Issue #34 must be completed or explicitly dispositioned before Phase B relies on repository identity across renames.
+
+## Multi-harness execution programme
+
+Status: owner-approved direction under Issue #31; architecture publication governed by Issue #32.
+
+Required order:
+
+1. Complete Issue #27 and revalidate `main` at the accepted post-hardening SHA.
+2. Publish and approve the MH-00 architecture through Issue #32.
+3. Complete the remaining Issue #3 Phase B before multi-harness runtime implementation.
+4. Prove harness-neutral local contracts and a Cursor-preserving registry refactor before adding external harnesses.
+5. Add external harnesses as read-only workers before granting write authority.
+6. Freeze distributed worker schemas only after local contracts and initial adapter conformance evidence exist.
+
+Target harnesses include Cursor, Claude Code, Codex CLI, GitHub Copilot CLI, and OpenCode. Only Cursor CLI, optional Cursor SDK, and mock are implemented today.
+
+## v0.4 — Durable multi-harness control plane
+
+Entry gates:
+
+- Issue #27 completed and post-hardening `main` revalidated at an exact SHA.
+- Issue #32 approved and merged.
+- Remaining Issue #3 Phase B completed before multi-harness runtime implementation.
+- Harness-neutral local contracts and the Cursor-preserving registry refactor proven.
+- Initial external read-only adapter conformance evidence available before distributed worker schemas are frozen.
+
+Planned capabilities:
 
 - PostgreSQL run/event store.
 - Object storage for immutable artifacts.
 - Queue, worker leases, retries, and transactional outbox.
 - REST API and MCP server.
-- Cursor cloud and self-hosted SDK runtimes.
+- Capability-negotiated local, cloud, and self-hosted harness adapters.
 - Team/repository policy hierarchy.
 - Service-account and secret-manager integration.
 - Structured logs, metrics, traces, cost, and token accounting.
@@ -94,7 +123,7 @@ Exit criteria:
 - At-least-once event processing with idempotent side effects.
 - Exact model and git provenance where providers expose it.
 - Zero silent fallback in fail-closed policy.
-- Reliable recovery from worker, provider, and GitHub outages.
+- Reliable recovery from worker, provider, harness, and GitHub outages.
 - Supported database migrations and upgrade policy.
 - Signed releases, pinned dependencies, and SBOM.
 - Documented SLOs, incident response, backup, and disaster recovery.

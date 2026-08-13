@@ -2,7 +2,7 @@
 
 ## Product
 
-**Cursor Multi-Agent Software Engineer (MASWE)**
+**Multi-Agent Software Engineer (MASWE)**
 
 ## Status
 
@@ -16,6 +16,10 @@
 MASWE is a durable orchestration layer for software development performed by multiple specialized coding models. It assigns discovery, specification, implementation, verification, and pull-request resolution to separate roles while deterministic software owns state transitions, approvals, quality commands, permissions, retry limits, and audit records.
 
 The first usable release is a local TypeScript CLI with Cursor CLI and Cursor SDK runtime adapters. The long-term product adds a GitHub App, remote control plane, durable database, and team policy administration without changing the role or artifact contracts.
+
+The current implementation is Cursor-first and supports only the `mock`, `cursor-cli`, and
+`cursor-sdk` runtime kinds. Multi-harness execution is an approved future direction under Issues
+`#31` and `#32`. External harness adapters are not implemented.
 
 ## Problem statement
 
@@ -84,9 +88,11 @@ Require an acceptance-criteria matrix, actual code inspection, command evidence,
 
 Classify review comments before editing, escalate scope changes, re-run CI after edits, and use a fresh verifier.
 
-### G7 — Cursor-native experience
+### G7 — Cursor-first current experience and harness-neutral evolution
 
-Support Cursor CLI immediately, Cursor SDK through an adapter, Superpowers practices in stage prompts, and a Cursor plugin skill as the editor entry point.
+Support Cursor CLI immediately, Cursor SDK through an adapter, Superpowers practices in stage
+prompts, and a Cursor plugin skill as the current editor entry point while preserving the approved
+future direction under Issues #31 and #32. External harness support remains unimplemented.
 
 ## Non-goals (historical v0.1) and remaining out of scope
 

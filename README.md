@@ -1,10 +1,12 @@
-# Cursor Multi-Agent Software Engineer
+# Multi-Agent Software Engineer (MASWE)
 
-A durable, model-configurable software delivery orchestrator for Cursor and the Superpowers methodology.
+A durable, model-configurable software-delivery orchestrator with deterministic workflow control, exact-head evidence, and independent verification.
 
 The system separates product discovery, specification, implementation, independent verification, and pull-request comment resolution into distinct roles. A deterministic state machine owns stage transitions and file-based artifacts preserve every handoff.
 
-> Project status: **v0.2 local hardening + v0.3 Phase A read-only GitHub checks**. The local CLI includes atomic run storage, git worktree isolation, deterministic commits/scope checks, marker enforcement, secret redaction, stdin prompt transport, budgets/timeouts, retry/supersede recovery, and a governed Node runtime contract. A read-only GitHub App webhook/check publisher lives in `src/github/`. Push/PR writes, comment automation, and the hosted control plane remain later milestones.
+> **Current execution support:** Cursor CLI, optional Cursor SDK, and the deterministic mock runtime.
+> **Approved direction:** capability-negotiated multi-harness execution is governed by [Issue #31](https://github.com/tomazb/multi-agent-software-engineer/issues/31) and [MH-00 Issue #32](https://github.com/tomazb/multi-agent-software-engineer/issues/32). Claude Code, Codex CLI, GitHub Copilot CLI, and OpenCode support is planned, not currently implemented.
+> Project status: **v0.2 local hardening + v0.3 Phase A read-only GitHub checks**. The local CLI includes atomic run storage, git worktree isolation, deterministic commits/scope checks, marker enforcement, secret redaction, stdin prompt transport, budgets/timeouts, retry/supersede recovery, and a governed Node runtime contract. A read-only GitHub App webhook/check publisher lives in `src/github/`. Push/PR writes, comment automation, multi-harness adapters, and the hosted control plane remain later milestones.
 
 ## Why this exists
 
@@ -38,7 +40,7 @@ Superpowers supplies the engineering practices inside each stage. MASWE supplies
 | Verifier | GPT-5.6 Sol High | Read-only | Independent evidence-based verification |
 | PR resolver | GPT-5.6 Sol High | Scoped workspace write | Minimal resolution of in-scope review comments |
 
-Model identifiers in Cursor can change and may differ by plan. The starter config contains the intended defaults as initial slugs. Run `agent models` and `maswe doctor`, then adjust the exact values available to your account.
+These defaults currently resolve through Cursor. Model identifiers in Cursor can change and may differ by plan. The starter config contains the intended defaults as initial slugs. Run `agent models` and `maswe doctor`, then adjust the exact values available to your account.
 
 ## Architecture at a glance
 
@@ -51,13 +53,14 @@ flowchart LR
   R --> C[Cursor CLI]
   R --> SDK[Cursor SDK]
   R --> M[Mock runtime]
+  R -. planned through #31/#32 .-> H[Additional harness adapters]
   O --> Q[Deterministic quality commands]
   C --> SP[Superpowers skills]
   SDK --> SP
   O --> GH[GitHub Phase A checks]
 ```
 
-The architecture deliberately keeps the Cursor plugin thin. The standalone orchestrator is the source of truth so a workflow can survive editor restarts, model failures, CI runs, and multi-day PR review.
+The implemented architecture deliberately keeps the Cursor plugin thin. The standalone orchestrator is the source of truth so a workflow can survive editor restarts, model failures, CI runs, and multi-day PR review.
 
 ## Quick start
 
@@ -67,8 +70,8 @@ The architecture deliberately keeps the Cursor plugin thin. The standalone orche
   - Canonical contributor and primary-CI baseline: exact Node `24.18.0` from `.nvmrc`.
   - Blocking compatibility floor: exact Node `22.22.2`.
 - Git.
-- Cursor CLI installed and authenticated when using the default runtime.
-- Superpowers installed in Cursor with `/add-plugin superpowers`.
+- Cursor CLI installed and authenticated when using the current default runtime.
+- Superpowers installed in Cursor with `/add-plugin superpowers` for current Cursor-backed execution.
 - A clean target repository, unless `policy.allowDirtyWorkspace` is explicitly enabled.
 
 Node 23, Node 25, Node 26+, Node 22 below `22.22.2`, and Node 24 below `24.18.0` are unsupported. Passing an ad hoc command on an unsupported runtime is exploratory evidence, not a supported configuration.
@@ -78,8 +81,8 @@ Node 23, Node 25, Node 26+, Node 22 below `22.22.2`, and Node 24 below `24.18.0`
 NVM is optional and is not a MASWE product dependency. When NVM is available, `.nvmrc` provides the canonical version:
 
 ```bash
-git clone https://github.com/tomazb/cursor-multi-agent-software-engineer.git
-cd cursor-multi-agent-software-engineer
+git clone https://github.com/tomazb/multi-agent-software-engineer.git
+cd multi-agent-software-engineer
 nvm install
 nvm use
 npm install
@@ -91,6 +94,25 @@ npm link
 With another version manager, container image, or system package, select any runtime inside the supported range before running npm commands. Normal installation, repository scripts, and the CLI fail early with `MASWE_UNSUPPORTED_NODE_VERSION` when the active runtime is outside the contract. The diagnostic reports the selected version, supported range, canonical `.nvmrc` baseline, and an optional NVM recovery example.
 
 `npm link` makes the `maswe` command available globally for local development. A packaged release can replace this later.
+
+### Existing checkout after the repository rename
+
+```bash
+git remote set-url origin git@github.com:tomazb/multi-agent-software-engineer.git
+git remote -v
+git fetch origin --prune
+```
+
+The SSH command assumes GitHub SSH authentication is already configured. To retain HTTPS
+transport instead, use:
+
+```bash
+git remote set-url origin https://github.com/tomazb/multi-agent-software-engineer.git
+git remote -v
+git fetch origin --prune
+```
+
+Also review external CI, Cursor Cloud projects, GitHub App allowlists, webhook deployments, bookmarks, and scripts that may store the former full repository name. Issue #34 tracks stable GitHub repository identity and rename reconciliation for persisted MASWE associations.
 
 ### Initialize a target repository
 
@@ -153,11 +175,13 @@ MASWE_MODEL_VERIFIER
 MASWE_MODEL_PR_RESOLVER
 ```
 
-The runtime can be:
+The currently implemented runtime kinds are:
 
 - `cursor-cli`: default and immediately usable with the `agent` executable.
 - `cursor-sdk`: local Cursor SDK execution; install `@cursor/sdk` and set `CURSOR_API_KEY`.
 - `mock`: deterministic development and test runtime.
+
+Do not configure Claude Code, Codex CLI, GitHub Copilot CLI, or OpenCode runtime kinds before their governed adapters are implemented.
 
 Fallback models are attempted only when `policy.rejectModelFallback` is `false`. With the default fail-closed policy, a role runs only with its primary configured model and rejects a reported model mismatch.
 
@@ -195,6 +219,8 @@ The v0.2 verifier and quality gates bind evidence to the current git **head SHA*
   binaries are unsupported. GitHub HTTP calls use a 30-second per-request deadline.
 - Model catalogue output differs across Cursor versions; for Cursor CLI, `maswe doctor` resolves logical names against exact catalogue IDs for its probe (without persisting a run snapshot) and fails closed on missing or ambiguous matches. `maswe start` persists resolved exact IDs into the new run config.
 - The Cursor SDK is a public beta and is kept behind an adapter boundary.
+- External harness adapters and capability-negotiated per-role routing are not implemented yet.
+- JSON Schema `$id` values introduced before the repository rename remain stable compatibility identifiers until a separately governed schema-version change.
 
 These are deliberate boundaries rather than hidden behavior. See [the roadmap](docs/ROADMAP.md).
 

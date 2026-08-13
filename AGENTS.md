@@ -2,6 +2,15 @@
 
 This repository implements a deterministic multi-agent software delivery orchestrator. Preserve the boundary between orchestration and model behavior.
 
+## Repository identity and scope
+
+- Canonical repository: `tomazb/multi-agent-software-engineer`.
+- Canonical product name: Multi-Agent Software Engineer (MASWE).
+- Current runtime kinds are `mock`, `cursor-cli`, and `cursor-sdk`.
+- Multi-harness execution is planned through Issues #31 and #32; do not claim external harness support or add adapter code before its entry gates.
+- Preserve historical design and plan artifacts even when they contain the former repository slug.
+- The existing schema URLs remain stable compatibility identifiers until a separately governed schema-version change.
+
 ## Required engineering behavior
 
 - Read `docs/PRD.md`, `docs/ARCHITECTURE.md`, and relevant ADRs before changing architecture.

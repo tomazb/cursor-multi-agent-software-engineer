@@ -64,6 +64,11 @@ The project follows semantic versioning once a public release process is establi
 
 ### Changed
 
+- Renamed the canonical repository and active product identity from Cursor Multi-Agent Software
+  Engineer to Multi-Agent Software Engineer (MASWE), including package, Cursor plugin, CLI,
+  installation, and contributor surfaces.
+- Documented the Cursor-first current implementation and the separately governed multi-harness
+  direction under Issues #31 and #32 without advertising unimplemented adapters.
 - The primary blocking CI runtime is now exact Node `24.18.0` from `.nvmrc`; exact Node `22.22.2`
   remains the blocking compatibility floor. Floating blocking Node aliases are removed.
 - Repository npm entry points and direct CLI execution now reject unsupported Node versions before
