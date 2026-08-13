@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readdir, rm, symlink } from "node:fs/promises";
+import { access, mkdtemp, readFile, readdir, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -13,6 +13,8 @@ import { spawnFileCaptured } from "./helpers/child-process.ts";
 
 const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
 const canonicalVersionPattern = CANONICAL_NODE_VERSION.replaceAll(".", "\\.");
+const canonicalRepository = "tomazb/multi-agent-software-engineer";
+const formerRepository = "tomazb/cursor-multi-agent-software-engineer";
 
 async function assertPathAbsent(target: string): Promise<void> {
   await assert.rejects(() => access(target), { code: "ENOENT" });
@@ -100,4 +102,42 @@ test("symlinked CLI entrypoint executes instead of being mistaken for an import"
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+});
+
+test("active package, plugin, README, and CLI identity use the renamed repository", async () => {
+  const packageJson = JSON.parse(await readFile(path.join(process.cwd(), "package.json"), "utf8")) as Record<string, unknown>;
+  const lock = JSON.parse(await readFile(path.join(process.cwd(), "package-lock.json"), "utf8")) as Record<string, unknown>;
+  const plugin = JSON.parse(await readFile(path.join(process.cwd(), ".cursor-plugin/plugin.json"), "utf8")) as Record<string, unknown>;
+  const readme = await readFile(path.join(process.cwd(), "README.md"), "utf8");
+  const cli = await readFile(path.join(process.cwd(), "src/cli-runner.ts"), "utf8");
+
+  assert.equal(packageJson.name, "multi-agent-software-engineer");
+  assert.equal(lock.name, "multi-agent-software-engineer");
+  assert.equal(
+    (lock.packages as Record<string, Record<string, unknown>>)[""]?.name,
+    "multi-agent-software-engineer",
+  );
+  assert.equal(plugin.name, "multi-agent-software-engineer");
+  assert.equal(plugin.homepage, `https://github.com/${canonicalRepository}`);
+  assert.equal(plugin.repository, `https://github.com/${canonicalRepository}`);
+  assert.equal(readme.includes(formerRepository), false);
+  assert.match(readme, /https:\/\/github\.com\/tomazb\/multi-agent-software-engineer\.git/);
+  assert.match(cli, /Multi-Agent Software Engineer \(maswe\)/);
+});
+
+test("pre-rename schema identifiers remain stable compatibility namespaces", async () => {
+  const configSchema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/config.schema.json"), "utf8"),
+  ) as Record<string, unknown>;
+  const runSchema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as Record<string, unknown>;
+  const oldSchemaBase = `https://github.com/${formerRepository}/schemas/`;
+
+  assert.equal(configSchema.$id, `${oldSchemaBase}config.schema.json`);
+  assert.equal(runSchema.$id, `${oldSchemaBase}run-record.schema.json`);
+  assert.equal(
+    ((runSchema.properties as Record<string, Record<string, unknown>>).config)?.$ref,
+    `${oldSchemaBase}config.schema.json`,
+  );
 });
