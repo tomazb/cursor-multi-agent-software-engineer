@@ -5,9 +5,7 @@ A durable, model-configurable software-delivery orchestrator with deterministic 
 The system separates product discovery, specification, implementation, independent verification, and pull-request comment resolution into distinct roles. A deterministic state machine owns stage transitions and file-based artifacts preserve every handoff.
 
 > **Current execution support:** Cursor CLI, optional Cursor SDK, and the deterministic mock runtime.
->
 > **Approved direction:** capability-negotiated multi-harness execution is governed by [Issue #31](https://github.com/tomazb/multi-agent-software-engineer/issues/31) and [MH-00 Issue #32](https://github.com/tomazb/multi-agent-software-engineer/issues/32). Claude Code, Codex CLI, GitHub Copilot CLI, and OpenCode support is planned, not currently implemented.
-
 > Project status: **v0.2 local hardening + v0.3 Phase A read-only GitHub checks**. The local CLI includes atomic run storage, git worktree isolation, deterministic commits/scope checks, marker enforcement, secret redaction, stdin prompt transport, budgets/timeouts, retry/supersede recovery, and a governed Node runtime contract. A read-only GitHub App webhook/check publisher lives in `src/github/`. Push/PR writes, comment automation, multi-harness adapters, and the hosted control plane remain later milestones.
 
 ## Why this exists
@@ -101,6 +99,15 @@ With another version manager, container image, or system package, select any run
 
 ```bash
 git remote set-url origin git@github.com:tomazb/multi-agent-software-engineer.git
+git remote -v
+git fetch origin --prune
+```
+
+The SSH command assumes GitHub SSH authentication is already configured. To retain HTTPS
+transport instead, use:
+
+```bash
+git remote set-url origin https://github.com/tomazb/multi-agent-software-engineer.git
 git remote -v
 git fetch origin --prune
 ```

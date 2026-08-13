@@ -25,6 +25,15 @@ git remote -v
 git fetch origin --prune
 ```
 
+The SSH command assumes GitHub SSH authentication is already configured. To retain HTTPS
+transport instead, use:
+
+```bash
+git remote set-url origin https://github.com/tomazb/multi-agent-software-engineer.git
+git remote -v
+git fetch origin --prune
+```
+
 Review external CI, Cursor Cloud projects, GitHub App allowlists, webhook deployments, bookmarks,
 and scripts that may store the former full repository name. Issue #34 tracks stable repository
 identity and governed rename reconciliation for persisted MASWE GitHub associations. Do not

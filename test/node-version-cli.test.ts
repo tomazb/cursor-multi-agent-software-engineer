@@ -135,7 +135,7 @@ test("active package, plugin, documentation, and CLI identity use the renamed re
   assert.equal(readme.includes(formerRepository), false);
   assert.match(readme, /https:\/\/github\.com\/tomazb\/multi-agent-software-engineer\.git/);
   assert.match(operations, /https:\/\/github\.com\/tomazb\/multi-agent-software-engineer\.git/);
-  assert.equal(operations.includes(`https://github.com/${formerRepository}.git`), false);
+  assert.equal(operations.includes(formerRepository), false);
   assert.match(prd, /\*\*Multi-Agent Software Engineer \(MASWE\)\*\*/);
   assert.equal(cliResult.code, 0, cliResult.stderr);
   assert.match(cliResult.stdout, /^Multi-Agent Software Engineer \(maswe\)$/m);

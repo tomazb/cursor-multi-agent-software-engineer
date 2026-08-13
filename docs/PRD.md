@@ -19,7 +19,7 @@ The first usable release is a local TypeScript CLI with Cursor CLI and Cursor SD
 
 The current implementation is Cursor-first and supports only the `mock`, `cursor-cli`, and
 `cursor-sdk` runtime kinds. Multi-harness execution is an approved future direction under Issues
-#31 and #32. External harness adapters are not implemented.
+`#31` and `#32`. External harness adapters are not implemented.
 
 ## Problem statement
 
