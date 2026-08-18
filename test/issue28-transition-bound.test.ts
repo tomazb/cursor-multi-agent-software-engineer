@@ -40,6 +40,7 @@ async function createRunInState(
 
 type FailureInjection =
   | "unchanged-prior"
+  | "partial-failure-metadata"
   | "failure-metadata"
   | "fail-event-details"
   | "historical-prefix";
@@ -85,7 +86,9 @@ class FailureInjectionStore implements RunStore {
 
     await this.delegate.applyEvent(run, type, actor, details);
     const observed = await this.delegate.load(run.id);
-    if (this.injection === "failure-metadata") {
+    if (this.injection === "partial-failure-metadata") {
+      delete observed.failure;
+    } else if (this.injection === "failure-metadata") {
       observed.failure!.message = "tampered failure metadata";
     } else if (this.injection === "fail-event-details") {
       const event = observed.events.at(-1)!;
@@ -239,6 +242,7 @@ test("failure recovery rethrows only an unchanged prior automatic record", async
 
 test("failure recovery rejects every altered failed publication shape", async (t) => {
   for (const injection of [
+    "partial-failure-metadata",
     "failure-metadata",
     "fail-event-details",
     "historical-prefix",
@@ -267,13 +271,24 @@ test("failure recovery rejects every altered failed publication shape", async (t
 
       assert.equal(reloaded.state, "FAILED");
       assert.equal(reloaded.events.filter((event) => event.type === "FAIL").length, 1);
-      assert.equal(reloaded.failure?.code, "automatic-transition-limit-exceeded");
+      if (injection === "partial-failure-metadata") {
+        assert.equal(reloaded.failure, undefined);
+      } else {
+        assert.equal(reloaded.failure?.code, "automatic-transition-limit-exceeded");
+      }
     });
   }
 });
 
 test("automatic transition limit accepts only positive safe integers", () => {
-  for (const limit of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+  for (const limit of [
+    0,
+    -1,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+  ]) {
     assert.throws(
       () => new Orchestrator("/tmp/maswe-transition-options", config(), new MockRuntime(), undefined, {
         automaticTransitionLimit: limit,
