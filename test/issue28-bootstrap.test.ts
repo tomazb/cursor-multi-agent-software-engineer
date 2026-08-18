@@ -6,6 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import * as gitSnapshot from "../src/git-snapshot.ts";
+import * as gitWorkspace from "../src/git-workspace.ts";
 import { gitWorkspaceFingerprint } from "../src/git-snapshot.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import type {
@@ -20,6 +21,7 @@ import type {
 } from "../src/domain.ts";
 import {
   externalWorktreePath,
+  type GitWorktreeRegistration,
   listGitWorktreeRegistrations,
   workingDirectoryFor,
 } from "../src/git-workspace.ts";
@@ -31,6 +33,7 @@ import { captureWorkspaceBootstrapIntent } from "../src/workspace-bootstrap.ts";
 const execFileAsync = promisify(execFile);
 
 type SourceFingerprint = (cwd: string, timeoutMs?: number) => Promise<string>;
+type PorcelainParser = (output: string) => GitWorktreeRegistration[];
 
 function captureWorkspaceSourceFingerprint(cwd: string): Promise<string> {
   const candidate = (
@@ -42,6 +45,18 @@ function captureWorkspaceSourceFingerprint(cwd: string): Promise<string> {
     assert.fail("captureWorkspaceSourceFingerprint must be exported");
   }
   return candidate(cwd);
+}
+
+function parseWorktreeRegistrations(output: string): GitWorktreeRegistration[] {
+  const candidate = (
+    gitWorkspace as typeof gitWorkspace & {
+      parseGitWorktreeRegistrationsPorcelain?: PorcelainParser;
+    }
+  ).parseGitWorktreeRegistrationsPorcelain;
+  if (typeof candidate !== "function") {
+    assert.fail("parseGitWorktreeRegistrationsPorcelain must be exported");
+  }
+  return candidate(output);
 }
 
 async function initRepo(): Promise<string> {
@@ -368,6 +383,16 @@ test("bootstrap barriers fail from authoritative CREATED state without running a
       assert.equal(runtime.executions, 0, "no role may execute before authoritative START");
       if (barrier === "afterWorkspaceCheckpoint") {
         assert.ok(authoritative.workspace?.worktreePath, "checkpointed workspace must survive failure");
+        await access(authoritative.workspace.worktreePath);
+        const registrations = await listGitWorktreeRegistrations(cwd);
+        assert.ok(
+          registrations.some(
+            (registration) =>
+              registration.worktreePath === path.resolve(authoritative.workspace!.worktreePath!) &&
+              registration.branch === authoritative.workspace!.branch,
+          ),
+          "checkpointed worktree registration must survive failure publication",
+        );
       } else {
         assert.equal(authoritative.workspace, undefined);
       }
@@ -410,6 +435,7 @@ test("bootstrap rejects staged, unstaged, and non-ignored untracked worktree dir
 test("bootstrap revalidates checkpoint cleanliness before START", async () => {
   const cwd = await initRepo();
   const config = isolatedConfig();
+  const sentinelBytes = Buffer.from("dirty sentinel must survive exactly\n\0binary tail", "utf8");
   const orchestrator = new Orchestrator(cwd, config, new CountingRuntime(), undefined, {
     afterWorkspaceCheckpoint: async (checkpoint: RunRecord) => {
       const authoritative = await orchestrator.store.load(checkpoint.id);
@@ -419,8 +445,7 @@ test("bootstrap revalidates checkpoint cleanliness before START", async () => {
       assert.equal(authoritative.events.length, 0);
       await writeFile(
         path.join(authoritative.workspace!.worktreePath!, "after-checkpoint.txt"),
-        "dirty\n",
-        "utf8",
+        sentinelBytes,
       );
     },
   });
@@ -432,6 +457,22 @@ test("bootstrap revalidates checkpoint cleanliness before START", async () => {
   assert.ok(authoritative.workspace?.worktreePath);
   assert.ok(authoritative.workspaceBootstrap);
   assert.equal(authoritative.events.some((event) => event.type === "START"), false);
+  const checkpointedPath = authoritative.workspace.worktreePath;
+  await access(checkpointedPath);
+  assert.deepEqual(
+    await readFile(path.join(checkpointedPath, "after-checkpoint.txt")),
+    sentinelBytes,
+    "bootstrap failure publication must preserve dirty untracked bytes exactly",
+  );
+  const registrations = await listGitWorktreeRegistrations(cwd);
+  assert.ok(
+    registrations.some(
+      (registration) =>
+        registration.worktreePath === path.resolve(checkpointedPath) &&
+        registration.branch === authoritative.workspace!.branch,
+    ),
+    "dirty checkpointed worktree registration must survive failure publication",
+  );
 });
 
 test("bootstrap rejects exact-path registration on the wrong branch", async () => {
@@ -572,6 +613,24 @@ test("structured worktree inspection accepts and omits a bare main repository re
   ]);
 });
 
+test("structured worktree parser rejects ambiguous marker combinations and duplicate bare records", () => {
+  const sha = "a".repeat(40);
+  const malformed = [
+    `worktree /tmp/detached-and-branch\0HEAD ${sha}\0detached\0branch refs/heads/topic\0\0`,
+    `worktree /tmp/no-checkout-marker\0HEAD ${sha}\0\0`,
+    `worktree /tmp/duplicate-detached\0HEAD ${sha}\0detached\0detached\0\0`,
+    `worktree /tmp/duplicate-locked\0HEAD ${sha}\0detached\0locked first\0locked second\0\0`,
+    "worktree /tmp/bare-one\0bare\0\0worktree /tmp/bare-two\0bare\0\0",
+  ];
+
+  for (const output of malformed) {
+    assert.throws(
+      () => parseWorktreeRegistrations(output),
+      /malformed|conflicting/i,
+    );
+  }
+});
+
 test("checkpoint outcome unknown reloads and fails the authoritative actionable checkpoint", async () => {
   const cwd = await initRepo();
   const config = isolatedConfig();
@@ -652,6 +711,16 @@ test("START pre-publication failure reloads and fails the exact CREATED checkpoi
   assert.ok(authoritative.workspaceBootstrap);
   assert.ok(authoritative.workspace?.worktreePath);
   assert.equal(authoritative.events.some((event) => event.type === "START"), false);
+  await access(authoritative.workspace.worktreePath);
+  const registrations = await listGitWorktreeRegistrations(cwd);
+  assert.ok(
+    registrations.some(
+      (registration) =>
+        registration.worktreePath === path.resolve(authoritative.workspace!.worktreePath!) &&
+        registration.branch === authoritative.workspace!.branch,
+    ),
+    "START pre-publication failure must preserve the checkpointed registration",
+  );
 });
 
 test("START recovery adopts an exact complete publication written from an independent clone", async () => {

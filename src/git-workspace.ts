@@ -65,25 +65,18 @@ export interface GitWorktreeRegistration {
 }
 
 /** Parse Git's NUL-delimited porcelain format without consulting diagnostic prose. */
-export async function listGitWorktreeRegistrations(
-  repositoryPath: string,
-): Promise<GitWorktreeRegistration[]> {
-  const result = await gitExec(
-    "git",
-    ["worktree", "list", "--porcelain", "-z"],
-    repositoryPath,
-  );
-  if (result.exitCode !== 0) {
-    throw new Error(`Failed to inspect Git worktree registrations: ${result.stderr || result.stdout}`);
-  }
-  if (!result.stdout.endsWith("\0\0")) {
+export function parseGitWorktreeRegistrationsPorcelain(
+  output: string,
+): GitWorktreeRegistration[] {
+  if (!output.endsWith("\0\0")) {
     throw new Error("Malformed Git worktree registration output: missing record terminator");
   }
 
   const registrations: GitWorktreeRegistration[] = [];
   const paths = new Set<string>();
   const branches = new Set<string>();
-  for (const rawRecord of result.stdout.slice(0, -2).split("\0\0")) {
+  let bareSeen = false;
+  for (const rawRecord of output.slice(0, -2).split("\0\0")) {
     const fields = rawRecord.split("\0");
     const worktreeField = fields.shift();
     const headField = fields.shift();
@@ -100,9 +93,10 @@ export async function listGitWorktreeRegistrations(
     }
     paths.add(worktreePath);
     if (headField === "bare") {
-      if (fields.length !== 0) {
+      if (bareSeen || fields.length !== 0) {
         throw new Error("Malformed bare Git worktree registration");
       }
+      bareSeen = true;
       continue;
     }
     if (!headField?.startsWith("HEAD ")) {
@@ -114,9 +108,22 @@ export async function listGitWorktreeRegistrations(
     }
 
     let branch: string | undefined;
+    let detached = false;
+    let locked = false;
     let prunable = false;
     for (const field of fields) {
-      if (field === "detached" || field === "locked" || field.startsWith("locked ")) {
+      if (field === "detached") {
+        if (detached) {
+          throw new Error("Malformed Git worktree registration: duplicate detached field");
+        }
+        detached = true;
+        continue;
+      }
+      if (field === "locked" || field.startsWith("locked ")) {
+        if (locked) {
+          throw new Error("Malformed Git worktree registration: duplicate locked field");
+        }
+        locked = true;
         continue;
       }
       if (field === "prunable" || field.startsWith("prunable ")) {
@@ -138,6 +145,12 @@ export async function listGitWorktreeRegistrations(
       throw new Error(`Malformed Git worktree registration field: ${field}`);
     }
 
+    if ((branch !== undefined) === detached) {
+      throw new Error(
+        "Malformed Git worktree registration: exactly one branch or detached marker is required",
+      );
+    }
+
     if (branch && branches.has(branch)) {
       throw new Error(`Conflicting Git worktree registrations for branch ${branch}`);
     }
@@ -145,6 +158,20 @@ export async function listGitWorktreeRegistrations(
     registrations.push({ worktreePath, headSha, ...(branch ? { branch } : {}), prunable });
   }
   return registrations;
+}
+
+export async function listGitWorktreeRegistrations(
+  repositoryPath: string,
+): Promise<GitWorktreeRegistration[]> {
+  const result = await gitExec(
+    "git",
+    ["worktree", "list", "--porcelain", "-z"],
+    repositoryPath,
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(`Failed to inspect Git worktree registrations: ${result.stderr || result.stdout}`);
+  }
+  return parseGitWorktreeRegistrationsPorcelain(result.stdout);
 }
 
 export async function gitLocalBranchHead(

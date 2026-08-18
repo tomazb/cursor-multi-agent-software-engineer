@@ -222,7 +222,13 @@ export class Orchestrator {
         ? this.recordsEqual(observed, checkpointExpected)
         : false;
       if (observed.state === "CREATED" && observed.workspaceBootstrap && (exactPrior || exactCheckpoint)) {
-        return this.failRun(observed, runFailureMessage(error), runFailureCode(error), runFailureRuntime(error));
+        return this.failRun(
+          observed,
+          runFailureMessage(error),
+          runFailureCode(error),
+          runFailureRuntime(error),
+          { preserveCreatedWorkspace: true },
+        );
       }
       throw new Error(
         "Workspace bootstrap publication outcome is ambiguous: authoritative state is neither an exact actionable CREATED checkpoint nor a complete START publication.",
@@ -610,8 +616,16 @@ export class Orchestrator {
     message: string,
     code: RunFailureCode = "workflow-failure",
     runtime?: DurableRuntimeFailureSummary,
+    options: { preserveCreatedWorkspace?: boolean } = {},
   ): Promise<RunRecord> {
     const resumeState = isTerminal(run.state) ? undefined : run.state;
+    if (options.preserveCreatedWorkspace && resumeState !== "CREATED") {
+      throw new Error("Workspace preservation is allowed only for a CREATED bootstrap failure");
+    }
+    const finishFailure = (record: RunRecord): Promise<RunRecord> =>
+      options.preserveCreatedWorkspace
+        ? Promise.resolve(record)
+        : this.finalizeTerminal(record);
     const safeMessage = safeFailureMessage(message);
     const candidate = structuredClone(run);
     candidate.failure = {
@@ -623,7 +637,7 @@ export class Orchestrator {
     };
     if (isTerminal(candidate.state)) {
       await this.store.save(candidate);
-      return this.finalizeTerminal(candidate);
+      return finishFailure(candidate);
     }
 
     const prior = await this.store.load(run.id);
@@ -653,14 +667,14 @@ export class Orchestrator {
         observedEvent.type === "FAIL" &&
         observedEvent.from === resumeState &&
         observedEvent.to === "FAILED";
-      if (completePublication) return this.finalizeTerminal(observed);
+      if (completePublication) return finishFailure(observed);
 
       throw new Error(
         "Failure publication outcome is ambiguous: authoritative state is neither unchanged nor a complete failed run.",
         { cause: error },
       );
     }
-    return this.finalizeTerminal(failed);
+    return finishFailure(failed);
   }
 
   private async executeRole(
