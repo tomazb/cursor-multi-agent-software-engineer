@@ -168,48 +168,126 @@ export async function isGitWorkspaceClean(cwd: string, timeoutMs = GIT_TIMEOUT_M
  */
 const NON_GIT_FINGERPRINT_NAMESPACE = "maswe:workspace-fingerprint:non-git\0";
 
+const WORKSPACE_SOURCE_FINGERPRINT_NAMESPACE = "maswe:workspace-source-fingerprint:v1\0";
+
+async function hashGitWorkspaceSource(
+  cwd: string,
+  hash: Hash,
+  timeoutMs: number,
+): Promise<void> {
+  // Explicit pathspecs exclude `.maswe` from the Git plane so source identity
+  // does not depend on `.git/info/exclude` having been modified beforehand.
+  const commands = [
+    ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...MASWE_GIT_PATHSPEC_EXCLUDES],
+    ["diff", "--binary", "--", ...MASWE_GIT_PATHSPEC_EXCLUDES],
+    ["diff", "--cached", "--binary", "--", ...MASWE_GIT_PATHSPEC_EXCLUDES],
+  ];
+  for (const args of commands) {
+    const result = await run("git", args, cwd, timeoutMs);
+    if (result.exitCode !== 0) throw gitFailure(args, result);
+    hash.update(result.stdout);
+    hash.update(result.stderr);
+  }
+
+  const untrackedArgs = [
+    "ls-files",
+    "--others",
+    "--exclude-standard",
+    "-z",
+    "--",
+    ...MASWE_GIT_PATHSPEC_EXCLUDES,
+  ];
+  const untracked = await run("git", untrackedArgs, cwd, timeoutMs);
+  if (untracked.exitCode !== 0) throw gitFailure(untrackedArgs, untracked);
+  for (const relative of untracked.stdout.split("\0").filter(Boolean).sort()) {
+    try {
+      hash.update(relative);
+      hash.update(await readFile(path.join(cwd, relative)));
+    } catch {
+      hash.update("unreadable");
+    }
+  }
+}
+
+async function hashNonGitWorkspaceSource(cwd: string, hash: Hash): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await readdir(cwd, { recursive: true });
+  } catch {
+    return;
+  }
+
+  const relativePaths = entries
+    .map((entry) => (path.sep === "\\" ? entry.replace(/\\/g, "/") : entry))
+    .filter((entry) => entry !== ".maswe" && !entry.startsWith(".maswe/"))
+    .sort();
+
+  for (const relative of relativePaths) {
+    const absolute = path.join(cwd, relative);
+    let fileStat;
+    try {
+      fileStat = await lstat(absolute);
+    } catch {
+      hash.update(`${relative}\0unreadable\0`);
+      continue;
+    }
+
+    if (fileStat.isSymbolicLink()) {
+      hash.update(`${relative}\0symlink\0`);
+      try {
+        hash.update(await readlink(absolute));
+      } catch {
+        hash.update("unreadable");
+      }
+    } else if (fileStat.isFile()) {
+      hash.update(`${relative}\0file\0`);
+      try {
+        hash.update(await readFile(absolute));
+      } catch {
+        hash.update("unreadable");
+      }
+    } else if (fileStat.isDirectory()) {
+      hash.update(`${relative}\0directory\0`);
+    } else {
+      hash.update(`${relative}\0other\0`);
+    }
+  }
+}
+
+/**
+ * Deterministic source-only workspace identity for bootstrap decisions.
+ *
+ * This intentionally excludes all `.maswe` state. Read-only enforcement must
+ * use `gitWorkspaceFingerprint()` so authoritative handoffs remain covered.
+ */
+export async function captureWorkspaceSourceFingerprint(
+  cwd: string,
+  timeoutMs = GIT_TIMEOUT_MS,
+): Promise<string> {
+  const hash = createHash("sha256");
+  hash.update(WORKSPACE_SOURCE_FINGERPRINT_NAMESPACE);
+
+  if (await isGitRepository(cwd, timeoutMs)) {
+    await hashGitWorkspaceSource(cwd, hash, timeoutMs);
+  } else {
+    hash.update(NON_GIT_FINGERPRINT_NAMESPACE);
+    await hashNonGitWorkspaceSource(cwd, hash);
+  }
+
+  return hash.digest("hex");
+}
+
 export async function gitWorkspaceFingerprint(
   cwd: string,
   timeoutMs = GIT_TIMEOUT_MS,
 ): Promise<string> {
   const hash = createHash("sha256");
-  const isGit = await isGitRepository(cwd, timeoutMs);
-
-  if (isGit) {
-    // Explicit pathspecs exclude `.maswe` from the Git plane so fingerprinting
-    // does not depend on `.git/info/exclude` having been modified beforehand.
-    // Authoritative `.maswe` state is hashed separately below.
-    const commands = [
-      ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...MASWE_GIT_PATHSPEC_EXCLUDES],
-      ["diff", "--binary", "--", ...MASWE_GIT_PATHSPEC_EXCLUDES],
-      ["diff", "--cached", "--binary", "--", ...MASWE_GIT_PATHSPEC_EXCLUDES],
-    ];
-    for (const args of commands) {
-      const result = await run("git", args, cwd, timeoutMs);
-      if (result.exitCode !== 0) throw gitFailure(args, result);
-      hash.update(result.stdout);
-      hash.update(result.stderr);
-    }
-
-    const untrackedArgs = [
-      "ls-files",
-      "--others",
-      "--exclude-standard",
-      "-z",
-      "--",
-      ...MASWE_GIT_PATHSPEC_EXCLUDES,
-    ];
-    const untracked = await run("git", untrackedArgs, cwd, timeoutMs);
-    if (untracked.exitCode !== 0) throw gitFailure(untrackedArgs, untracked);
-    for (const relative of untracked.stdout.split("\0").filter(Boolean).sort()) {
-      try {
-        hash.update(relative);
-        hash.update(await readFile(path.join(cwd, relative)));
-      } catch {
-        hash.update("unreadable");
-      }
-    }
+  const sourceFingerprint = await captureWorkspaceSourceFingerprint(cwd, timeoutMs);
+  if (await isGitRepository(cwd, timeoutMs)) {
+    hash.update(sourceFingerprint);
   } else {
+    // Preserve the read-only non-Git contract: ordinary source files are not
+    // authoritative state. Bootstrap source identity above still includes them.
     hash.update(NON_GIT_FINGERPRINT_NAMESPACE);
   }
 
