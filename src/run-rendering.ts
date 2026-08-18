@@ -64,6 +64,7 @@ export function renderRun(run: RunRecord): string {
             run.failure.message,
             FAILURE_AGGREGATE_MAX_CODE_POINTS,
           ).text}`,
+          ...(run.failure.code ? [`Failure code: ${run.failure.code}`] : []),
           ...renderRuntimeFailure(run),
         ]
       : []),

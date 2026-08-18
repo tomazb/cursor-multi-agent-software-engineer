@@ -68,17 +68,36 @@ export function extractVerifierDefects(report: string): string {
   return ["# Verifier defects", "", ...defects.map((line) => `- ${line}`), ""].join("\n");
 }
 
+export interface OrchestratorOptions {
+  /** Test-only seam for exercising bounded automatic workflow transitions. */
+  automaticTransitionLimit?: number;
+}
+
 export class Orchestrator {
   readonly store: RunStore;
   private readonly cwd: string;
   private readonly config: MasweConfig;
   private readonly runtime: AgentRuntime;
+  private readonly automaticTransitionLimit: number;
 
-  constructor(cwd: string, config: MasweConfig, runtime: AgentRuntime, store?: RunStore) {
+  constructor(
+    cwd: string,
+    config: MasweConfig,
+    runtime: AgentRuntime,
+    store?: RunStore,
+    options: OrchestratorOptions = {},
+  ) {
     this.cwd = cwd;
     this.config = config;
     this.runtime = runtime;
     this.store = store ?? new FileRunStore(cwd);
+    this.automaticTransitionLimit = options.automaticTransitionLimit ?? 20;
+    if (
+      !Number.isSafeInteger(this.automaticTransitionLimit) ||
+      this.automaticTransitionLimit <= 0
+    ) {
+      throw new Error("automaticTransitionLimit must be a positive safe integer");
+    }
   }
 
   private assertWithinBudget(run: RunRecord): void {
@@ -130,11 +149,18 @@ export class Orchestrator {
   async runUntilBlocked(runId: string): Promise<RunRecord> {
     let run = await this.store.load(runId);
     let iterations = 0;
-    while (!isTerminal(run.state) && !isHumanGate(run.state) && iterations < 20) {
+    while (!isTerminal(run.state) && !isHumanGate(run.state)) {
       run = await this.advance(run.id);
       iterations += 1;
+      if (isTerminal(run.state) || isHumanGate(run.state)) return run;
+      if (iterations >= this.automaticTransitionLimit) {
+        return this.failRun(
+          run,
+          `Workflow exceeded ${this.automaticTransitionLimit} automatic transitions.`,
+          "automatic-transition-limit-exceeded",
+        );
+      }
     }
-    if (iterations >= 20) throw new Error("Workflow exceeded 20 automatic transitions.");
     return run;
   }
 
@@ -458,22 +484,58 @@ export class Orchestrator {
   ): Promise<RunRecord> {
     const resumeState = isTerminal(run.state) ? undefined : run.state;
     const safeMessage = safeFailureMessage(message);
-    run.failure = {
+    const candidate = structuredClone(run);
+    candidate.failure = {
       code,
       message: safeMessage,
       at: new Date().toISOString(),
       ...(resumeState ? { resumeState } : {}),
       ...(runtime ? { runtime } : {}),
     };
-    await this.store.save(run);
-    if (!isTerminal(run.state)) {
-      const failed = await this.store.applyEvent(run, "FAIL", "orchestrator", {
+    if (isTerminal(candidate.state)) {
+      await this.store.save(candidate);
+      return this.finalizeTerminal(candidate);
+    }
+
+    const priorEventIds = new Set(run.events.map((event) => event.id));
+    let failed: RunRecord;
+    try {
+      failed = await this.store.applyEvent(candidate, "FAIL", "orchestrator", {
         ...runFailureDetails(code, safeMessage, runtime),
         ...(resumeState ? { resumeState } : {}),
       });
-      return this.finalizeTerminal(failed);
+    } catch (error) {
+      const observed = await this.store.load(run.id);
+      const newEvents = observed.events.filter((event) => !priorEventIds.has(event.id));
+      const observedEvent = newEvents[0];
+      const publishedEvent = candidate.events.find((event) => !priorEventIds.has(event.id));
+      const priorRecordIsUnchanged =
+        observed.version === run.version &&
+        observed.updatedAt === run.updatedAt &&
+        observed.state === run.state &&
+        newEvents.length === 0 &&
+        JSON.stringify(observed.failure) === JSON.stringify(run.failure);
+      if (priorRecordIsUnchanged) throw error;
+
+      const completePublication =
+        observed.state === "FAILED" &&
+        observed.failure !== undefined &&
+        JSON.stringify(observed.failure) === JSON.stringify(candidate.failure) &&
+        newEvents.length === 1 &&
+        observedEvent !== undefined &&
+        publishedEvent !== undefined &&
+        observedEvent.id === publishedEvent.id &&
+        observedEvent.type === "FAIL" &&
+        observedEvent.from === resumeState &&
+        observedEvent.to === "FAILED";
+      if (completePublication) return this.finalizeTerminal(observed);
+
+      throw new Error(
+        "Failure publication outcome is ambiguous: authoritative state is neither unchanged nor a complete failed run.",
+        { cause: error },
+      );
     }
-    return this.finalizeTerminal(run);
+    return this.finalizeTerminal(failed);
   }
 
   private async executeRole(
