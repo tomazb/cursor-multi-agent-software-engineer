@@ -39,7 +39,7 @@ async function nonGitDir(): Promise<string> {
   return mkdtemp(path.join(os.tmpdir(), "maswe-issue28-bootstrap-nongit-"));
 }
 
-test("Git bootstrap source fingerprint excludes .maswe and tracks source planes", async () => {
+test("Git bootstrap source fingerprint excludes .maswe state", async () => {
   const cwd = await initRepo();
   const runPath = path.join(cwd, ".maswe", "runs", "run-1", "run.json");
   await mkdir(path.dirname(runPath), { recursive: true });
@@ -58,25 +58,56 @@ test("Git bootstrap source fingerprint excludes .maswe and tracks source planes"
     authoritativeBefore,
     "authoritative fingerprint must retain read-only .maswe enforcement",
   );
+});
 
-  await writeFile(path.join(cwd, "README.md"), "# unstaged source\n", "utf8");
-  assert.notEqual(
-    await captureWorkspaceSourceFingerprint(cwd),
-    sourceBefore,
-    "unstaged source content must affect the Git source plane",
-  );
+test("Git bootstrap source fingerprint hashes unstaged diff bytes beyond status", async () => {
+  const cwd = await initRepo();
+  const readme = path.join(cwd, "README.md");
+
+  await writeFile(readme, "# first unstaged content\n", "utf8");
+  const first = await captureWorkspaceSourceFingerprint(cwd);
+  const firstStatus = await execFileAsync("git", ["status", "--porcelain=v1"], { cwd });
+  assert.equal(firstStatus.stdout, " M README.md\n");
+
+  await writeFile(readme, "# second unstaged content\n", "utf8");
+  const second = await captureWorkspaceSourceFingerprint(cwd);
+  const secondStatus = await execFileAsync("git", ["status", "--porcelain=v1"], { cwd });
+  assert.equal(secondStatus.stdout, firstStatus.stdout);
+  assert.notEqual(second, first, "unstaged diff bytes must affect source identity");
+});
+
+test("Git bootstrap source fingerprint hashes staged diff bytes beyond status", async () => {
+  const cwd = await initRepo();
+  const readme = path.join(cwd, "README.md");
+
+  await writeFile(readme, "# first staged content\n", "utf8");
   await execFileAsync("git", ["add", "README.md"], { cwd });
-  assert.notEqual(
-    await captureWorkspaceSourceFingerprint(cwd),
-    sourceBefore,
-    "staged source content must affect the Git source plane",
-  );
-  await writeFile(path.join(cwd, "untracked.txt"), "untracked source\n", "utf8");
-  assert.notEqual(
-    await captureWorkspaceSourceFingerprint(cwd),
-    sourceBefore,
-    "non-ignored untracked source content must affect the Git source plane",
-  );
+  const first = await captureWorkspaceSourceFingerprint(cwd);
+  const firstStatus = await execFileAsync("git", ["status", "--porcelain=v1"], { cwd });
+  assert.equal(firstStatus.stdout, "M  README.md\n");
+
+  await writeFile(readme, "# second staged content\n", "utf8");
+  await execFileAsync("git", ["add", "README.md"], { cwd });
+  const second = await captureWorkspaceSourceFingerprint(cwd);
+  const secondStatus = await execFileAsync("git", ["status", "--porcelain=v1"], { cwd });
+  assert.equal(secondStatus.stdout, firstStatus.stdout);
+  assert.notEqual(second, first, "staged diff bytes must affect source identity");
+});
+
+test("Git bootstrap source fingerprint hashes untracked bytes beyond status and path", async () => {
+  const cwd = await initRepo();
+  const untracked = path.join(cwd, "untracked.txt");
+
+  await writeFile(untracked, "first untracked content\n", "utf8");
+  const first = await captureWorkspaceSourceFingerprint(cwd);
+  const firstStatus = await execFileAsync("git", ["status", "--porcelain=v1"], { cwd });
+  assert.equal(firstStatus.stdout, "?? untracked.txt\n");
+
+  await writeFile(untracked, "second untracked content\n", "utf8");
+  const second = await captureWorkspaceSourceFingerprint(cwd);
+  const secondStatus = await execFileAsync("git", ["status", "--porcelain=v1"], { cwd });
+  assert.equal(secondStatus.stdout, firstStatus.stdout);
+  assert.notEqual(second, first, "untracked bytes must affect source identity");
 });
 
 test("non-Git bootstrap source fingerprint excludes .maswe and tracks source files", async () => {
