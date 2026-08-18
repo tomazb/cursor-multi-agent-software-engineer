@@ -80,6 +80,47 @@
         "worktreePath": { "type": "string" }
       }
     },
+    "workspaceBootstrap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "sourceBaseSha",
+        "sourceBranch",
+        "sourceTreeFingerprint",
+        "plannedAt"
+      ],
+      "properties": {
+        "mode": { "enum": ["operator-checkout", "isolated-worktree"] },
+        "sourceBaseSha": { "type": "string" },
+        "sourceBranch": { "type": "string" },
+        "sourceTreeFingerprint": { "type": "string" },
+        "remote": { "type": "string" },
+        "plannedAt": { "type": "string" }
+      }
+    },
+    "revalidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "returnState",
+        "source",
+        "originHeadSha",
+        "requestedHeadSha",
+        "generation",
+        "requestedAt",
+        "updatedAt"
+      ],
+      "properties": {
+        "returnState": { "enum": ["PR_READY", "PR_REVIEW"] },
+        "source": { "enum": ["local-workspace", "github"] },
+        "originHeadSha": { "type": "string" },
+        "requestedHeadSha": { "type": "string" },
+        "generation": { "type": "integer", "minimum": 1 },
+        "requestedAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      }
+    },
     "evidence": {
       "type": "object",
       "properties": {
@@ -138,7 +179,11 @@
       "required": ["message", "at"],
       "properties": {
         "code": {
-          "enum": ["runtime-models-exhausted", "workflow-failure"]
+          "enum": [
+            "runtime-models-exhausted",
+            "workflow-failure",
+            "automatic-transition-limit-exceeded"
+          ]
         },
         "message": { "type": "string" },
         "at": { "type": "string" },

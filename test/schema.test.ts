@@ -255,6 +255,58 @@ test("persisted run records satisfy run-record schema required shape", async (t)
   assertMatches(schema, schema, run, "run");
 });
 
+test("run-record schema and migration accept exact recovery metadata", async (t) => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-recovery-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("schema", "recovery contracts", DEFAULT_CONFIG);
+  run.workspaceBootstrap = {
+    mode: "isolated-worktree",
+    sourceBaseSha: "a".repeat(40),
+    sourceBranch: "main",
+    sourceTreeFingerprint: "b".repeat(64),
+    remote: "https://github.com/owner/repo.git",
+    plannedAt: "2026-08-18T12:00:00.000Z",
+  };
+  run.revalidation = {
+    returnState: "PR_REVIEW",
+    source: "github",
+    originHeadSha: "c".repeat(40),
+    requestedHeadSha: "d".repeat(40),
+    generation: 2,
+    requestedAt: "2026-08-18T12:01:00.000Z",
+    updatedAt: "2026-08-18T12:02:00.000Z",
+  };
+  run.failure = {
+    code: "automatic-transition-limit-exceeded",
+    message: "automatic transition limit exceeded",
+    at: "2026-08-18T12:03:00.000Z",
+    resumeState: "CI_RUNNING",
+  };
+  await store.save(run);
+  const persisted = await store.load(run.id);
+
+  assert.doesNotThrow(() => assertMatches(schema, schema, persisted, "run"));
+  assert.doesNotThrow(() => migrateRunRecord(persisted));
+
+  const recovery = persisted as unknown as Record<string, unknown>;
+  const revalidation = recovery.revalidation as Record<string, unknown>;
+  revalidation.generation = 0;
+  assert.throws(() => assertMatches(schema, schema, persisted, "run"), /generation/);
+  assert.throws(() => migrateRunRecord(persisted), /generation/);
+  revalidation.generation = 2;
+  delete revalidation.requestedAt;
+  assert.throws(() => assertMatches(schema, schema, persisted, "run"), /requestedAt.*required/);
+  assert.throws(() => migrateRunRecord(persisted), /requestedAt.*required/);
+  revalidation.requestedAt = "2026-08-18T12:01:00.000Z";
+  revalidation.unknown = true;
+  assert.throws(() => assertMatches(schema, schema, persisted, "run"), /additionalProperties/);
+  assert.throws(() => migrateRunRecord(persisted), /unsupported.*revalidation.*unknown/i);
+});
+
 test("persisted run config uses the exact config schema and rejects nested secrets", async (t) => {
   const configSchema = JSON.parse(
     await readFile(path.join(process.cwd(), "schemas/config.schema.json"), "utf8"),

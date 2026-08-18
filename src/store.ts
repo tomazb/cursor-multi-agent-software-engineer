@@ -198,6 +198,8 @@ const RUN_RECORD_FIELDS = new Set([
   "artifacts",
   "events",
   "workspace",
+  "workspaceBootstrap",
+  "revalidation",
   "evidence",
   "github",
   "supersedes",
@@ -805,11 +807,15 @@ export class FileRunStore implements RunStore {
   ): Promise<RunRecord> {
     const from = run.state;
     const safeDetails = sanitizeEventDetails(type, details);
-    const to = transition(
-      from,
-      type,
-      safeDetails?.resumeState as WorkflowState | undefined,
-    );
+    const to = transition(from, type, {
+      ...(safeDetails?.resumeState !== undefined
+        ? { retryResumeState: safeDetails.resumeState as WorkflowState }
+        : {}),
+      ...(run.failure?.resumeState !== undefined
+        ? { failureResumeState: run.failure.resumeState }
+        : {}),
+      hasRevalidation: run.revalidation !== undefined,
+    });
     run.state = to;
     run.events.push({
       id: randomUUID(),

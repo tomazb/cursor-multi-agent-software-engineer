@@ -125,6 +125,8 @@ export const WORKFLOW_EVENTS = [
   "FAIL",
   "CANCEL",
   "RETRY_FROM_FAILED",
+  "REVALIDATE_REQUESTED",
+  "REVALIDATION_RETARGETED",
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENTS)[number];
@@ -157,6 +159,28 @@ export interface RunWorkspace {
   worktreePath?: string;
 }
 
+export type RevalidationReturnState = "PR_READY" | "PR_REVIEW";
+export type RevalidationSource = "local-workspace" | "github";
+
+export interface WorkspaceBootstrapIntent {
+  mode: "operator-checkout" | "isolated-worktree";
+  sourceBaseSha: string;
+  sourceBranch: string;
+  sourceTreeFingerprint: string;
+  remote?: string;
+  plannedAt: string;
+}
+
+export interface RunRevalidation {
+  returnState: RevalidationReturnState;
+  source: RevalidationSource;
+  originHeadSha: string;
+  requestedHeadSha: string;
+  generation: number;
+  requestedAt: string;
+  updatedAt: string;
+}
+
 export interface EvidenceBinding {
   headSha: string;
   passed: boolean;
@@ -171,7 +195,8 @@ export interface RunEvidence {
 
 export type RunFailureCode =
   | "runtime-models-exhausted"
-  | "workflow-failure";
+  | "workflow-failure"
+  | "automatic-transition-limit-exceeded";
 
 export interface DurableRuntimeFailureAttempt {
   model: string;
@@ -224,6 +249,8 @@ export interface RunRecord {
   artifacts: ArtifactReference[];
   events: WorkflowEvent[];
   workspace?: RunWorkspace;
+  workspaceBootstrap?: WorkspaceBootstrapIntent;
+  revalidation?: RunRevalidation;
   evidence?: RunEvidence;
   github?: RunGitHubAssociation;
   supersedes?: string;

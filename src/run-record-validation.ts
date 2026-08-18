@@ -75,6 +75,104 @@ function validateWorkspace(value: unknown): NonNullable<RunRecord["workspace"]> 
   };
 }
 
+function validateWorkspaceBootstrap(
+  value: unknown,
+): NonNullable<RunRecord["workspaceBootstrap"]> {
+  const bootstrap = exactObject(
+    value,
+    "run record workspaceBootstrap",
+    [
+      "mode",
+      "sourceBaseSha",
+      "sourceBranch",
+      "sourceTreeFingerprint",
+      "remote",
+      "plannedAt",
+    ],
+    ["mode", "sourceBaseSha", "sourceBranch", "sourceTreeFingerprint", "plannedAt"],
+  );
+  if (bootstrap.mode !== "operator-checkout" && bootstrap.mode !== "isolated-worktree") {
+    throw new Error("Run record workspaceBootstrap.mode is invalid");
+  }
+  return {
+    mode: bootstrap.mode,
+    sourceBaseSha: requiredRunRecordString(
+      bootstrap.sourceBaseSha,
+      "Run record workspaceBootstrap.sourceBaseSha",
+    ),
+    sourceBranch: requiredRunRecordString(
+      bootstrap.sourceBranch,
+      "Run record workspaceBootstrap.sourceBranch",
+    ),
+    sourceTreeFingerprint: requiredRunRecordString(
+      bootstrap.sourceTreeFingerprint,
+      "Run record workspaceBootstrap.sourceTreeFingerprint",
+    ),
+    ...(bootstrap.remote !== undefined
+      ? {
+          remote: requiredRunRecordString(
+            bootstrap.remote,
+            "Run record workspaceBootstrap.remote",
+          ),
+        }
+      : {}),
+    plannedAt: requiredRunRecordString(
+      bootstrap.plannedAt,
+      "Run record workspaceBootstrap.plannedAt",
+    ),
+  };
+}
+
+function validateRevalidation(value: unknown): NonNullable<RunRecord["revalidation"]> {
+  const revalidation = exactObject(
+    value,
+    "run record revalidation",
+    [
+      "returnState",
+      "source",
+      "originHeadSha",
+      "requestedHeadSha",
+      "generation",
+      "requestedAt",
+      "updatedAt",
+    ],
+  );
+  if (revalidation.returnState !== "PR_READY" && revalidation.returnState !== "PR_REVIEW") {
+    throw new Error("Run record revalidation.returnState is invalid");
+  }
+  if (revalidation.source !== "local-workspace" && revalidation.source !== "github") {
+    throw new Error("Run record revalidation.source is invalid");
+  }
+  const generation = nonNegativeRunRecordInteger(
+    revalidation.generation,
+    "Run record revalidation.generation",
+  );
+  if (generation < 1) {
+    throw new Error("Run record revalidation.generation must be a positive integer");
+  }
+  return {
+    returnState: revalidation.returnState,
+    source: revalidation.source,
+    originHeadSha: requiredRunRecordString(
+      revalidation.originHeadSha,
+      "Run record revalidation.originHeadSha",
+    ),
+    requestedHeadSha: requiredRunRecordString(
+      revalidation.requestedHeadSha,
+      "Run record revalidation.requestedHeadSha",
+    ),
+    generation,
+    requestedAt: requiredRunRecordString(
+      revalidation.requestedAt,
+      "Run record revalidation.requestedAt",
+    ),
+    updatedAt: requiredRunRecordString(
+      revalidation.updatedAt,
+      "Run record revalidation.updatedAt",
+    ),
+  };
+}
+
 function validateEvidence(value: unknown): NonNullable<RunRecord["evidence"]> {
   const evidence = exactObject(
     value,
@@ -153,7 +251,8 @@ function validateFailure(value: unknown): NonNullable<RunRecord["failure"]> {
   if (
     failure.code !== undefined &&
     failure.code !== "runtime-models-exhausted" &&
-    failure.code !== "workflow-failure"
+    failure.code !== "workflow-failure" &&
+    failure.code !== "automatic-transition-limit-exceeded"
   ) {
     throw new Error("Run record failure.code is invalid");
   }
@@ -236,6 +335,12 @@ export function exactRunRecord(
     events: validateEvents(candidate.events),
     ...(candidate.workspace !== undefined
       ? { workspace: validateWorkspace(candidate.workspace) }
+      : {}),
+    ...(candidate.workspaceBootstrap !== undefined
+      ? { workspaceBootstrap: validateWorkspaceBootstrap(candidate.workspaceBootstrap) }
+      : {}),
+    ...(candidate.revalidation !== undefined
+      ? { revalidation: validateRevalidation(candidate.revalidation) }
       : {}),
     ...(candidate.evidence !== undefined
       ? { evidence: validateEvidence(candidate.evidence) }

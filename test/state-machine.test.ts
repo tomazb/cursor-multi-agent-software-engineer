@@ -29,8 +29,50 @@ test("post-review verification returns to the existing PR review state", () => {
 });
 
 test("retry-from-failed resumes into the provided resumeState", () => {
-  assert.equal(transition("FAILED", "RETRY_FROM_FAILED", "BUILDING"), "BUILDING");
-  assert.throws(() => transition("PR_READY", "RETRY_FROM_FAILED", "BUILDING"), /not allowed/);
+  assert.equal(
+    transition("FAILED", "RETRY_FROM_FAILED", { retryResumeState: "BUILDING" }),
+    "BUILDING",
+  );
+  assert.throws(
+    () => transition("PR_READY", "RETRY_FROM_FAILED", { retryResumeState: "BUILDING" }),
+    /not allowed/,
+  );
   assert.throws(() => transition("FAILED", "RETRY_FROM_FAILED"), /resumeState/);
   assert.deepEqual(allowedEvents("FAILED"), ["RETRY_FROM_FAILED"]);
+});
+
+test("revalidation transitions are centralized", () => {
+  assert.equal(transition("PR_READY", "REVALIDATE_REQUESTED", {}), "CI_RUNNING");
+  assert.equal(transition("PR_REVIEW", "REVALIDATE_REQUESTED", {}), "CI_RUNNING");
+  for (const state of ["CI_RUNNING", "BUILDING", "VERIFYING"] as const) {
+    assert.equal(transition(state, "REVALIDATION_RETARGETED", {}), "CI_RUNNING");
+  }
+});
+
+test("failed retarget requires active revalidation and a legal resume state", () => {
+  assert.equal(
+    transition("FAILED", "REVALIDATION_RETARGETED", {
+      hasRevalidation: true,
+      failureResumeState: "VERIFYING",
+    }),
+    "FAILED",
+  );
+  assert.throws(
+    () => transition("FAILED", "REVALIDATION_RETARGETED", {}),
+    /active revalidation|resume state/i,
+  );
+  assert.deepEqual(
+    allowedEvents("FAILED", {
+      hasRevalidation: true,
+      failureResumeState: "VERIFYING",
+    }),
+    ["RETRY_FROM_FAILED", "REVALIDATION_RETARGETED"],
+  );
+});
+
+test("CREATED is retry-resumable", () => {
+  assert.equal(
+    transition("FAILED", "RETRY_FROM_FAILED", { retryResumeState: "CREATED" }),
+    "CREATED",
+  );
 });
