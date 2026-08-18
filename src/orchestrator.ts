@@ -52,6 +52,31 @@ import {
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
+function isCanonicalFileStoreTimestamp(value: string): boolean {
+  if (value.length !== 24) return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+function isOrderedFileStorePublicationTimestamp(
+  priorUpdatedAt: string,
+  eventAt: string | undefined,
+  observedUpdatedAt: string,
+): boolean {
+  if (
+    !isCanonicalFileStoreTimestamp(priorUpdatedAt) ||
+    !isCanonicalFileStoreTimestamp(observedUpdatedAt) ||
+    (eventAt !== undefined && !isCanonicalFileStoreTimestamp(eventAt))
+  ) {
+    return false;
+  }
+  return (
+    observedUpdatedAt >= priorUpdatedAt &&
+    (eventAt === undefined ||
+      (eventAt >= priorUpdatedAt && observedUpdatedAt >= eventAt))
+  );
+}
+
 export function extractVerifierDefects(report: string): string {
   const lines = report.split(/\r?\n/);
   const defects: string[] = [];
@@ -931,6 +956,11 @@ export class Orchestrator {
       expected.events = observed.events;
       const completePublication =
         observed.version === prior.version + 1 &&
+        isOrderedFileStorePublicationTimestamp(
+          prior.updatedAt,
+          retryEvent?.at,
+          observed.updatedAt,
+        ) &&
         historicalPrefixExact &&
         observed.failure === undefined &&
         retryEvent?.type === "RETRY_FROM_FAILED" &&
@@ -942,14 +972,23 @@ export class Orchestrator {
       if (completePublication) {
         resumed = observed;
       } else {
-        const retryablePrior = structuredClone(prior);
-        retryablePrior.version = observed.version;
-        retryablePrior.updatedAt = observed.updatedAt;
+        const unchangedPrior = this.recordsEqual(observed, prior);
+        const oneStepConflict = structuredClone(prior);
+        oneStepConflict.version = prior.version + 1;
+        oneStepConflict.updatedAt = observed.updatedAt;
+        const validOneStepConflict =
+          observed.version === prior.version + 1 &&
+          isOrderedFileStorePublicationTimestamp(
+            prior.updatedAt,
+            undefined,
+            observed.updatedAt,
+          ) &&
+          this.recordsEqual(observed, oneStepConflict);
         const originalRetryRemains =
           newEvents.length === 0 &&
           observed.state === "FAILED" &&
           this.recordsEqual(observed.failure, previousFailure) &&
-          this.recordsEqual(observed, retryablePrior);
+          (unchangedPrior || validOneStepConflict);
         if (originalRetryRemains) throw error;
         throw new Error(
           "Retry publication outcome is inconsistent: authoritative state is neither the original retryable FAILED record nor one complete retry publication.",

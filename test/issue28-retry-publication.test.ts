@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -33,7 +33,16 @@ after(async () => {
   await rm(publicationCwd, { recursive: true, force: true });
 });
 
-type RetryInjection = "before" | "complete-after" | "failure-restored-after";
+type RetryInjection =
+  | "before"
+  | "before-version-jump"
+  | "before-malformed-timestamp"
+  | "before-unbounded-timestamp"
+  | "complete-after"
+  | "complete-malformed-event-timestamp-after"
+  | "complete-malformed-timestamp-after"
+  | "complete-unbounded-timestamp-after"
+  | "failure-restored-after";
 
 class RetryInjectionStore implements RunStore {
   private readonly delegate: FileRunStore;
@@ -65,6 +74,14 @@ class RetryInjectionStore implements RunStore {
     return this.delegate.list();
   }
 
+  private async overwriteAuthoritative(run: RunRecord): Promise<void> {
+    await writeFile(
+      path.join(this.delegate.root, run.id, "run.json"),
+      `${JSON.stringify(run, null, 2)}\n`,
+      "utf8",
+    );
+  }
+
   async applyEvent(
     run: RunRecord,
     type: WorkflowEventType,
@@ -74,8 +91,26 @@ class RetryInjectionStore implements RunStore {
     if (type !== "RETRY_FROM_FAILED") {
       return this.delegate.applyEvent(run, type, actor, details);
     }
-    if (this.injection === "before") {
-      throw new Error("simulated RETRY_FROM_FAILED pre-publication failure");
+    if (this.injection.startsWith("before")) {
+      if (this.injection !== "before") {
+        const observed = await this.delegate.load(run.id);
+        if (this.injection === "before-version-jump") {
+          observed.version += 2;
+          observed.updatedAt = new Date(Date.now() + 1_000).toISOString();
+        } else {
+          observed.version += 1;
+          observed.updatedAt =
+            this.injection === "before-malformed-timestamp"
+              ? "not-a-file-store-timestamp"
+              : "x".repeat(4_096);
+        }
+        await this.overwriteAuthoritative(observed);
+      }
+      throw new Error(
+        this.injection === "before"
+          ? "simulated RETRY_FROM_FAILED pre-publication failure"
+          : `simulated ${this.injection} RETRY_FROM_FAILED failure`,
+      );
     }
 
     const published = await this.delegate.applyEvent(
@@ -89,6 +124,15 @@ class RetryInjectionStore implements RunStore {
         details?.previousFailure as NonNullable<RunRecord["failure"]>,
       );
       await this.delegate.save(published);
+    } else if (this.injection === "complete-malformed-event-timestamp-after") {
+      published.events.at(-1)!.at = "not-a-file-store-timestamp";
+      await this.overwriteAuthoritative(published);
+    } else if (this.injection === "complete-malformed-timestamp-after") {
+      published.updatedAt = "not-a-file-store-timestamp";
+      await this.overwriteAuthoritative(published);
+    } else if (this.injection === "complete-unbounded-timestamp-after") {
+      published.updatedAt = "x".repeat(4_096);
+      await this.overwriteAuthoritative(published);
     }
     throw new Error(`simulated ${this.injection} RETRY_FROM_FAILED publication`);
   }
@@ -123,6 +167,23 @@ async function initGitRepo(): Promise<string> {
   await execFileAsync("git", ["add", "README.md"], { cwd });
   await execFileAsync("git", ["commit", "-qm", "init"], { cwd });
   return cwd;
+}
+
+async function cleanupGitRepo(cwd: string): Promise<void> {
+  try {
+    const registrations = await listGitWorktreeRegistrations(cwd);
+    for (const registration of registrations) {
+      if (registration.worktreePath === path.resolve(cwd)) continue;
+      await execFileAsync(
+        "git",
+        ["worktree", "remove", "--force", registration.worktreePath],
+        { cwd },
+      ).catch(() => undefined);
+    }
+    await execFileAsync("git", ["worktree", "prune"], { cwd }).catch(() => undefined);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 }
 
 async function createFailedRun(
@@ -234,6 +295,15 @@ test("retry reconciles a FAILED CREATED run with no workspace before publishing 
     authoritative.events.filter((event) => event.type === "START").length,
     1,
   );
+  const retryIndex = authoritative.events.findIndex(
+    (event) => event.type === "RETRY_FROM_FAILED",
+  );
+  const startIndex = authoritative.events.findIndex((event) => event.type === "START");
+  assert.ok(retryIndex >= 0 && retryIndex < startIndex);
+  assert.equal(authoritative.events[retryIndex]?.from, "FAILED");
+  assert.equal(authoritative.events[retryIndex]?.to, "CREATED");
+  assert.equal(authoritative.events[startIndex]?.from, "CREATED");
+  assert.equal(authoritative.events[startIndex]?.to, "BRAINSTORMING");
 });
 
 test("retry optimistic conflict preserves failure metadata and publishes no retry event", async () => {
@@ -256,6 +326,36 @@ test("retry optimistic conflict preserves failure metadata and publishes no retr
   assert.equal(authoritative.state, "FAILED");
   assert.deepEqual(authoritative.failure, previousFailure);
   assert.equal(retryEvents(authoritative).length, 0);
+});
+
+test("retry rejects malformed no-event version and timestamp shapes", async (t) => {
+  for (const injection of [
+    "before-version-jump",
+    "before-malformed-timestamp",
+    "before-unbounded-timestamp",
+  ] as const) {
+    await t.test(injection, async () => {
+      const cwd = publicationCwd;
+      const value = config();
+      const { run, store } = await createFailedRun(cwd, value);
+      const previousFailure = structuredClone(run.failure);
+
+      await assert.rejects(
+        new Orchestrator(
+          cwd,
+          value,
+          new MockRuntime(),
+          new RetryInjectionStore(store, injection),
+        ).retryFromFailed(run.id),
+        /retry publication outcome is inconsistent/i,
+      );
+
+      const authoritative = await new FileRunStore(cwd).load(run.id);
+      assert.equal(authoritative.state, "FAILED");
+      assert.deepEqual(authoritative.failure, previousFailure);
+      assert.equal(retryEvents(authoritative).length, 0);
+    });
+  }
 });
 
 test("retry directory-sync outcome unknown adopts the one complete authoritative retry", async () => {
@@ -316,6 +416,35 @@ test("retry adopts an independently completed publication after applyEvent throw
   assert.equal(authoritative.state, "WAITING_FOR_BRAINSTORM_APPROVAL");
   assert.equal(authoritative.failure, undefined);
   assert.equal(currentRetries.length, 1);
+});
+
+test("retry rejects complete-looking publications with malformed timestamps", async (t) => {
+  for (const injection of [
+    "complete-malformed-event-timestamp-after",
+    "complete-malformed-timestamp-after",
+    "complete-unbounded-timestamp-after",
+  ] as const) {
+    await t.test(injection, async () => {
+      const cwd = publicationCwd;
+      const value = config();
+      const { run, store } = await createFailedRun(cwd, value);
+
+      await assert.rejects(
+        new Orchestrator(
+          cwd,
+          value,
+          new MockRuntime(),
+          new RetryInjectionStore(store, injection),
+        ).retryFromFailed(run.id),
+        /retry publication outcome is inconsistent/i,
+      );
+
+      const authoritative = await new FileRunStore(cwd).load(run.id);
+      assert.equal(authoritative.state, "WAITING_FOR_BRAINSTORM_APPROVAL");
+      assert.equal(authoritative.failure, undefined);
+      assert.equal(retryEvents(authoritative).length, 1);
+    });
+  }
 });
 
 test("retry rejects a partial publication that restores active failure metadata", async () => {
@@ -392,6 +521,108 @@ test("retry rejects a dirty isolated worktree without cleaning or removing it", 
   assert.equal(authoritative.state, "FAILED");
   assert.equal(authoritative.failure?.resumeState, "WAITING_FOR_BRAINSTORM_APPROVAL");
   assert.equal(await readFile(dirtyPath, "utf8"), "do not discard\n");
+});
+
+test("later Git operator retry rejects branch, HEAD, and source-plane drift", async (t) => {
+  for (const mutation of ["branch", "head", "dirty"] as const) {
+    await t.test(mutation, async (t) => {
+      const cwd = await initGitRepo();
+      t.after(async () => cleanupGitRepo(cwd));
+      const value = config();
+      const { run, store } = await createFailedRun(cwd, value);
+      const previousFailure = structuredClone(run.failure);
+
+      if (mutation === "branch") {
+        await execFileAsync("git", ["switch", "-qc", `retry-drift-${run.id}`], { cwd });
+      } else if (mutation === "head") {
+        await writeFile(path.join(cwd, "README.md"), "# advanced operator HEAD\n", "utf8");
+        await execFileAsync("git", ["add", "README.md"], { cwd });
+        await execFileAsync("git", ["commit", "-qm", "advance operator HEAD"], { cwd });
+      } else {
+        await writeFile(path.join(cwd, "operator-dirty.txt"), "preserve me\n", "utf8");
+      }
+
+      await assert.rejects(
+        new Orchestrator(cwd, value, new MockRuntime(), store).retryFromFailed(run.id),
+        mutation === "dirty" ? /dirty/ : /moved|supersede/,
+      );
+
+      const authoritative = await new FileRunStore(cwd).load(run.id);
+      assert.equal(authoritative.state, "FAILED");
+      assert.deepEqual(authoritative.failure, previousFailure);
+      assert.equal(retryEvents(authoritative).length, 0);
+    });
+  }
+});
+
+test("later isolated retry rejects every conflicting preserved workspace shape", async (t) => {
+  for (const mutation of [
+    "wrong-path",
+    "alternate-registration",
+    "prunable-registration",
+    "wrong-branch",
+    "wrong-head",
+    "fingerprint-drift",
+  ] as const) {
+    await t.test(mutation, async (t) => {
+      const cwd = await initGitRepo();
+      t.after(async () => cleanupGitRepo(cwd));
+      const value = config(true);
+      const { run, store } = await createFailedRun(cwd, value);
+      const previousFailure = structuredClone(run.failure);
+      const worktreePath = run.workspace?.worktreePath;
+      const branch = run.workspace?.branch;
+      const headSha = run.workspace?.headSha;
+      assert.ok(worktreePath && branch && headSha);
+
+      if (mutation === "wrong-path") {
+        run.workspace!.worktreePath = path.join(cwd, "wrong-retry-path");
+        await store.save(run);
+      } else if (mutation === "alternate-registration") {
+        const alternatePath = path.join(os.tmpdir(), `maswe-retry-alternate-${run.id}`);
+        await execFileAsync("git", ["worktree", "remove", "--force", worktreePath], { cwd });
+        await execFileAsync("git", ["worktree", "add", "--", alternatePath, branch], { cwd });
+      } else if (mutation === "prunable-registration") {
+        await rm(worktreePath, { recursive: true, force: true });
+        const registration = (await listGitWorktreeRegistrations(cwd)).find(
+          (candidate) => candidate.branch === branch,
+        );
+        assert.equal(registration?.prunable, true);
+      } else if (mutation === "wrong-branch") {
+        const alternateBranch = `retry-wrong/${run.id}`;
+        await execFileAsync("git", ["worktree", "remove", "--force", worktreePath], { cwd });
+        await execFileAsync("git", ["branch", alternateBranch, headSha], { cwd });
+        await execFileAsync(
+          "git",
+          ["worktree", "add", "--", worktreePath, alternateBranch],
+          { cwd },
+        );
+      } else if (mutation === "wrong-head") {
+        await writeFile(path.join(worktreePath, "README.md"), "# advanced retry HEAD\n", "utf8");
+        await execFileAsync("git", ["add", "README.md"], { cwd: worktreePath });
+        await execFileAsync("git", ["commit", "-qm", "advance retry HEAD"], {
+          cwd: worktreePath,
+        });
+      } else {
+        await mkdir(path.join(worktreePath, ".maswe"), { recursive: true });
+        await writeFile(
+          path.join(worktreePath, ".maswe", "config.json"),
+          "{\"drift\":true}\n",
+          "utf8",
+        );
+      }
+
+      await assert.rejects(
+        new Orchestrator(cwd, value, new MockRuntime(), store).retryFromFailed(run.id),
+        /identity|alternate|prunable|wrong|moved|fingerprint|conflict/i,
+      );
+
+      const authoritative = await new FileRunStore(cwd).load(run.id);
+      assert.equal(authoritative.state, "FAILED");
+      assert.deepEqual(authoritative.failure, previousFailure);
+      assert.equal(retryEvents(authoritative).length, 0);
+    });
+  }
 });
 
 test("later non-Git operator-checkout retry fails closed and requires supersession", async (t) => {
