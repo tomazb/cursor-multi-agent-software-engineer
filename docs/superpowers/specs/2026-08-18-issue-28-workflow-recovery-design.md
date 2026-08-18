@@ -2,287 +2,182 @@
 
 ## Status
 
-- **Issue:** [#28 — Harden workflow provenance, durable recovery, and stale-evidence revalidation](https://github.com/tomazb/multi-agent-software-engineer/issues/28)
-- **Parent:** [#27 — Correctness hardening: workflow provenance, recovery, and policy boundaries](https://github.com/tomazb/multi-agent-software-engineer/issues/27)
-- **Design status:** Owner-approved direction, published for exact-artifact review
-- **Implementation status:** Not authorized by this document
+- **Issue:** [#28](https://github.com/tomazb/multi-agent-software-engineer/issues/28)
+- **Parent:** [#27](https://github.com/tomazb/multi-agent-software-engineer/issues/27)
+- **Revision:** 2
+- **Status:** Owner-approved direction amended after external review; reissued for exact-artifact review
+- **Implementation:** Not authorized until this revision and its later implementation plan are approved
 - **Date:** 2026-08-18
-- **Exact design baseline:** `e80043cb208b5c26671a7aae34283d75ffab9dec`
-- **Design branch:** `issue-28-workflow-recovery`
+- **Baseline:** `e80043cb208b5c26671a7aae34283d75ffab9dec`
+- **Branch:** `issue-28-workflow-recovery`
+- **Supersedes design commit:** `f76001860191e2358e5b5938910a286daa012fdc`
 
-This document specifies one coherent repair slice for Issue #28. It does not authorize implementation until the repository owner approves this exact committed artifact and a subsequent implementation plan.
+Revision 2 incorporates all six validated external-review findings. It keeps schema version `1`, the existing file store, and `src/state-machine.ts` as the sole workflow transition map.
 
-## 1. Decision summary
+## 1. Decisions
 
-MASWE will repair Issue #28 with narrow additions to the existing schema-version-1 run contract and the existing optimistic file-store architecture. The design does not add a database transaction API, a second state machine, or new persisted workflow states.
+MASWE will implement one coherent recovery slice:
 
-The repair has five coordinated parts:
+1. Editing events expose the evaluated post-publication SHA as public `headSha`.
+2. Automatic-transition overflow publishes a durable failure after checking the resulting state.
+3. Every production-created run persists bootstrap intent before Git side effects, then publishes a real `CREATED + workspace` checkpoint before `START`.
+4. Failure and retry transitions publish from cloned candidates so the prior recovery key remains durable until the complete next record is published.
+5. Stale evidence starts explicit revalidation, and a newer head retargets an active or failed cycle to the latest generation.
+6. GitHub association rollback is event-free and field-scoped; published workflow events are not rolled back.
 
-1. Builder and resolver events bind public `headSha` to the evaluated post-publication SHA.
-2. The automatic-advance bound checks the resulting state before reporting overflow and publishes overflow through the normal durable failure path.
-3. `CREATED` becomes an idempotent bootstrap state backed by a persisted workspace-bootstrap intent.
-4. Retry stages the restored workspace, retry event, cleared active failure, and retained `previousFailure` audit data in one run-record publication.
-5. `PR_READY` and `PR_REVIEW` gain an explicit `REVALIDATE_REQUESTED` route through `CI_RUNNING` and `VERIFYING`, with durable return context.
+## 2. External-review corrections
 
-The implementation will continue to use:
+| Finding | Required correction |
+|---|---|
+| Operator-checkout bootstrap fingerprints MASWE's own new run record | Add a source-tree fingerprint that excludes `.maswe`; keep the existing authoritative fingerprint for read-only role checks. |
+| Active revalidation remains targeted at B after GitHub advances to C | Add `REVALIDATION_RETARGETED`, generation fencing, and active/failed-cycle preflight. |
+| Association rollback can restore a pre-event snapshot | Split association snapshot commit from workflow-event publication; only event-free fields may be rolled back. |
+| `supersede()` can create an intent-less replacement | Route `start()` and every replacement creation through one production planning helper that persists intent first. |
+| The design names but never writes `CREATED + workspace` | Add a standalone workspace checkpoint save, reload, and later `START` publication. |
+| Correctly registered worktree may be dirty | Require clean staged/unstaged/non-ignored-untracked status before reuse, checkpoint, `START`, and retry. |
 
-- `src/state-machine.ts` as the only transition map;
-- MASWE-owned branch, worktree, commit, evidence, and publication authority;
-- exact SHA-bound quality and verification evidence;
-- schema version `1` with optional backward-compatible fields;
-- one-host file-store optimistic concurrency and durable atomic replacement;
-- deterministic failure-injection seams and authoritative reload assertions.
+## 3. Scope boundaries
 
-## 2. Context and confirmed defects
+### Goals
 
-Issue #28 groups five defects that share one invariant: a run must never claim a state, recovery path, or evaluated code identity that is not durably and exactly represented in its authoritative record.
+- Exact SHA provenance and exact-head evidence.
+- Durable automatic-bound failure with a stable code.
+- Recoverable bootstrap before branch creation, after branch creation, after worktree creation, and after workspace save.
+- No implicit isolated-run fallback to the operator checkout.
+- No false bootstrap drift caused by `.maswe` writes.
+- No adoption of dirty managed worktrees.
+- Retry publication that leaves either the prior retryable `FAILED` record or the complete resumed record.
+- Revalidation from `PR_READY` and `PR_REVIEW`, including B→C target changes while active or failed.
+- Append-only workflow event history across GitHub association failures.
+- Schema-version-1 compatibility without rewriting historical events.
 
-### 2.1 Incorrect evaluated SHA in editing events
+### Non-goals
 
-`BUILD_COMPLETED` and `RESOLUTION_COMPLETED` currently record the pre-publication SHA in both `inputHeadSha` and public `headSha`, even when MASWE subsequently creates a deterministic commit and records a different `outputHeadSha`.
+- PostgreSQL, distributed workers, leases, or transactional outbox.
+- Automatic fetch, reset, rebase, merge, force-update, worktree prune, path deletion, PR creation, or merge.
+- Issue #29 policy/input work, Issue #30 terminal cleanup recovery, Issue #34 repository-rename migration, or GitHub Phase B writes.
+- Canonical fingerprint framing/race redesign owned by Issue #13.
+- CLI parser, runtime adapter, dependency, package, or workflow refactors.
 
-This makes the public event provenance ambiguous: downstream consumers can interpret `headSha` as the evaluated output while it actually identifies the input.
+## 4. Invariants
 
-### 2.2 Non-durable and off-by-one automatic-advance bound
+1. **Transition authority:** only `src/state-machine.ts` maps events to states.
+2. **Evaluated identity:** quality, verification, merge-ready, completion, and checks bind to the exact evaluated SHA.
+3. **Fingerprint planes:** bootstrap source drift excludes `.maswe`; read-only enforcement includes authoritative `.maswe` state.
+4. **Isolated workspace:** an isolated run without its exact managed worktree fails closed.
+5. **Actionable checkpoints:** every persisted `CREATED` shape retains `workspaceBootstrap` and a legal run/retry operation.
+6. **Publication:** each write leaves the prior actionable record or the complete next record.
+7. **Event history:** published event IDs, order, details, and count do not decrease or change during reconciliation.
+8. **External versus local identity:** GitHub observation does not establish local branch/worktree content.
+9. **Latest target:** one active revalidation generation names one current target; later authenticated heads supersede earlier targets.
+10. **Historical compatibility:** migration does not rewrite historical SHAs or events.
 
-`runUntilBlocked()` currently throws after the loop when the iteration counter reaches 20. It therefore:
+## 5. Domain contract
 
-- leaves a run durably stored in an automatic state while the CLI reports failure; and
-- reports overflow when the final allowed advance legitimately lands on a human gate or terminal state.
+### 5.1 Source-tree fingerprint
 
-### 2.3 Unrecoverable partial `CREATED` initialization
-
-Run creation is durable before branch/worktree establishment and before the `START` event. A failure in that interval can leave a `CREATED` record with partial Git resources. A later `maswe run` routes through generic failure, records `resumeState: CREATED`, and then cannot retry because `CREATED` is not resumable.
-
-The current `workingDirectoryFor()` fallback also makes an absent managed worktree dangerous: an isolated run must never treat the operator checkout as an implicit substitute.
-
-### 2.4 Retry can destroy its only durable retry key
-
-`retryFromFailed()` currently deletes `run.failure`, restores and saves the workspace, and only then publishes `RETRY_FROM_FAILED`. A failure in the final publication can leave a durable `FAILED` record without `failure.resumeState`, making the next retry impossible.
-
-### 2.5 Human-gate evidence invalidation has no legal re-entry path
-
-Local workspace synchronization and GitHub head observation can remove stale evidence while the workflow remains at `PR_READY` or `PR_REVIEW`. `runUntilBlocked()` stops at those human gates, and no event returns the run to `CI_RUNNING`.
-
-The return state after successful verification cannot be inferred only from `commentResolutionCycles`: an external head change can occur in `PR_REVIEW` before MASWE has resolved any comment.
-
-## 3. Goals
-
-The implementation must provide all of the following:
-
-- exact, unambiguous input/output/evaluated SHA provenance;
-- a durable automatic-advance overflow failure with a stable code;
-- correct behavior when the allowed boundary lands on a gate or terminal state;
-- idempotent recovery from each partial `CREATED` bootstrap boundary;
-- no implicit execution in the operator checkout for an isolated run;
-- retry publication that leaves either the original retryable failure or the complete resumed record;
-- one explicit revalidation event and one shared revalidation semantic for local and GitHub head movement;
-- correct return to `PR_READY` or `PR_REVIEW` after fresh quality and verification;
-- fail-closed merge-ready and completion checks while evidence is absent, stale, or revalidation is pending;
-- schema-version-1 compatibility without rewriting historical event SHAs.
-
-## 4. Non-goals
-
-This issue does not include:
-
-- a general state-machine redesign;
-- PostgreSQL, distributed workers, leases, or a transactional outbox;
-- automatic fetch, merge, rebase, reset, force-update, PR creation, or merge;
-- a new CLI grammar or broad command-surface redesign;
-- policy-violation and untrusted-input hardening owned by Issue #29;
-- terminal-worktree cleanup recovery owned by Issue #30;
-- repository-rename identity migration owned by Issue #34;
-- GitHub Phase B write authority;
-- unrelated dependency, package, workflow, or runtime-adapter changes.
-
-## 5. Governing invariants
-
-### I28-INV-01 — One transition authority
-
-Only `src/state-machine.ts` maps events to workflow states. Bootstrap, retry, local synchronization, and GitHub integration may request events but may not assign workflow states directly.
-
-### I28-INV-02 — Exact evaluated identity
-
-Every quality, verification, merge-ready, completion, and GitHub check conclusion is bound to the exact SHA it evaluated. Editing-stage public `headSha` identifies the output/evaluated state, not the input.
-
-### I28-INV-03 — No operator-checkout substitution
-
-When `run.config.policy.useIsolatedWorktree` is true, role execution, quality commands, verification, and recovery require the exact MASWE-managed worktree recorded or deterministically reconstructed for that run. Absence is an error, not permission to use `run.repositoryPath`.
-
-### I28-INV-04 — Old or complete publication
-
-A recovery publication must leave either:
-
-- the prior authoritative record, still actionable under its prior operation; or
-- the complete next authoritative record, including its state, event, workspace identity, and audit fields.
-
-Intermediate durable records that remove the only recovery key are forbidden.
-
-### I28-INV-05 — External observations do not become authority by themselves
-
-A GitHub head observation can request revalidation and bind the GitHub association to the observed head. It cannot claim that the local managed workspace contains that head. Quality and verification run only when local and required external identity constraints are satisfied.
-
-### I28-INV-06 — Historical events are immutable evidence
-
-Migration may add optional current-state metadata or validate new invariants. It must not rewrite existing event details, input SHAs, output SHAs, or event ordering.
-
-### I28-INV-07 — No unrecoverable intermediate workflow state
-
-The design adds metadata, not new persisted workflow states. Every persisted active or failed state retains a documented operator operation.
-
-## 6. Alternatives considered
-
-### 6.1 Selected: staged run snapshots plus narrow recovery metadata
-
-Use optional `workspaceBootstrap` and `revalidation` metadata, clone the authoritative run before multi-field transitions, and publish through the existing `RunStore.save()` or `RunStore.applyEvent()` optimistic write.
-
-Advantages:
-
-- smallest coherent repair;
-- preserves current file-store and schema-version contracts;
-- supports deterministic fault injection;
-- does not pre-empt the future PostgreSQL transaction model;
-- keeps state transitions centralized.
-
-### 6.2 Rejected: generic file-store transaction or mutation API
-
-A generic `RunStore.transaction()` or `mutate()` API could express the changes, but it would broaden the local store contract before Issue #4 defines the hosted consistency model. Issue #28 needs coherent run-record publication, not a general database abstraction.
-
-### 6.3 Rejected: `BOOTSTRAPPING` and `REVALIDATING` workflow states
-
-Dedicated states would make the graph more descriptive but would enlarge every state/event/schema/documentation surface and risk introducing states with no distinct operator action. Optional metadata on existing actionable states is sufficient.
-
-### 6.4 Rejected: infer review return solely from counters
-
-`commentResolutionCycles > 0` cannot prove that the current validation cycle originated in `PR_REVIEW`. The design records the source gate explicitly.
-
-### 6.5 Rejected: silently recapture or reset a conflicting workspace
-
-If a persisted branch, worktree registration, path, or SHA conflicts with the run record, MASWE fails closed. It does not move refs, delete paths, prune registrations, or replace the operator checkout to make recovery appear successful.
-
-## 7. Domain-model additions
-
-All additions are optional schema-version-1 fields.
-
-### 7.1 Workspace bootstrap intent
+Add a helper equivalent to:
 
 ```ts
-export interface WorkspaceBootstrapIntent {
-  mode: "operator-checkout" | "isolated-worktree";
+captureWorkspaceSourceFingerprint(cwd): Promise<string>
+```
+
+It is domain-separated from `gitWorkspaceFingerprint()` and excludes the complete `.maswe` namespace.
+
+- **Git:** hash the current source plane outside `.maswe`, including staged, unstaged, and non-ignored untracked content using the current encoding. Base SHA and branch stay separate.
+- **Non-Git:** deterministically hash source-tree entries outside `.maswe` using current bounds/encoding. Issue #13 still owns later framing and race changes.
+
+This helper is used only for bootstrap drift. `RunWorkspace.fingerprint` remains a last-observed diagnostic; normal read-only checks still call `gitWorkspaceFingerprint()` and include authoritative `.maswe` state.
+
+### 5.2 Bootstrap intent
+
+```ts
+interface WorkspaceBootstrapIntent {
+  mode: 'operator-checkout' | 'isolated-worktree';
   sourceBaseSha: string;
   sourceBranch: string;
-  sourceFingerprint: string;
+  sourceTreeFingerprint: string;
   remote?: string;
   plannedAt: string;
 }
 ```
 
-`RunRecord` gains:
+`RunRecord` gains `workspaceBootstrap?`.
 
-```ts
-workspaceBootstrap?: WorkspaceBootstrapIntent;
-```
-
-The target managed branch and worktree path remain deterministic functions of the run ID:
+Deterministic targets remain:
 
 ```text
 branch       = maswe/{run-id}
 worktreePath = externalWorktreePath(repositoryPath, runId)
 ```
 
-They are not duplicated in the bootstrap intent.
+Valid shapes:
 
-The field has three meaningful shapes:
-
-| Run shape | Meaning |
+| Shape | Meaning |
 |---|---|
-| `CREATED` + bootstrap intent + no workspace | Workspace is planned but not durably established. |
-| `CREATED` + bootstrap intent + workspace | Workspace is durably established; `START` is not yet published. |
-| `FAILED` + `failure.resumeState: CREATED` + bootstrap intent | Bootstrap failed and is retryable from the exact intent. |
+| `CREATED` + intent + no workspace | Planned, workspace not checkpointed. |
+| `CREATED` + intent + workspace | Workspace checkpointed, `START` absent. |
+| `FAILED` + `resumeState: CREATED` + intent | Bootstrap failed and remains retryable. |
 
-After a successful `START` publication, `workspaceBootstrap` is removed in the same run-record write as the event.
+Intent is removed only in the same publication as `START`.
 
-### 7.2 Revalidation context
+### 5.3 Revalidation context
 
 ```ts
-export type RevalidationReturnState = "PR_READY" | "PR_REVIEW";
-export type RevalidationSource = "local-workspace" | "github";
-
-export interface RunRevalidation {
-  returnState: RevalidationReturnState;
-  source: RevalidationSource;
-  previousHeadSha: string;
+interface RunRevalidation {
+  returnState: 'PR_READY' | 'PR_REVIEW';
+  source: 'local-workspace' | 'github';
+  originHeadSha: string;
   requestedHeadSha: string;
+  generation: number;
   requestedAt: string;
+  updatedAt: string;
 }
 ```
 
-`RunRecord` gains:
+`RunRecord` gains `revalidation?`.
 
-```ts
-revalidation?: RunRevalidation;
-```
+- `returnState` is derived once from the source gate.
+- `requestedHeadSha` is the only current target.
+- `generation` starts at `1` and increments per accepted target change.
+- Event details retain old/new targets; no unbounded target-history array is added.
 
-`requestedHeadSha` records the head that triggered revalidation. A corrective builder loop may create a later SHA; final evidence remains bound to the actual evaluated SHA. `returnState` remains stable throughout the quality/build/verification loop.
+### 5.4 Failure code and events
 
-The context is cleared in the same publication as the successful verification event that returns to the recorded gate.
-
-### 7.3 Failure code
-
-`RunFailureCode` gains:
+Add failure code:
 
 ```text
 automatic-transition-limit-exceeded
 ```
 
-The code is persisted in `run.failure.code` and `FAIL.details.code`, and is rendered explicitly for operators. Historical failures without a code remain valid.
-
-### 7.4 Workflow event
-
-`WorkflowEventType` gains:
+Add events:
 
 ```text
 REVALIDATE_REQUESTED
+REVALIDATION_RETARGETED
 ```
 
-No other new workflow event is required.
+## 6. State-machine contract
 
-## 8. State-machine changes
-
-The centralized transition table gains:
+Add transitions:
 
 ```text
 PR_READY  + REVALIDATE_REQUESTED -> CI_RUNNING
 PR_REVIEW + REVALIDATE_REQUESTED -> CI_RUNNING
+
+CI_RUNNING + REVALIDATION_RETARGETED -> CI_RUNNING
+BUILDING   + REVALIDATION_RETARGETED -> CI_RUNNING
+VERIFYING  + REVALIDATION_RETARGETED -> CI_RUNNING
+FAILED     + REVALIDATION_RETARGETED -> FAILED
 ```
 
-`CREATED` is added to the resumable-state allowlist for `RETRY_FROM_FAILED`.
+Add `CREATED` to retry resumable states.
 
-The resulting relevant graph is:
+The `FAILED` self-transition is valid only with active revalidation and `failure.resumeState` in `BUILDING`, `CI_RUNNING`, or `VERIFYING`. Its candidate changes the operational resume state to `CI_RUNNING` and records the prior resume state in event details. The historical `FAIL` event remains unchanged.
 
-```mermaid
-stateDiagram-v2
-  [*] --> CREATED
-  CREATED --> BRAINSTORMING: START
-  CREATED --> FAILED: FAIL
-  FAILED --> CREATED: RETRY_FROM_FAILED(resumeState=CREATED)
+## 7. Editing-stage provenance
 
-  PR_READY --> CI_RUNNING: REVALIDATE_REQUESTED
-  PR_REVIEW --> CI_RUNNING: REVALIDATE_REQUESTED
-  CI_RUNNING --> VERIFYING: CI_PASSED
-  CI_RUNNING --> BUILDING: CI_FAILED
-  VERIFYING --> PR_READY: VERIFY_PASSED + returnState=PR_READY
-  VERIFYING --> PR_REVIEW: VERIFY_PASSED_AFTER_REVIEW + returnState=PR_REVIEW
-  VERIFYING --> BUILDING: VERIFY_FAILED
-```
-
-The generic `FAIL` and `CANCEL` rules remain unchanged. No handler may bypass these transitions by assigning `run.state`.
-
-## 9. Exact editing-stage provenance
-
-### 9.1 Builder
-
-`BUILD_COMPLETED.details` uses:
+For `BUILD_COMPLETED` and `RESOLUTION_COMPLETED`:
 
 ```ts
 {
@@ -292,588 +187,405 @@ The generic `FAIL` and `CANCEL` rules remain unchanged. No handler may bypass th
 }
 ```
 
-For an editing builder:
+Editing execution:
 
 ```text
 inputHeadSha != outputHeadSha
 headSha == outputHeadSha == run.workspace.headSha
 ```
 
-For a no-op builder:
+No-op execution:
 
 ```text
 inputHeadSha == outputHeadSha == headSha == run.workspace.headSha
 ```
 
-### 9.2 Resolver
+Historical event details are not rewritten.
 
-`RESOLUTION_COMPLETED.details` follows the identical contract.
+## 8. Production run planning
 
-### 9.3 Non-Git workspaces
+Introduce one orchestrator production path equivalent to:
 
-The existing `not-a-git-repository` sentinel remains the coherent evaluated identity where the current architecture supports non-Git operation. The event fields must not disagree with `run.workspace.headSha`.
-
-### 9.4 Historical compatibility
-
-Existing events retain their original details. Migration does not reinterpret or rewrite the old public `headSha`. Documentation states the corrected contract applies to newly published events after this repair.
-
-## 10. Idempotent `CREATED` bootstrap
-
-### 10.1 Start sequence
-
-`start()` performs the following ordered operations:
-
-1. Validate dirty-workspace policy.
-2. Discover models and resolve the immutable run configuration snapshot.
-3. Capture the read-only source workspace identity immediately before run creation.
-4. Create the `CREATED` run with `workspaceBootstrap` included in the initial authoritative record.
-5. Invoke `runUntilBlocked(run.id)`.
-
-The source capture occurs before the initial run write so a newly created run never lacks the exact intent needed to recover its first workspace.
-
-`RunStore.create()` may receive an optional initial-record argument containing `workspaceBootstrap`; existing callers that do not supply it retain their current behavior for tests and controlled fixtures.
-
-### 10.2 `advance(CREATED)`
-
-`advance()` gains a `CREATED` case:
-
-1. Validate or reconstruct the intended workspace using `workspaceBootstrap`.
-2. Stage the established `run.workspace` on a cloned record.
-3. Remove `workspaceBootstrap` from that clone.
-4. Publish `START` on the clone through `RunStore.applyEvent()`.
-
-If the workspace was already saved while the state remained `CREATED`, the method verifies it and proceeds directly to the coherent `START` publication.
-
-### 10.3 Exact isolated-worktree reconciliation
-
-For `mode: isolated-worktree`, recovery derives the expected branch and path from the run ID and classifies exact Git state.
-
-#### Branch rules
-
-| Observation | Result |
-|---|---|
-| Expected branch absent | Create it at `sourceBaseSha`. |
-| Branch exists at `sourceBaseSha` | Reuse it. |
-| Branch exists at another SHA | Fail closed; do not move the ref. |
-| Branch identity cannot be read | Fail closed with a bounded exact diagnostic. |
-
-#### Worktree rules
-
-| Observation | Result |
-|---|---|
-| Expected path and registration absent | Add the expected branch at the deterministic path. |
-| Registration exists at expected path, branch, and SHA | Reuse it. |
-| Path exists as the exact registered worktree with expected identity | Reuse it. |
-| Branch is checked out at another path | Fail closed. |
-| Expected path contains unrelated or unregistered content | Fail closed. |
-| Registration, path, branch, or HEAD disagrees | Fail closed. |
-| A stale registration would require prune/removal | Fail closed; Issue #28 does not authorize repository cleanup. |
-
-Classification uses structured Git inspection such as `git worktree list --porcelain` and exact ref resolution. Recovery must not rely only on matching localized Git stderr such as “already exists.”
-
-### 10.4 Operator-checkout mode
-
-For `mode: operator-checkout`, recovery verifies that the current repository still matches the captured source base, branch, and authoritative fingerprint before assigning `run.workspace`.
-
-If it changed, bootstrap fails closed. The run does not silently start against a different checkout state.
-
-### 10.5 Legacy `CREATED` records
-
-Schema-version-1 records created before this repair can lack `workspaceBootstrap`.
-
-Recovery rules are:
-
-- If an exact persisted `run.workspace` exists, validate it and synthesize the minimum in-memory bootstrap intent needed to publish `START` without changing historical events.
-- If neither the deterministic branch nor worktree exists, the operator may retry initial bootstrap from a freshly captured current source; the resulting intent is persisted before any branch/worktree side effect.
-- If partial deterministic resources exist but no exact source base can be proven, fail closed with an operator action to supersede or recover the exact Git resources manually.
-
-The implementation must never guess the base of an existing partial branch or worktree.
-
-### 10.6 Working-directory guard
-
-`workingDirectoryFor(run)` changes from a silent fallback to an invariant check:
-
-```text
-if isolated-worktree policy is true and run.workspace.worktreePath is absent:
-    throw an exact managed-workspace-not-established error
+```ts
+createPlannedRun({ title, request, config, supersedes? })
 ```
 
-The operator checkout remains valid only when isolated-worktree policy is false.
+It:
 
-## 11. Durable automatic-advance bound
+1. validates dirty-workspace policy;
+2. resolves the immutable config snapshot where applicable;
+3. captures source base, branch, remote, and source-tree fingerprint;
+4. creates the initial `CREATED` record with `workspaceBootstrap`;
+5. includes `supersedes` in that initial record for a replacement;
+6. performs no branch/worktree side effect before that write is durable.
 
-### 11.1 Boundary semantics
+`start()` and `supersede()` replacement creation must use this path. Production orchestrator code may not call `store.create()` without bootstrap intent. Explicit historical/test fixtures may create bare records.
 
-The default bound remains 20 automatic `advance()` operations per `runUntilBlocked()` invocation.
+## 9. `CREATED` bootstrap protocol
 
-After each successful automatic advance:
+### Phase 1 — Reconcile
 
-1. increment the advance count;
-2. return immediately if the resulting state is terminal or a human gate;
-3. if the count has reached the bound and the resulting state is still automatic, publish the overflow failure.
+For operator-checkout mode require:
 
-Therefore:
+```text
+current base SHA == sourceBaseSha
+current branch == sourceBranch
+current source-tree fingerprint == sourceTreeFingerprint
+```
 
-- advance 20 landing on a human gate succeeds;
-- advance 20 landing on a terminal state succeeds;
-- needing another automatic advance after 20 produces `FAILED`.
+MASWE `.maswe` writes do not alter this comparison; user/source changes do.
 
-Human or integration events published before `runUntilBlocked()` are not counted in that invocation.
+For isolated mode derive the expected branch/path and classify exact Git state.
 
-### 11.2 Durable overflow publication
+Branch rules:
 
-Overflow calls the normal failure path with:
+| Observation | Result |
+|---|---|
+| Branch absent | Create at `sourceBaseSha`. |
+| Branch exists at source base | Reuse. |
+| Branch exists at another SHA | Fail closed; do not move it. |
+
+Worktree rules:
+
+| Observation | Result |
+|---|---|
+| Path/registration absent | Add expected branch at deterministic path. |
+| Registration, path, branch, HEAD, and clean status match | Reuse. |
+| Identity matches but staged, unstaged, or non-ignored untracked changes exist | Fail closed; do not reset, clean, or commit them. |
+| Branch checked out elsewhere, path occupied, registration stale, or identity differs | Fail closed. |
+
+Use structured inspection (`git worktree list --porcelain`, exact refs, existing clean-status helper), not localized stderr matching.
+
+### Phase 2 — Workspace checkpoint
+
+When workspace is absent:
+
+1. clone the authoritative `CREATED` record;
+2. set `candidate.workspace`;
+3. retain `candidate.workspaceBootstrap` and state `CREATED`;
+4. publish no event;
+5. save;
+6. reload the authoritative record.
+
+Outcome-unknown classification:
+
+- exact `CREATED + workspace + intent`: adopt;
+- prior `CREATED + intent`: remain retryable and report failure;
+- another shape: fail closed.
+
+A deterministic seam runs after this save and before `START`.
+
+### Phase 3 — `START`
+
+After reload:
+
+1. revalidate source identity or exact managed registration/branch/HEAD/clean status;
+2. clone the checkpoint;
+3. remove bootstrap intent;
+4. publish `START` through `applyEvent()`.
+
+Outcomes are the actionable checkpoint or `BRAINSTORMING` with workspace and exact `START` event. No role runs before the latter is authoritative.
+
+Clean status is checked before checkpoint, after reload/before `START`, and during retry reconciliation.
+
+Historical `CREATED` records use conservative classification: persist a provable intent before side effects; if partial resources exist but their source cannot be proven, require supersede/manual recovery.
+
+`workingDirectoryFor()` throws for isolated policy without an exact worktree; it does not return the operator checkout.
+
+## 10. Automatic-transition bound
+
+Keep production bound `20`.
+
+After each successful advance:
+
+1. increment count;
+2. return if result is a human gate or terminal state;
+3. if count reached 20 and result remains automatic, publish `FAIL` with:
 
 ```text
 code: automatic-transition-limit-exceeded
 resumeState: CURRENT_AUTOMATIC_STATE
 ```
 
-The authoritative record contains the failure, `FAIL` event, and `FAILED` state. The CLI does not merely throw while leaving the run automatic.
+A test-only dependency seam may use a lower bound; it is neither config nor persisted policy.
 
-### 11.3 Test seam
+## 11. Failure and retry publication
 
-The production constant remains 20. A constructor or internal dependency seam may supply a smaller bound for deterministic focused tests. The seam is not project configuration, is not persisted, and does not change the public product policy.
+### Failure
 
-## 12. Coherent failure publication
+`failRun()` clones the run, stages bounded failure metadata, and publishes `FAIL` once. The durable result is the prior nonterminal record or the complete `FAILED` record with metadata and event.
 
-`failRun()` stages failure metadata and the `FAIL` event on a cloned run rather than saving `run.failure` separately before the event.
+### Retry
 
-Conceptually:
+`retryFromFailed()`:
 
-```ts
-const candidate = structuredClone(run);
-candidate.failure = makeFailure(...);
-const failed = await store.applyEvent(candidate, "FAIL", "orchestrator", details);
-```
+1. loads authoritative `FAILED`;
+2. copies bounded/redacted `previousFailure`;
+3. reconciles workspace on a clone, including bootstrap and dirty-worktree rules;
+4. reconciles a newer active revalidation target before continuation;
+5. removes active failure only in memory;
+6. publishes `RETRY_FROM_FAILED` with restored workspace, resume state, and `previousFailure`;
+7. continues only after authoritative success.
 
-This reduces the authoritative outcomes to:
+No standalone save occurs while state is durably `FAILED`.
 
-- the prior nonterminal record if publication did not occur; or
-- the complete `FAILED` record with failure metadata and event.
+On publication error reload and classify:
 
-Outcome-unknown durable writes are classified by reloading the authoritative record. In-memory mutation is never treated as proof of publication.
+- exact retry event/resumed state: adopt;
+- original retryable `FAILED`: report error and retain retry path;
+- another shape: fail closed.
 
-Terminal cleanup remains after terminal-state persistence and remains governed by Issue #30.
+## 12. Revalidation and active retargeting
 
-## 13. Coherent retry publication
+### Initial request
 
-### 13.1 Required sequence
+`requestRevalidation()` accepts `PR_READY` or `PR_REVIEW` with no active context. It derives return gate, invalidates stale evidence, creates generation `1`, and publishes `REVALIDATE_REQUESTED -> CI_RUNNING`.
 
-`retryFromFailed()` performs:
+### Retarget
 
-1. Load the authoritative `FAILED` record.
-2. Require `failure.resumeState` and copy the complete bounded/redacted failure as `previousFailure`.
-3. Clone the run.
-4. Reconcile the intended workspace on the clone:
-   - `CREATED` uses `workspaceBootstrap` recovery;
-   - later isolated states use the persisted branch/head/worktree identity;
-   - operator-checkout states verify the current checkout identity.
-5. Remove the active `candidate.failure` only in memory.
-6. Publish `RETRY_FROM_FAILED` on the candidate with `resumeState` and `previousFailure`.
-7. Continue through `runUntilBlocked()` only after authoritative publication succeeds.
+`retargetRevalidation()` accepts active context with a different current target. One event publication stages:
 
-No standalone save occurs while the durable state is still `FAILED`.
+- new requested head;
+- generation + 1;
+- latest source/timestamp;
+- stale-evidence invalidation;
+- event details: `previousRequestedHeadSha`, `requestedHeadSha`, `generation`, `returnState`, `source`, and prior resume state where applicable;
+- routing to `CI_RUNNING`, or `FAILED -> FAILED` with operational resume state set to `CI_RUNNING`.
 
-### 13.2 Publication failure semantics
+B→C leaves C as the only acceptable target. Alignment only to superseded B is rejected.
 
-If workspace reconciliation fails, the authoritative `FAILED` record is unchanged.
+### Preflight and crash recovery
 
-If retry-event publication fails before replacement, the authoritative record remains the original retryable `FAILED` record with `failure.resumeState` intact.
+`reconcileRevalidationTarget()` runs from:
 
-If the durable write outcome is unknown, reload and classify:
+- webhook/manual live-head handling after association commit;
+- `runUntilBlocked()` in active `BUILDING`, `CI_RUNNING`, or `VERIFYING`;
+- `retryFromFailed()` with retained revalidation.
 
-- exact retry event and resumed state present: adopt the authoritative resumed record;
-- prior `FAILED` record present: report the publication failure while preserving retryability;
-- any other record: fail closed as an inconsistent authoritative outcome.
-
-### 13.3 Audit preservation
-
-`RETRY_FROM_FAILED.details.previousFailure` continues to use the existing bounded and redacted contract. The retry does not delete or rewrite the earlier `FAIL` event.
-
-## 14. Shared stale-evidence revalidation
-
-### 14.1 Core operation
-
-Introduce one public core operation, named during implementation according to existing conventions, with semantics equivalent to:
-
-```ts
-requestRevalidation(run, {
-  source,
-  previousHeadSha,
-  requestedHeadSha,
-  actor
-})
-```
-
-The operation:
-
-1. requires source state `PR_READY` or `PR_REVIEW`;
-2. derives `returnState` from the actual source state;
-3. invalidates stale `quality`, `verification`, and `mergeReady` evidence;
-4. stores `run.revalidation`;
-5. publishes `REVALIDATE_REQUESTED` to `CI_RUNNING`.
-
-Local workspace observation and the GitHub adapter call this same operation. They do not implement separate return-state logic.
-
-### 14.2 Local head movement
-
-`runUntilBlocked()` performs a human-gate preflight before deciding to stop.
-
-For `PR_READY` or `PR_REVIEW`:
-
-1. inspect the exact managed workspace branch and HEAD;
-2. compare the observed HEAD with the previously recorded workspace HEAD;
-3. determine whether required quality and verification bindings are present for the observed HEAD;
-4. if the head moved or required bindings are absent/stale, update the workspace identity on a candidate and request revalidation;
-5. continue automatically through `CI_RUNNING` and `VERIFYING`.
-
-A repeated `maswe run` with a fresh gate and current evidence remains a no-op.
-
-### 14.3 GitHub head movement
-
-The GitHub adapter continues to authenticate, normalize, deduplicate, live-head-check, and association-fence the event.
-
-When an associated run at `PR_READY` or `PR_REVIEW` observes a different live PR head, the adapter transaction:
-
-1. updates the GitHub association and pending old-head cancellation set;
-2. delegates stale-evidence invalidation and state routing to the core revalidation operation;
-3. binds the updated association index;
-4. registers the existing run-record rollback behavior if the association transaction fails;
-5. publishes neutral/current-head checks according to Phase A behavior.
-
-The webhook path requests revalidation but does not invoke provider work. A later operator or runner invocation executes `maswe run`.
-
-### 14.4 Local/GitHub head alignment
-
-For a GitHub-associated revalidation, quality and verification may run only when:
+Required target:
 
 ```text
-run.workspace.headSha == run.github.headSha
+GitHub-associated: run.github.headSha
+local-only: exact observed workspace HEAD
 ```
 
-after exact local workspace synchronization.
+A mismatch with `revalidation.requestedHeadSha` publishes `REVALIDATION_RETARGETED` before builder publication, quality, verification, or retry continuation. This also repairs a process stop after association commit but before routing event.
 
-Issue #28 does not authorize MASWE to fetch, reset, rebase, merge, or force-update the managed branch. If the identities differ, execution fails closed with recoverable `CI_RUNNING` provenance and no fresh success evidence.
+### Generation fencing
 
-On retry, an exact branch move to the persisted GitHub revalidation target may be accepted only when all of the following hold:
+Each active attempt captures run version, generation, and requested target. Before publishing commits, evidence, or return-to-gate success, those values must still match authoritative state. A retarget changes version/generation; stale B-bound work reloads and follows current-head routing instead of publishing success for C.
 
-- the run is already in a GitHub-requested revalidation cycle;
-- the branch is the exact recorded MASWE branch;
-- the branch now resolves to the persisted requested GitHub head;
-- the deterministic worktree registration and path still match;
-- no unrelated path or registration conflict exists.
+### Alignment and return
 
-No other branch movement is accepted.
-
-### 14.5 Successful return
-
-During `VERIFYING`, success-event selection follows:
+For GitHub-associated revalidation:
 
 ```text
-if run.revalidation.returnState == PR_READY:
-    VERIFY_PASSED
-else if run.revalidation.returnState == PR_REVIEW:
-    VERIFY_PASSED_AFTER_REVIEW
-else:
-    preserve the existing non-revalidation selection behavior
+workspace.headSha == revalidation.requestedHeadSha == github.headSha
 ```
 
-The successful event, fresh verification evidence, target gate, and removal of `run.revalidation` are published coherently.
+Issue #28 does not move refs automatically. An external/operator move is accepted only for the exact MASWE branch/path/registration, clean worktree, and current target.
 
-The revalidation context remains present through:
+Successful current-generation verification publishes:
 
-- `CI_FAILED -> BUILDING`;
-- `VERIFY_FAILED -> BUILDING`;
-- retry from a failure in `BUILDING`, `CI_RUNNING`, or `VERIFYING`.
+```text
+returnState PR_READY  -> VERIFY_PASSED
+returnState PR_REVIEW -> VERIFY_PASSED_AFTER_REVIEW
+```
 
-This allows corrective builder commits while preserving the correct final gate.
+The event, evidence, target gate, and removal of context publish coherently. Context survives correction loops and retry until current-generation success.
 
-### 14.6 Idempotency
+Repeated same-target observations are no-ops.
 
-The core operation rejects `REVALIDATE_REQUESTED` outside `PR_READY` and `PR_REVIEW` through the state machine.
+## 13. GitHub association and event preservation
 
-Duplicate GitHub delivery IDs remain governed by the existing durable inbox. Repeated local `maswe run` calls after the state has moved to `CI_RUNNING` continue the existing cycle rather than publishing a second revalidation request.
+Live-head handling uses two phases under the existing per-PR publication fence.
 
-## 15. Merge-ready and completion gates
+### Phase A — rollback-capable event-free snapshot
 
-`markMergeReady()` and `complete()` must reject when any of these are true:
+Inside the association transaction:
 
-- `run.revalidation` is present;
-- current workspace HEAD is unknown or differs from required GitHub head for an associated run;
-- quality evidence is absent or not bound to the exact current HEAD;
-- verification evidence is absent or not bound to the exact current HEAD;
-- required evidence has `passed: false`;
-- merge-ready evidence is absent or stale where completion requires it;
-- the exact managed worktree is dirty or its branch identity differs.
+1. load and clone run;
+2. update only `github`, pending cancellation heads, and stale evidence;
+3. keep state, events, failure, revalidation target, artifacts, approvals, and counters unchanged;
+4. save the event-free snapshot;
+5. bind and commit association index.
 
-These checks apply regardless of whether stale evidence was discovered locally or through GitHub.
+Known index non-publication may invoke a field-scoped rollback that restores only `github` and `evidence`, and only when exact version, state, event IDs/order/count, failure, revalidation, artifacts, approvals, and counters still match the attempted event-free record.
 
-The operations never recreate success from historical events after current evidence has been invalidated.
+Full-snapshot rollback is prohibited for this path. A callback must not write fewer events than the authoritative record.
 
-## 16. Store and consistency behavior
+### Phase B — non-rollback routing
 
-### 16.1 Existing primitives remain authoritative
+After association commit:
 
-The design uses the current:
+1. reload run;
+2. request, retarget, or no-op according to current target/context;
+3. publish checks after routing classification;
+4. do not register routing events for association rollback.
 
-- optimistic `version` check;
-- per-run immutable lock journal;
-- durable atomic run-record replacement;
-- `RunStore.applyEvent()` transition validation;
-- outcome-unknown reconciliation by authoritative reload.
+Failure behavior:
 
-No generic transaction API is added.
+| Point | Behavior |
+|---|---|
+| Run snapshot save fails | Prior state remains, subject to existing outcome-unknown reload. |
+| Known index failure | Field-scoped event-free rollback may run. |
+| Index outcome unknown | Do not roll back; reload run/index and reconcile. |
+| Stop after index commit, before event | Association/stale evidence remain; delivery retry or `maswe run` publishes missing routing event. |
+| Routing event failure | Do not roll back association or events; retry/self-heal. |
+| Check failure | Existing cancellation/idempotency recovery applies; events remain. |
 
-### 16.2 Clone-before-publication rule
+Apply this protocol to webhook PR/push head changes and manual check publication live-head refresh.
 
-Any operation that changes multiple authoritative concerns before one transition uses a cloned candidate. The caller’s loaded record is not mutated into an unrecoverable shape before the publication succeeds.
+## 14. Merge-ready and completion
 
-This applies to:
+Reject when:
 
-- `START` publication after workspace establishment;
-- `FAIL` publication;
-- `RETRY_FROM_FAILED` publication;
-- revalidation request publication;
-- successful verification that clears revalidation context.
+- revalidation context exists;
+- workspace HEAD is unknown;
+- associated workspace, requested target, and GitHub head disagree;
+- quality or verification evidence is absent, failed, or stale;
+- completion lacks current merge-ready evidence;
+- managed worktree is dirty or on another branch.
 
-### 16.3 Association transaction integration
+Historical events do not recreate current success after evidence invalidation.
 
-The GitHub adapter retains its existing association journal and rollback model. The adapter records the pre-mutation run, delegates the state mutation to the core operation, and registers rollback against the exact attempted run version if the association transaction later fails.
+## 15. Schema, migration, rendering, and docs
 
-A rollback must never rewrite immutable workflow history from a concurrently advanced run; existing version fencing remains mandatory.
+Schema stays version `1`.
 
-## 17. Migration and compatibility
-
-### 17.1 Schema version
-
-`schemaVersion` remains `1`.
-
-New optional fields:
+Add optional fields:
 
 ```text
 workspaceBootstrap
 revalidation
 ```
 
-New accepted failure code:
+Add failure code and event enum values from Sections 5–6. Synchronize:
 
 ```text
-automatic-transition-limit-exceeded
+src/domain.ts
+src/run-record-validation.ts
+src/store.ts
+src/state-machine.ts
+schemas/run-record.schema.json
 ```
 
-New event value:
+Historical valid records remain loadable; historical events and SHAs are unchanged. Malformed or contradictory new metadata fails closed.
+
+Human rendering adds failure code, bootstrap phase/conflicts, revalidation return gate/target/generation/source, and workspace/GitHub alignment. Diagnostics remain bounded/redacted.
+
+Update:
 
 ```text
-REVALIDATE_REQUESTED
+docs/PRD.md
+docs/ARCHITECTURE.md
+docs/ARTIFACT_CONTRACTS.md
+docs/GITHUB_APP.md
+docs/OPERATIONS.md
 ```
 
-### 17.2 Exact validation
+No document may imply that evidence invalidation alone resumes a gate, that superseded targets remain valid, or that published events can be rolled back.
 
-Synchronize:
+## 16. Mandatory tests
 
-- `src/domain.ts`;
-- `src/run-record-validation.ts`;
-- `src/store.ts` field allowlists and migration;
-- `schemas/run-record.schema.json`;
-- schema and migration regression tests.
+All recovery claims reload the authoritative run record.
 
-Both metadata objects use `additionalProperties: false` in JSON Schema and exact-key validation in TypeScript.
+### Provenance and bound
 
-### 17.3 Historical records
+- Editing/no-op builder and resolver SHA contracts.
+- Exact boundary to gate and terminal state.
+- Overflow to durable `FAILED`, stable code, resume state.
 
-Existing valid schema-version-1 records remain loadable.
+### Bootstrap
 
-- Historical events are not rewritten.
-- Historical failures without `code` remain valid.
-- Historical non-`CREATED` runs need no bootstrap metadata.
-- Historical `CREATED` runs use the conservative recovery rules in Section 10.5.
-- Historical gate records with current evidence remain valid.
-- Historical gate records with absent or stale evidence request revalidation on the next public run/head-observation operation.
+- MASWE run/checkpoint/event writes do not change source-tree fingerprint.
+- User source changes do change it.
+- Existing read-only fingerprint still detects authoritative `.maswe` mutation.
+- Fail before branch, after branch, after worktree, after checkpoint/before `START`, and during `START`.
+- Production `start` and `supersede` both persist intent first.
+- Branch/path/registration conflicts and stale registration.
+- Correct identity but dirty worktree is rejected.
+- Operator-checkout drift, legacy `CREATED`, and no isolated fallback.
 
-### 17.4 Fail-closed new invariants
+### Retry
 
-A record fails closed when new metadata is present but malformed, internally contradictory, or incompatible with exact Git identity. Compatibility does not require accepting a record that claims two conflicting authoritative workspaces or return gates.
+- Ordinary failure, version conflict, and outcome unknown.
+- Prior `failure.resumeState` remains when publication does not occur.
+- Exact retry event/workspace/cleared failure all appear when it does.
 
-## 18. Rendering and operator behavior
+### Revalidation
 
-Human-readable status adds:
+- Local/GitHub request from both gates.
+- `PR_REVIEW` with zero comment cycles.
+- B→C while `CI_RUNNING`, `BUILDING`, `VERIFYING`, and active `FAILED`.
+- Stop after association commit/before event.
+- Same-head idempotency.
+- Generation fence blocks stale B evidence.
+- Only C accepted after retarget.
+- Return to original gate; merge-ready/completion blocked while active.
 
-- stable failure code when present;
-- bootstrap status for `CREATED` or bootstrap-failed runs;
-- revalidation source, requested head, and return gate while active;
-- exact managed-workspace diagnostics where recovery is blocked.
+### Association/event history
 
-JSON output naturally includes the new optional fields.
+Inject run-save failure, known index failure, index outcome unknown, routing-event failure, and concurrent event before rollback. Assert:
 
-Messages remain bounded and redacted through existing diagnostics. Git stderr and path details are included only to the extent needed to identify the exact conflicting branch/worktree and do not include credentials or raw provider output.
+- event IDs/order/count never decrease;
+- published request/retarget events remain;
+- field-scoped rollback refuses history mismatch;
+- repeated delivery converges without duplicate routing events.
 
-No new CLI command is required. Existing operations remain:
+### Contract
 
-```text
-maswe run {run-id}
-maswe retry {run-id}
-maswe merge-ready {run-id}
-maswe complete {run-id}
-```
+- Exact schema/type enum synchronization.
+- Historical schema-v1 records.
+- Rendering and documentation literals.
+- Package contents remain stable.
 
-## 19. Documentation changes
+## 17. Acceptance traceability
 
-Implementation must synchronize externally observable behavior in:
-
-- `docs/PRD.md` — durable recovery, exact automatic bound, and revalidation requirements;
-- `docs/ARCHITECTURE.md` — state graph, bootstrap publication, retry consistency, and revalidation data flow;
-- `docs/ARTIFACT_CONTRACTS.md` — corrected event SHA meaning and new run metadata;
-- `docs/GITHUB_APP.md` — core revalidation request on live-head movement and local/GitHub alignment;
-- `docs/OPERATIONS.md` — bootstrap/retry diagnostics and operator recovery procedure;
-- `schemas/run-record.schema.json` — exact machine contract.
-
-No active documentation may imply that invalidating evidence alone is sufficient to resume a human-gated run.
-
-## 20. Test architecture
-
-All recovery claims require reloading the authoritative run record from disk after injected failure. In-memory assertions alone are insufficient.
-
-### 20.1 Deterministic seams
-
-The implementation may add narrow test-only seams for:
-
-- automatic-advance bound;
-- before branch creation;
-- after branch creation;
-- after worktree creation;
-- after workspace save / before `START` publication;
-- run-record save and event-publication failure;
-- durable write outcome unknown;
-- GitHub association transaction rollback;
-- local head observation before revalidation.
-
-Seams do not alter production defaults or become configuration.
-
-### 20.2 Provenance tests
-
-Cover:
-
-- editing builder;
-- no-op builder;
-- editing resolver;
-- no-op resolver;
-- Git and supported non-Git sentinel behavior;
-- quality and verification bound to the same final workspace SHA.
-
-### 20.3 Automatic-bound tests
-
-Cover:
-
-- final allowed advance reaching a human gate;
-- final allowed advance reaching a terminal state;
-- one more required automatic advance producing durable `FAILED`;
-- stable failure code;
-- valid `failure.resumeState`;
-- authoritative reload after failure.
-
-### 20.4 Bootstrap tests
-
-Inject failure:
-
-1. before branch creation;
-2. after branch creation but before worktree registration;
-3. after worktree creation but before workspace save;
-4. after workspace save but before `START`.
-
-For every case:
-
-- reload the run;
-- verify exact partial Git state;
-- retry;
-- prove the intended branch/worktree is reconstructed or reused;
-- prove the operator checkout is never selected;
-- prove role execution begins only after coherent `START` publication.
-
-Also cover conflicting branch SHA, alternate worktree registration, occupied path, stale registration, non-isolated checkout drift, and legacy `CREATED` classification.
-
-### 20.5 Retry publication tests
-
-Inject failure during retry publication and prove by authoritative reload that either:
-
-- state remains `FAILED` with the original `failure.resumeState` and failure metadata; or
-- the exact `RETRY_FROM_FAILED` event, restored workspace identity, cleared active failure, and resumed state are all present.
-
-Cover ordinary pre-publication failure, optimistic version conflict, and durable outcome unknown.
-
-### 20.6 Revalidation tests
-
-Cover:
-
-- local movement from `PR_READY` returning to `PR_READY`;
-- local movement from `PR_REVIEW` returning to `PR_REVIEW`;
-- GitHub movement from both gates;
-- GitHub movement in `PR_REVIEW` with zero comment-resolution cycles;
-- missing/stale evidence without another head change;
-- CI failure, corrective build, and successful return;
-- verifier failure, corrective build, and successful return;
-- local/GitHub head mismatch;
-- duplicate webhook and repeated local invocation;
-- merge-ready and completion rejection while revalidation is pending;
-- fresh GitHub checks bound only to the evaluated current head.
-
-### 20.7 Contract tests
-
-Cover:
-
-- exact schema acceptance and rejection;
-- TypeScript/schema enum synchronization;
-- rendering of failure and revalidation context;
-- old schema-version-1 records;
-- no historical event mutation;
-- package-content stability.
-
-## 21. Acceptance-criteria traceability
-
-| ID | Issue #28 acceptance criterion | Primary evidence |
+| ID | Criterion | Evidence |
 |---|---|---|
-| I28-AC-01 | Editing builder: `headSha === outputHeadSha === workspace.headSha`, input differs | Editing builder provenance regression |
-| I28-AC-02 | Editing resolver has the same contract | New editing resolver regression |
-| I28-AC-03 | No-op build/resolution records a coherent evaluated SHA | No-op builder and resolver regressions |
-| I28-AC-04 | Automatic valve durably records `FAILED` with stable code and recovery metadata | Bound-overflow store-reload regression |
-| I28-AC-05 | Exact boundary reaching human gate is accepted | Deterministic boundary test |
-| I28-AC-06 | Exact boundary reaching terminal state is accepted | Deterministic boundary test |
-| I28-AC-07 | Failure before branch creation is recoverable | Bootstrap barrier test 1 |
-| I28-AC-08 | Failure after branch creation is recoverable | Bootstrap barrier test 2 |
-| I28-AC-09 | Failure after worktree creation is recoverable | Bootstrap barrier test 3 |
-| I28-AC-10 | Failure after workspace save / before `START` is recoverable | Bootstrap barrier test 4 |
-| I28-AC-11 | Retried bootstrap reconstructs intended workspace before role execution | Retry plus runtime-cwd assertion |
-| I28-AC-12 | Retry publication failure preserves retryable `FAILED` metadata | Store-reload publication-failure matrix |
-| I28-AC-13 | Revalidation from `PR_READY` returns to `PR_READY` | Local and GitHub integration tests |
-| I28-AC-14 | Revalidation from `PR_REVIEW` returns to `PR_REVIEW` | Local and GitHub integration tests |
-| I28-AC-15 | External head movement before comment cycles returns to review | Zero-cycle GitHub regression |
-| I28-AC-16 | Stale evidence cannot authorize merge-ready or completion | Gate rejection regressions |
-| I28-AC-17 | Types, schema, rendering, artifact, architecture, and PRD agree | Schema/docs synchronization review and tests |
-| I28-AC-18 | Required commands pass on both Node baselines | Exact-head CI and local validation evidence |
+| I28-AC-01 | Editing builder SHA contract | Builder regression |
+| I28-AC-02 | Editing resolver SHA contract | Resolver regression |
+| I28-AC-03 | No-op coherent SHA | Builder/resolver no-op tests |
+| I28-AC-04 | Durable overflow failure | Reload regression |
+| I28-AC-05 | Boundary reaches human gate | Boundary test |
+| I28-AC-06 | Boundary reaches terminal state | Boundary test |
+| I28-AC-07 | Failure before branch recoverable | Bootstrap barrier 1 |
+| I28-AC-08 | Failure after branch recoverable | Bootstrap barrier 2 |
+| I28-AC-09 | Failure after worktree recoverable | Bootstrap barrier 3 |
+| I28-AC-10 | Failure after workspace save recoverable | Real checkpoint barrier 4 |
+| I28-AC-11 | Retry reconstructs intended workspace before roles | Runtime-cwd plus dirty-worktree tests |
+| I28-AC-12 | Retry publication keeps recovery metadata | Publication matrix |
+| I28-AC-13 | Revalidation returns to `PR_READY` | Local/GitHub tests |
+| I28-AC-14 | Revalidation returns to `PR_REVIEW` | Local/GitHub tests |
+| I28-AC-15 | External movement before comment cycle returns to review | Zero-cycle and B→C tests |
+| I28-AC-16 | Stale evidence cannot authorize merge-ready/completion | Gate tests |
+| I28-AC-17 | Types/schema/rendering/docs synchronized | Contract tests/review |
+| I28-AC-18 | Required commands pass on both Node baselines | Exact-head evidence |
 
-## 22. Expected implementation scope
+Review-derived mandatory regressions are part of the blocking suite: source-only bootstrap fingerprint, supersede intent, real workspace checkpoint, dirty-worktree rejection, active/failed B→C retarget, and append-only event history.
 
-Expected production files include:
+## 18. Expected implementation scope
+
+Expected production files:
 
 ```text
 src/domain.ts
 src/state-machine.ts
 src/orchestrator.ts
+src/git-snapshot.ts
 src/git-workspace.ts
 src/store.ts
 src/run-record-validation.ts
 src/run-rendering.ts
 src/github/adapter.ts
+src/github/association.ts
 schemas/run-record.schema.json
 ```
 
-A focused helper such as `src/revalidation.ts` or `src/workspace-bootstrap.ts` is permitted when it keeps exact classification and tests isolated. It must not become a second transition authority.
+Focused `workspace-bootstrap.ts` or `revalidation.ts` helpers are permitted without transition authority.
 
-Expected tests include focused Issue #28 suites plus updates to existing provenance, evidence, schema, retry, and GitHub integration tests.
-
-Expected documentation files are listed in Section 19.
-
-Explicitly excluded:
+Excluded unless a direct dependency is proven and separately approved:
 
 ```text
 src/config.ts
@@ -886,34 +598,26 @@ package-lock.json
 .github/workflows/**
 ```
 
-An excluded file may change only if implementation proves an unavoidable direct contract dependency and the owner approves the scope amendment before publication.
+## 19. Implementation order after approval
 
-## 23. Implementation ordering
+1. Provenance red tests and SHA correction.
+2. Boundary red tests and durable overflow failure.
+3. Source-tree fingerprint helper/tests without changing read-only semantics.
+4. Bootstrap intent/schema for all production creation paths.
+5. Exact Git/cleanliness tests and real workspace checkpoint.
+6. `CREATED` recovery and working-directory guard.
+7. Clone-staged failure/retry.
+8. Initial revalidation and active-retarget domain/events/tests.
+9. Two-phase association/routing reconciliation and field-scoped rollback.
+10. B→C and event-history regressions.
+11. Rendering/schema/docs/migration synchronization.
+12. Exact-baseline validation and independent exact-head review.
 
-After approval of this design, the implementation plan will order work as follows:
+Every behavioral task is test-first. Fail-closed behavior is not weakened to satisfy tests.
 
-1. Add red provenance regressions and correct builder/resolver event SHA semantics.
-2. Add red boundary tests and implement durable automatic-limit failure.
-3. Add bootstrap domain/schema contract and exact Git reconciliation tests.
-4. Implement idempotent `CREATED` bootstrap and working-directory guard.
-5. Add retry-publication failure tests and implement clone-staged retry.
-6. Add revalidation domain/event/transition tests.
-7. Implement shared local/GitHub revalidation routing and gate checks.
-8. Synchronize rendering, schema, docs, and migration tests.
-9. Run exact supported-baseline validation and independent exact-head review.
+## 20. Validation gates
 
-Every behavioral task is test-first. No implementation batch may weaken fail-closed behavior to satisfy a test.
-
-## 24. Validation and merge gates
-
-The implementation PR must pass on the exact supported baselines:
-
-```text
-Node 24.18.0 — canonical contributor and primary-CI baseline
-Node 22.22.2 — blocking compatibility floor
-```
-
-Required commands:
+Required commands on exact Node `24.18.0` and `22.22.2`:
 
 ```bash
 npm run check
@@ -921,67 +625,32 @@ npm run pack:dry
 git diff --check
 ```
 
-Required governance evidence:
+Before merge require exact-head CI, every Issue #28 and review-derived regression, independent exact-head review, zero unresolved actionable threads, clean scope, and post-merge `main` revalidation.
 
-- branch based on the approved Issue #28 implementation baseline;
-- exact-head CI success;
-- regression coverage for every I28 acceptance criterion;
-- independent exact-head review;
-- no unresolved actionable review threads;
-- clean scope audit with no Issue #29, #30, or unrelated changes;
-- post-merge `main` revalidation before Issue #29 begins.
+## 21. Resolved decisions and self-review
 
-## 25. Risks and mitigations
+Revision 2 sets these decisions:
 
-### Risk: bootstrap reconciliation deletes or adopts unrelated Git state
+- source-tree fingerprint excludes `.maswe`; read-only fingerprint retains it;
+- every production run, including supersede replacement, starts with durable intent;
+- `CREATED + workspace + intent` is a real checkpoint;
+- dirty managed worktrees are not reused;
+- initial and retarget revalidation use distinct events;
+- return gate survives target generations;
+- active and failed cycles follow the latest authenticated/observed head;
+- association snapshot publication precedes non-rollback event routing;
+- published events are not rolled back;
+- schema version remains `1`;
+- no new CLI command or automatic destructive Git operation is added;
+- terminal cleanup remains Issue #30.
 
-Mitigation: exact branch SHA, structured worktree registration, deterministic path, and fail-closed conflict behavior. No prune, reset, force, or recursive deletion.
+Self-review requirements:
 
-### Risk: optional metadata creates hidden state outside the workflow graph
-
-Mitigation: metadata never maps events to states. Every transition remains in `src/state-machine.ts`, and metadata has explicit lifecycle and operator behavior.
-
-### Risk: retry workspace side effects occur before run-record publication
-
-Mitigation: side effects are idempotent and exact. Publication failure leaves the old `FAILED` record retryable; the next retry reclassifies and reuses the exact resources.
-
-### Risk: GitHub head observation is mistaken for local code identity
-
-Mitigation: separate `run.github.headSha` and `run.workspace.headSha`, require alignment before CI/verification, and prohibit automatic ref movement in this issue.
-
-### Risk: revalidation context survives too long
-
-Mitigation: context is cleared coherently only after successful verification. It intentionally survives correction loops and retry; merge-ready and completion reject while it exists.
-
-### Risk: boundary tests depend on incidental workflow length
-
-Mitigation: use a deterministic internal bound seam while preserving production default 20.
-
-## 26. Resolved design decisions
-
-The following choices are final for this design:
-
-- use optional metadata, not new workflow states;
-- retain schema version `1`;
-- use `REVALIDATE_REQUESTED` as the single new event;
-- derive revalidation return state from the actual source gate;
-- retain existing counter-based success selection only when no revalidation context exists;
-- treat `CREATED` as resumable;
-- persist bootstrap intent in the initial run record before branch/worktree side effects;
-- derive target branch and worktree path from run ID;
-- stage failure and retry on cloned records;
-- do not add a new CLI command;
-- do not automatically fetch, reset, rebase, move, prune, or delete Git resources;
-- keep terminal cleanup recovery in Issue #30.
-
-## 27. Spec self-review
-
-The committed specification must satisfy these checks before being offered for owner review:
-
-- no unresolved marker, placeholder token, or open design decision;
-- no contradiction between state transitions and lifecycle metadata;
-- no implementation authorization before the design and plan gates;
-- every Issue #28 acceptance criterion mapped to deterministic evidence;
-- no accidental Issue #29 or Issue #30 scope;
-- exact baseline and branch recorded;
-- historical schema-version-1 and event compatibility stated explicitly.
+- no unresolved placeholders or open design choices;
+- no fingerprint self-reference;
+- lifecycle shapes match failure barriers;
+- B→C has an active and failed recovery path;
+- no reconciliation can reduce event history;
+- all production creation paths and dirty-worktree cases are covered;
+- all 18 criteria and six review findings map to deterministic evidence;
+- historical event compatibility and scope boundaries are explicit.
