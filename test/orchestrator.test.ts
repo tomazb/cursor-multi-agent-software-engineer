@@ -160,6 +160,12 @@ test("verifier failures write explicit defects and retry into a passing build", 
 
 test("retry-from-failed resumes a failed run using stored resumeState", async () => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-retry-"));
+  await execFileAsync("git", ["init", "-q"], { cwd });
+  await execFileAsync("git", ["config", "user.email", "maswe@example.com"], { cwd });
+  await execFileAsync("git", ["config", "user.name", "MASWE"], { cwd });
+  await writeFile(path.join(cwd, "README.md"), "# retry\n", "utf8");
+  await execFileAsync("git", ["add", "README.md"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "init"], { cwd });
   const config = testConfig((c) => {
     c.gates.requireBrainstormApproval = false;
     c.gates.requireDesignApproval = false;

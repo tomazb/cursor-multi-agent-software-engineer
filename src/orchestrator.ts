@@ -18,7 +18,6 @@ import {
   createDeterministicCommit,
   invalidateStaleEvidence,
   refreshWorkspaceHead,
-  restoreRunWorkspace,
   workingDirectoryFor,
 } from "./git-workspace.ts";
 import { parseRoleMarker } from "./markers.ts";
@@ -30,6 +29,7 @@ import {
   assertBootstrapWorkspaceReady,
   captureWorkspaceBootstrapIntent,
   reconcileBootstrapWorkspace,
+  reconcileRetryWorkspace,
   type WorkspaceBootstrapHooks,
 } from "./workspace-bootstrap.ts";
 import type { MasweConfig } from "./domain.ts";
@@ -50,6 +50,7 @@ import {
   safeFailureMessage,
 } from "./failure-diagnostics.ts";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 export function extractVerifierDefects(report: string): string {
   const lines = report.split(/\r?\n/);
@@ -82,6 +83,8 @@ export interface OrchestratorOptions {
   bootstrapHooks?: WorkspaceBootstrapHooks;
   /** Failure barrier after the CREATED workspace checkpoint has been reloaded. */
   afterWorkspaceCheckpoint?: (run: RunRecord) => Promise<void>;
+  /** Test seam immediately before the single retry event publication. */
+  beforeRetryPublication?: (candidate: RunRecord) => Promise<void>;
 }
 
 export class Orchestrator {
@@ -93,6 +96,7 @@ export class Orchestrator {
   private readonly beforeBootstrapReconcile: ((run: RunRecord) => Promise<void>) | undefined;
   private readonly bootstrapHooks: WorkspaceBootstrapHooks;
   private readonly afterWorkspaceCheckpoint: ((run: RunRecord) => Promise<void>) | undefined;
+  private readonly beforeRetryPublication: ((candidate: RunRecord) => Promise<void>) | undefined;
 
   constructor(
     cwd: string,
@@ -109,6 +113,7 @@ export class Orchestrator {
     this.beforeBootstrapReconcile = options.beforeBootstrapReconcile;
     this.bootstrapHooks = options.bootstrapHooks ?? {};
     this.afterWorkspaceCheckpoint = options.afterWorkspaceCheckpoint;
+    this.beforeRetryPublication = options.beforeRetryPublication;
     if (
       !Number.isSafeInteger(this.automaticTransitionLimit) ||
       this.automaticTransitionLimit <= 0
@@ -132,8 +137,8 @@ export class Orchestrator {
     return run;
   }
 
-  private recordsEqual(left: RunRecord, right: RunRecord): boolean {
-    return JSON.stringify(left) === JSON.stringify(right);
+  private recordsEqual(left: unknown, right: unknown): boolean {
+    return isDeepStrictEqual(left, right);
   }
 
   private isCompleteBootstrapStart(prior: RunRecord, candidate: RunRecord): boolean {
@@ -888,22 +893,75 @@ export class Orchestrator {
   }
 
   async retryFromFailed(runId: string): Promise<RunRecord> {
-    const run = await this.store.load(runId);
-    const resumeState = run.failure?.resumeState;
-    if (run.state !== "FAILED" || !resumeState) {
+    const prior = await this.store.load(runId);
+    const resumeState = prior.failure?.resumeState;
+    if (prior.state !== "FAILED" || !resumeState || !prior.failure) {
       throw new Error("retry requires a FAILED run with failure.resumeState");
     }
-    const previousFailure = run.failure;
-    delete run.failure;
-    if (run.config.policy.useIsolatedWorktree) {
-      run.workspace = await restoreRunWorkspace(this.cwd, run);
-      await this.store.save(run);
+    const previousFailure = structuredClone(prior.failure);
+    const priorEventIds = new Set(prior.events.map((event) => event.id));
+    const candidate = structuredClone(prior);
+    const workspace = await reconcileRetryWorkspace(this.cwd, candidate);
+    if (workspace) candidate.workspace = workspace;
+    else delete candidate.workspace;
+    delete candidate.failure;
+    await this.beforeRetryPublication?.(candidate);
+    const publicationCandidate = structuredClone(candidate);
+
+    let resumed: RunRecord;
+    try {
+      resumed = await this.store.applyEvent(candidate, "RETRY_FROM_FAILED", "user", {
+        resumeState,
+        previousFailure,
+      });
+    } catch (error) {
+      const observed = await this.store.load(runId);
+      const newEvents = observed.events.filter((event) => !priorEventIds.has(event.id));
+      const retryEvent = newEvents.length === 1 ? newEvents[0] : undefined;
+      const historicalPrefixExact =
+        observed.events.length === prior.events.length + 1 &&
+        this.recordsEqual(
+          { ...prior, events: observed.events.slice(0, prior.events.length) },
+          prior,
+        );
+      const expected = structuredClone(publicationCandidate);
+      expected.state = resumeState;
+      expected.version = observed.version;
+      expected.updatedAt = observed.updatedAt;
+      expected.events = observed.events;
+      const completePublication =
+        observed.version === prior.version + 1 &&
+        historicalPrefixExact &&
+        observed.failure === undefined &&
+        retryEvent?.type === "RETRY_FROM_FAILED" &&
+        retryEvent.actor === "user" &&
+        retryEvent.from === "FAILED" &&
+        retryEvent.to === resumeState &&
+        this.recordsEqual(retryEvent.details, { resumeState, previousFailure }) &&
+        this.recordsEqual(observed, expected);
+      if (completePublication) {
+        resumed = observed;
+      } else {
+        const retryablePrior = structuredClone(prior);
+        retryablePrior.version = observed.version;
+        retryablePrior.updatedAt = observed.updatedAt;
+        const originalRetryRemains =
+          newEvents.length === 0 &&
+          observed.state === "FAILED" &&
+          this.recordsEqual(observed.failure, previousFailure) &&
+          this.recordsEqual(observed, retryablePrior);
+        if (originalRetryRemains) throw error;
+        throw new Error(
+          "Retry publication outcome is inconsistent: authoritative state is neither the original retryable FAILED record nor one complete retry publication.",
+          { cause: error },
+        );
+      }
     }
-    await this.store.applyEvent(run, "RETRY_FROM_FAILED", "user", {
-      resumeState,
-      previousFailure,
-    });
-    return this.runUntilBlocked(run.id);
+
+    if (resumed.state === "CREATED") {
+      resumed = await this.bootstrapCreatedRun(resumed.id);
+    }
+    return this.runUntilBlocked(resumed.id);
   }
 
   async supersede(runId: string): Promise<RunRecord> {

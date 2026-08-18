@@ -282,3 +282,153 @@ export async function reconcileBootstrapWorkspace(
   await assertBootstrapWorkspaceReady(repositoryPath, candidate);
   return workspace;
 }
+
+/**
+ * Reconcile the exact durable workspace needed by a retry without discarding
+ * operator or model changes. A retry may recreate only a completely absent,
+ * deterministically named isolated worktree; every conflicting shape fails
+ * closed for explicit operator recovery or supersession.
+ */
+export async function reconcileRetryWorkspace(
+  repositoryPath: string,
+  run: RunRecord,
+): Promise<RunWorkspace | undefined> {
+  const resumeState = run.failure?.resumeState;
+  if (!resumeState) {
+    throw new Error(`Run ${run.id} has no retry workspace resume state`);
+  }
+  if (path.resolve(run.repositoryPath) !== path.resolve(repositoryPath)) {
+    throw new Error(`Run ${run.id} repository path does not match the retry checkout`);
+  }
+  if (resumeState === "CREATED") {
+    return reconcileBootstrapWorkspace(repositoryPath, run);
+  }
+
+  const workspace = run.workspace;
+  if (!workspace) {
+    throw new Error(`Run ${run.id} has no preserved workspace; supersede the run`);
+  }
+
+  if (!run.config.policy.useIsolatedWorktree) {
+    if (!(await isGitRepository(repositoryPath))) {
+      throw new Error(
+        `Run ${run.id} uses a later non-Git operator checkout whose source identity cannot be proven; supersede the run`,
+      );
+    }
+    if (
+      workspace.worktreePath !== undefined ||
+      workspace.baseSha === NON_GIT_WORKSPACE ||
+      workspace.headSha === NON_GIT_WORKSPACE ||
+      workspace.branch === NON_GIT_WORKSPACE
+    ) {
+      throw new Error(`Run ${run.id} operator-checkout workspace identity is not exact`);
+    }
+    const [branch, headSha, clean] = await Promise.all([
+      gitCurrentBranch(repositoryPath),
+      gitRevParse(repositoryPath, "HEAD"),
+      isGitWorkspaceClean(repositoryPath),
+    ]);
+    if (branch !== workspace.branch || headSha !== workspace.headSha) {
+      throw new Error(
+        `Run ${run.id} operator checkout moved from ${workspace.branch}@${workspace.headSha}; supersede the run`,
+      );
+    }
+    if (!clean) {
+      throw new Error(`Run ${run.id} operator checkout is dirty; preserve the changes and supersede the run`);
+    }
+    return structuredClone(workspace);
+  }
+
+  if (!(await isGitRepository(repositoryPath))) {
+    throw new Error(`Run ${run.id} isolated retry requires the preserved Git repository`);
+  }
+  const expectedBranch = `maswe/${run.id}`;
+  const expectedPath = path.resolve(externalWorktreePath(repositoryPath, run.id));
+  if (
+    workspace.baseSha === NON_GIT_WORKSPACE ||
+    workspace.headSha === NON_GIT_WORKSPACE ||
+    workspace.branch !== expectedBranch ||
+    !workspace.worktreePath ||
+    path.resolve(workspace.worktreePath) !== expectedPath
+  ) {
+    throw new Error(`Run ${run.id} isolated retry workspace identity is not exact`);
+  }
+
+  let registrations = await listGitWorktreeRegistrations(repositoryPath);
+  let byPath = registrations.find(
+    (registration) => registration.worktreePath === expectedPath,
+  );
+  let byBranch = registrations.find(
+    (registration) => registration.branch === expectedBranch,
+  );
+  if (byPath?.prunable || byBranch?.prunable) {
+    throw new Error(`Run ${run.id} isolated retry registration is stale or prunable`);
+  }
+  if (byPath && byPath.branch !== expectedBranch) {
+    throw new Error(`Run ${run.id} retry path is registered to the wrong branch`);
+  }
+  if (byBranch && byBranch.worktreePath !== expectedPath) {
+    throw new Error(`Run ${run.id} retry branch is registered at an alternate path`);
+  }
+
+  const branchHead = await gitLocalBranchHead(repositoryPath, expectedBranch);
+  if (branchHead !== workspace.headSha) {
+    throw new Error(
+      `Run branch ${expectedBranch} moved to ${branchHead ?? "(missing)"} but preserved headSha is ${workspace.headSha}; refusing to modify it, so supersede or recover manually`,
+    );
+  }
+  const worktreeExists = await pathExists(expectedPath);
+  if (byPath || byBranch) {
+    if (!byPath || !byBranch || byPath !== byBranch || !worktreeExists) {
+      throw new Error(`Run ${run.id} isolated retry registration is incomplete or conflicting`);
+    }
+  } else {
+    if (worktreeExists) {
+      throw new Error(`Run ${run.id} retry path is occupied but unregistered`);
+    }
+    await mkdir(path.dirname(expectedPath), { recursive: true });
+    const added = await gitRun(
+      ["worktree", "add", "--", expectedPath, expectedBranch],
+      repositoryPath,
+    );
+    if (added.exitCode !== 0) {
+      throw new Error(
+        `Failed to recreate exact retry worktree: ${added.stderr || added.stdout}`,
+      );
+    }
+    registrations = await listGitWorktreeRegistrations(repositoryPath);
+    byPath = registrations.find(
+      (registration) => registration.worktreePath === expectedPath,
+    );
+    byBranch = registrations.find(
+      (registration) => registration.branch === expectedBranch,
+    );
+  }
+
+  if (
+    !byPath ||
+    !byBranch ||
+    byPath !== byBranch ||
+    byPath.prunable ||
+    byPath.branch !== expectedBranch ||
+    byPath.headSha !== workspace.headSha
+  ) {
+    throw new Error(`Run ${run.id} isolated retry registration is not exact`);
+  }
+  const [actualBranch, actualHead, clean, fingerprint] = await Promise.all([
+    gitCurrentBranch(expectedPath),
+    gitRevParse(expectedPath, "HEAD"),
+    isGitWorkspaceClean(expectedPath),
+    gitWorkspaceFingerprint(expectedPath),
+  ]);
+  if (actualBranch !== expectedBranch || actualHead !== workspace.headSha) {
+    throw new Error(`Run ${run.id} isolated retry worktree has the wrong branch or HEAD`);
+  }
+  if (!clean) {
+    throw new Error(`Run ${run.id} isolated retry worktree is dirty`);
+  }
+  if (fingerprint !== workspace.fingerprint) {
+    throw new Error(`Run ${run.id} isolated retry workspace fingerprint changed`);
+  }
+  return structuredClone(workspace);
+}
