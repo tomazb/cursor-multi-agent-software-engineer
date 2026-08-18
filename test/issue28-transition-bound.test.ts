@@ -4,11 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
-import type { MasweConfig, RunRecord } from "../src/domain.ts";
+import type {
+  MasweConfig,
+  RunRecord,
+  WorkflowEventType,
+} from "../src/domain.ts";
 import { Orchestrator } from "../src/orchestrator.ts";
 import { renderRun } from "../src/run-rendering.ts";
 import { MockRuntime } from "../src/runtimes/mock.ts";
-import { FileRunStore } from "../src/store.ts";
+import { FileRunStore, type RunStore } from "../src/store.ts";
 
 function config(overrides: (value: MasweConfig) => void = () => undefined): MasweConfig {
   const value = structuredClone(DEFAULT_CONFIG);
@@ -32,6 +36,75 @@ async function createRunInState(
   await store.applyEvent(run, "DESIGN_COMPLETED", "designer");
   await store.applyEvent(run, "APPROVE_DESIGN", "user");
   return run;
+}
+
+type FailureInjection =
+  | "unchanged-prior"
+  | "failure-metadata"
+  | "fail-event-details"
+  | "historical-prefix";
+
+class FailureInjectionStore implements RunStore {
+  private readonly delegate: FileRunStore;
+  private readonly injection: FailureInjection;
+
+  constructor(
+    delegate: FileRunStore,
+    injection: FailureInjection,
+  ) {
+    this.delegate = delegate;
+    this.injection = injection;
+  }
+
+  create(title: string, request: string, value: MasweConfig): Promise<RunRecord> {
+    return this.delegate.create(title, request, value);
+  }
+
+  save(run: RunRecord): Promise<void> {
+    return this.delegate.save(run);
+  }
+
+  load(runId: string): Promise<RunRecord> {
+    return this.delegate.load(runId);
+  }
+
+  list(): Promise<RunRecord[]> {
+    return this.delegate.list();
+  }
+
+  async applyEvent(
+    run: RunRecord,
+    type: WorkflowEventType,
+    actor: string,
+    details?: Record<string, unknown>,
+  ): Promise<RunRecord> {
+    if (type !== "FAIL") return this.delegate.applyEvent(run, type, actor, details);
+    if (this.injection === "unchanged-prior") {
+      throw new Error("simulated pre-publication failure");
+    }
+
+    await this.delegate.applyEvent(run, type, actor, details);
+    const observed = await this.delegate.load(run.id);
+    if (this.injection === "failure-metadata") {
+      observed.failure!.message = "tampered failure metadata";
+    } else if (this.injection === "fail-event-details") {
+      const event = observed.events.at(-1)!;
+      event.actor = "tampered-orchestrator";
+      event.details = { ...event.details, tampered: true };
+    } else {
+      observed.events[0]!.actor = "tampered-history";
+    }
+    await this.delegate.save(observed);
+    throw new Error(`simulated altered ${this.injection} publication`);
+  }
+
+  writeArtifact(run: RunRecord, name: string, content: string) {
+    return this.delegate.writeArtifact(run, name, content);
+  }
+
+  readArtifact(run: RunRecord, name: string) {
+    return this.delegate.readArtifact(run, name);
+  }
 }
 
 test("an approval gate reached at the automatic transition limit wins", async (t) => {
@@ -135,4 +208,77 @@ test("a post-rename failure publication is recovered only as a complete failed r
   assert.equal(newFailEvents.length, 1);
   assert.equal(newFailEvents[0]?.from, "DESIGNING");
   assert.equal(newFailEvents[0]?.to, "FAILED");
+});
+
+test("failure recovery rethrows only an unchanged prior automatic record", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-transition-prior-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const value = config((current) => {
+    current.gates.requireBrainstormApproval = false;
+  });
+  const store = new FileRunStore(cwd);
+  const initial = await createRunInState(store, value, "BRAINSTORMING");
+  const orchestrator = new Orchestrator(
+    cwd,
+    value,
+    new MockRuntime(),
+    new FailureInjectionStore(store, "unchanged-prior"),
+    { automaticTransitionLimit: 1 },
+  );
+
+  await assert.rejects(
+    orchestrator.runUntilBlocked(initial.id),
+    /simulated pre-publication failure/,
+  );
+  const reloaded = await store.load(initial.id);
+
+  assert.equal(reloaded.state, "DESIGNING");
+  assert.equal(reloaded.failure, undefined);
+  assert.equal(reloaded.events.at(-1)?.type, "APPROVE_BRAINSTORM");
+});
+
+test("failure recovery rejects every altered failed publication shape", async (t) => {
+  for (const injection of [
+    "failure-metadata",
+    "fail-event-details",
+    "historical-prefix",
+  ] as const) {
+    await t.test(injection, async (t) => {
+      const cwd = await mkdtemp(path.join(os.tmpdir(), `maswe-transition-${injection}-`));
+      t.after(async () => rm(cwd, { recursive: true, force: true }));
+      const value = config((current) => {
+        current.gates.requireBrainstormApproval = false;
+      });
+      const store = new FileRunStore(cwd);
+      const initial = await createRunInState(store, value, "BRAINSTORMING");
+      const orchestrator = new Orchestrator(
+        cwd,
+        value,
+        new MockRuntime(),
+        new FailureInjectionStore(store, injection),
+        { automaticTransitionLimit: 1 },
+      );
+
+      await assert.rejects(
+        orchestrator.runUntilBlocked(initial.id),
+        /Failure publication outcome is ambiguous/,
+      );
+      const reloaded = await store.load(initial.id);
+
+      assert.equal(reloaded.state, "FAILED");
+      assert.equal(reloaded.events.filter((event) => event.type === "FAIL").length, 1);
+      assert.equal(reloaded.failure?.code, "automatic-transition-limit-exceeded");
+    });
+  }
+});
+
+test("automatic transition limit accepts only positive safe integers", () => {
+  for (const limit of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(
+      () => new Orchestrator("/tmp/maswe-transition-options", config(), new MockRuntime(), undefined, {
+        automaticTransitionLimit: limit,
+      }),
+      /positive safe integer/,
+    );
+  }
 });

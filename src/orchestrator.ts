@@ -497,7 +497,8 @@ export class Orchestrator {
       return this.finalizeTerminal(candidate);
     }
 
-    const priorEventIds = new Set(run.events.map((event) => event.id));
+    const prior = await this.store.load(run.id);
+    const priorEventIds = new Set(prior.events.map((event) => event.id));
     let failed: RunRecord;
     try {
       failed = await this.store.applyEvent(candidate, "FAIL", "orchestrator", {
@@ -508,23 +509,18 @@ export class Orchestrator {
       const observed = await this.store.load(run.id);
       const newEvents = observed.events.filter((event) => !priorEventIds.has(event.id));
       const observedEvent = newEvents[0];
-      const publishedEvent = candidate.events.find((event) => !priorEventIds.has(event.id));
-      const priorRecordIsUnchanged =
-        observed.version === run.version &&
-        observed.updatedAt === run.updatedAt &&
-        observed.state === run.state &&
-        newEvents.length === 0 &&
-        JSON.stringify(observed.failure) === JSON.stringify(run.failure);
+      const expectedNewEvents = candidate.events.filter((event) => !priorEventIds.has(event.id));
+      const expectedEvent = expectedNewEvents[0];
+      const priorRecordIsUnchanged = JSON.stringify(observed) === JSON.stringify(prior);
       if (priorRecordIsUnchanged) throw error;
 
       const completePublication =
-        observed.state === "FAILED" &&
-        observed.failure !== undefined &&
-        JSON.stringify(observed.failure) === JSON.stringify(candidate.failure) &&
+        JSON.stringify(observed) === JSON.stringify(candidate) &&
         newEvents.length === 1 &&
+        expectedNewEvents.length === 1 &&
         observedEvent !== undefined &&
-        publishedEvent !== undefined &&
-        observedEvent.id === publishedEvent.id &&
+        expectedEvent !== undefined &&
+        observedEvent.id === expectedEvent.id &&
         observedEvent.type === "FAIL" &&
         observedEvent.from === resumeState &&
         observedEvent.to === "FAILED";
