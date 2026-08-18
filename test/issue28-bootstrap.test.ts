@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -8,10 +8,25 @@ import test from "node:test";
 import * as gitSnapshot from "../src/git-snapshot.ts";
 import { gitWorkspaceFingerprint } from "../src/git-snapshot.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
-import type { MasweConfig, WorkspaceBootstrapIntent } from "../src/domain.ts";
-import { externalWorktreePath } from "../src/git-workspace.ts";
+import type {
+  AgentRuntime,
+  MasweConfig,
+  RunRecord,
+  RuntimeDoctorResult,
+  RuntimeRequest,
+  RuntimeResult,
+  WorkspaceBootstrapIntent,
+  WorkflowEventType,
+} from "../src/domain.ts";
+import {
+  externalWorktreePath,
+  listGitWorktreeRegistrations,
+  workingDirectoryFor,
+} from "../src/git-workspace.ts";
 import { Orchestrator } from "../src/orchestrator.ts";
 import { MockRuntime } from "../src/runtimes/mock.ts";
+import { FileRunStore, type CreateRunOptions, type RunStore } from "../src/store.ts";
+import { captureWorkspaceBootstrapIntent } from "../src/workspace-bootstrap.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -38,6 +53,83 @@ async function initRepo(): Promise<string> {
   await execFileAsync("git", ["add", "README.md"], { cwd });
   await execFileAsync("git", ["commit", "-qm", "init"], { cwd });
   return cwd;
+}
+
+async function plannedRun(store: FileRunStore, cwd: string, config: MasweConfig): Promise<RunRecord> {
+  return store.create("Bootstrap recovery", "Reconcile the exact workspace.", config, {
+    workspaceBootstrap: await captureWorkspaceBootstrapIntent(cwd, config),
+  });
+}
+
+class CountingRuntime implements AgentRuntime {
+  executions = 0;
+
+  async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    this.executions += 1;
+    return new MockRuntime().execute(request);
+  }
+
+  doctor(): Promise<RuntimeDoctorResult> {
+    return new MockRuntime().doctor();
+  }
+
+  listModels(): Promise<string[]> {
+    return new MockRuntime().listModels();
+  }
+}
+
+class StartInjectionStore implements RunStore {
+  private readonly delegate: FileRunStore;
+  private readonly mode: "before" | "complete-clone-after" | "altered-after";
+
+  constructor(
+    delegate: FileRunStore,
+    mode: "before" | "complete-clone-after" | "altered-after",
+  ) {
+    this.delegate = delegate;
+    this.mode = mode;
+  }
+
+  create(title: string, request: string, config: MasweConfig, options: CreateRunOptions = {}) {
+    return this.delegate.create(title, request, config, options);
+  }
+  save(run: RunRecord) {
+    return this.delegate.save(run);
+  }
+  load(runId: string) {
+    return this.delegate.load(runId);
+  }
+  list() {
+    return this.delegate.list();
+  }
+  async applyEvent(
+    run: RunRecord,
+    type: WorkflowEventType,
+    actor: string,
+    details?: Record<string, unknown>,
+  ): Promise<RunRecord> {
+    if (type !== "START") return this.delegate.applyEvent(run, type, actor, details);
+    if (this.mode === "before") throw new Error("simulated START pre-publication failure");
+    await this.delegate.applyEvent(
+      this.mode === "complete-clone-after" ? structuredClone(run) : run,
+      type,
+      actor,
+      details,
+    );
+    if (this.mode === "complete-clone-after") {
+      throw new Error("simulated exact independent START publication");
+    }
+    const altered = await this.delegate.load(run.id);
+    altered.title = "altered after START";
+    await this.delegate.save(altered);
+    throw new Error("simulated ambiguous START publication");
+  }
+  writeArtifact(run: RunRecord, name: string, content: string) {
+    return this.delegate.writeArtifact(run, name, content);
+  }
+  readArtifact(run: RunRecord, name: string) {
+    return this.delegate.readArtifact(run, name);
+  }
 }
 
 async function nonGitDir(): Promise<string> {
@@ -242,4 +334,352 @@ test("supersede persists linked bootstrap intent before any Git bootstrap side e
   assert.equal(replacement.supersedes, original.id);
   await assertCompleteIsolatedBootstrapIntent(cwd, replacement);
   await assertNoBootstrapGitSideEffects(cwd, replacement.id);
+});
+
+test("bootstrap barriers fail from authoritative CREATED state without running a role", async (t) => {
+  for (const barrier of [
+    "beforeBranchCreate",
+    "afterBranchCreate",
+    "afterWorktreeCreate",
+    "afterWorkspaceCheckpoint",
+  ] as const) {
+    await t.test(barrier, async () => {
+      const cwd = await initRepo();
+      const runtime = new CountingRuntime();
+      const config = isolatedConfig();
+      const hook = async () => {
+        throw new Error(`interrupt at ${barrier}`);
+      };
+      const options = {
+        automaticTransitionLimit: 20,
+        ...(barrier === "afterWorkspaceCheckpoint"
+          ? { afterWorkspaceCheckpoint: hook }
+          : { bootstrapHooks: { [barrier]: hook } }),
+      };
+      const orchestrator = new Orchestrator(cwd, config, runtime, undefined, options);
+
+      const result = await orchestrator.start("Barrier", `Stop at ${barrier}.`);
+      const authoritative = await orchestrator.store.load(result.id);
+
+      assert.equal(authoritative.state, "FAILED");
+      assert.equal(authoritative.failure?.resumeState, "CREATED");
+      assert.ok(authoritative.workspaceBootstrap);
+      assert.equal(authoritative.events.filter((event) => event.type === "START").length, 0);
+      assert.equal(runtime.executions, 0, "no role may execute before authoritative START");
+      if (barrier === "afterWorkspaceCheckpoint") {
+        assert.ok(authoritative.workspace?.worktreePath, "checkpointed workspace must survive failure");
+      } else {
+        assert.equal(authoritative.workspace, undefined);
+      }
+    });
+  }
+});
+
+test("bootstrap rejects staged, unstaged, and non-ignored untracked worktree dirt before checkpoint", async (t) => {
+  for (const dirtyKind of ["staged", "unstaged", "untracked"] as const) {
+    await t.test(dirtyKind, async () => {
+      const cwd = await initRepo();
+      const config = isolatedConfig();
+      const orchestrator = new Orchestrator(cwd, config, new CountingRuntime(), undefined, {
+        bootstrapHooks: {
+          afterWorktreeCreate: async (run: RunRecord) => {
+            const worktreePath = externalWorktreePath(cwd, run.id);
+            if (dirtyKind === "untracked") {
+              await writeFile(path.join(worktreePath, "new.txt"), "untracked\n", "utf8");
+              return;
+            }
+            await writeFile(path.join(worktreePath, "README.md"), `${dirtyKind}\n`, "utf8");
+            if (dirtyKind === "staged") {
+              await execFileAsync("git", ["add", "README.md"], { cwd: worktreePath });
+            }
+          },
+        },
+      });
+
+      const result = await orchestrator.start("Dirty bootstrap", dirtyKind);
+      const authoritative = await orchestrator.store.load(result.id);
+
+      assert.equal(authoritative.state, "FAILED");
+      assert.equal(authoritative.failure?.resumeState, "CREATED");
+      assert.equal(authoritative.workspace, undefined, "dirty workspace must not be checkpointed");
+      assert.equal(authoritative.events.some((event) => event.type === "START"), false);
+    });
+  }
+});
+
+test("bootstrap revalidates checkpoint cleanliness before START", async () => {
+  const cwd = await initRepo();
+  const config = isolatedConfig();
+  const orchestrator = new Orchestrator(cwd, config, new CountingRuntime(), undefined, {
+    afterWorkspaceCheckpoint: async (checkpoint: RunRecord) => {
+      const authoritative = await orchestrator.store.load(checkpoint.id);
+      assert.equal(authoritative.state, "CREATED");
+      assert.ok(authoritative.workspaceBootstrap);
+      assert.deepEqual(authoritative.workspace, checkpoint.workspace);
+      assert.equal(authoritative.events.length, 0);
+      await writeFile(
+        path.join(authoritative.workspace!.worktreePath!, "after-checkpoint.txt"),
+        "dirty\n",
+        "utf8",
+      );
+    },
+  });
+
+  const result = await orchestrator.start("Checkpoint dirt", "Reject dirt before START.");
+  const authoritative = await orchestrator.store.load(result.id);
+  assert.equal(authoritative.state, "FAILED");
+  assert.equal(authoritative.failure?.resumeState, "CREATED");
+  assert.ok(authoritative.workspace?.worktreePath);
+  assert.ok(authoritative.workspaceBootstrap);
+  assert.equal(authoritative.events.some((event) => event.type === "START"), false);
+});
+
+test("bootstrap rejects exact-path registration on the wrong branch", async () => {
+  const cwd = await initRepo();
+  const config = isolatedConfig();
+  const store = new FileRunStore(cwd);
+  const run = await plannedRun(store, cwd, config);
+  const worktreePath = externalWorktreePath(cwd, run.id);
+  await mkdir(path.dirname(worktreePath), { recursive: true });
+  await execFileAsync("git", ["branch", "alternate", "HEAD"], { cwd });
+  await execFileAsync("git", ["worktree", "add", worktreePath, "alternate"], { cwd });
+
+  const result = await new Orchestrator(cwd, config, new CountingRuntime(), store).bootstrapCreatedRun(run.id);
+  const authoritative = await store.load(result.id);
+  assert.equal(authoritative.state, "FAILED");
+  assert.match(
+    authoritative.failure?.message ?? "",
+    /deterministic path is registered to the wrong branch/i,
+  );
+  assert.equal(authoritative.workspace, undefined);
+});
+
+test("bootstrap rejects a deterministic branch at the wrong HEAD", async () => {
+  const cwd = await initRepo();
+  await writeFile(path.join(cwd, "second.txt"), "second\n", "utf8");
+  await execFileAsync("git", ["add", "second.txt"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "second"], { cwd });
+  const config = isolatedConfig();
+  const store = new FileRunStore(cwd);
+  const run = await plannedRun(store, cwd, config);
+  await execFileAsync("git", ["branch", `maswe/${run.id}`, "HEAD~1"], { cwd });
+
+  const result = await new Orchestrator(cwd, config, new CountingRuntime(), store).bootstrapCreatedRun(run.id);
+  const authoritative = await store.load(result.id);
+  assert.equal(authoritative.state, "FAILED");
+  assert.match(authoritative.failure?.message ?? "", /deterministic branch has the wrong HEAD/i);
+  assert.equal(authoritative.workspace, undefined);
+});
+
+test("bootstrap rejects its deterministic branch registered at an alternate path", async () => {
+  const cwd = await initRepo();
+  const alternatePath = await mkdtemp(path.join(os.tmpdir(), "maswe-alternate-registration-"));
+  await rm(alternatePath, { recursive: true, force: true });
+  const config = isolatedConfig();
+  const store = new FileRunStore(cwd);
+  const run = await plannedRun(store, cwd, config);
+  await execFileAsync("git", ["branch", `maswe/${run.id}`, "HEAD"], { cwd });
+  await execFileAsync("git", ["worktree", "add", alternatePath, `maswe/${run.id}`], { cwd });
+
+  const result = await new Orchestrator(cwd, config, new CountingRuntime(), store).bootstrapCreatedRun(run.id);
+  const authoritative = await store.load(result.id);
+  assert.equal(authoritative.state, "FAILED");
+  assert.match(
+    authoritative.failure?.message ?? "",
+    /deterministic branch is registered at an alternate path/i,
+  );
+  assert.equal(authoritative.workspace, undefined);
+});
+
+test("bootstrap rejects an occupied unregistered deterministic path", async () => {
+  const cwd = await initRepo();
+  const config = isolatedConfig();
+  const store = new FileRunStore(cwd);
+  const run = await plannedRun(store, cwd, config);
+  const worktreePath = externalWorktreePath(cwd, run.id);
+  await mkdir(worktreePath, { recursive: true });
+  await writeFile(path.join(worktreePath, "occupied.txt"), "occupied\n", "utf8");
+
+  const result = await new Orchestrator(cwd, config, new CountingRuntime(), store).bootstrapCreatedRun(run.id);
+  const authoritative = await store.load(result.id);
+  assert.equal(authoritative.state, "FAILED");
+  assert.match(authoritative.failure?.message ?? "", /occupied|unregistered/i);
+  assert.equal(authoritative.workspace, undefined);
+});
+
+test("bootstrap rejects a stale prunable deterministic registration", async () => {
+  const cwd = await initRepo();
+  const config = isolatedConfig();
+  const store = new FileRunStore(cwd);
+  const run = await plannedRun(store, cwd, config);
+  const worktreePath = externalWorktreePath(cwd, run.id);
+  await mkdir(path.dirname(worktreePath), { recursive: true });
+  await execFileAsync("git", ["branch", `maswe/${run.id}`, "HEAD"], { cwd });
+  await execFileAsync("git", ["worktree", "add", worktreePath, `maswe/${run.id}`], { cwd });
+  await rm(worktreePath, { recursive: true, force: true });
+
+  const result = await new Orchestrator(cwd, config, new CountingRuntime(), store).bootstrapCreatedRun(run.id);
+  const authoritative = await store.load(result.id);
+  assert.equal(authoritative.state, "FAILED");
+  assert.match(authoritative.failure?.message ?? "", /prunable|stale/i);
+  assert.equal(authoritative.workspace, undefined);
+});
+
+test("bootstrap rejects operator source drift after durable intent", async () => {
+  const cwd = await initRepo();
+  const config = isolatedConfig();
+  config.policy.useIsolatedWorktree = false;
+  const store = new FileRunStore(cwd);
+  const run = await plannedRun(store, cwd, config);
+  await writeFile(path.join(cwd, "README.md"), "# drifted\n", "utf8");
+
+  const result = await new Orchestrator(cwd, config, new CountingRuntime(), store).bootstrapCreatedRun(run.id);
+  const authoritative = await store.load(result.id);
+  assert.equal(authoritative.state, "FAILED");
+  assert.match(authoritative.failure?.message ?? "", /source|drift|fingerprint/i);
+  assert.equal(authoritative.events.some((event) => event.type === "START"), false);
+});
+
+test("isolated working directory never falls back to the operator checkout", async () => {
+  const cwd = await initRepo();
+  const config = isolatedConfig();
+  const store = new FileRunStore(cwd);
+  const run = await plannedRun(store, cwd, config);
+
+  assert.throws(
+    () => workingDirectoryFor(run),
+    /requires an established MASWE-managed worktree/,
+  );
+});
+
+test("structured worktree inspection accepts and omits a bare main repository record", async () => {
+  const source = await initRepo();
+  const bare = await mkdtemp(path.join(os.tmpdir(), "maswe-bare-registration-"));
+  await rm(bare, { recursive: true, force: true });
+  await execFileAsync("git", ["clone", "-q", "--bare", source, bare]);
+  const linked = await mkdtemp(path.join(os.tmpdir(), "maswe-bare-linked-"));
+  await rm(linked, { recursive: true, force: true });
+  await execFileAsync("git", ["worktree", "add", linked], { cwd: bare });
+
+  const registrations = await listGitWorktreeRegistrations(bare);
+  assert.deepEqual(registrations, [
+    {
+      worktreePath: path.resolve(linked),
+      headSha: (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: linked })).stdout.trim(),
+      branch: path.basename(linked),
+      prunable: false,
+    },
+  ]);
+});
+
+test("checkpoint outcome unknown reloads and fails the authoritative actionable checkpoint", async () => {
+  const cwd = await initRepo();
+  const config = isolatedConfig();
+  let inject = true;
+  const store = new FileRunStore(cwd, {
+    syncDirectory: async (directoryPath) => {
+      if (!inject) return;
+      try {
+        const observed = JSON.parse(
+          await readFile(path.join(directoryPath, "run.json"), "utf8"),
+        ) as RunRecord;
+        if (observed.state === "CREATED" && observed.workspace?.worktreePath) {
+          inject = false;
+          throw new Error("simulated checkpoint directory sync failure");
+        }
+      } catch (error) {
+        if (!inject) throw error;
+      }
+    },
+  });
+  const run = await plannedRun(store, cwd, config);
+
+  const result = await new Orchestrator(cwd, config, new CountingRuntime(), store).bootstrapCreatedRun(run.id);
+  const authoritative = await store.load(result.id);
+  assert.equal(authoritative.state, "FAILED");
+  assert.equal(authoritative.failure?.resumeState, "CREATED");
+  assert.ok(authoritative.workspace?.worktreePath);
+  assert.ok(authoritative.workspaceBootstrap);
+});
+
+test("START outcome unknown adopts only the exact complete START publication", async () => {
+  const cwd = await initRepo();
+  const config = isolatedConfig();
+  const initialStore = new FileRunStore(cwd);
+  const run = await plannedRun(initialStore, cwd, config);
+  let inject = true;
+  const outcomeUnknownStore = new FileRunStore(cwd, {
+    syncDirectory: async (directoryPath) => {
+      if (!inject) return;
+      try {
+        const observed = JSON.parse(
+          await readFile(path.join(directoryPath, "run.json"), "utf8"),
+        ) as RunRecord;
+        if (observed.state === "BRAINSTORMING" && observed.events.at(-1)?.type === "START") {
+          inject = false;
+          throw new Error("simulated START directory sync failure");
+        }
+      } catch (error) {
+        if (!inject) throw error;
+      }
+    },
+  });
+
+  const result = await new Orchestrator(
+    cwd,
+    config,
+    new CountingRuntime(),
+    outcomeUnknownStore,
+  ).bootstrapCreatedRun(run.id);
+  const authoritative = await initialStore.load(result.id);
+  assert.equal(authoritative.state, "BRAINSTORMING");
+  assert.equal(authoritative.workspaceBootstrap, undefined);
+  assert.ok(authoritative.workspace?.worktreePath);
+  assert.equal(authoritative.events.filter((event) => event.type === "START").length, 1);
+});
+
+test("START pre-publication failure reloads and fails the exact CREATED checkpoint", async () => {
+  const cwd = await initRepo();
+  const config = isolatedConfig();
+  const delegate = new FileRunStore(cwd);
+  const run = await plannedRun(delegate, cwd, config);
+  const store = new StartInjectionStore(delegate, "before");
+
+  const result = await new Orchestrator(cwd, config, new CountingRuntime(), store).bootstrapCreatedRun(run.id);
+  const authoritative = await delegate.load(result.id);
+  assert.equal(authoritative.state, "FAILED");
+  assert.equal(authoritative.failure?.resumeState, "CREATED");
+  assert.ok(authoritative.workspaceBootstrap);
+  assert.ok(authoritative.workspace?.worktreePath);
+  assert.equal(authoritative.events.some((event) => event.type === "START"), false);
+});
+
+test("START recovery adopts an exact complete publication written from an independent clone", async () => {
+  const cwd = await initRepo();
+  const config = isolatedConfig();
+  const delegate = new FileRunStore(cwd);
+  const run = await plannedRun(delegate, cwd, config);
+  const store = new StartInjectionStore(delegate, "complete-clone-after");
+
+  const result = await new Orchestrator(cwd, config, new CountingRuntime(), store).bootstrapCreatedRun(run.id);
+  const authoritative = await delegate.load(result.id);
+  assert.equal(authoritative.state, "BRAINSTORMING");
+  assert.equal(authoritative.workspaceBootstrap, undefined);
+  assert.equal(authoritative.events.filter((event) => event.type === "START").length, 1);
+});
+
+test("START recovery rejects an altered authoritative publication", async () => {
+  const cwd = await initRepo();
+  const config = isolatedConfig();
+  const delegate = new FileRunStore(cwd);
+  const run = await plannedRun(delegate, cwd, config);
+  const store = new StartInjectionStore(delegate, "altered-after");
+
+  await assert.rejects(
+    new Orchestrator(cwd, config, new CountingRuntime(), store).bootstrapCreatedRun(run.id),
+    /bootstrap publication outcome is ambiguous/i,
+  );
+  const authoritative = await delegate.load(run.id);
+  assert.equal(authoritative.state, "BRAINSTORMING");
+  assert.equal(authoritative.title, "altered after START");
 });

@@ -16,7 +16,6 @@ import {
   assertWorkingTreeScope,
   cleanupRunWorkspace,
   createDeterministicCommit,
-  ensureRunWorkspace,
   invalidateStaleEvidence,
   refreshWorkspaceHead,
   restoreRunWorkspace,
@@ -27,7 +26,12 @@ import { resolveProjectModels } from "./model-resolution.ts";
 import { renderQualityReport, runQualityChecks } from "./quality.ts";
 import { isHumanGate, isTerminal } from "./state-machine.ts";
 import { FileRunStore, type RunStore } from "./store.ts";
-import { captureWorkspaceBootstrapIntent } from "./workspace-bootstrap.ts";
+import {
+  assertBootstrapWorkspaceReady,
+  captureWorkspaceBootstrapIntent,
+  reconcileBootstrapWorkspace,
+  type WorkspaceBootstrapHooks,
+} from "./workspace-bootstrap.ts";
 import type { MasweConfig } from "./domain.ts";
 import {
   appendFailureAggregate,
@@ -74,6 +78,10 @@ export interface OrchestratorOptions {
   automaticTransitionLimit?: number;
   /** Test seam immediately after durable bootstrap intent publication. */
   beforeBootstrapReconcile?: (run: RunRecord) => Promise<void>;
+  /** Failure barriers around deterministic branch/worktree reconciliation. */
+  bootstrapHooks?: WorkspaceBootstrapHooks;
+  /** Failure barrier after the CREATED workspace checkpoint has been reloaded. */
+  afterWorkspaceCheckpoint?: (run: RunRecord) => Promise<void>;
 }
 
 export class Orchestrator {
@@ -83,6 +91,8 @@ export class Orchestrator {
   private readonly runtime: AgentRuntime;
   private readonly automaticTransitionLimit: number;
   private readonly beforeBootstrapReconcile: ((run: RunRecord) => Promise<void>) | undefined;
+  private readonly bootstrapHooks: WorkspaceBootstrapHooks;
+  private readonly afterWorkspaceCheckpoint: ((run: RunRecord) => Promise<void>) | undefined;
 
   constructor(
     cwd: string,
@@ -97,6 +107,8 @@ export class Orchestrator {
     this.store = store ?? new FileRunStore(cwd);
     this.automaticTransitionLimit = options.automaticTransitionLimit ?? 20;
     this.beforeBootstrapReconcile = options.beforeBootstrapReconcile;
+    this.bootstrapHooks = options.bootstrapHooks ?? {};
+    this.afterWorkspaceCheckpoint = options.afterWorkspaceCheckpoint;
     if (
       !Number.isSafeInteger(this.automaticTransitionLimit) ||
       this.automaticTransitionLimit <= 0
@@ -117,9 +129,106 @@ export class Orchestrator {
       ...options,
     });
     await this.beforeBootstrapReconcile?.(run);
-    run.workspace = await ensureRunWorkspace(this.cwd, run);
-    await this.store.save(run);
     return run;
+  }
+
+  private recordsEqual(left: RunRecord, right: RunRecord): boolean {
+    return JSON.stringify(left) === JSON.stringify(right);
+  }
+
+  private isCompleteBootstrapStart(prior: RunRecord, candidate: RunRecord): boolean {
+    if (
+      prior.state !== "CREATED" ||
+      !prior.workspace ||
+      !prior.workspaceBootstrap ||
+      candidate.state !== "BRAINSTORMING" ||
+      candidate.workspaceBootstrap !== undefined ||
+      candidate.version !== prior.version + 1 ||
+      candidate.events.length !== prior.events.length + 1 ||
+      JSON.stringify(candidate.events.slice(0, prior.events.length)) !==
+        JSON.stringify(prior.events)
+    ) {
+      return false;
+    }
+    const event = candidate.events.at(-1);
+    const expectedDetails = prior.supersedes ? { supersedes: prior.supersedes } : undefined;
+    if (
+      !event ||
+      event.type !== "START" ||
+      event.actor !== "user" ||
+      event.from !== "CREATED" ||
+      event.to !== "BRAINSTORMING" ||
+      JSON.stringify(event.details) !== JSON.stringify(expectedDetails)
+    ) {
+      return false;
+    }
+
+    const expected = structuredClone(prior);
+    expected.state = "BRAINSTORMING";
+    expected.version = candidate.version;
+    expected.updatedAt = candidate.updatedAt;
+    expected.events = candidate.events;
+    delete expected.workspaceBootstrap;
+    return this.recordsEqual(candidate, expected);
+  }
+
+  /** Establish and publish the durable CREATED workspace checkpoint before START. */
+  async bootstrapCreatedRun(runId: string): Promise<RunRecord> {
+    const prior = await this.store.load(runId);
+    if (prior.state !== "CREATED") {
+      throw new Error(`Run ${runId} bootstrap requires CREATED state, found ${prior.state}`);
+    }
+    let checkpointExpected: RunRecord | undefined;
+    let startExpected: RunRecord | undefined;
+    try {
+      if (prior.workspace) {
+        checkpointExpected = structuredClone(prior);
+        await assertBootstrapWorkspaceReady(this.cwd, checkpointExpected);
+      } else {
+        const workspace = await reconcileBootstrapWorkspace(
+          this.cwd,
+          prior,
+          this.bootstrapHooks,
+        );
+        checkpointExpected = structuredClone(prior);
+        checkpointExpected.workspace = workspace;
+        await this.store.save(checkpointExpected);
+      }
+
+      const checkpoint = await this.store.load(runId);
+      if (!checkpointExpected || !this.recordsEqual(checkpoint, checkpointExpected)) {
+        throw new Error("Authoritative CREATED workspace checkpoint changed during bootstrap");
+      }
+      await this.afterWorkspaceCheckpoint?.(checkpoint);
+      const reloaded = await this.store.load(runId);
+      if (!this.recordsEqual(reloaded, checkpoint)) {
+        throw new Error("Authoritative CREATED workspace checkpoint changed before START");
+      }
+      await assertBootstrapWorkspaceReady(this.cwd, reloaded);
+
+      startExpected = structuredClone(reloaded);
+      delete startExpected.workspaceBootstrap;
+      const details = startExpected.supersedes
+        ? { supersedes: startExpected.supersedes }
+        : undefined;
+      return await this.store.applyEvent(startExpected, "START", "user", details);
+    } catch (error) {
+      const observed = await this.store.load(runId);
+      if (checkpointExpected && this.isCompleteBootstrapStart(checkpointExpected, observed)) {
+        return observed;
+      }
+      const exactPrior = this.recordsEqual(observed, prior);
+      const exactCheckpoint = checkpointExpected
+        ? this.recordsEqual(observed, checkpointExpected)
+        : false;
+      if (observed.state === "CREATED" && observed.workspaceBootstrap && (exactPrior || exactCheckpoint)) {
+        return this.failRun(observed, runFailureMessage(error), runFailureCode(error), runFailureRuntime(error));
+      }
+      throw new Error(
+        "Workspace bootstrap publication outcome is ambiguous: authoritative state is neither an exact actionable CREATED checkpoint nor a complete START publication.",
+        { cause: error },
+      );
+    }
   }
 
   private assertWithinBudget(run: RunRecord): void {
@@ -149,8 +258,8 @@ export class Orchestrator {
     }
     const catalogue = await this.runtime.listModels();
     const resolvedConfig = resolveProjectModels(this.config, catalogue);
-    const run = await this.createPlannedRun(title, request, resolvedConfig);
-    await this.store.applyEvent(run, "START", "user");
+    const planned = await this.createPlannedRun(title, request, resolvedConfig);
+    const run = await this.bootstrapCreatedRun(planned.id);
     return this.runUntilBlocked(run.id);
   }
 
@@ -810,7 +919,7 @@ export class Orchestrator {
       await this.store.save(existing);
       await this.finalizeTerminal(existing);
     }
-    await this.store.applyEvent(replacement, "START", "user", { supersedes: existing.id });
+    await this.bootstrapCreatedRun(replacement.id);
     return this.runUntilBlocked(replacement.id);
   }
 }

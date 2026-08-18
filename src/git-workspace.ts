@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
+import { appendFile, lstat, mkdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { RunRecord, RunWorkspace } from "./domain.ts";
@@ -55,6 +55,123 @@ export function externalWorktreePath(repositoryPath: string, runId: string): str
   assertSafeRunId(runId);
   const repoKey = createHash("sha256").update(path.resolve(repositoryPath)).digest("hex").slice(0, 16);
   return path.join(os.tmpdir(), "maswe-worktrees", repoKey, runId);
+}
+
+export interface GitWorktreeRegistration {
+  worktreePath: string;
+  headSha: string;
+  branch?: string;
+  prunable: boolean;
+}
+
+/** Parse Git's NUL-delimited porcelain format without consulting diagnostic prose. */
+export async function listGitWorktreeRegistrations(
+  repositoryPath: string,
+): Promise<GitWorktreeRegistration[]> {
+  const result = await gitExec(
+    "git",
+    ["worktree", "list", "--porcelain", "-z"],
+    repositoryPath,
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(`Failed to inspect Git worktree registrations: ${result.stderr || result.stdout}`);
+  }
+  if (!result.stdout.endsWith("\0\0")) {
+    throw new Error("Malformed Git worktree registration output: missing record terminator");
+  }
+
+  const registrations: GitWorktreeRegistration[] = [];
+  const paths = new Set<string>();
+  const branches = new Set<string>();
+  for (const rawRecord of result.stdout.slice(0, -2).split("\0\0")) {
+    const fields = rawRecord.split("\0");
+    const worktreeField = fields.shift();
+    const headField = fields.shift();
+    if (!worktreeField?.startsWith("worktree ")) {
+      throw new Error("Malformed Git worktree registration: worktree must come first");
+    }
+    const rawPath = worktreeField.slice("worktree ".length);
+    if (!path.isAbsolute(rawPath)) {
+      throw new Error("Malformed Git worktree registration path");
+    }
+    const worktreePath = path.resolve(rawPath);
+    if (paths.has(worktreePath)) {
+      throw new Error(`Conflicting Git worktree registrations for path ${worktreePath}`);
+    }
+    paths.add(worktreePath);
+    if (headField === "bare") {
+      if (fields.length !== 0) {
+        throw new Error("Malformed bare Git worktree registration");
+      }
+      continue;
+    }
+    if (!headField?.startsWith("HEAD ")) {
+      throw new Error("Malformed Git worktree registration: HEAD must follow worktree");
+    }
+    const headSha = headField.slice("HEAD ".length).toLowerCase();
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(headSha)) {
+      throw new Error("Malformed Git worktree registration HEAD");
+    }
+
+    let branch: string | undefined;
+    let prunable = false;
+    for (const field of fields) {
+      if (field === "detached" || field === "locked" || field.startsWith("locked ")) {
+        continue;
+      }
+      if (field === "prunable" || field.startsWith("prunable ")) {
+        if (prunable) throw new Error("Malformed Git worktree registration: duplicate prunable field");
+        prunable = true;
+        continue;
+      }
+      if (field.startsWith("branch ")) {
+        if (branch !== undefined) {
+          throw new Error("Malformed Git worktree registration: duplicate branch field");
+        }
+        const fullRef = field.slice("branch ".length);
+        if (!fullRef.startsWith("refs/heads/") || fullRef.length === "refs/heads/".length) {
+          throw new Error("Malformed Git worktree registration branch ref");
+        }
+        branch = fullRef.slice("refs/heads/".length);
+        continue;
+      }
+      throw new Error(`Malformed Git worktree registration field: ${field}`);
+    }
+
+    if (branch && branches.has(branch)) {
+      throw new Error(`Conflicting Git worktree registrations for branch ${branch}`);
+    }
+    if (branch) branches.add(branch);
+    registrations.push({ worktreePath, headSha, ...(branch ? { branch } : {}), prunable });
+  }
+  return registrations;
+}
+
+export async function gitLocalBranchHead(
+  repositoryPath: string,
+  branch: string,
+): Promise<string | undefined> {
+  const result = await gitExec(
+    "git",
+    ["rev-parse", "--verify", `refs/heads/${branch}`],
+    repositoryPath,
+  );
+  if (result.exitCode !== 0) return undefined;
+  const headSha = result.stdout.trim().toLowerCase();
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(headSha)) {
+    throw new Error(`Git returned a malformed HEAD for branch ${branch}`);
+  }
+  return headSha;
+}
+
+export async function pathExists(candidatePath: string): Promise<boolean> {
+  try {
+    await lstat(candidatePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 export async function ensureMasweGitExclude(repositoryPath: string): Promise<void> {
@@ -393,5 +510,11 @@ export async function restoreRunWorkspace(
 }
 
 export function workingDirectoryFor(run: RunRecord): string {
-  return run.workspace?.worktreePath ?? run.repositoryPath;
+  if (run.config.policy.useIsolatedWorktree) {
+    if (!run.workspace?.worktreePath) {
+      throw new Error(`Run ${run.id} requires an established MASWE-managed worktree`);
+    }
+    return run.workspace.worktreePath;
+  }
+  return run.repositoryPath;
 }
