@@ -4,7 +4,7 @@
 
 **Goal:** Repair Issue #28 so MASWE publishes exact evaluated SHA provenance, recovers every partial `CREATED` bootstrap, durably handles automatic-transition overflow and retry publication, and revalidates stale evidence against the latest local or GitHub head without rolling back workflow history.
 
-**Architecture:** Keep schema version `1`, the current optimistic file store, and `src/state-machine.ts` as the sole transition map. Add two focused helpers: `src/workspace-bootstrap.ts` owns bootstrap intent capture and exact workspace reconciliation, while `src/revalidation.ts` owns request/retarget metadata and event publication through `RunStore.applyEvent()`. GitHub head handling becomes a two-phase protocol: rollback-capable event-free association publication followed by non-rollback workflow routing.
+**Architecture:** Keep schema version `1`, the optimistic file store, and `src/state-machine.ts` as the sole transition map. Add two focused helpers: `src/workspace-bootstrap.ts` owns bootstrap intent capture and exact workspace reconciliation, while `src/revalidation.ts` owns request/retarget metadata and publishes transitions only through `RunStore.applyEvent()`. GitHub head handling becomes a two-phase protocol: rollback-capable event-free association publication followed by non-rollback workflow routing.
 
 **Tech Stack:** TypeScript ESM, Node.js built-in test runner, Node `--experimental-strip-types`, Git CLI worktrees, JSON Schema Draft 2020-12, file-backed optimistic persistence.
 
@@ -33,20 +33,20 @@
 
 ### New production files
 
-- `src/workspace-bootstrap.ts` — bootstrap intent capture, exact source/worktree classification, clean-status checks, and retry-safe workspace reconciliation. It does not publish workflow events.
-- `src/revalidation.ts` — initial revalidation, active/failed retargeting, target reconciliation, and generation fences. Every transition is published through `RunStore.applyEvent()`.
+- `src/workspace-bootstrap.ts` — bootstrap intent capture, source identity checks, structured worktree reconciliation, clean-status enforcement, and retry-safe workspace restoration. It does not publish workflow events.
+- `src/revalidation.ts` — initial revalidation, active/failed retargeting, required-target reconciliation, and generation fences. It publishes transitions through `RunStore.applyEvent()`.
 
 ### Modified production files
 
 - `src/domain.ts` — new metadata types, event values, and failure code.
 - `src/state-machine.ts` — centralized request/retarget transitions and constrained failed self-transition.
-- `src/git-snapshot.ts` — source-tree fingerprint that excludes `.maswe` without changing the current authoritative fingerprint.
+- `src/git-snapshot.ts` — source-tree fingerprint that excludes `.maswe` without changing the authoritative read-only fingerprint.
 - `src/git-workspace.ts` — structured worktree inspection, strict isolated-workspace guard, and dirty-worktree rejection.
 - `src/store.ts` — initial run fields, exact migration allowlists, and transition-context forwarding.
 - `src/run-record-validation.ts` — exact validation for bootstrap and revalidation metadata.
 - `src/orchestrator.ts` — planned run creation, real `CREATED + workspace` checkpoint, durable overflow/failure/retry, revalidation preflight, generation fences, and return-to-gate behavior.
 - `src/run-rendering.ts` — stable failure code and bootstrap/revalidation diagnostics.
-- `src/github/adapter.ts` — two-phase association/routing protocol and crash-recovery seams.
+- `src/github/adapter.ts` — two-phase association/routing protocol and deterministic crash-recovery seams.
 - `src/github/association.ts` — explicit known-failure rollback contract and outcome-unknown behavior.
 - `schemas/run-record.schema.json` — exact optional metadata and enum synchronization.
 
@@ -95,7 +95,7 @@
 - Produces: `WorkspaceBootstrapIntent`, `RunRevalidation`, `RevalidationSource`, `RevalidationReturnState`, `TransitionContext`.
 - Produces: workflow events `REVALIDATE_REQUESTED` and `REVALIDATION_RETARGETED`.
 - Produces: failure code `automatic-transition-limit-exceeded`.
-- Consumes: existing `RunRecord`, `WorkflowState`, `WorkflowEventType`, `RunFailureCode`, `RunStore.applyEvent()`.
+- Consumes: existing `RunRecord`, `WorkflowState`, `WorkflowEventType`, `RunFailureCode`, and `RunStore.applyEvent()`.
 
 - [ ] **Step 1: Write failing state-machine tests for request, retarget, and `CREATED` retry**
 
@@ -152,8 +152,6 @@ Update existing direct `transition()` calls to pass `{ retryResumeState }` rathe
 
 - [ ] **Step 2: Run the state-machine tests and verify the red state**
 
-Run:
-
 ```bash
 node --experimental-strip-types --test test/state-machine.test.ts
 ```
@@ -200,8 +198,9 @@ test("run schema and migration accept exact Issue 28 metadata", async (t) => {
   assert.doesNotThrow(() => migrateRunRecord(run));
 });
 
-test("Issue 28 metadata rejects extra fields and invalid generation", async () => {
+test("Issue 28 metadata rejects extra fields and invalid generation", async (t) => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-issue28-schema-invalid-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
   const run = await new FileRunStore(cwd).create("issue28", "schema", DEFAULT_CONFIG);
   run.revalidation = {
     returnState: "PR_READY",
@@ -220,8 +219,6 @@ test("Issue 28 metadata rejects extra fields and invalid generation", async () =
 ```
 
 - [ ] **Step 4: Run schema tests and verify the red state**
-
-Run:
 
 ```bash
 node --experimental-strip-types --test test/schema.test.ts
@@ -268,7 +265,7 @@ Extend `WORKFLOW_EVENTS` with both revalidation event values and extend `RunFail
 
 - [ ] **Step 6: Implement context-aware centralized transitions**
 
-Use this public context in `src/state-machine.ts`:
+Add to `src/state-machine.ts`:
 
 ```ts
 export interface TransitionContext {
@@ -278,7 +275,7 @@ export interface TransitionContext {
 }
 ```
 
-Implement the special cases before the normal transition lookup:
+Use the context in `transition()`:
 
 ```ts
 if (event === "RETRY_FROM_FAILED") {
@@ -307,9 +304,9 @@ if (state === "FAILED" && event === "REVALIDATION_RETARGETED") {
 }
 ```
 
-Add the normal request/retarget mappings to `TRANSITIONS`, add `CREATED` to `RESUMABLE_STATES`, and make `allowedEvents()` accept an optional `TransitionContext` so it exposes failed retarget only when the same preconditions hold.
+Add the request/retarget mappings to `TRANSITIONS`, add `CREATED` to `RESUMABLE_STATES`, and make `allowedEvents()` accept an optional `TransitionContext` so it exposes failed retarget only when the same preconditions hold.
 
-- [ ] **Step 7: Forward transition context from `RunStore.applyEvent()` and validate exact metadata**
+- [ ] **Step 7: Forward transition context and validate exact metadata**
 
 In `src/store.ts`, call:
 
@@ -324,8 +321,6 @@ const to = transition(from, type, {
 Add both fields to the top-level allowlist. In `src/run-record-validation.ts`, add exact-object validators that reject unknown fields, non-positive generation, invalid return states/sources, and empty identity strings. Mirror the same requirements in `schemas/run-record.schema.json` with `additionalProperties: false`.
 
 - [ ] **Step 8: Run focused tests and type checking**
-
-Run:
 
 ```bash
 node --experimental-strip-types --test test/state-machine.test.ts test/schema.test.ts
@@ -351,7 +346,7 @@ git commit -m "feat: add Issue 28 recovery contracts"
 
 **Interfaces:**
 - Produces: corrected `BUILD_COMPLETED.details` and `RESOLUTION_COMPLETED.details` contracts.
-- Consumes: existing `createDeterministicCommit()`, `run.workspace.headSha`, `runtimeEventIdentityDetails()`.
+- Consumes: existing `createDeterministicCommit()`, `run.workspace.headSha`, and `runtimeEventIdentityDetails()`.
 
 - [ ] **Step 1: Extend the editing runtime fixture to support resolver edits**
 
@@ -366,48 +361,48 @@ return {
 };
 ```
 
-Use `MockRuntime` for comment classification and other roles.
+Use `MockRuntime` for comment classification and all roles not explicitly edited by the fixture.
 
 - [ ] **Step 2: Add failing builder and resolver assertions**
 
-For the existing editing builder test, add:
+For the editing builder test, add:
 
 ```ts
 assert.equal(build.details?.headSha, build.details?.outputHeadSha);
 assert.equal(build.details?.headSha, run.workspace?.headSha);
+assert.notEqual(build.details?.inputHeadSha, build.details?.headSha);
 ```
 
-Add an editing resolver test that starts a run, opens review, submits an in-scope comment, and asserts:
+Add editing and no-op resolver tests. For each `RESOLUTION_COMPLETED` event assert:
 
 ```ts
-const resolution = run.events.find((event) => event.type === "RESOLUTION_COMPLETED");
-assert.ok(resolution);
-assert.notEqual(
-  resolution.details?.inputHeadSha,
-  resolution.details?.outputHeadSha,
-);
 assert.equal(resolution.details?.headSha, resolution.details?.outputHeadSha);
 assert.equal(resolution.details?.headSha, run.workspace?.headSha);
 ```
 
-Add no-op builder and resolver tests asserting all three SHA fields equal the final workspace head.
+The editing case also asserts input differs; the no-op case asserts all three SHA fields are equal.
 
-- [ ] **Step 3: Run the provenance tests and verify the red state**
+- [ ] **Step 3: Run the provenance test and verify the red state**
 
 ```bash
 node --experimental-strip-types --test test/commit-provenance.test.ts
 ```
 
-Expected: FAIL because public `headSha` still records `beforeSha`.
+Expected: FAIL because public `headSha` still records the input SHA.
 
-- [ ] **Step 4: Publish the evaluated SHA in both event paths**
+- [ ] **Step 4: Bind public `headSha` to the evaluated output**
 
-Replace the event details in both methods with:
+In builder and resolver publication, compute:
 
 ```ts
-const evaluatedHeadSha = outputHeadSha ?? beforeSha;
+const evaluatedHeadSha =
+  outputHeadSha ?? beforeSha ?? run.workspace?.headSha;
+```
 
-return this.store.applyEvent(run, eventType, actor, {
+Publish details with this shape:
+
+```ts
+{
   ...runtimeEventIdentityDetails(result),
   marker: markers.marker,
   ...(beforeSha ? { inputHeadSha: beforeSha } : {}),
@@ -417,10 +412,10 @@ return this.store.applyEvent(run, eventType, actor, {
         outputHeadSha: evaluatedHeadSha,
       }
     : {}),
-});
+}
 ```
 
-Use the concrete event type and actor already present in each method; do not introduce a shared abstraction merely for these two call sites.
+Do not rewrite historical events.
 
 - [ ] **Step 5: Run focused provenance and evidence tests**
 
@@ -430,7 +425,7 @@ node --experimental-strip-types --test test/commit-provenance.test.ts test/evide
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit the provenance repair**
+- [ ] **Step 6: Commit the provenance correction**
 
 ```bash
 git add src/orchestrator.ts test/commit-provenance.test.ts
@@ -439,105 +434,96 @@ git commit -m "fix: bind editing events to evaluated head"
 
 ---
 
-### Task 3: Make automatic-transition overflow durable and boundary-correct
+### Task 3: Make the automatic-transition bound and failure publication durable
 
 **Files:**
 - Modify: `src/orchestrator.ts`
-- Create: `test/issue28-transition-bound.test.ts`
 - Modify: `src/run-rendering.ts`
+- Create: `test/issue28-transition-bound.test.ts`
 
 **Interfaces:**
-- Produces: `OrchestratorOptions.automaticTransitionLimit` as a test-only dependency seam.
-- Produces: atomic `failRun()` publication using a cloned candidate.
-- Consumes: `isHumanGate()`, `isTerminal()`, `RunFailureCode`.
+- Produces: `OrchestratorOptions.automaticTransitionLimit` test seam.
+- Produces: clone-staged `failRun()` publication and stable overflow code.
+- Consumes: `isHumanGate()`, `isTerminal()`, `RunStore.applyEvent()`.
 
-- [ ] **Step 1: Add deterministic boundary fixtures**
+- [ ] **Step 1: Add exact-boundary tests**
 
-Create `test/issue28-transition-bound.test.ts` with a non-isolated mock configuration and a helper that seeds a run in `BRAINSTORMING` by creating a run, assigning a captured workspace, saving, and publishing `START`.
+Create three tests:
 
-Add three tests:
+1. bound `1`, seeded `BRAINSTORMING`, approval required: one advance reaches `WAITING_FOR_BRAINSTORM_APPROVAL` and returns it;
+2. bound `1`, seeded `BUILDING` with `buildVerifyCycles === maxBuildVerifyCycles`: one advance reaches `FAILED` and returns it;
+3. bound `1`, seeded `BRAINSTORMING`, approval disabled: one advance ends in automatic `DESIGNING`, then overflow durably publishes `FAILED` with code `automatic-transition-limit-exceeded` and `resumeState: "DESIGNING"`.
 
-```ts
-test("final allowed advance may reach a human gate", async () => {
-  const orchestrator = new Orchestrator(cwd, config, new MockRuntime(), store, {
-    automaticTransitionLimit: 1,
-  });
-  const run = await seedBrainstormingRun(cwd, store, config);
-  const result = await orchestrator.runUntilBlocked(run.id);
-  assert.equal(result.state, "WAITING_FOR_BRAINSTORM_APPROVAL");
-});
+Every test reloads through `FileRunStore` before asserting state, code, resume state, and final event.
 
-test("final allowed advance may reach a terminal state", async () => {
-  const run = await seedBuildingRunAtCycleLimit(cwd, store, config);
-  const result = await orchestrator.runUntilBlocked(run.id);
-  assert.equal(result.state, "FAILED");
-  assert.notEqual(result.failure?.code, "automatic-transition-limit-exceeded");
-});
+- [ ] **Step 2: Add failure outcome-unknown coverage**
 
-test("one more required automatic advance durably fails", async () => {
-  const result = await orchestrator.runUntilBlocked(run.id);
-  const reloaded = await store.load(run.id);
-  assert.equal(result.state, "FAILED");
-  assert.equal(reloaded.state, "FAILED");
-  assert.equal(reloaded.failure?.code, "automatic-transition-limit-exceeded");
-  assert.equal(reloaded.failure?.resumeState, "DESIGNING");
-  assert.equal(
-    reloaded.events.at(-1)?.type,
-    "FAIL",
-  );
-});
-```
+Use a store whose directory sync throws once after the `FAIL` rename. Reload and require either the exact new `FAIL` event and complete failure record, or the unchanged prior automatic record. Reject any partial failure metadata without the event.
 
-The overflow case uses disabled brainstorm approval so one `advance()` leaves the run in automatic `DESIGNING` at the configured bound.
-
-- [ ] **Step 2: Run the new tests and verify the red state**
+- [ ] **Step 3: Run the new test and verify the red state**
 
 ```bash
 node --experimental-strip-types --test test/issue28-transition-bound.test.ts
 ```
 
-Expected: FAIL because the constructor seam and durable overflow behavior do not exist.
+Expected: FAIL because the loop throws at the boundary and failure publication is multi-write.
 
-- [ ] **Step 3: Add the internal option and correct loop ordering**
+- [ ] **Step 4: Add constructor options without parameter properties**
 
-Add:
+In `src/orchestrator.ts`:
 
 ```ts
 export interface OrchestratorOptions {
   automaticTransitionLimit?: number;
 }
 
-const DEFAULT_AUTOMATIC_TRANSITION_LIMIT = 20;
-```
+export class Orchestrator {
+  private readonly options: OrchestratorOptions;
 
-Store an effective positive integer in the constructor; reject zero, negative, fractional, or unsafe values.
-
-Implement:
-
-```ts
-while (!isTerminal(run.state) && !isHumanGate(run.state)) {
-  run = await this.advance(run.id);
-  iterations += 1;
-  if (isTerminal(run.state) || isHumanGate(run.state)) return run;
-  if (iterations >= this.automaticTransitionLimit) {
-    return this.failRun(
-      run,
-      `Workflow exceeded ${this.automaticTransitionLimit} automatic transitions.`,
-      "automatic-transition-limit-exceeded",
-    );
+  constructor(
+    cwd: string,
+    config: MasweConfig,
+    runtime: AgentRuntime,
+    store?: RunStore,
+    options: OrchestratorOptions = {},
+  ) {
+    this.cwd = cwd;
+    this.config = config;
+    this.runtime = runtime;
+    this.store = store ?? new FileRunStore(cwd);
+    this.options = options;
   }
 }
-return run;
 ```
 
-- [ ] **Step 4: Make `failRun()` a single cloned publication**
+Validate the supplied limit as a positive safe integer; production default remains `20`.
 
-Replace the pre-event `store.save()` sequence with:
+- [ ] **Step 5: Check resulting state before overflow**
+
+Implement `runUntilBlocked()` so every advance follows this order:
+
+```ts
+run = await this.advance(run.id);
+iterations += 1;
+if (isTerminal(run.state) || isHumanGate(run.state)) return run;
+if (iterations >= automaticTransitionLimit) {
+  return this.failRun(
+    run,
+    `Workflow exceeded ${automaticTransitionLimit} automatic transitions.`,
+    "automatic-transition-limit-exceeded",
+  );
+}
+```
+
+The initial human-gate/terminal check remains before the loop.
+
+- [ ] **Step 6: Publish failure from one cloned candidate**
+
+Refactor `failRun()`:
 
 ```ts
 const candidate = structuredClone(run);
 const resumeState = isTerminal(candidate.state) ? undefined : candidate.state;
-const safeMessage = safeFailureMessage(message);
 candidate.failure = {
   code,
   message: safeMessage,
@@ -545,36 +531,28 @@ candidate.failure = {
   ...(resumeState ? { resumeState } : {}),
   ...(runtime ? { runtime } : {}),
 };
-
-if (!isTerminal(candidate.state)) {
-  const failed = await this.store.applyEvent(candidate, "FAIL", "orchestrator", {
-    ...runFailureDetails(code, safeMessage, runtime),
-    ...(resumeState ? { resumeState } : {}),
-  });
-  return this.finalizeTerminal(failed);
-}
-return this.finalizeTerminal(candidate);
+const beforeEventIds = new Set(run.events.map((event) => event.id));
 ```
 
-Do not mutate the caller’s loaded record before publication.
+Publish `FAIL` once through `applyEvent(candidate, ...)`. On error, reload and accept publication only when one new `FAIL` event not present in `beforeEventIds`, state `FAILED`, and complete failure metadata are all present. If the prior record remains unchanged, rethrow the storage error. Reject every other shape as inconsistent.
 
-- [ ] **Step 5: Render the stable failure code**
+- [ ] **Step 7: Render the stable failure code**
 
-Add this line before the failure message in `renderRun()`:
+Add one line before the failure message when a code exists:
 
 ```ts
 ...(run.failure?.code ? [`Failure code: ${run.failure.code}`] : []),
 ```
 
-- [ ] **Step 6: Run focused and existing orchestrator tests**
+- [ ] **Step 8: Run focused tests**
 
 ```bash
-node --experimental-strip-types --test test/issue28-transition-bound.test.ts test/orchestrator.test.ts test/failed-run-provenance.test.ts
+node --experimental-strip-types --test test/issue28-transition-bound.test.ts test/orchestrator.test.ts
 ```
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit the durable bound**
+- [ ] **Step 9: Commit durable bound handling**
 
 ```bash
 git add src/orchestrator.ts src/run-rendering.ts test/issue28-transition-bound.test.ts
@@ -583,117 +561,73 @@ git commit -m "fix: durably enforce automatic transition bound"
 
 ---
 
-### Task 4: Add a source-tree bootstrap fingerprint without weakening read-only enforcement
+### Task 4: Add a bootstrap source fingerprint that excludes MASWE state
 
 **Files:**
 - Modify: `src/git-snapshot.ts`
 - Create: `test/issue28-bootstrap.test.ts`
-- Modify: `test/github-authoritative-state.test.ts`
 
 **Interfaces:**
-- Produces: `captureWorkspaceSourceFingerprint(cwd: string, timeoutMs?: number): Promise<string>`.
-- Consumes: current Git-plane status/diff/untracked commands and existing filesystem hashing conventions.
+- Produces: `captureWorkspaceSourceFingerprint(cwd, timeoutMs?)`.
+- Preserves: current `gitWorkspaceFingerprint()` behavior, including authoritative `.maswe` hashing.
 
-- [ ] **Step 1: Add red tests for the two fingerprint planes**
+- [ ] **Step 1: Add fingerprint-plane regressions**
 
-In `test/issue28-bootstrap.test.ts`, add Git and non-Git cases:
+Add tests for Git and non-Git directories:
 
 ```ts
-test("bootstrap source fingerprint ignores MASWE state but detects source changes", async (t) => {
-  const cwd = await initGitRepository(t);
-  const before = await captureWorkspaceSourceFingerprint(cwd);
-  const store = new FileRunStore(cwd);
-  const run = await store.create("fingerprint", "maswe write", DEFAULT_CONFIG);
-  const afterRunWrite = await captureWorkspaceSourceFingerprint(cwd);
-  assert.equal(afterRunWrite, before);
-
-  await writeFile(path.join(cwd, "src", "changed.ts"), "export const changed = true;\n");
-  const afterSourceWrite = await captureWorkspaceSourceFingerprint(cwd);
-  assert.notEqual(afterSourceWrite, before);
-
-  const authoritativeBefore = await gitWorkspaceFingerprint(cwd);
-  run.request = "changed authoritative state";
-  await store.save(run);
-  const authoritativeAfter = await gitWorkspaceFingerprint(cwd);
-  assert.notEqual(authoritativeAfter, authoritativeBefore);
-});
+const sourceBefore = await captureWorkspaceSourceFingerprint(cwd);
+const authoritativeBefore = await gitWorkspaceFingerprint(cwd);
+await writeFile(runJsonPath, "{\"changed\":true}\n", "utf8");
+assert.equal(await captureWorkspaceSourceFingerprint(cwd), sourceBefore);
+assert.notEqual(await gitWorkspaceFingerprint(cwd), authoritativeBefore);
 ```
 
-Add a non-Git case proving a file outside `.maswe` changes the source fingerprint while `.maswe/runs/x/run.json` does not.
+Then change a source file outside `.maswe` and assert the source fingerprint changes. Include staged, unstaged, and non-ignored untracked Git cases.
 
-- [ ] **Step 2: Run the fingerprint tests and verify the red state**
+- [ ] **Step 2: Run the bootstrap fingerprint tests and verify the red state**
 
 ```bash
-node --experimental-strip-types --test test/issue28-bootstrap.test.ts test/github-authoritative-state.test.ts
+node --experimental-strip-types --test test/issue28-bootstrap.test.ts
 ```
 
-Expected: FAIL because `captureWorkspaceSourceFingerprint()` does not exist.
+Expected: FAIL because the source-only fingerprint does not exist.
 
-- [ ] **Step 3: Refactor the Git source-plane hashing into a private helper**
+- [ ] **Step 3: Factor the existing Git source plane without changing its update order**
 
-In `src/git-snapshot.ts`, extract the existing Git status/diff/untracked hashing into:
+Add a private helper that executes the current three Git probes and sorted untracked-file hashing with the existing `.maswe` pathspec exclusions. `gitWorkspaceFingerprint()` calls that helper, then calls `hashMasweAuthoritativeState()` exactly as before.
 
-```ts
-async function hashGitSourcePlane(
-  cwd: string,
-  hash: Hash,
-  timeoutMs: number,
-): Promise<void>
-```
+- [ ] **Step 4: Implement the source-only public helper**
 
-It must continue using `MASWE_GIT_PATHSPEC_EXCLUDES`, so `.maswe` is excluded from all Git-plane commands.
-
-- [ ] **Step 4: Add deterministic non-Git source-tree hashing**
-
-Add a private recursive hasher that:
-
-- skips the first path segment `.maswe`;
-- sorts normalized relative paths;
-- hashes path identity plus `file`, `directory`, `symlink`, or `other` type markers;
-- hashes file bytes or link-target bytes without following symlinks;
-- records `unreadable` on read failure using the current fingerprint convention;
-- uses the domain separator `maswe:workspace-source-fingerprint:v1\0`.
-
-This task must not redesign canonical framing or race semantics owned by Issue #13.
-
-- [ ] **Step 5: Implement the public helper and preserve current behavior**
+Add:
 
 ```ts
 export async function captureWorkspaceSourceFingerprint(
   cwd: string,
   timeoutMs = GIT_TIMEOUT_MS,
-): Promise<string> {
-  const hash = createHash("sha256");
-  hash.update("maswe:workspace-source-fingerprint:v1\0");
-  if (await isGitRepository(cwd, timeoutMs)) {
-    await hashGitSourcePlane(cwd, hash, timeoutMs);
-  } else {
-    await hashNonGitSourcePlane(cwd, hash);
-  }
-  return hash.digest("hex");
-}
+): Promise<string>;
 ```
 
-Refactor `gitWorkspaceFingerprint()` to call the same Git source helper and then `hashMasweAuthoritativeState()`. Its output semantics remain unchanged except for code organization.
+Use domain separator `maswe:workspace-source-fingerprint:v1\0`.
 
-- [ ] **Step 6: Run focused tests and the existing fingerprint suite**
+- Git repositories: hash the fact that the directory is Git, then call the factored Git source-plane helper.
+- Non-Git directories: recursively enumerate outside `.maswe`, normalize separators to `/`, sort paths, and hash path plus observed type and content. Hash symlink target text without following it; hash `unreadable` when an observed item cannot be read.
+- Do not alter canonical framing/race semantics beyond the current code; Issue #13 owns that redesign.
+
+- [ ] **Step 5: Run source and authoritative fingerprint suites**
 
 ```bash
-node --experimental-strip-types --test test/issue28-bootstrap.test.ts test/github-authoritative-state.test.ts test/workspace-fingerprint.test.ts
+node --experimental-strip-types --test test/issue28-bootstrap.test.ts test/git-snapshot.test.ts test/readonly-authoritative-state.test.ts
 ```
 
-If `test/workspace-fingerprint.test.ts` does not exist on the execution branch, run every test file returned by:
+If either existing test filename is absent, run `npm run test` and record the exact existing fingerprint tests that cover the same behavior before committing.
+
+Expected: PASS with existing authoritative mutation detection unchanged.
+
+- [ ] **Step 6: Commit the fingerprint separation**
 
 ```bash
-grep -l "gitWorkspaceFingerprint" test/*.test.ts
-```
-
-Expected: PASS.
-
-- [ ] **Step 7: Commit the two-plane fingerprint contract**
-
-```bash
-git add src/git-snapshot.ts test/issue28-bootstrap.test.ts test/github-authoritative-state.test.ts
+git add src/git-snapshot.ts test/issue28-bootstrap.test.ts
 git commit -m "feat: separate bootstrap source fingerprint"
 ```
 
@@ -706,44 +640,31 @@ git commit -m "feat: separate bootstrap source fingerprint"
 - Modify: `src/store.ts`
 - Modify: `src/orchestrator.ts`
 - Modify: `test/issue28-bootstrap.test.ts`
+- Modify: `test/orchestrator.test.ts`
 
 **Interfaces:**
-- Produces: `CreateRunOptions` on `RunStore.create()`.
-- Produces: `captureWorkspaceBootstrapIntent(repositoryPath, config, now?)`.
-- Produces: private orchestrator `createPlannedRun()` used by `start()` and `supersede()`.
-- Consumes: `captureWorkspaceSourceFingerprint()`, `captureWorkspace()`, persisted configuration snapshots.
+- Produces: `CreateRunOptions`, `captureWorkspaceBootstrapIntent()`, and `Orchestrator.createPlannedRun()`.
+- Consumes: `captureWorkspaceSourceFingerprint()`, `captureWorkspace()`, `ensureMasweGitExclude()`.
 
-- [ ] **Step 1: Add red tests for start and supersede planning before Git side effects**
+- [ ] **Step 1: Add intent-before-side-effect tests for `start()` and `supersede()`**
 
-Add a test-only hook to the planned constructor options in the test code expectation:
+Extend `OrchestratorOptions` with:
 
 ```ts
 beforeBootstrapReconcile?: (run: RunRecord) => Promise<void>;
 ```
 
-Add tests that make the hook throw and then reload the run list:
+In each test, make the hook throw, reload all records, and assert the newly created run is `CREATED`, has complete `workspaceBootstrap`, and has no deterministic `maswe/<run-id>` branch or worktree. For the replacement case, also assert `supersedes` is already present in the initial replacement record.
 
-```ts
-assert.equal(planned.state, "CREATED");
-assert.ok(planned.workspaceBootstrap);
-assert.equal(planned.workspace, undefined);
-assert.equal(planned.events.length, 0);
-await assert.rejects(
-  execFileAsync("git", ["rev-parse", "--verify", `maswe/${planned.id}`], { cwd }),
-);
-```
-
-For `supersede()`, identify the replacement by `supersedes === original.id` and assert the same properties.
-
-- [ ] **Step 2: Run the planning tests and verify the red state**
+- [ ] **Step 2: Run bootstrap creation tests and verify the red state**
 
 ```bash
-node --experimental-strip-types --test test/issue28-bootstrap.test.ts
+node --experimental-strip-types --test test/issue28-bootstrap.test.ts test/orchestrator.test.ts
 ```
 
-Expected: FAIL because initial run creation cannot persist bootstrap intent or `supersedes` atomically.
+Expected: FAIL because production creation writes no intent.
 
-- [ ] **Step 3: Extend `RunStore.create()` with exact initial fields**
+- [ ] **Step 3: Extend the store creation contract**
 
 Add:
 
@@ -754,46 +675,25 @@ export interface CreateRunOptions {
 }
 ```
 
-Change the interface and implementation to:
+Update `RunStore.create()` and `FileRunStore.create()` to accept `options: CreateRunOptions = {}` and include supplied fields in the initial record before the first durable write.
 
-```ts
-create(
-  title: string,
-  request: string,
-  config: MasweConfig,
-  options?: CreateRunOptions,
-): Promise<RunRecord>;
-```
+- [ ] **Step 4: Capture bootstrap intent**
 
-Construct the initial record with `workspaceBootstrap` and `supersedes` before the first durable write. Existing tests and historical fixtures may omit options.
-
-- [ ] **Step 4: Implement bootstrap intent capture**
-
-In `src/workspace-bootstrap.ts`:
+In `src/workspace-bootstrap.ts` export:
 
 ```ts
 export async function captureWorkspaceBootstrapIntent(
   repositoryPath: string,
   config: MasweConfig,
-  now: () => string = () => new Date().toISOString(),
-): Promise<WorkspaceBootstrapIntent> {
-  const source = await captureWorkspace(repositoryPath);
-  return {
-    mode: config.policy.useIsolatedWorktree
-      ? "isolated-worktree"
-      : "operator-checkout",
-    sourceBaseSha: source.baseSha,
-    sourceBranch: source.branch,
-    sourceTreeFingerprint: await captureWorkspaceSourceFingerprint(repositoryPath),
-    ...(source.remote ? { remote: source.remote } : {}),
-    plannedAt: now(),
-  };
-}
+  plannedAt = new Date().toISOString(),
+): Promise<WorkspaceBootstrapIntent>;
 ```
 
-- [ ] **Step 5: Route both production creation paths through `createPlannedRun()`**
+The function calls `ensureMasweGitExclude()`, captures source base/branch/remote, computes `captureWorkspaceSourceFingerprint()`, and selects mode from `config.policy.useIsolatedWorktree`.
 
-Add a private orchestrator method:
+- [ ] **Step 5: Add one production creation helper**
+
+In `src/orchestrator.ts`:
 
 ```ts
 private async createPlannedRun(
@@ -802,10 +702,7 @@ private async createPlannedRun(
   config: MasweConfig,
   options: { supersedes?: string } = {},
 ): Promise<RunRecord> {
-  const workspaceBootstrap = await captureWorkspaceBootstrapIntent(
-    this.cwd,
-    config,
-  );
+  const workspaceBootstrap = await captureWorkspaceBootstrapIntent(this.cwd, config);
   return this.store.create(title, request, config, {
     workspaceBootstrap,
     ...(options.supersedes ? { supersedes: options.supersedes } : {}),
@@ -813,21 +710,23 @@ private async createPlannedRun(
 }
 ```
 
-`start()` resolves models first, calls this method, runs the test hook, and only then enters bootstrap. `supersede()` uses the existing persisted configuration snapshot and passes `supersedes: existing.id`.
+`start()` resolves models once and calls this helper. Replacement creation in `supersede()` passes the persisted config and `supersedes: existing.id`; it does not rediscover or substitute models.
 
-- [ ] **Step 6: Run focused creation and compatibility tests**
+Keep existing workspace establishment temporarily after the new hook so this task can pass independently. Task 6 replaces that flow with `advance(CREATED)`.
+
+- [ ] **Step 6: Run creation and persistence tests**
 
 ```bash
 node --experimental-strip-types --test test/issue28-bootstrap.test.ts test/orchestrator.test.ts test/schema.test.ts
 ```
 
-Expected: PASS for planned intent tests; later bootstrap tests may remain skipped until Task 6 only when explicitly marked with the Node test runner’s skip option.
+Expected: PASS.
 
-- [ ] **Step 7: Commit production run planning**
+- [ ] **Step 7: Commit planned run creation**
 
 ```bash
-git add src/workspace-bootstrap.ts src/store.ts src/orchestrator.ts test/issue28-bootstrap.test.ts
-git commit -m "feat: persist bootstrap intent before git effects"
+git add src/workspace-bootstrap.ts src/store.ts src/orchestrator.ts test/issue28-bootstrap.test.ts test/orchestrator.test.ts
+git commit -m "feat: persist workspace bootstrap intent"
 ```
 
 ---
@@ -842,14 +741,12 @@ git commit -m "feat: persist bootstrap intent before git effects"
 - Modify: `test/failed-run-provenance.test.ts`
 
 **Interfaces:**
-- Produces: `WorkspaceBootstrapHooks` and `reconcileBootstrapWorkspace()`.
-- Produces: strict `workingDirectoryFor()` guard.
-- Produces: a durable `CREATED + workspace + workspaceBootstrap` checkpoint before `START`.
-- Consumes: structured `git worktree list --porcelain`, exact refs, source-tree fingerprint, clean-status helper.
+- Produces: `WorkspaceBootstrapHooks`, `listGitWorktreeRegistrations()`, `reconcileBootstrapWorkspace()`, `assertBootstrapWorkspaceReady()`.
+- Consumes: persisted `workspaceBootstrap`, deterministic branch/path derivation, source fingerprint, and `RunStore.save()`.
 
 - [ ] **Step 1: Add deterministic failure-barrier tests**
 
-Define hooks:
+Define:
 
 ```ts
 export interface WorkspaceBootstrapHooks {
@@ -859,56 +756,56 @@ export interface WorkspaceBootstrapHooks {
 }
 ```
 
-Add a table-driven test for each hook. The hook throws once, the test reloads the authoritative record, retries with hooks disabled, and asserts the intended branch/worktree exists before the first runtime call.
-
-For the post-checkpoint boundary, use an orchestrator hook:
+Extend `OrchestratorOptions` with:
 
 ```ts
+bootstrapHooks?: WorkspaceBootstrapHooks;
 afterWorkspaceCheckpoint?: (run: RunRecord) => Promise<void>;
 ```
 
-After the hook throws, assert:
+Add table-driven failures before branch creation, after branch creation, after worktree creation, and after workspace checkpoint/before `START`. Reload after each failure, then retry with hooks disabled.
 
-```ts
-const checkpoint = await store.load(run.id);
-assert.equal(checkpoint.state, "FAILED");
-assert.equal(checkpoint.failure?.resumeState, "CREATED");
-assert.ok(checkpoint.workspaceBootstrap);
-assert.ok(checkpoint.workspace?.worktreePath);
-assert.equal(
-  checkpoint.events.some((event) => event.type === "START"),
-  false,
-);
-```
+For the checkpoint boundary assert the authoritative failed record retains workspace and intent, has `failure.resumeState === "CREATED"`, and has no `START` event.
 
-The failed record retains the checkpointed workspace because `failRun()` publishes from the authoritative reload.
+- [ ] **Step 2: Add dirty-worktree and identity-conflict tests**
 
-- [ ] **Step 2: Add dirty-worktree and conflict tests**
+Cover:
 
-After the worktree is created, write an untracked source file and throw. Retry must remain `FAILED`, must not call the runtime, and must report a dirty managed worktree.
-
-Add separate cases for:
-
+- exact registration/path/branch/HEAD but staged changes;
+- exact identity but unstaged changes;
+- exact identity but non-ignored untracked changes;
 - branch exists at another SHA;
-- branch checked out at another worktree path;
+- branch checked out at another path;
 - deterministic path occupied by an ordinary directory;
 - stale/prunable registration;
-- matching registration but wrong branch;
-- matching branch/path but wrong HEAD;
+- wrong branch or wrong HEAD;
 - operator-checkout source drift;
-- isolated run with no worktree passed to `workingDirectoryFor()`.
+- isolated run without worktree passed to `workingDirectoryFor()`.
 
-- [ ] **Step 3: Run bootstrap tests and verify the red state**
+Dirty recovery must remain failed, must not call the runtime, and must not reset, clean, or commit the changes.
+
+- [ ] **Step 3: Add checkpoint and `START` outcome-unknown tests**
+
+For checkpoint save outcome unknown, reload and accept only exact `CREATED + workspace + intent` or the prior `CREATED + intent` record.
+
+For `START` outcome unknown, reload and accept only:
+
+- `BRAINSTORMING` with exactly one new `START` event and no bootstrap intent; or
+- the actionable `CREATED + workspace + intent` checkpoint.
+
+Reject any other shape.
+
+- [ ] **Step 4: Run bootstrap tests and verify the red state**
 
 ```bash
 node --experimental-strip-types --test test/issue28-bootstrap.test.ts test/failed-run-provenance.test.ts
 ```
 
-Expected: FAIL because reconciliation, checkpointing, and strict reuse do not exist.
+Expected: FAIL because exact reconciliation and checkpointing do not exist.
 
-- [ ] **Step 4: Add structured worktree inspection**
+- [ ] **Step 5: Add structured worktree inspection**
 
-In `src/git-workspace.ts`, add:
+In `src/git-workspace.ts`:
 
 ```ts
 export interface GitWorktreeRegistration {
@@ -923,11 +820,11 @@ export async function listGitWorktreeRegistrations(
 ): Promise<GitWorktreeRegistration[]>;
 ```
 
-Parse blank-line-separated porcelain records. Normalize paths with `path.resolve()`. Represent `branch refs/heads/maswe/x` as `maswe/x`. Reject malformed duplicate fields, missing worktree/head values, and conflicting records rather than guessing.
+Parse blank-line-separated `git worktree list --porcelain` records. Normalize paths with `path.resolve()`, convert `refs/heads/name` to `name`, and reject malformed duplicate fields, missing worktree/head values, and conflicting records.
 
-- [ ] **Step 5: Implement exact reconciliation**
+- [ ] **Step 6: Implement exact workspace reconciliation**
 
-In `src/workspace-bootstrap.ts`, export:
+Export:
 
 ```ts
 export async function reconcileBootstrapWorkspace(
@@ -937,61 +834,44 @@ export async function reconcileBootstrapWorkspace(
 ): Promise<RunWorkspace>;
 ```
 
-Operator-checkout mode must require exact base SHA, branch, and source-tree fingerprint, then return `captureWorkspace(repositoryPath)`.
+Operator-checkout mode requires exact source base SHA, branch, and source-tree fingerprint, then returns `captureWorkspace(repositoryPath)`.
 
-Isolated mode must:
+Isolated mode:
 
-1. derive `maswe/${run.id}` and `externalWorktreePath(repositoryPath, run.id)`;
-2. inspect branch ref and all worktree registrations;
-3. create the branch only when absent, at `sourceBaseSha`;
-4. add the worktree only when both path and registration are absent;
-5. require exact path, branch, and HEAD;
-6. reject prunable/stale registrations;
-7. require `isGitWorkspaceClean(worktreePath) === true`;
-8. return a fresh `RunWorkspace` with exact HEAD and authoritative fingerprint.
+1. derives `maswe/${run.id}` and `externalWorktreePath(repositoryPath, run.id)`;
+2. inspects exact branch ref and registrations;
+3. creates an absent branch at `sourceBaseSha` only;
+4. adds a worktree only when path and registration are both absent;
+5. rejects prunable/stale or conflicting registrations;
+6. requires exact path, branch, and HEAD;
+7. requires `isGitWorkspaceClean(worktreePath) === true`;
+8. returns fresh HEAD and authoritative fingerprint.
 
-Do not call reset, clean, prune, remove, checkout, rebase, or force operations.
+Do not invoke reset, clean, prune, remove, checkout, rebase, or force operations.
 
-- [ ] **Step 6: Implement the three-phase `CREATED` protocol**
+- [ ] **Step 7: Implement the three-phase `CREATED` protocol**
 
-Add a dedicated orchestrator method:
+Add:
 
 ```ts
 private async bootstrapCreatedRun(runId: string): Promise<RunRecord>
 ```
 
-Its protocol is:
+Protocol:
 
-```ts
-let run = await this.store.load(runId);
-if (run.state !== "CREATED") return run;
+1. load authoritative `CREATED`;
+2. reconcile workspace when absent;
+3. save cloned `CREATED + workspace + intent` with no event;
+4. reload and invoke `afterWorkspaceCheckpoint`;
+5. revalidate source or exact managed identity and cleanliness;
+6. clone, remove intent, and publish `START`;
+7. on any error, reload and classify checkpoint/`START` publication before calling `failRun()`.
 
-if (!run.workspace) {
-  const workspace = await reconcileBootstrapWorkspace(
-    this.cwd,
-    run,
-    this.options.bootstrapHooks,
-  );
-  const checkpoint = structuredClone(run);
-  checkpoint.workspace = workspace;
-  await this.store.save(checkpoint);
-  await this.options.afterWorkspaceCheckpoint?.(structuredClone(checkpoint));
-  run = await this.store.load(runId);
-}
+If an exact new `START` event was already published, return the authoritative started record instead of failing it. If the checkpoint remains authoritative, `failRun()` records `resumeState: CREATED` and preserves workspace plus intent.
 
-await assertBootstrapWorkspaceReady(this.cwd, run);
-const started = structuredClone(run);
-delete started.workspaceBootstrap;
-return this.store.applyEvent(started, "START", "user");
-```
+`advance()` handles `CREATED` through this method. `start()` and replacement `supersede()` call `runUntilBlocked()` rather than creating workspaces directly.
 
-On any error, reload the authoritative run and call `failRun(authoritative, ...)`, preserving whichever checkpoint was actually published.
-
-`advance()` handles `CREATED` by calling this method. `start()` and replacement `supersede()` call `runUntilBlocked()` rather than performing workspace setup themselves.
-
-- [ ] **Step 7: Make isolated working-directory selection fail closed**
-
-Replace the fallback in `workingDirectoryFor()`:
+- [ ] **Step 8: Make isolated working-directory selection fail closed**
 
 ```ts
 export function workingDirectoryFor(run: RunRecord): string {
@@ -1007,7 +887,7 @@ export function workingDirectoryFor(run: RunRecord): string {
 }
 ```
 
-- [ ] **Step 8: Run bootstrap, retry-provenance, and orchestrator tests**
+- [ ] **Step 9: Run bootstrap, provenance, and orchestrator tests**
 
 ```bash
 node --experimental-strip-types --test test/issue28-bootstrap.test.ts test/failed-run-provenance.test.ts test/orchestrator.test.ts
@@ -1015,7 +895,7 @@ node --experimental-strip-types --test test/issue28-bootstrap.test.ts test/faile
 
 Expected: PASS.
 
-- [ ] **Step 9: Commit exact bootstrap recovery**
+- [ ] **Step 10: Commit exact bootstrap recovery**
 
 ```bash
 git add src/workspace-bootstrap.ts src/git-workspace.ts src/orchestrator.ts test/issue28-bootstrap.test.ts test/failed-run-provenance.test.ts
@@ -1035,22 +915,50 @@ git commit -m "feat: recover CREATED workspace bootstrap"
 
 **Interfaces:**
 - Produces: `reconcileRetryWorkspace(repositoryPath, run)`.
-- Consumes: `failure.resumeState`, `previousFailure`, bootstrap reconciliation, exact managed-worktree cleanliness.
+- Consumes: `CreateRunOptions`, `failure.resumeState`, `previousFailure`, bootstrap reconciliation, and exact managed-worktree cleanliness.
 
-- [ ] **Step 1: Add a pre-publication failure test**
-
-Create a `RunStore` wrapper that throws before delegating `RETRY_FROM_FAILED`:
+- [ ] **Step 1: Add a pre-publication failure test with a strip-only-compatible store wrapper**
 
 ```ts
 class RejectRetryEventStore implements RunStore {
-  constructor(private readonly delegate: RunStore) {}
+  private readonly delegate: RunStore;
 
-  create = this.delegate.create.bind(this.delegate);
-  save = this.delegate.save.bind(this.delegate);
-  load = this.delegate.load.bind(this.delegate);
-  list = this.delegate.list.bind(this.delegate);
-  writeArtifact = this.delegate.writeArtifact.bind(this.delegate);
-  readArtifact = this.delegate.readArtifact.bind(this.delegate);
+  constructor(delegate: RunStore) {
+    this.delegate = delegate;
+  }
+
+  create(
+    title: string,
+    request: string,
+    config: MasweConfig,
+    options: CreateRunOptions = {},
+  ): Promise<RunRecord> {
+    return this.delegate.create(title, request, config, options);
+  }
+
+  save(run: RunRecord): Promise<void> {
+    return this.delegate.save(run);
+  }
+
+  load(runId: string): Promise<RunRecord> {
+    return this.delegate.load(runId);
+  }
+
+  list(): Promise<RunRecord[]> {
+    return this.delegate.list();
+  }
+
+  writeArtifact(
+    run: RunRecord,
+    name: string,
+    content: string,
+  ): Promise<ArtifactReference> {
+    return this.delegate.writeArtifact(run, name, content);
+  }
+
+  readArtifact(run: RunRecord, name: string): Promise<string | undefined> {
+    return this.delegate.readArtifact(run, name);
+  }
 
   async applyEvent(
     run: RunRecord,
@@ -1066,36 +974,27 @@ class RejectRetryEventStore implements RunStore {
 }
 ```
 
-After rejection, reload through the real `FileRunStore` and assert the original state, complete failure metadata, and `resumeState` remain.
+After rejection, reload through the real `FileRunStore` and assert original state, failure metadata, and `resumeState` remain.
 
 - [ ] **Step 2: Add version-conflict and outcome-unknown tests**
 
-For a version conflict, mutate the authoritative run after the retry candidate is loaded through a deterministic hook and assert the canonical `FAILED` record remains actionable.
-
-For outcome unknown, construct a `FileRunStore` whose `syncDirectory` throws once after rename. Assert one of exactly two outcomes:
+Extend `OrchestratorOptions` with:
 
 ```ts
-const authoritative = await durableStore.load(run.id);
-const retryEvents = authoritative.events.filter(
-  (event) => event.type === "RETRY_FROM_FAILED",
-);
-if (retryEvents.length === 0) {
-  assert.equal(authoritative.state, "FAILED");
-  assert.ok(authoritative.failure?.resumeState);
-} else {
-  assert.equal(retryEvents.length, 1);
-  assert.notEqual(authoritative.state, "FAILED");
-  assert.equal(authoritative.failure, undefined);
-}
+beforeRetryPublication?: (candidate: RunRecord) => Promise<void>;
 ```
 
-- [ ] **Step 3: Run the retry tests and verify the red state**
+Use it to publish a concurrent authoritative mutation after the retry candidate is prepared. Assert the canonical `FAILED` record remains actionable.
+
+For outcome unknown, use a `FileRunStore` whose directory sync throws once after rename. Distinguish the current retry publication using the pre-publication event-ID set; do not accept an older historical retry event.
+
+- [ ] **Step 3: Run retry tests and verify the red state**
 
 ```bash
 node --experimental-strip-types --test test/issue28-retry-publication.test.ts test/orchestrator.test.ts test/failed-run-provenance.test.ts
 ```
 
-Expected: FAIL because current retry deletes failure and may save while still durably `FAILED`.
+Expected: FAIL because current retry deletes failure and may save while state remains durably `FAILED`.
 
 - [ ] **Step 4: Implement retry workspace reconciliation on a clone**
 
@@ -1105,19 +1004,20 @@ Export:
 export async function reconcileRetryWorkspace(
   repositoryPath: string,
   run: RunRecord,
-): Promise<RunWorkspace | undefined>
+): Promise<RunWorkspace | undefined>;
 ```
 
 Behavior:
 
-- `failure.resumeState === "CREATED"`: require retained bootstrap intent and call `reconcileBootstrapWorkspace()`.
-- later isolated state: require persisted workspace identity, exact branch/path/registration/HEAD, and clean status; recreate only an absent exact worktree from the preserved branch/head.
-- operator-checkout state: verify current branch, HEAD, and source identity appropriate to the persisted workspace.
-- any conflict or dirty state fails without mutating the authoritative record.
+- `resumeState === "CREATED"`: require retained intent and use bootstrap reconciliation.
+- later isolated state: require persisted branch/head, exact deterministic path/registration, and clean status; recreate only an absent exact worktree from preserved branch/head.
+- Git operator-checkout state: require exact branch/HEAD and a clean source plane outside `.maswe`.
+- non-Git later operator-checkout state without a retained provable source identity: fail closed and require supersession rather than guessing.
+- every conflict leaves authoritative state untouched.
 
 - [ ] **Step 5: Replace retry publication with one candidate event**
 
-Implement:
+Implementation sequence:
 
 ```ts
 const failed = await this.store.load(runId);
@@ -1126,34 +1026,21 @@ if (failed.state !== "FAILED" || !resumeState) {
   throw new Error("retry requires a FAILED run with failure.resumeState");
 }
 const previousFailure = structuredClone(failed.failure);
+const beforeEventIds = new Set(failed.events.map((event) => event.id));
 const candidate = structuredClone(failed);
 const workspace = await reconcileRetryWorkspace(this.cwd, candidate);
 if (workspace) candidate.workspace = workspace;
 delete candidate.failure;
-
-try {
-  await this.store.applyEvent(candidate, "RETRY_FROM_FAILED", "user", {
-    resumeState,
-    previousFailure,
-  });
-} catch (error) {
-  const authoritative = await this.store.load(runId);
-  const retryEvent = authoritative.events.find(
-    (event) => event.type === "RETRY_FROM_FAILED" && event.from === "FAILED",
-  );
-  if (!retryEvent && authoritative.state === "FAILED" && authoritative.failure?.resumeState) {
-    throw error;
-  }
-  if (!retryEvent || authoritative.failure !== undefined) {
-    throw new Error("Retry publication produced an inconsistent authoritative record", {
-      cause: error,
-    });
-  }
-}
-return this.runUntilBlocked(runId);
+await this.options.beforeRetryPublication?.(structuredClone(candidate));
 ```
 
-Compare the exact new event ID/version against the pre-publication snapshot so an old historical retry event cannot be mistaken for the current publication.
+Publish `RETRY_FROM_FAILED` once. On error, reload:
+
+- one new retry event not in `beforeEventIds`, resumed state, restored workspace, and no active failure: adopt and continue;
+- no new retry event plus original retryable `FAILED`: rethrow storage error;
+- any other shape: throw an inconsistent-authoritative-record error.
+
+No standalone save occurs while state is `FAILED`.
 
 - [ ] **Step 6: Run focused retry and persistence tests**
 
@@ -1176,63 +1063,28 @@ git commit -m "fix: preserve retry metadata until publication"
 
 **Files:**
 - Create: `src/revalidation.ts`
-- Modify: `src/orchestrator.ts`
 - Create: `test/issue28-revalidation.test.ts`
 - Modify: `test/evidence-freshness.test.ts`
 
 **Interfaces:**
-- Produces: `RevalidationService.route()` and `reconcileRequiredTarget()`.
-- Produces: `RevalidationFence`, `captureRevalidationFence()`, `assertRevalidationFence()`.
+- Produces: `RevalidationTargetInput`, `RevalidationService.route()`, `RevalidationFence`, `captureRevalidationFence()`, `assertRevalidationFence()`.
 - Consumes: `RunStore`, `invalidateStaleEvidence()`, centralized request/retarget transitions.
 
 - [ ] **Step 1: Add initial request and return-gate tests**
 
-Seed exact `PR_READY` and `PR_REVIEW` records with evidence bound to head A. Route target B and assert:
-
-```ts
-assert.equal(result.state, "CI_RUNNING");
-assert.equal(result.revalidation?.returnState, sourceState);
-assert.equal(result.revalidation?.originHeadSha, headA);
-assert.equal(result.revalidation?.requestedHeadSha, headB);
-assert.equal(result.revalidation?.generation, 1);
-assert.equal(result.evidence, undefined);
-assert.equal(result.events.at(-1)?.type, "REVALIDATE_REQUESTED");
-```
-
-Run quality and verification with a mock runtime and assert the successful state returns to the recorded gate even when `commentResolutionCycles === 0` for `PR_REVIEW`.
+Seed exact `PR_READY` and `PR_REVIEW` records with evidence bound to head A. Route target B and assert state `CI_RUNNING`, correct return gate, origin A, target B, generation `1`, invalidated evidence, and final event `REVALIDATE_REQUESTED`.
 
 - [ ] **Step 2: Add B-to-C retarget tests for every active state and failed recovery**
 
-For `CI_RUNNING`, `BUILDING`, and `VERIFYING`, seed active generation 1 targeting B, route C, and assert state `CI_RUNNING`, generation 2, and event `REVALIDATION_RETARGETED`.
+For `CI_RUNNING`, `BUILDING`, and `VERIFYING`, seed generation `1` targeting B, route C, and assert state `CI_RUNNING`, generation `2`, and event `REVALIDATION_RETARGETED`.
 
-For `FAILED`, seed `failure.resumeState: "VERIFYING"` plus active context targeting B. Route C and assert:
+For `FAILED`, seed `failure.resumeState: "VERIFYING"` plus active context targeting B. Route C and assert state remains `FAILED`, operational resume state becomes `CI_RUNNING`, generation becomes `2`, and event details retain `previousResumeState: "VERIFYING"`.
 
-```ts
-assert.equal(result.state, "FAILED");
-assert.equal(result.failure?.resumeState, "CI_RUNNING");
-assert.equal(result.revalidation?.requestedHeadSha, headC);
-assert.equal(result.revalidation?.generation, 2);
-assert.equal(result.events.at(-1)?.type, "REVALIDATION_RETARGETED");
-assert.equal(
-  result.events.at(-1)?.details?.previousResumeState,
-  "VERIFYING",
-);
-```
-
-Add same-target idempotency: version and event count do not change.
+Add same-target idempotency: version and event count do not change unless an supplied observed workspace must be saved for alignment.
 
 - [ ] **Step 3: Add generation-fence tests**
 
-Capture a fence for B, retarget to C, and assert:
-
-```ts
-await assert.rejects(
-  assertRevalidationFence(store, run.id, fenceB),
-  /generation|target|version/i,
-);
-```
-
-Capture a fresh C fence and assert it passes.
+Capture a B fence, retarget to C, and require the B fence to fail. Capture a fresh C fence and require it to pass.
 
 - [ ] **Step 4: Run revalidation tests and verify the red state**
 
@@ -1242,13 +1094,12 @@ node --experimental-strip-types --test test/issue28-revalidation.test.ts test/ev
 
 Expected: FAIL because the service and generation contract do not exist.
 
-- [ ] **Step 5: Implement `RevalidationService`**
-
-Use:
+- [ ] **Step 5: Implement `RevalidationService` without parameter properties**
 
 ```ts
 export interface RevalidationTargetInput {
   source: RevalidationSource;
+  previousHeadSha: string;
   requestedHeadSha: string;
   actor: string;
   observedWorkspace?: RunWorkspace;
@@ -1256,25 +1107,34 @@ export interface RevalidationTargetInput {
 }
 
 export class RevalidationService {
-  constructor(
-    private readonly store: RunStore,
-    private readonly now: () => string = () => new Date().toISOString(),
-  ) {}
+  private readonly store: RunStore;
+  private readonly now: () => string;
 
-  async route(runId: string, input: RevalidationTargetInput): Promise<RunRecord>;
+  constructor(
+    store: RunStore,
+    now: () => string = () => new Date().toISOString(),
+  ) {
+    this.store = store;
+    this.now = now;
+  }
+
+  async route(
+    runId: string,
+    input: RevalidationTargetInput,
+  ): Promise<RunRecord>;
 }
 ```
 
-`route()` loads the authoritative record and performs exactly one of:
+`route()` performs exactly one action:
 
-- no context + gate state: create generation 1 and publish `REVALIDATE_REQUESTED`;
-- active context + same target: optionally save only a supplied observed workspace and publish no event;
-- active context + different target: increment generation and publish `REVALIDATION_RETARGETED`;
-- no legal source state: fail closed.
+- no context plus `PR_READY`/`PR_REVIEW`: clone, optionally adopt observed workspace, invalidate evidence, create generation `1`, publish `REVALIDATE_REQUESTED`;
+- active context plus same target: save only a changed observed workspace, otherwise no-op;
+- active context plus different target in legal active/failed state: clone, invalidate evidence, increment generation, update source/timestamps, and publish `REVALIDATION_RETARGETED`;
+- illegal state/context: fail closed.
 
-For failed retarget, clone the prior failure, update `candidate.failure.resumeState = "CI_RUNNING"`, and include the previous resume state in event details. Preserve the historical `FAIL` event.
+For failed retarget, update only the candidate failure’s operational `resumeState` to `CI_RUNNING` and preserve the historical `FAIL` event.
 
-- [ ] **Step 6: Add target reconciliation and fencing helpers**
+- [ ] **Step 6: Add fencing helpers**
 
 ```ts
 export interface RevalidationFence {
@@ -1294,17 +1154,77 @@ export async function assertRevalidationFence(
 ): Promise<void>;
 ```
 
-`assertRevalidationFence()` reloads and requires exact version, generation, and target. Do not accept a later version merely because target text matches.
+Reload and require exact version, generation, and target. A later version is stale even when target text matches.
 
-`reconcileRequiredTarget()` chooses `run.github.headSha` for associated runs and exact observed workspace HEAD for local-only runs, then delegates to `route()`.
+- [ ] **Step 7: Run service and schema tests**
 
-- [ ] **Step 7: Integrate revalidation preflight and return behavior into the orchestrator**
+```bash
+node --experimental-strip-types --test test/issue28-revalidation.test.ts test/evidence-freshness.test.ts test/schema.test.ts
+```
 
-Before stopping at `PR_READY` or `PR_REVIEW`, refresh the exact workspace. If required evidence is absent/stale or the head changed, route revalidation and continue.
+Expected: PASS.
 
-Before advancing active `BUILDING`, `CI_RUNNING`, or `VERIFYING`, reconcile the required target. If routing publishes a retarget, return that result so the next loop iteration starts at `CI_RUNNING`.
+- [ ] **Step 8: Commit the revalidation core**
 
-During verification success selection:
+```bash
+git add src/revalidation.ts test/issue28-revalidation.test.ts test/evidence-freshness.test.ts
+git commit -m "feat: add revalidation target generations"
+```
+
+---
+
+### Task 9: Integrate latest-target revalidation into workflow execution
+
+**Files:**
+- Modify: `src/orchestrator.ts`
+- Modify: `src/revalidation.ts`
+- Modify: `test/issue28-revalidation.test.ts`
+- Modify: `test/evidence-freshness.test.ts`
+- Modify: `test/orchestrator.test.ts`
+
+**Interfaces:**
+- Produces: local gate preflight, active target reconciliation, exact alignment checks, and current-generation return behavior.
+- Consumes: `RevalidationService`, `RevalidationFence`, workspace refresh, evidence binding, builder/resolver publication.
+
+- [ ] **Step 1: Add local gate revalidation tests**
+
+From `PR_READY` and `PR_REVIEW`, create a clean local commit B after evidence A. `runUntilBlocked()` must request revalidation, run quality and verification for B, and return to the original gate. The `PR_REVIEW` case keeps `commentResolutionCycles === 0`.
+
+- [ ] **Step 2: Add active alignment and stale-work tests**
+
+Cover:
+
+- associated active target C while workspace remains B: quality and verification do not run; run fails with recoverable `CI_RUNNING` provenance;
+- operator moves exact MASWE branch/worktree cleanly to C, retry resumes current generation;
+- a builder/verifier B fence becomes stale after retarget C and cannot publish event or evidence;
+- same-target repeated preflight publishes no duplicate event.
+
+- [ ] **Step 3: Run workflow tests and verify the red state**
+
+```bash
+node --experimental-strip-types --test test/issue28-revalidation.test.ts test/evidence-freshness.test.ts test/orchestrator.test.ts
+```
+
+Expected: FAIL because gates stop without routing and active states do not reconcile targets.
+
+- [ ] **Step 4: Add a shared required-target preflight**
+
+Before stopping at `PR_READY` or `PR_REVIEW`:
+
+1. preserve previous workspace head;
+2. refresh exact branch/HEAD/fingerprint;
+3. determine whether current required evidence exists for observed HEAD;
+4. route revalidation with source `local-workspace` when head moved or evidence is stale/missing;
+5. continue automatically when routing enters `CI_RUNNING`.
+
+Before advancing active `BUILDING`, `CI_RUNNING`, or `VERIFYING`:
+
+- associated target is `run.github.headSha`;
+- local-only target is exact observed workspace HEAD;
+- differing active target publishes retarget before work;
+- matching target but workspace misalignment throws a bounded exact error rather than evaluating the wrong tree.
+
+- [ ] **Step 5: Select success event from durable return context**
 
 ```ts
 const successEvent = run.revalidation?.returnState === "PR_READY"
@@ -1316,38 +1236,41 @@ const successEvent = run.revalidation?.returnState === "PR_READY"
       : "VERIFY_PASSED";
 ```
 
-Delete `candidate.revalidation` on the same candidate passed to the successful event publication.
+Clear `revalidation` on the same cloned candidate that receives fresh verification evidence and the successful event.
 
-- [ ] **Step 8: Fence commits and evidence publication**
+- [ ] **Step 6: Fence commits and evidence publication**
 
-After each orchestrator-owned artifact write and immediately before deterministic commit, CI-event publication, verifier-event publication, or return-to-gate success:
+Integration points:
 
-1. capture the current fence from the updated run object;
-2. reload and assert it;
-3. perform the side effect/publication;
-4. rely on optimistic version checks for a later race;
-5. on conflict, reload and follow the current target without publishing stale success.
+- builder/resolver: after artifact publication, capture/assert fence immediately before deterministic commit and assert again immediately after commit before event publication;
+- quality: artifact publication rejects stale run versions; capture/assert fence before CI event/evidence publication;
+- verifier: artifact publication rejects stale versions; capture/assert fence before verifier event/evidence publication;
+- successful return: assert current fence before clearing context and applying success event.
 
-Do not label B-bound evidence as C-bound evidence.
+A retarget during a deterministic Git command may leave an unaccepted commit, but optimistic publication and the post-command fence must prevent stale event/evidence. The next preflight fails closed on head/target mismatch; this issue does not reset the branch.
 
-- [ ] **Step 9: Run focused and existing workflow tests**
+- [ ] **Step 7: Reconcile latest target before retry continuation**
+
+When a failed run has active revalidation, compare `run.github.headSha` or observed local HEAD with `revalidation.requestedHeadSha` before publishing retry. If different, publish `REVALIDATION_RETARGETED` while state remains `FAILED`, reload, and only then prepare the retry candidate for `CI_RUNNING`.
+
+- [ ] **Step 8: Run focused workflow tests**
 
 ```bash
-node --experimental-strip-types --test test/issue28-revalidation.test.ts test/evidence-freshness.test.ts test/orchestrator.test.ts
+node --experimental-strip-types --test test/issue28-revalidation.test.ts test/evidence-freshness.test.ts test/orchestrator.test.ts test/issue28-retry-publication.test.ts
 ```
 
 Expected: PASS.
 
-- [ ] **Step 10: Commit revalidation core behavior**
+- [ ] **Step 9: Commit workflow integration**
 
 ```bash
-git add src/revalidation.ts src/orchestrator.ts test/issue28-revalidation.test.ts test/evidence-freshness.test.ts
-git commit -m "feat: revalidate against latest workflow head"
+git add src/orchestrator.ts src/revalidation.ts test/issue28-revalidation.test.ts test/evidence-freshness.test.ts test/orchestrator.test.ts test/issue28-retry-publication.test.ts
+git commit -m "feat: execute current-head revalidation"
 ```
 
 ---
 
-### Task 9: Split GitHub association publication from non-rollback routing
+### Task 10: Split GitHub association publication from non-rollback routing
 
 **Files:**
 - Modify: `src/github/adapter.ts`
@@ -1356,126 +1279,97 @@ git commit -m "feat: revalidate against latest workflow head"
 - Modify: `test/github-adapter.integration.test.ts`
 
 **Interfaces:**
-- Produces: event-free `saveAssociationSnapshot()` and field-scoped rollback.
-- Produces: `afterAssociationCommitBeforeRouting` deterministic test seam.
-- Consumes: `RevalidationService.route()` after association commit.
+- Produces: event-free `saveAssociationSnapshot()`, field-scoped rollback, and `afterAssociationCommitBeforeRouting` seam.
+- Consumes: `RevalidationService.route()` only after association commit.
 
-- [ ] **Step 1: Add failure-matrix tests for event preservation**
+- [ ] **Step 1: Add the event-preservation failure matrix**
 
-Cover these injection points:
+Inject:
 
-1. run snapshot save fails;
-2. association index write fails before publication;
-3. association index rename publishes but directory sync fails;
-4. process seam throws after association commit and before routing;
-5. request/retarget event publication fails;
-6. a concurrent event is published before a known-failure rollback callback runs.
+1. run snapshot save failure;
+2. known association-index write failure;
+3. association-index outcome unknown after rename;
+4. stop after association commit/before routing;
+5. request/retarget event publication failure;
+6. concurrent event before a known-failure rollback callback.
 
-For every case reload the run and assert:
-
-```ts
-assert.deepEqual(
-  authoritative.events.map((event) => event.id),
-  expectedEventIds,
-);
-assert.ok(authoritative.events.length >= before.events.length);
-```
-
-No callback may restore fewer events, a previous state, a prior failure object, or a prior revalidation generation.
+Reload and assert event IDs/order/details never decrease or change. Field rollback must refuse a record whose non-association invariant changed.
 
 - [ ] **Step 2: Add B-to-C webhook and crash-recovery tests**
 
-Deliver head B to a `PR_REVIEW` run with zero comment cycles, assert generation 1. Before work completes, deliver C and assert generation 2 targeting C.
+Deliver B to a `PR_REVIEW` run with zero comment cycles, then C before work completes. Assert generation `2`, target C, and only C accepted for alignment/evidence.
 
-Inject a stop after association commit but before routing. The durable run must retain `github.headSha === C` and invalidated evidence. A repeated delivery or later orchestrator preflight must publish the missing request/retarget exactly once.
+Inject a stop after association commit before routing. The run retains `github.headSha === C` and invalidated evidence. Repeated delivery or later orchestrator preflight publishes the missing request/retarget exactly once.
 
-- [ ] **Step 3: Run GitHub reconciliation tests and verify the red state**
+- [ ] **Step 3: Run GitHub tests and verify the red state**
 
 ```bash
 node --experimental-strip-types --test test/issue28-github-reconciliation.test.ts test/github-adapter.integration.test.ts
 ```
 
-Expected: FAIL because current full-snapshot rollback can remove events and routing occurs inside the rollback scope.
+Expected: FAIL because current full-snapshot rollback can remove events and routing is inside rollback scope.
 
-- [ ] **Step 4: Implement event-history equality guards**
-
-Add private adapter helpers:
+- [ ] **Step 4: Implement exact history and rollback invariants**
 
 ```ts
-function eventIdentity(events: RunRecord["events"]): string[] {
-  return events.map((event) =>
-    JSON.stringify({
-      id: event.id,
-      at: event.at,
-      type: event.type,
-      actor: event.actor,
-      from: event.from,
-      to: event.to,
-      details: event.details,
-    })
-  );
+function eventHistoryIdentity(events: RunRecord["events"]): string {
+  return JSON.stringify(events.map((event) => ({
+    id: event.id,
+    at: event.at,
+    type: event.type,
+    actor: event.actor,
+    from: event.from,
+    to: event.to,
+    details: event.details,
+  })));
 }
 
-function assertEventHistoryUnchanged(
-  expected: RunRecord,
-  actual: RunRecord,
-): void {
-  assert.deepEqual(eventIdentity(actual.events), eventIdentity(expected.events));
+function associationRollbackInvariant(run: RunRecord): string {
+  const record = structuredClone(run) as unknown as Record<string, unknown>;
+  delete record.version;
+  delete record.updatedAt;
+  delete record.github;
+  delete record.evidence;
+  return JSON.stringify(record);
 }
 ```
 
-Use production error checks rather than importing the test assertion library: compare serialized arrays and throw an exact rollback-fence error when they differ.
+Before field rollback require exact attempted version, identical event history, and identical rollback invariant. Clone the current record and restore only prior `github` and `evidence`. Refuse every mismatch.
 
-- [ ] **Step 5: Replace full-snapshot rollback with field-scoped rollback**
+- [ ] **Step 5: Implement two-phase live-head handling**
 
-Capture only:
-
-```ts
-interface AssociationRunFields {
-  github?: RunRecord["github"];
-  evidence?: RunRecord["evidence"];
-}
-```
-
-On known index non-publication, reload and require exact attempted version plus unchanged state, events, failure, revalidation, artifacts, approvals, and counters. Clone the current record and restore only `github` and `evidence`. Refuse rollback on any mismatch.
-
-Do not roll back on `DurableAtomicWriteOutcomeUnknownError`; retain the association class’s existing outcome-unknown rule and reconcile by reload.
-
-- [ ] **Step 6: Implement two-phase live-head handling**
-
-Under the per-PR publication fence:
+Under the existing per-PR publication fence:
 
 **Phase A inside `associations.withTransaction()`:**
 
-- load run;
-- update `github.headSha`, pending cancellation heads, and stale evidence only;
-- publish no workflow event and do not alter revalidation target;
-- save the event-free snapshot;
-- bind the index;
+- load and clone run;
+- capture previous head;
+- update only `github`, pending cancellation heads, and stale evidence;
+- publish no event and do not change revalidation target;
+- save event-free snapshot;
+- bind association index;
 - register only field-scoped rollback.
 
 **Phase B after transaction success:**
 
 - invoke `afterAssociationCommitBeforeRouting` when configured;
 - reload run;
-- call `RevalidationService.route()` with source `github` and the committed live head;
-- publish checks from the resulting authoritative state;
-- never register the request/retarget event with association rollback.
+- route request, retarget, or no-op with source `github`, previous head, and committed live head;
+- publish checks from authoritative routed state;
+- never register routing events for association rollback.
 
-Apply the same protocol to webhook head changes and manual check publication live-head refresh.
+Apply to webhook PR/push head changes and manual check publication live-head refresh.
 
-- [ ] **Step 7: Clarify association transaction callback semantics**
+- [ ] **Step 6: Keep outcome-unknown association behavior non-rollback**
 
-In `src/github/association.ts`, document and test:
+In `src/github/association.ts`, retain and test:
 
 - rollback callbacks run only for known non-publication failures;
 - callbacks do not run for `DurableAtomicWriteOutcomeUnknownError`;
 - callbacks execute in reverse registration order;
-- callback failure is aggregated without masking the original failure.
+- callback errors aggregate with the primary error.
 
-No new distributed transaction abstraction is introduced.
-
-- [ ] **Step 8: Run focused GitHub and durable-ingress tests**
+- [ ] **Step 7: Run focused GitHub and durable-ingress tests**
 
 ```bash
 node --experimental-strip-types --test test/issue28-github-reconciliation.test.ts test/github-adapter.integration.test.ts test/github-durable-ingress.test.ts test/github-authoritative-state.test.ts
@@ -1483,7 +1377,7 @@ node --experimental-strip-types --test test/issue28-github-reconciliation.test.t
 
 Expected: PASS.
 
-- [ ] **Step 9: Commit append-only GitHub reconciliation**
+- [ ] **Step 8: Commit append-only GitHub reconciliation**
 
 ```bash
 git add src/github/adapter.ts src/github/association.ts test/issue28-github-reconciliation.test.ts test/github-adapter.integration.test.ts
@@ -1492,87 +1386,14 @@ git commit -m "fix: preserve events during github head routing"
 
 ---
 
-### Task 10: Harden merge-ready, completion, and retry against active revalidation
+### Task 11: Harden merge-ready/completion, rendering, schema examples, and documentation
 
 **Files:**
 - Modify: `src/orchestrator.ts`
-- Modify: `test/issue28-revalidation.test.ts`
-- Modify: `test/evidence-freshness.test.ts`
-- Modify: `test/issue28-retry-publication.test.ts`
-
-**Interfaces:**
-- Produces: one exact current-head gate predicate used by merge-ready and completion.
-- Consumes: current workspace, GitHub head, revalidation target, quality/verification/merge-ready evidence.
-
-- [ ] **Step 1: Add gate-rejection tests**
-
-For both `markMergeReady()` and `complete()`, cover:
-
-- active revalidation context;
-- workspace head differs from `revalidation.requestedHeadSha`;
-- associated GitHub head differs from workspace or requested target;
-- quality evidence missing, failed, or stale;
-- verification evidence missing, failed, or stale;
-- managed worktree dirty or wrong branch;
-- completion merge-ready evidence missing or stale.
-
-Assert no event, evidence, or state change after rejection.
-
-- [ ] **Step 2: Add retry-to-latest-target tests**
-
-Seed failed active revalidation targeting B, update `github.headSha` to C without the retarget event, call retry, and assert retry first publishes `REVALIDATION_RETARGETED` or otherwise leaves the run `FAILED` with operational resume state `CI_RUNNING` and generation targeting C. It must not resume B-bound verification.
-
-- [ ] **Step 3: Run focused tests and verify the red state**
-
-```bash
-node --experimental-strip-types --test test/issue28-revalidation.test.ts test/evidence-freshness.test.ts test/issue28-retry-publication.test.ts
-```
-
-Expected: FAIL where current gate checks do not account for active context or all three head identities.
-
-- [ ] **Step 4: Add one exact gate assertion helper**
-
-In `src/orchestrator.ts`, add a private method that reloads or synchronizes the current workspace and requires:
-
-```text
-no run.revalidation
-workspace HEAD known
-workspace branch exact
-managed worktree clean when isolated
-if associated: workspace.headSha == github.headSha
-quality evidence current and passing when required
-verification evidence current and passing when required
-for completion: mergeReady evidence current and passing
-```
-
-Return the current head SHA for event details. Do not recover success from historical events after evidence invalidation.
-
-- [ ] **Step 5: Reconcile latest target before retry continuation**
-
-At the start of `retryFromFailed()`, after loading the failure but before workspace reconciliation, compare active `revalidation.requestedHeadSha` with the required current target. Publish or reconcile `REVALIDATION_RETARGETED` while retaining the failed state, then reload and continue only from the latest generation.
-
-- [ ] **Step 6: Run all focused gate and retry tests**
-
-```bash
-node --experimental-strip-types --test test/issue28-revalidation.test.ts test/evidence-freshness.test.ts test/issue28-retry-publication.test.ts test/orchestrator.test.ts
-```
-
-Expected: PASS.
-
-- [ ] **Step 7: Commit current-head gate enforcement**
-
-```bash
-git add src/orchestrator.ts test/issue28-revalidation.test.ts test/evidence-freshness.test.ts test/issue28-retry-publication.test.ts
-git commit -m "fix: require current-head evidence at final gates"
-```
-
----
-
-### Task 11: Synchronize rendering, schema literals, and public documentation
-
-**Files:**
 - Modify: `src/run-rendering.ts`
 - Create: `test/issue28-rendering.test.ts`
+- Modify: `test/issue28-revalidation.test.ts`
+- Modify: `test/evidence-freshness.test.ts`
 - Modify: `test/schema.test.ts`
 - Modify: `docs/PRD.md`
 - Modify: `docs/ARCHITECTURE.md`
@@ -1581,115 +1402,115 @@ git commit -m "fix: require current-head evidence at final gates"
 - Modify: `docs/OPERATIONS.md`
 
 **Interfaces:**
-- Produces: operator-visible bootstrap phase, revalidation source/target/generation/return gate, and stable failure code.
-- Consumes: final domain names and exact state/event behavior from Tasks 1–10.
+- Produces: one exact current-head gate assertion used by merge-ready and completion.
+- Produces: operator-visible bootstrap/revalidation diagnostics and synchronized public contracts.
+- Consumes: current workspace, GitHub head, revalidation target, and quality/verification/merge-ready evidence.
 
-- [ ] **Step 1: Add rendering tests**
+- [ ] **Step 1: Add merge-ready/completion rejection tests**
 
-Create exact run fixtures for:
+For both operations cover:
 
-- `CREATED` with planned intent and no workspace;
-- `CREATED` with workspace checkpoint;
-- `FAILED` with `resumeState: CREATED` and bootstrap intent;
-- active GitHub revalidation generation 3 returning to `PR_REVIEW`;
-- automatic-transition overflow.
+- active revalidation context;
+- workspace differs from requested target;
+- associated GitHub head differs from workspace or target;
+- quality evidence missing, failed, or stale;
+- verification evidence missing, failed, or stale;
+- dirty or wrong-branch managed worktree;
+- completion merge-ready evidence missing or stale.
 
-Assert human output contains bounded lines such as:
+Assert no new event, evidence, or state change after rejection.
+
+- [ ] **Step 2: Add rendering tests**
+
+For bootstrap failure require output to contain:
 
 ```text
-Failure code: automatic-transition-limit-exceeded
-Bootstrap: mode=isolated-worktree, phase=workspace-checkpointed
-Revalidation: source=github, target=<12-char-sha>, generation=3, return=PR_REVIEW
+Failure code: workflow-failure
+Bootstrap: mode=isolated-worktree, source=<12-char SHA>, workspace=checkpointed
 ```
 
-Do not print the full repository path twice or expose credentials embedded in remotes.
+For active revalidation require:
 
-- [ ] **Step 2: Run rendering tests and verify the red state**
-
-```bash
-node --experimental-strip-types --test test/issue28-rendering.test.ts
+```text
+Revalidation: source=github, target=<12-char SHA>, generation=2, return=PR_REVIEW
 ```
 
-Expected: FAIL because the new status lines are absent.
+For overflow require stable failure code. Do not render secrets or full unbounded diagnostics.
 
-- [ ] **Step 3: Implement bounded rendering**
-
-Use existing diagnostic sanitizers for any conflict/error text. Render SHA displays with the existing 12-character convention. Derive bootstrap phase from record shape rather than persisting another field.
-
-- [ ] **Step 4: Add schema/domain synchronization assertions**
-
-In `test/schema.test.ts`, assert the JSON Schema enums contain every `WORKFLOW_EVENT`, `WORKFLOW_STATE`, and `RunFailureCode` literal used by the TypeScript contract. Add negative cases for:
-
-- generation zero;
-- unsupported source/return state;
-- extra metadata property;
-- failed retarget without active revalidation during store event publication;
-- contradictory `CREATED` checkpoint without bootstrap intent where the new invariant applies.
-
-Historical schema-v1 records that predate new metadata remain accepted under the documented conservative migration rules.
-
-- [ ] **Step 5: Update the PRD**
-
-Document:
-
-- automatic advance checks the resulting state before durable overflow;
-- all production creation paths persist bootstrap intent first;
-- bootstrap source drift excludes MASWE state writes;
-- retry preserves its prior durable recovery key until complete publication;
-- stale evidence routes through explicit request/retarget semantics to the latest head;
-- final gates require exact current-head evidence.
-
-- [ ] **Step 6: Update architecture and artifact contracts**
-
-Add the new state-machine edges, two fingerprint planes, real workspace checkpoint, cloned failure/retry publication, generation fencing, append-only event rule, and corrected editing-event SHA meaning.
-
-The artifact contract must state that corrected `headSha` semantics apply to newly published events and historical events are not rewritten.
-
-- [ ] **Step 7: Update GitHub App and operations documentation**
-
-Document the two-phase association/routing protocol, crash point after index commit, B-to-C coalescing, outcome-unknown reconciliation, dirty-worktree refusal, and operator procedures for blocked bootstrap/alignment.
-
-Do not imply that Phase A fetches or moves a local branch.
-
-- [ ] **Step 8: Run contract, rendering, and documentation-sensitive tests**
+- [ ] **Step 3: Run gate/rendering tests and verify the red state**
 
 ```bash
-node --experimental-strip-types --test test/issue28-rendering.test.ts test/schema.test.ts test/state-machine.test.ts
+node --experimental-strip-types --test test/issue28-rendering.test.ts test/issue28-revalidation.test.ts test/evidence-freshness.test.ts
+```
+
+Expected: FAIL because exact gate and rendering contracts are incomplete.
+
+- [ ] **Step 4: Add one exact gate assertion**
+
+The helper must require:
+
+```text
+no active revalidation
+known workspace HEAD
+exact workspace branch
+clean managed worktree when isolated
+if associated: workspace.headSha == github.headSha
+current passing quality evidence when required
+current passing verification evidence when required
+for completion: current passing merge-ready evidence
+```
+
+Return the exact current head for event details. Historical events never recreate current success after invalidation.
+
+- [ ] **Step 5: Implement bounded rendering**
+
+Render failure code, bootstrap mode/phase, and revalidation source/target/generation/return gate. Use existing diagnostic sanitizers and truncate displayed SHAs to 12 characters while retaining full values in JSON.
+
+- [ ] **Step 6: Synchronize documentation with exact normative text**
+
+Add these requirements, adapted only for document grammar:
+
+```text
+Bootstrap source-drift checks exclude the orchestrator-owned .maswe namespace; read-only role fingerprints continue to include authoritative .maswe state.
+
+Every production-created run, including a superseding replacement, persists workspace bootstrap intent before branch or worktree side effects and durably checkpoints the established workspace before START.
+
+A newer authenticated or local head retargets an active or recoverable failed revalidation generation. Evidence from a superseded generation is unusable.
+
+GitHub association publication is event-free and rollback-capable; workflow request and retarget events publish only after association commit and are never rolled back.
+```
+
+Update state diagrams for both revalidation events, artifact/run-record examples for the optional metadata, and operations guidance for dirty worktree, alignment, retry, and non-destructive manual recovery.
+
+- [ ] **Step 7: Run contract and documentation tests**
+
+```bash
+node --experimental-strip-types --test test/issue28-rendering.test.ts test/schema.test.ts test/issue28-revalidation.test.ts test/evidence-freshness.test.ts
 npm run typecheck
 ```
 
 Expected: PASS.
 
-- [ ] **Step 9: Commit public-contract synchronization**
+- [ ] **Step 8: Commit public contract synchronization**
 
 ```bash
-git add src/run-rendering.ts test/issue28-rendering.test.ts test/schema.test.ts docs/PRD.md docs/ARCHITECTURE.md docs/ARTIFACT_CONTRACTS.md docs/GITHUB_APP.md docs/OPERATIONS.md
+git add src/orchestrator.ts src/run-rendering.ts test/issue28-rendering.test.ts test/issue28-revalidation.test.ts test/evidence-freshness.test.ts test/schema.test.ts docs/PRD.md docs/ARCHITECTURE.md docs/ARTIFACT_CONTRACTS.md docs/GITHUB_APP.md docs/OPERATIONS.md
 git commit -m "docs: synchronize Issue 28 recovery contracts"
 ```
 
 ---
 
-### Task 12: Run complete validation and prepare exact-head review
+### Task 12: Run exact-baseline validation and prepare review evidence
 
 **Files:**
-- Review: all files changed since `d85451f984a80ec6681dfcd7226a31099b1479fe`
-- Modify only when a verification failure proves a defect in the Issue #28 scope.
+- Modify only files required to correct failures attributable to Tasks 1–11.
+- Do not change package metadata, lock files, workflows, runtime adapters, CLI grammar, or configuration schema.
 
 **Interfaces:**
-- Consumes: every prior task deliverable.
-- Produces: exact canonical and compatibility evidence for review.
+- Produces: exact-head validation evidence for canonical Node 24 and blocking Node 22 compatibility.
+- Consumes: the complete Issue #28 implementation and test matrix.
 
-- [ ] **Step 1: Verify scope before running the suite**
-
-```bash
-git status --short
-git diff --name-only d85451f984a80ec6681dfcd7226a31099b1479fe...HEAD
-git diff --check d85451f984a80ec6681dfcd7226a31099b1479fe...HEAD
-```
-
-Expected: only Issue #28 production, test, schema, plan/spec, rendering, and listed documentation files; no dependencies, runtime adapters, configuration schema, package files, or workflows.
-
-- [ ] **Step 2: Run every Issue #28 focused suite on canonical Node 24.18.0**
+- [ ] **Step 1: Run focused Issue #28 suites on canonical Node 24.18.0**
 
 Record:
 
@@ -1698,28 +1519,12 @@ command -v node
 node --version
 node -p 'process.execPath'
 npm --version
+node --experimental-strip-types --test test/issue28-transition-bound.test.ts test/issue28-bootstrap.test.ts test/issue28-retry-publication.test.ts test/issue28-revalidation.test.ts test/issue28-github-reconciliation.test.ts test/issue28-rendering.test.ts
 ```
 
-Require `node --version` to equal `v24.18.0`, then run:
+Expected Node version: `v24.18.0`. Expected tests: PASS.
 
-```bash
-node --experimental-strip-types --test \
-  test/issue28-transition-bound.test.ts \
-  test/issue28-bootstrap.test.ts \
-  test/issue28-retry-publication.test.ts \
-  test/issue28-revalidation.test.ts \
-  test/issue28-github-reconciliation.test.ts \
-  test/issue28-rendering.test.ts \
-  test/commit-provenance.test.ts \
-  test/evidence-freshness.test.ts \
-  test/failed-run-provenance.test.ts \
-  test/state-machine.test.ts \
-  test/schema.test.ts
-```
-
-Expected: all tests pass, zero failures.
-
-- [ ] **Step 3: Run full canonical validation**
+- [ ] **Step 2: Run the complete canonical validation**
 
 ```bash
 npm run check
@@ -1727,11 +1532,21 @@ npm run pack:dry
 git diff --check
 ```
 
-Expected: all commands exit zero.
+Expected: all commands exit `0`.
+
+- [ ] **Step 3: Audit scope and event-history requirements**
+
+```bash
+git status --short
+git diff --name-only e80043cb208b5c26671a7aae34283d75ffab9dec...HEAD
+git grep -nE 'TODO|TBD|implement later' -- src test schemas docs
+```
+
+Disposition every match as pre-existing documentation language or remove it. Confirm no Issue #29/#30 behavior, dependency change, workflow change, runtime-adapter change, or destructive Git operation entered scope.
 
 - [ ] **Step 4: Run exact Node 22.22.2 compatibility validation**
 
-Switch through the project-supported runtime manager, record the same executable evidence, require `v22.22.2`, then run:
+Under exact Node `22.22.2`, record the same runtime evidence and run:
 
 ```bash
 npm run check
@@ -1739,66 +1554,97 @@ npm run pack:dry
 git diff --check
 ```
 
-Expected: all commands exit zero.
+Expected: all commands exit `0`.
 
-- [ ] **Step 5: Inspect authoritative recovery claims manually**
+- [ ] **Step 5: Verify acceptance and external-review traceability**
 
-Review the focused tests and implementation line by line against the approved spec. Confirm:
+Review every row below against a passing test or exact code/document evidence:
 
-- all four bootstrap failure barriers reload disk state;
-- dirty registered worktrees are rejected;
-- `supersede()` persists intent before side effects;
-- retry failure never leaves `FAILED` without `resumeState`;
-- B-to-C retarget works in active and failed states;
-- generation fencing blocks B evidence after C;
-- GitHub rollback cannot reduce event history;
-- merge-ready/completion reject active or stale evidence;
-- historical event SHAs remain unchanged.
+| Requirement | Blocking evidence |
+|---|---|
+| Builder/resolver evaluated SHA | editing and no-op provenance tests |
+| Durable boundary behavior | exact gate, terminal, and overflow reload tests |
+| Source fingerprint excludes `.maswe` | Git/non-Git bootstrap fingerprint tests |
+| All production paths persist intent | start and supersede interruption tests |
+| Real workspace checkpoint | after-checkpoint/before-`START` reload test |
+| Dirty worktree rejected | staged/unstaged/untracked recovery tests |
+| Retry metadata survives | pre-publication, conflict, and outcome-unknown tests |
+| Gate return context | `PR_READY` and zero-cycle `PR_REVIEW` tests |
+| B-to-C retarget | active and failed generation tests |
+| Stale generation blocked | fence tests around commit/evidence publication |
+| Published events append-only | association failure matrix |
+| Merge-ready/completion fail closed | current-head gate tests |
+| Schema/docs/rendering synchronized | schema, rendering, and literal contract tests |
 
-- [ ] **Step 6: Commit only verification-driven corrections**
+- [ ] **Step 6: Commit only validation-driven corrections**
 
-When verification reveals an Issue #28 defect, add or strengthen the failing regression first, implement the smallest correction, rerun the focused test, then rerun the full canonical suite. Commit corrections by concern; do not use a generic cleanup commit.
-
-- [ ] **Step 7: Prepare exact-head review evidence**
-
-Capture:
+If validation required corrections:
 
 ```bash
-git rev-parse HEAD
-git status --short
-git diff --stat d85451f984a80ec6681dfcd7226a31099b1479fe...HEAD
-git diff --check d85451f984a80ec6681dfcd7226a31099b1479fe...HEAD
+git add <exact corrected files>
+git commit -m "test: complete Issue 28 validation"
 ```
 
-Record canonical Node 24 and compatibility Node 22 command output separately. Request independent review against the exact final SHA and require zero unresolved actionable threads before merge.
+If no files changed, do not create an empty commit.
+
+- [ ] **Step 7: Request independent exact-head review**
+
+The review request must include:
+
+```text
+base SHA: e80043cb208b5c26671a7aae34283d75ffab9dec
+head SHA: <full current HEAD>
+canonical Node: 24.18.0
+compatibility Node: 22.22.2
+required commands: npm run check; npm run pack:dry; git diff --check
+scope: Issue #28 only
+required special review: bootstrap fingerprint planes, dirty-worktree recovery, B-to-C active/failed retarget, and append-only event history
+```
+
+Do not mark the PR ready or merge while any exact-head CI, independent review, or actionable-thread gate is incomplete.
 
 ---
 
-## Requirement Coverage Check
+## Acceptance-Criteria Coverage
 
-| Requirement | Implemented by |
+| Issue #28 criterion | Plan task |
 |---|---|
-| Correct builder/resolver `headSha` | Task 2 |
-| Durable and boundary-correct automatic limit | Task 3 |
-| Source fingerprint excludes `.maswe` | Task 4 |
-| Every production creation path persists intent | Task 5 |
-| Recoverable branch/worktree partial creation | Task 6 |
-| Real `CREATED + workspace` checkpoint | Task 6 |
-| Dirty registered worktree rejection | Tasks 6–7 |
-| Retry preserves recovery metadata | Task 7 |
-| Revalidation from both PR gates | Task 8 |
-| Active/failed B-to-C retarget | Tasks 8–10 |
-| Generation fence blocks stale evidence | Task 8 |
-| Append-only event history across association failure | Task 9 |
-| Final gates reject stale/active evidence | Task 10 |
-| Schema, rendering, artifact, architecture, PRD, GitHub, operations synchronization | Task 11 |
-| Exact Node 24.18.0 and 22.22.2 validation | Task 12 |
+| Editing builder SHA contract | Task 2 |
+| Editing resolver SHA contract | Task 2 |
+| No-op coherent evaluated SHA | Task 2 |
+| Durable automatic overflow | Task 3 |
+| Exact boundary to human gate | Task 3 |
+| Exact boundary to terminal state | Task 3 |
+| Failure before branch recoverable | Tasks 5–6 |
+| Failure after branch recoverable | Task 6 |
+| Failure after worktree recoverable | Task 6 |
+| Failure after workspace save recoverable | Task 6 |
+| Retry reconstructs intended workspace before roles | Tasks 6–7 |
+| Retry publication preserves recovery metadata | Task 7 |
+| Revalidation returns to `PR_READY` | Tasks 8–9 |
+| Revalidation returns to `PR_REVIEW` | Tasks 8–9 |
+| External movement before comment cycle returns to review | Tasks 8–10 |
+| Stale evidence cannot authorize merge-ready/completion | Task 11 |
+| Types/schema/rendering/docs synchronized | Tasks 1 and 11 |
+| Required commands on both Node baselines | Task 12 |
+
+## External-Review Finding Coverage
+
+| Finding | Plan task |
+|---|---|
+| Bootstrap fingerprint self-invalidates on `.maswe` writes | Task 4 |
+| Active revalidation cannot coalesce B-to-C | Tasks 8–10 |
+| Association rollback can remove published events | Task 10 |
+| Supersede replacement lacks intent | Task 5 |
+| Missing `CREATED + workspace` checkpoint | Task 6 |
+| Dirty registered worktree can be reused | Tasks 6–7 |
 
 ## Plan Self-Review Result
 
-- Every original Issue #28 acceptance criterion maps to at least one task and focused test.
-- All six external-review findings map to blocking implementation tasks and regressions.
-- No task introduces an unowned Issue #29, #30, #34, Phase B, dependency, runtime-adapter, or CLI-parser change.
-- Function and type names are consistent across producers and consumers.
-- The plan contains no unresolved design marker or deferred implementation placeholder.
-- The execution sequence keeps each commit independently testable and reviewable.
+- All 18 Issue #28 acceptance criteria map to implementation and deterministic evidence.
+- All six external-review findings map to blocking tests.
+- Every type and helper referenced by a later task is defined by an earlier task.
+- Test-only options are constructor data, not persisted configuration.
+- Code examples avoid enums, parameter properties, and transform-dependent syntax.
+- No task authorizes destructive Git recovery, event-history rollback, Issue #29 work, or Issue #30 work.
+- The plan contains no unresolved placeholders or open design decisions.
