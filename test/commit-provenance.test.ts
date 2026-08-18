@@ -39,13 +39,28 @@ function config(overrides: (c: MasweConfig) => void = () => undefined): MasweCon
 }
 
 class EditingRuntime implements AgentRuntime {
-  private readonly mode: "edit" | "commit" | "dirty-extra" | "out-of-scope" | "commit-fail-prep";
+  private readonly mode: "edit" | "noop" | "commit" | "dirty-extra" | "out-of-scope" | "commit-fail-prep";
 
-  constructor(mode: "edit" | "commit" | "dirty-extra" | "out-of-scope" | "commit-fail-prep") {
+  constructor(mode: "edit" | "noop" | "commit" | "dirty-extra" | "out-of-scope" | "commit-fail-prep") {
     this.mode = mode;
   }
 
   async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    if (request.role === "prResolver" && request.prompt.includes("Role: PR comment scope classifier")) {
+      return new MockRuntime().execute(request);
+    }
+    if (request.role === "prResolver") {
+      if (this.mode === "edit") {
+        await mkdir(path.join(request.cwd, "src"), { recursive: true });
+        await writeFile(path.join(request.cwd, "src", "review-fix.ts"), "export const fix = true;\n", "utf8");
+      }
+      return {
+        status: "finished",
+        output: "# resolution\n\nRESOLUTION_COMPLETE\n",
+        requestedModel: request.roleConfig.model,
+        actualModel: request.roleConfig.model,
+      };
+    }
     if (request.role === "builder") {
       if (this.mode === "edit" || this.mode === "commit-fail-prep") {
         await mkdir(path.join(request.cwd, "src"), { recursive: true });
@@ -87,18 +102,65 @@ test("BUILD_COMPLETED is emitted only after deterministic commit with input and 
   const cwd = await initRepo();
   const orchestrator = new Orchestrator(cwd, config(), new EditingRuntime("edit"));
   const run = await orchestrator.start("Commit after build", "Edit src only.");
-  assert.equal(run.state, "PR_READY");
-  const build = run.events.find((e) => e.type === "BUILD_COMPLETED");
+  const authoritative = await orchestrator.store.load(run.id);
+  assert.equal(authoritative.state, "PR_READY");
+  const build = authoritative.events.find((e) => e.type === "BUILD_COMPLETED");
   assert.ok(build);
   assert.ok(typeof build.details?.inputHeadSha === "string");
   assert.ok(typeof build.details?.outputHeadSha === "string");
   assert.notEqual(build.details?.inputHeadSha, build.details?.outputHeadSha);
-  assert.equal(build.details?.outputHeadSha, run.workspace?.headSha);
-  assert.equal(run.evidence?.quality?.headSha, run.workspace?.headSha);
-  assert.equal(run.evidence?.verification?.headSha, run.workspace?.headSha);
-  const worktree = run.workspace?.worktreePath;
+  assert.equal(build.details?.headSha, build.details?.outputHeadSha);
+  assert.equal(build.details?.headSha, authoritative.workspace?.headSha);
+  assert.equal(build.details?.outputHeadSha, authoritative.workspace?.headSha);
+  assert.equal(authoritative.evidence?.quality?.headSha, authoritative.workspace?.headSha);
+  assert.equal(authoritative.evidence?.verification?.headSha, authoritative.workspace?.headSha);
+  const worktree = authoritative.workspace?.worktreePath;
   assert.ok(worktree);
   assert.equal(await isGitWorkspaceClean(worktree), true);
+});
+
+test("BUILD_COMPLETED keeps all SHAs on the workspace head for a no-op build", async () => {
+  const cwd = await initRepo();
+  const orchestrator = new Orchestrator(cwd, config(), new EditingRuntime("noop"));
+  const run = await orchestrator.start("No-op build", "Make no source changes.");
+  const authoritative = await orchestrator.store.load(run.id);
+  const build = authoritative.events.find((e) => e.type === "BUILD_COMPLETED");
+  assert.ok(build);
+  assert.equal(build.details?.inputHeadSha, authoritative.workspace?.headSha);
+  assert.equal(build.details?.headSha, authoritative.workspace?.headSha);
+  assert.equal(build.details?.outputHeadSha, authoritative.workspace?.headSha);
+});
+
+test("RESOLUTION_COMPLETED binds editing provenance to the evaluated workspace head", async () => {
+  const cwd = await initRepo();
+  const orchestrator = new Orchestrator(cwd, config(), new EditingRuntime("edit"));
+  let run = await orchestrator.start("Resolve after review", "Build the requested change.");
+  run = await orchestrator.markPrOpened(run.id);
+  run = await orchestrator.receiveReviewComment(run.id, "Please fix the review finding.");
+  const authoritative = await orchestrator.store.load(run.id);
+  assert.equal(authoritative.state, "PR_REVIEW");
+  const resolution = authoritative.events.find((e) => e.type === "RESOLUTION_COMPLETED");
+  assert.ok(resolution);
+  assert.ok(typeof resolution.details?.inputHeadSha === "string");
+  assert.ok(typeof resolution.details?.outputHeadSha === "string");
+  assert.equal(resolution.details?.headSha, resolution.details?.outputHeadSha);
+  assert.equal(resolution.details?.headSha, authoritative.workspace?.headSha);
+  assert.equal(resolution.details?.outputHeadSha, authoritative.workspace?.headSha);
+  assert.notEqual(resolution.details?.inputHeadSha, resolution.details?.headSha);
+});
+
+test("RESOLUTION_COMPLETED keeps all SHAs on the workspace head for a no-op resolution", async () => {
+  const cwd = await initRepo();
+  const orchestrator = new Orchestrator(cwd, config(), new EditingRuntime("noop"));
+  let run = await orchestrator.start("No-op resolution", "Build the requested change.");
+  run = await orchestrator.markPrOpened(run.id);
+  run = await orchestrator.receiveReviewComment(run.id, "No source change is needed.");
+  const authoritative = await orchestrator.store.load(run.id);
+  const resolution = authoritative.events.find((e) => e.type === "RESOLUTION_COMPLETED");
+  assert.ok(resolution);
+  assert.equal(resolution.details?.inputHeadSha, authoritative.workspace?.headSha);
+  assert.equal(resolution.details?.headSha, authoritative.workspace?.headSha);
+  assert.equal(resolution.details?.outputHeadSha, authoritative.workspace?.headSha);
 });
 
 test("rejects model-created commits before deterministic publish", async () => {

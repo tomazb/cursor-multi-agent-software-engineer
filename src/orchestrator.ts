@@ -390,11 +390,14 @@ export class Orchestrator {
       invalidateStaleEvidence(run, committed.headSha);
     }
 
+    const evaluatedHeadSha = outputHeadSha ?? beforeSha ?? run.workspace?.headSha;
     return this.store.applyEvent(run, "BUILD_COMPLETED", "builder", {
       ...runtimeEventIdentityDetails(result),
       marker: markers.marker,
-      ...(beforeSha ? { inputHeadSha: beforeSha, headSha: beforeSha } : {}),
-      ...(outputHeadSha ? { outputHeadSha } : {}),
+      ...(beforeSha ? { inputHeadSha: beforeSha } : {}),
+      ...(evaluatedHeadSha
+        ? { headSha: evaluatedHeadSha, outputHeadSha: evaluatedHeadSha }
+        : {}),
     });
   }
 
@@ -436,11 +439,14 @@ export class Orchestrator {
       invalidateStaleEvidence(run, committed.headSha);
     }
 
+    const evaluatedHeadSha = outputHeadSha ?? beforeSha ?? run.workspace?.headSha;
     return this.store.applyEvent(run, "RESOLUTION_COMPLETED", "prResolver", {
       ...runtimeEventIdentityDetails(result),
       marker: markers.marker,
-      ...(beforeSha ? { inputHeadSha: beforeSha, headSha: beforeSha } : {}),
-      ...(outputHeadSha ? { outputHeadSha } : {}),
+      ...(beforeSha ? { inputHeadSha: beforeSha } : {}),
+      ...(evaluatedHeadSha
+        ? { headSha: evaluatedHeadSha, outputHeadSha: evaluatedHeadSha }
+        : {}),
     });
   }
 
