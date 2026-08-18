@@ -27,6 +27,7 @@ import { resolveProjectModels } from "./model-resolution.ts";
 import { renderQualityReport, runQualityChecks } from "./quality.ts";
 import { isHumanGate, isTerminal } from "./state-machine.ts";
 import { FileRunStore, type RunStore } from "./store.ts";
+import { captureWorkspaceBootstrapIntent } from "./workspace-bootstrap.ts";
 import type { MasweConfig } from "./domain.ts";
 import {
   appendFailureAggregate,
@@ -71,6 +72,8 @@ export function extractVerifierDefects(report: string): string {
 export interface OrchestratorOptions {
   /** Test-only seam for exercising bounded automatic workflow transitions. */
   automaticTransitionLimit?: number;
+  /** Test seam immediately after durable bootstrap intent publication. */
+  beforeBootstrapReconcile?: (run: RunRecord) => Promise<void>;
 }
 
 export class Orchestrator {
@@ -79,6 +82,7 @@ export class Orchestrator {
   private readonly config: MasweConfig;
   private readonly runtime: AgentRuntime;
   private readonly automaticTransitionLimit: number;
+  private readonly beforeBootstrapReconcile: ((run: RunRecord) => Promise<void>) | undefined;
 
   constructor(
     cwd: string,
@@ -92,12 +96,30 @@ export class Orchestrator {
     this.runtime = runtime;
     this.store = store ?? new FileRunStore(cwd);
     this.automaticTransitionLimit = options.automaticTransitionLimit ?? 20;
+    this.beforeBootstrapReconcile = options.beforeBootstrapReconcile;
     if (
       !Number.isSafeInteger(this.automaticTransitionLimit) ||
       this.automaticTransitionLimit <= 0
     ) {
       throw new Error("automaticTransitionLimit must be a positive safe integer");
     }
+  }
+
+  private async createPlannedRun(
+    title: string,
+    request: string,
+    config: MasweConfig,
+    options: { supersedes?: string } = {},
+  ): Promise<RunRecord> {
+    const workspaceBootstrap = await captureWorkspaceBootstrapIntent(this.cwd, config);
+    const run = await this.store.create(title, request, config, {
+      workspaceBootstrap,
+      ...options,
+    });
+    await this.beforeBootstrapReconcile?.(run);
+    run.workspace = await ensureRunWorkspace(this.cwd, run);
+    await this.store.save(run);
+    return run;
   }
 
   private assertWithinBudget(run: RunRecord): void {
@@ -127,9 +149,7 @@ export class Orchestrator {
     }
     const catalogue = await this.runtime.listModels();
     const resolvedConfig = resolveProjectModels(this.config, catalogue);
-    const run = await this.store.create(title, request, resolvedConfig);
-    run.workspace = await ensureRunWorkspace(this.cwd, run);
-    await this.store.save(run);
+    const run = await this.createPlannedRun(title, request, resolvedConfig);
     await this.store.applyEvent(run, "START", "user");
     return this.runUntilBlocked(run.id);
   }
@@ -768,14 +788,12 @@ export class Orchestrator {
     if (existing.supersededBy) {
       throw new Error(`Run ${runId} was already superseded by ${existing.supersededBy}`);
     }
-    const replacement = await this.store.create(
+    const replacement = await this.createPlannedRun(
       existing.title,
       existing.request,
       existing.config,
+      { supersedes: existing.id },
     );
-    replacement.supersedes = existing.id;
-    replacement.workspace = await ensureRunWorkspace(this.cwd, replacement);
-    await this.store.save(replacement);
     existing.supersededBy = replacement.id;
     if (!isTerminal(existing.state)) {
       existing.failure = {
