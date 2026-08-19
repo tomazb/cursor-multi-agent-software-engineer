@@ -836,6 +836,7 @@ export class Orchestrator {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
+      const rollbackBaselineFingerprint = await captureWorkspaceSourceFingerprint(workdir);
 
       let deltaApplied = false;
       let publicationAttempted = false;
@@ -910,9 +911,11 @@ export class Orchestrator {
         }
         let actualHeadSha: string | undefined;
         let workspaceClean: boolean | undefined;
+        let actualSourceFingerprint: string | undefined;
         try {
           actualHeadSha = await gitRevParse(workdir);
           workspaceClean = await isGitWorkspaceClean(workdir);
+          actualSourceFingerprint = await captureWorkspaceSourceFingerprint(workdir);
         } catch (error) {
           rollbackErrors.push(error);
         }
@@ -922,10 +925,13 @@ export class Orchestrator {
             "Role publication and authoritative workspace rollback failed",
           );
         }
-        if (actualHeadSha !== beforeSha) {
+        if (
+          actualHeadSha !== beforeSha ||
+          actualSourceFingerprint !== rollbackBaselineFingerprint
+        ) {
           throw new RolePublicationOutcomeUnknownError(
             [publicationError],
-            `Role publication rollback observed the authoritative branch move from ${beforeSha} to ${actualHeadSha} (${workspaceClean ? "clean" : "dirty"}); operator reconciliation is required`,
+            `Role publication rollback did not restore the exact authoritative baseline at ${actualHeadSha} (${workspaceClean ? "clean" : "dirty"}); operator reconciliation is required`,
           );
         }
         throw publicationError;

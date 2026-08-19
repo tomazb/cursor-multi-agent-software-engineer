@@ -429,6 +429,85 @@ test("ordinary role ref-lock failure restores the exact clean baseline", async (
   assert.equal(status, "");
 });
 
+test("role ref-lock failure preserves a concurrently changed managed worktree", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-isolated-role-lock-race-");
+  const config = testConfig((c) => {
+    c.policy.useIsolatedWorktree = true;
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+  let winningWorktreePath: string | undefined;
+  let lockPath: string | undefined;
+  const orchestrator = new Orchestrator(cwd, config, new EditingBuilderRuntime(), undefined, {
+    beforeRoleRefPublish: async () => {
+      const { stdout } = await execFileAsync("git", ["worktree", "list", "--porcelain"], { cwd });
+      winningWorktreePath = stdout
+        .split("\n")
+        .filter((line) => line.startsWith("worktree "))
+        .map((line) => line.slice("worktree ".length))
+        .find((worktreePath) => path.resolve(worktreePath) !== path.resolve(cwd));
+      assert.ok(winningWorktreePath);
+      const { stdout: branch } = await execFileAsync("git", ["branch", "--show-current"], {
+        cwd: winningWorktreePath,
+      });
+      const { stdout: rawLockPath } = await execFileAsync(
+        "git",
+        ["rev-parse", "--git-path", `refs/heads/${branch.trim()}.lock`],
+        { cwd: winningWorktreePath },
+      );
+      lockPath = path.resolve(winningWorktreePath, rawLockPath.trim());
+      await writeFile(lockPath, "ordinary ref lock failure\n", "utf8");
+      await writeFile(
+        path.join(winningWorktreePath, "external-change.txt"),
+        "external winner\n",
+        "utf8",
+      );
+    },
+  });
+
+  const run = await orchestrator.start(
+    "Managed role lock race",
+    "Preserve a managed checkout changed during a rejected publication.",
+  );
+  assert.ok(winningWorktreePath);
+  assert.ok(lockPath);
+  t.after(async () => {
+    await rm(lockPath!, { force: true });
+    await execFileAsync("git", ["worktree", "remove", "--force", winningWorktreePath!], {
+      cwd,
+    }).catch(() => undefined);
+  });
+  const { stdout: registrations } = await execFileAsync(
+    "git",
+    ["worktree", "list", "--porcelain"],
+    { cwd },
+  );
+  const registeredWorktreePaths = registrations
+    .split("\n")
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => path.resolve(line.slice("worktree ".length)))
+    .sort();
+
+  assert.equal(run.state, "FAILED");
+  assert.match(run.failure?.message ?? "", /operator reconciliation/i);
+  assert.deepEqual(
+    registeredWorktreePaths,
+    [cwd, winningWorktreePath].map((worktreePath) => path.resolve(worktreePath)).sort(),
+  );
+  assert.equal(
+    await readFile(path.join(winningWorktreePath, "external-change.txt"), "utf8"),
+    "external winner\n",
+  );
+  assert.equal(
+    await readFile(path.join(winningWorktreePath, "builder-change.txt"), "utf8").then(
+      () => true,
+      () => false,
+    ),
+    false,
+  );
+});
+
 test("lost role CAS preserves an externally reset winning checkout", async (t) => {
   const cwd = await initGitRepo(t, "maswe-clean-role-reset-cas-");
   await writeFile(path.join(cwd, "baseline.txt"), "B\n", "utf8");
