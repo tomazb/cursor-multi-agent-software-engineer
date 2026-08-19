@@ -258,6 +258,7 @@ async function prepareCurrentHeadGate(
   orchestrator: Orchestrator;
   run: RunRecord;
   headSha: string;
+  trackWorktreePath: (worktreePath: string) => void;
 }> {
   const cwd = await initRepo();
   const config = baseConfig((candidate) => {
@@ -277,12 +278,15 @@ async function prepareCurrentHeadGate(
   if (gate === "complete") {
     run = await store.applyEvent(run, "MARK_MERGE_READY", "user", { headSha });
   }
+  const worktreePaths = new Set<string>();
   const worktreePath = run.workspace?.worktreePath;
+  if (worktreePath) worktreePaths.add(worktreePath);
   t.after(async () => {
-    if (worktreePath) {
-      await execFileAsync("git", ["worktree", "remove", "--force", worktreePath], { cwd }).catch(
+    for (const registeredPath of worktreePaths) {
+      await execFileAsync("git", ["worktree", "remove", "--force", registeredPath], { cwd }).catch(
         () => undefined,
       );
+      await rm(registeredPath, { recursive: true, force: true });
     }
     await rm(cwd, { recursive: true, force: true });
   });
@@ -291,6 +295,7 @@ async function prepareCurrentHeadGate(
     orchestrator: new Orchestrator(cwd, config, new MockRuntime(), store),
     run,
     headSha,
+    trackWorktreePath: (registeredPath) => worktreePaths.add(registeredPath),
   };
 }
 
@@ -329,6 +334,7 @@ const currentHeadGateCases: Array<{
     orchestrator: Orchestrator;
     run: RunRecord;
     headSha: string;
+    trackWorktreePath: (worktreePath: string) => void;
   }) => Promise<void> | void;
 }> = [
   {
@@ -360,6 +366,69 @@ const currentHeadGateCases: Array<{
     arrange: ({ run }) => {
       assert.ok(run.workspace);
       delete run.workspace.worktreePath;
+    },
+  },
+  {
+    name: "alternate registered checkout path",
+    expected: /canonical.*worktree|worktree.*canonical/i,
+    arrange: async ({ cwd, run, trackWorktreePath }) => {
+      assert.ok(run.workspace?.worktreePath);
+      const canonicalPath = run.workspace.worktreePath;
+      const alternatePath = await mkdtemp(path.join(os.tmpdir(), "maswe-alternate-worktree-"));
+      await rm(alternatePath, { recursive: true, force: true });
+      trackWorktreePath(alternatePath);
+      await execFileAsync("git", ["worktree", "remove", "--force", canonicalPath], { cwd });
+      await execFileAsync("git", ["worktree", "add", alternatePath, run.workspace.branch], { cwd });
+      run.workspace.worktreePath = alternatePath;
+    },
+  },
+  {
+    name: "unregistered canonical path",
+    expected: /registered.*worktree|worktree.*registration/i,
+    arrange: async ({ cwd, run }) => {
+      assert.ok(run.workspace?.worktreePath);
+      await execFileAsync("git", ["worktree", "remove", "--force", run.workspace.worktreePath], {
+        cwd,
+      });
+      await mkdir(run.workspace.worktreePath, { recursive: true });
+    },
+  },
+  {
+    name: "prunable canonical registration",
+    expected: /prunable.*worktree|worktree.*prunable/i,
+    arrange: async ({ run }) => {
+      assert.ok(run.workspace?.worktreePath);
+      await rm(run.workspace.worktreePath, { recursive: true, force: true });
+    },
+  },
+  {
+    name: "noncanonical recorded branch",
+    expected: /canonical.*branch/i,
+    arrange: ({ run }) => {
+      assert.ok(run.workspace);
+      run.workspace.branch = `maswe/noncanonical-${run.id}`;
+    },
+  },
+  {
+    name: "canonical path registered to a conflicting branch",
+    expected: /registered.*branch|registration.*branch/i,
+    arrange: async ({ cwd, run }) => {
+      assert.ok(run.workspace?.worktreePath);
+      const canonicalPath = run.workspace.worktreePath;
+      const conflictingBranch = `maswe/conflicting-${run.id}`;
+      await execFileAsync("git", ["worktree", "remove", "--force", canonicalPath], { cwd });
+      await execFileAsync("git", ["branch", conflictingBranch, run.workspace.headSha], { cwd });
+      await execFileAsync("git", ["worktree", "add", canonicalPath, conflictingBranch], { cwd });
+    },
+  },
+  {
+    name: "registered HEAD conflicts with recorded HEAD",
+    expected: /registered.*HEAD|registration.*HEAD/i,
+    arrange: async ({ run }) => {
+      assert.ok(run.workspace?.worktreePath);
+      await execFileAsync("git", ["commit", "--allow-empty", "-qm", "move registered head"], {
+        cwd: run.workspace.worktreePath,
+      });
     },
   },
   {

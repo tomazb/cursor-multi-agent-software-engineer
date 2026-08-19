@@ -76,7 +76,7 @@ test("build/CI/verify events record the evaluated head SHA", async () => {
   assert.equal(run.evidence?.verification?.headSha, run.workspace?.headSha);
 });
 
-test("new commits invalidate prior verification evidence", async () => {
+test("new commits reject merge-ready without mutating prior verification evidence", async () => {
   const cwd = await initRepo();
   const orchestrator = new Orchestrator(cwd, testConfig(), new MockRuntime());
   let run = await orchestrator.start("Invalidate", "Fresh commit must invalidate evidence.");
@@ -90,10 +90,21 @@ test("new commits invalidate prior verification evidence", async () => {
   await execFileAsync("git", ["add", "src/extra.ts"], { cwd: worktree });
   await execFileAsync("git", ["commit", "-qm", "extra"], { cwd: worktree });
 
-  await assert.rejects(orchestrator.markMergeReady(run.id), /invalidat|stale|head sha/i);
+  const before = await orchestrator.store.load(run.id);
+  const beforeGate = structuredClone({
+    state: before.state,
+    events: before.events,
+    evidence: before.evidence,
+  });
+  await assert.rejects(
+    orchestrator.markMergeReady(run.id),
+    /registered HEAD .* does not match recorded workspace HEAD/i,
+  );
   run = await orchestrator.store.load(run.id);
-  assert.equal(run.evidence?.verification, undefined);
-  assert.equal(run.evidence?.quality, undefined);
+  assert.deepEqual(
+    { state: run.state, events: run.events, evidence: run.evidence },
+    beforeGate,
+  );
 });
 
 test("concurrent store writers cannot silently overwrite run state", async () => {

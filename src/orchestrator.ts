@@ -16,7 +16,9 @@ import {
   assertWorkingTreeScope,
   cleanupRunWorkspace,
   createDeterministicCommit,
+  externalWorktreePath,
   invalidateStaleEvidence,
+  listGitWorktreeRegistrations,
   refreshWorkspaceHead,
   workingDirectoryFor,
 } from "./git-workspace.ts";
@@ -1041,6 +1043,40 @@ export class Orchestrator {
     }
     if (!run.config.policy.useIsolatedWorktree || !run.workspace.worktreePath) {
       throw new Error(`${label} requires an isolated MASWE-managed worktree.`);
+    }
+
+    const canonicalWorktreePath = path.resolve(externalWorktreePath(run.repositoryPath, run.id));
+    if (run.workspace.worktreePath !== canonicalWorktreePath) {
+      throw new Error(`${label} requires the canonical MASWE-managed worktree path.`);
+    }
+    const canonicalBranch = `maswe/${run.id}`;
+    if (run.workspace.branch !== canonicalBranch) {
+      throw new Error(`${label} requires the canonical MASWE-managed branch ${canonicalBranch}.`);
+    }
+
+    const registrations = await listGitWorktreeRegistrations(run.repositoryPath);
+    const pathRegistration = registrations.find(
+      (registration) => registration.worktreePath === canonicalWorktreePath,
+    );
+    if (!pathRegistration) {
+      throw new Error(`${label} requires a registered canonical MASWE-managed worktree.`);
+    }
+    if (pathRegistration.prunable) {
+      throw new Error(`${label} rejected the prunable canonical worktree registration.`);
+    }
+    const branchRegistration = registrations.find(
+      (registration) => registration.branch === canonicalBranch,
+    );
+    if (
+      pathRegistration.branch !== canonicalBranch ||
+      branchRegistration?.worktreePath !== canonicalWorktreePath
+    ) {
+      throw new Error(`${label} requires the registered path and branch to identify the same worktree.`);
+    }
+    if (pathRegistration.headSha !== run.workspace.headSha) {
+      throw new Error(
+        `${label} rejected: registered HEAD ${pathRegistration.headSha} does not match recorded workspace HEAD ${run.workspace.headSha}.`,
+      );
     }
 
     const workdir = workingDirectoryFor(run);
