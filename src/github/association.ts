@@ -297,6 +297,26 @@ export class GitHubAssociationIndex {
       );
   }
 
+  async findAllByInstallation(
+    installationId: number,
+    repository?: string,
+  ): Promise<AssociationRecord[]> {
+    const records = await this.readAll();
+    return Object.values(records)
+      .filter(
+        (record) =>
+          record.installationId === installationId &&
+          (repository === undefined || record.repository === repository),
+      )
+      .map((record) => ({ ...record }))
+      .sort(
+        (left, right) =>
+          left.repository.localeCompare(right.repository) ||
+          left.pullRequestNumber - right.pullRequestNumber ||
+          left.runId.localeCompare(right.runId),
+      );
+  }
+
   async suspend(
     repository: string,
     pullRequestNumber: number,

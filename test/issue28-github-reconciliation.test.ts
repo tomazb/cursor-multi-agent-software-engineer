@@ -136,6 +136,9 @@ async function adapterHarness(
     wrapStore?: (store: FileRunStore) => RunStore;
     associationWriteRecords?: (filePath: string, content: string) => Promise<void>;
     afterAssociationCommitBeforeRouting?: (runId: string) => Promise<void>;
+    afterAssociationValidatedBeforeRouting?: (runId: string) => Promise<void>;
+    afterAssociationRoutedBeforeChecks?: (runId: string) => Promise<void>;
+    beforeCheckPost?: () => Promise<void>;
   } = {},
 ): Promise<AdapterHarness> {
   process.env[SECRET_ENV] = SECRET;
@@ -171,6 +174,7 @@ async function adapterHarness(
         return { status: 200, headers: {}, body: { check_runs: [] } };
       }
       if (method === "POST" && url.includes("/check-runs")) {
+        await options.beforeCheckPost?.();
         posts.push(structuredClone(requestOptions?.body as Record<string, unknown>));
         return { status: 201, headers: {}, body: { id: nextCheckId++ } };
       }
@@ -190,6 +194,12 @@ async function adapterHarness(
     ...(options.afterAssociationCommitBeforeRouting
       ? { afterAssociationCommitBeforeRouting: options.afterAssociationCommitBeforeRouting }
       : {}),
+    ...(options.afterAssociationValidatedBeforeRouting
+      ? { afterAssociationValidatedBeforeRouting: options.afterAssociationValidatedBeforeRouting }
+      : {}),
+    ...(options.afterAssociationRoutedBeforeChecks
+      ? { afterAssociationRoutedBeforeChecks: options.afterAssociationRoutedBeforeChecks }
+      : {}),
   });
   return {
     cwd,
@@ -202,6 +212,17 @@ async function adapterHarness(
       liveHead = headSha;
     },
   };
+}
+
+async function deleteInstallation(adapter: GitHubAppAdapter, deliveryId: string): Promise<void> {
+  const rawBody = JSON.stringify({ action: "deleted", installation: { id: 44 } });
+  const result = await adapter.handleWebhook({
+    deliveryId,
+    eventName: "installation",
+    signatureHeader: sign(rawBody),
+    rawBody,
+  });
+  assert.equal(result.status, 200);
 }
 
 async function deliver(harness: AdapterHarness, headSha: string, deliveryId: string): Promise<void> {
@@ -510,6 +531,86 @@ test("post-commit association fence blocks routing when authoritative identity c
       assert.equal(harness.posts.length, 0);
     });
   }
+});
+
+test("installation suspension that wins after association validation publishes no routing event", async (t) => {
+  let suspensionAdapter!: GitHubAppAdapter;
+  const harness = await adapterHarness(t, {
+    afterAssociationValidatedBeforeRouting: async () => {
+      await deleteInstallation(
+        suspensionAdapter,
+        "installation-deleted-after-association-validation",
+      );
+    },
+  });
+  suspensionAdapter = new GitHubAppAdapter({
+    cwd: harness.cwd,
+    config: config(),
+    store: harness.store,
+    http: { async request() { throw new Error("installation suspension must not call GitHub"); } },
+    tokenProvider: async () => {
+      throw new Error("installation suspension must not create a token");
+    },
+    synchronousWebhookDispatch: true,
+  });
+  await suspensionAdapter.initialize();
+  const before = await harness.store.load(harness.runId);
+
+  await assert.rejects(
+    deliver(harness, HEAD_B, "suspension-after-association-validation"),
+    /association.*changed|association.*active|routing/i,
+  );
+
+  const recovered = await harness.store.load(harness.runId);
+  assert.deepEqual(eventIdentity(recovered), eventIdentity(before));
+  assert.equal(recovered.github?.suspended, true);
+  assert.equal((await harness.index.find("owner/repo", 28))?.suspended, true);
+  assert.equal(harness.posts.length, 0);
+});
+
+test("installation suspension started after routing cannot publish checks against suspended state", async (t) => {
+  let harness!: AdapterHarness;
+  let suspensionAdapter!: GitHubAppAdapter;
+  let suspension: Promise<void> | undefined;
+  let eventHistoryDuringCheckPublication: unknown[] | undefined;
+  let staleCheckPosts = 0;
+  harness = await adapterHarness(t, {
+    afterAssociationRoutedBeforeChecks: async () => {
+      suspension = deleteInstallation(
+        suspensionAdapter,
+        "installation-deleted-after-association-routing",
+      );
+    },
+    beforeCheckPost: async () => {
+      const authoritative = await harness.store.load(harness.runId);
+      eventHistoryDuringCheckPublication = eventIdentity(authoritative);
+      if (authoritative.github?.suspended) staleCheckPosts += 1;
+    },
+  });
+  suspensionAdapter = new GitHubAppAdapter({
+    cwd: harness.cwd,
+    config: config(),
+    store: harness.store,
+    http: { async request() { throw new Error("installation suspension must not call GitHub"); } },
+    tokenProvider: async () => {
+      throw new Error("installation suspension must not create a token");
+    },
+    synchronousWebhookDispatch: true,
+  });
+  await suspensionAdapter.initialize();
+
+  await deliver(harness, HEAD_B, "suspension-after-association-routing");
+  assert.ok(suspension, "post-route suspension interleaving was not injected");
+  await suspension;
+
+  const recovered = await harness.store.load(harness.runId);
+  assert.equal(staleCheckPosts, 0);
+  assert.ok(eventHistoryDuringCheckPublication);
+  assert.deepEqual(eventIdentity(recovered), eventHistoryDuringCheckPublication);
+  assert.equal(recovered.events.at(-1)?.type, "REVALIDATE_REQUESTED");
+  assert.equal(recovered.github?.suspended, true);
+  assert.equal((await harness.index.find("owner/repo", 28))?.suspended, true);
+  assert.ok(harness.posts.length > 0);
 });
 
 test("association rollback callbacks run in reverse and aggregate every known-failure callback error", async (t) => {

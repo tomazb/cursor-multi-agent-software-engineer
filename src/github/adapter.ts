@@ -99,6 +99,10 @@ export class GitHubAppAdapter {
   private readonly beforeAssociationTransaction: ((deliveryId: string) => Promise<void>) | undefined;
   private readonly afterAssociationCommitBeforeRouting:
     ((runId: string) => Promise<void>) | undefined;
+  private readonly afterAssociationValidatedBeforeRouting:
+    ((runId: string) => Promise<void>) | undefined;
+  private readonly afterAssociationRoutedBeforeChecks:
+    ((runId: string) => Promise<void>) | undefined;
   private journalInitialization: Promise<void> | undefined;
   private inboxInitialization: Promise<void> | undefined;
   private readonly webhookWorker: GitHubWebhookWorker;
@@ -128,6 +132,10 @@ export class GitHubAppAdapter {
     beforeAssociationTransaction?: (deliveryId: string) => Promise<void>;
     /** Deterministic crash seam after association commit and before workflow routing. */
     afterAssociationCommitBeforeRouting?: (runId: string) => Promise<void>;
+    /** Deterministic concurrency seam after the advisory validation, before identity fencing. */
+    afterAssociationValidatedBeforeRouting?: (runId: string) => Promise<void>;
+    /** Deterministic concurrency seam while identity-fenced after routing, before checks. */
+    afterAssociationRoutedBeforeChecks?: (runId: string) => Promise<void>;
     /** Deterministic test seam for association index commit failures. */
     associationWriteRecords?: (filePath: string, content: string) => Promise<void>;
   }) {
@@ -139,6 +147,9 @@ export class GitHubAppAdapter {
     this.afterManualRunLoaded = options.afterManualRunLoaded;
     this.beforeAssociationTransaction = options.beforeAssociationTransaction;
     this.afterAssociationCommitBeforeRouting = options.afterAssociationCommitBeforeRouting;
+    this.afterAssociationValidatedBeforeRouting =
+      options.afterAssociationValidatedBeforeRouting;
+    this.afterAssociationRoutedBeforeChecks = options.afterAssociationRoutedBeforeChecks;
     const root = githubStateRoot(options.cwd);
     this.root = root;
     this.inbox = new GitHubDeliveryInbox(root, options.inboxOptions);
@@ -413,23 +424,9 @@ export class GitHubAppAdapter {
           });
           return { run, previousHeadSha, pendingHeadShas, committedAssociation };
         });
-        const routed = await this.routeAssociationHead(
+        return this.publishCommittedAssociation(
           publication.committedAssociation,
           publication.previousHeadSha,
-        );
-        await this.publishChecks(
-          routed,
-          routed.github!.repository,
-          routed.github!.pullRequestNumber,
-          liveHead,
-          routed.github!.installationId,
-          publication.pendingHeadShas,
-        );
-        return this.clearPublishedCancellationHeads(
-          routed.id,
-          routed.github!.repository,
-          routed.github!.pullRequestNumber,
-          liveHead,
           publication.pendingHeadShas,
         );
       },
@@ -445,6 +442,20 @@ export class GitHubAppAdapter {
       this.root,
       "publication",
       `${repository.toLowerCase()}#${pullRequestNumber}`,
+      callback,
+      { timeoutMs: 60_000 },
+    );
+  }
+
+  private async withAssociationIdentityFence<T>(
+    repository: string,
+    pullRequestNumber: number,
+    callback: () => Promise<T>,
+  ): Promise<T> {
+    return withGitHubJournal(
+      this.root,
+      "publication",
+      `association:${repository.toLowerCase()}#${pullRequestNumber}`,
       callback,
       { timeoutMs: 60_000 },
     );
@@ -513,7 +524,6 @@ export class GitHubAppAdapter {
     expected: AssociationRoutingIdentity,
     previousHeadSha: string | undefined,
   ): Promise<RunRecord> {
-    await this.afterAssociationCommitBeforeRouting?.(expected.runId);
     const authoritative = await this.loadActiveCommittedAssociation(expected);
     const requestedHeadSha = expected.headSha;
     const priorAssociationHeadSha =
@@ -554,6 +564,39 @@ export class GitHubAppAdapter {
       actor: "github-app",
     });
     return this.loadActiveCommittedAssociation(expected);
+  }
+
+  private async publishCommittedAssociation(
+    expected: AssociationRoutingIdentity,
+    previousHeadSha: string | undefined,
+    pendingHeadShas: readonly string[],
+  ): Promise<RunRecord> {
+    await this.afterAssociationCommitBeforeRouting?.(expected.runId);
+    await this.loadActiveCommittedAssociation(expected);
+    await this.afterAssociationValidatedBeforeRouting?.(expected.runId);
+    return this.withAssociationIdentityFence(
+      expected.repository,
+      expected.pullRequestNumber,
+      async () => {
+        const routed = await this.routeAssociationHead(expected, previousHeadSha);
+        await this.afterAssociationRoutedBeforeChecks?.(expected.runId);
+        await this.publishChecks(
+          routed,
+          expected.repository,
+          expected.pullRequestNumber,
+          expected.headSha,
+          expected.installationId,
+          pendingHeadShas,
+        );
+        return this.clearPublishedCancellationHeads(
+          expected.runId,
+          expected.repository,
+          expected.pullRequestNumber,
+          expected.headSha,
+          pendingHeadShas,
+        );
+      },
+    );
   }
 
   private async loadActiveCommittedAssociation(
@@ -640,8 +683,10 @@ export class GitHubAppAdapter {
   private async dispatch(event: GitHubInternalEvent, app: GitHubAppConfig): Promise<void> {
     if (event.type === "installation.deleted") {
       if (event.installationId !== undefined) {
-        const suspended = await this.associations.suspendInstallation(event.installationId);
-        await this.suspendRunRecords(suspended.map((record) => record.runId));
+        const associations = await this.associations.findAllByInstallation(
+          event.installationId,
+        );
+        await this.suspendAssociations(associations);
       }
       return;
     }
@@ -654,15 +699,13 @@ export class GitHubAppAdapter {
           : event.repository
             ? [event.repository]
             : [];
-      const runIds: string[] = [];
       for (const repository of repositories) {
-        const suspended = await this.associations.suspendRepository(
+        const associations = await this.associations.findAllByInstallation(
           event.installationId,
           repository,
         );
-        runIds.push(...suspended.map((record) => record.runId));
+        await this.suspendAssociations(associations);
       }
-      await this.suspendRunRecords(runIds);
       return;
     }
 
@@ -689,31 +732,61 @@ export class GitHubAppAdapter {
     }
   }
 
-  private async suspendRunRecords(runIds: string[]): Promise<void> {
-    for (const runId of runIds) {
-      let run: RunRecord;
-      try {
-        run = await this.store.load(runId);
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code === "ENOENT") continue;
-        if (error instanceof Error && /not found|missing/i.test(error.message)) continue;
-        throw error;
-      }
-      if (!run.github) continue;
-      if (
-        run.github.suspended &&
-        run.github.suspensionReason === "authorization-revoked"
-      ) {
-        continue;
-      }
-      run.github = {
-        ...run.github,
-        suspended: true,
-        suspensionReason: "authorization-revoked",
-      };
-      await this.store.save(run);
+  private async suspendAssociations(
+    associations: readonly AssociationRecord[],
+  ): Promise<void> {
+    for (const expected of associations) {
+      await this.withAssociationIdentityFence(
+        expected.repository,
+        expected.pullRequestNumber,
+        async () => {
+          const association = await this.associations.find(
+            expected.repository,
+            expected.pullRequestNumber,
+          );
+          if (!association || association.installationId !== expected.installationId) return;
+          const suspended = await this.associations.suspend(
+            association.repository,
+            association.pullRequestNumber,
+            "authorization-revoked",
+          );
+          if (suspended) await this.suspendRunRecord(suspended);
+        },
+      );
     }
+  }
+
+  private async suspendRunRecord(association: AssociationRecord): Promise<void> {
+    const runId = association.runId;
+    let run: RunRecord;
+    try {
+      run = await this.store.load(runId);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return;
+      if (error instanceof Error && /not found|missing/i.test(error.message)) return;
+      throw error;
+    }
+    if (!run.github) return;
+    if (
+      run.github.installationId !== association.installationId ||
+      run.github.repository !== association.repository ||
+      run.github.pullRequestNumber !== association.pullRequestNumber
+    ) {
+      return;
+    }
+    if (
+      run.github.suspended &&
+      run.github.suspensionReason === "authorization-revoked"
+    ) {
+      return;
+    }
+    run.github = {
+      ...run.github,
+      suspended: true,
+      suspensionReason: "authorization-revoked",
+    };
+    await this.store.save(run);
   }
 
   private async handlePushEvent(event: GitHubInternalEvent): Promise<void> {
@@ -917,23 +990,9 @@ export class GitHubAppAdapter {
       });
 
       if (publication.kind === "publish") {
-        const routed = await this.routeAssociationHead(
+        await this.publishCommittedAssociation(
           publication.committedAssociation,
           publication.previousHeadSha,
-        );
-        await this.publishChecks(
-          routed,
-          repository,
-          pullRequestNumber,
-          headSha,
-          installationId,
-          publication.pendingHeadShas,
-        );
-        await this.clearPublishedCancellationHeads(
-          routed.id,
-          repository,
-          pullRequestNumber,
-          headSha,
           publication.pendingHeadShas,
         );
         return;
