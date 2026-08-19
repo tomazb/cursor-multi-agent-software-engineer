@@ -58,22 +58,11 @@ function isCanonicalFileStoreTimestamp(value: string): boolean {
   return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
 }
 
-function isOrderedFileStorePublicationTimestamp(
-  priorUpdatedAt: string,
-  eventAt: string | undefined,
-  observedUpdatedAt: string,
+function areCanonicalFileStoreTimestamps(
+  ...values: Array<string | undefined>
 ): boolean {
-  if (
-    !isCanonicalFileStoreTimestamp(priorUpdatedAt) ||
-    !isCanonicalFileStoreTimestamp(observedUpdatedAt) ||
-    (eventAt !== undefined && !isCanonicalFileStoreTimestamp(eventAt))
-  ) {
-    return false;
-  }
-  return (
-    observedUpdatedAt >= priorUpdatedAt &&
-    (eventAt === undefined ||
-      (eventAt >= priorUpdatedAt && observedUpdatedAt >= eventAt))
+  return values.every(
+    (value) => value === undefined || isCanonicalFileStoreTimestamp(value),
   );
 }
 
@@ -956,7 +945,7 @@ export class Orchestrator {
       expected.events = observed.events;
       const completePublication =
         observed.version === prior.version + 1 &&
-        isOrderedFileStorePublicationTimestamp(
+        areCanonicalFileStoreTimestamps(
           prior.updatedAt,
           retryEvent?.at,
           observed.updatedAt,
@@ -978,7 +967,7 @@ export class Orchestrator {
         oneStepConflict.updatedAt = observed.updatedAt;
         const validOneStepConflict =
           observed.version === prior.version + 1 &&
-          isOrderedFileStorePublicationTimestamp(
+          areCanonicalFileStoreTimestamps(
             prior.updatedAt,
             undefined,
             observed.updatedAt,

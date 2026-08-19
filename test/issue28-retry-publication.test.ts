@@ -39,8 +39,10 @@ type RetryInjection =
   | "before-malformed-timestamp"
   | "before-unbounded-timestamp"
   | "complete-after"
+  | "complete-event-clock-regression-after"
   | "complete-malformed-event-timestamp-after"
   | "complete-malformed-timestamp-after"
+  | "complete-save-clock-regression-after"
   | "complete-unbounded-timestamp-after"
   | "failure-restored-after";
 
@@ -124,6 +126,13 @@ class RetryInjectionStore implements RunStore {
         details?.previousFailure as NonNullable<RunRecord["failure"]>,
       );
       await this.delegate.save(published);
+    } else if (this.injection === "complete-event-clock-regression-after") {
+      published.events.at(-1)!.at = "2000-01-01T00:00:00.000Z";
+      await this.overwriteAuthoritative(published);
+    } else if (this.injection === "complete-save-clock-regression-after") {
+      const eventAt = published.events.at(-1)!.at;
+      published.updatedAt = new Date(Date.parse(eventAt) - 1_000).toISOString();
+      await this.overwriteAuthoritative(published);
     } else if (this.injection === "complete-malformed-event-timestamp-after") {
       published.events.at(-1)!.at = "not-a-file-store-timestamp";
       await this.overwriteAuthoritative(published);
@@ -443,6 +452,35 @@ test("retry rejects complete-looking publications with malformed timestamps", as
       assert.equal(authoritative.state, "WAITING_FOR_BRAINSTORM_APPROVAL");
       assert.equal(authoritative.failure, undefined);
       assert.equal(retryEvents(authoritative).length, 1);
+    });
+  }
+});
+
+test("retry adopts exact complete publications across wall-clock regression", async (t) => {
+  for (const injection of [
+    "complete-event-clock-regression-after",
+    "complete-save-clock-regression-after",
+  ] as const) {
+    await t.test(injection, async () => {
+      const cwd = publicationCwd;
+      const value = config();
+      const { run, store } = await createFailedRun(cwd, value);
+      const priorEventIds = new Set(run.events.map((event) => event.id));
+
+      const result = await new Orchestrator(
+        cwd,
+        value,
+        new MockRuntime(),
+        new RetryInjectionStore(store, injection),
+      ).retryFromFailed(run.id);
+      const authoritative = await new FileRunStore(cwd).load(result.id);
+      const currentRetries = retryEvents(authoritative).filter(
+        (event) => !priorEventIds.has(event.id),
+      );
+
+      assert.equal(authoritative.state, "WAITING_FOR_BRAINSTORM_APPROVAL");
+      assert.equal(authoritative.failure, undefined);
+      assert.equal(currentRetries.length, 1);
     });
   }
 });
