@@ -165,6 +165,10 @@ export interface OrchestratorOptions {
   afterDirtyRoleDeltaApplied?: () => Promise<void>;
   /** Deterministic barrier immediately before mutable-role ref publication. */
   beforeRoleRefPublish?: () => Promise<void>;
+  /** Deterministic barrier before reversing a rejected mutable-role publication. */
+  beforeRoleFailureRollback?: () => Promise<void>;
+  /** Deterministic barrier after rollback safety observation and before failure propagation. */
+  afterRoleFailureRollbackObserved?: () => Promise<void>;
 }
 
 interface ActiveRevalidationPreflight {
@@ -219,6 +223,8 @@ export class Orchestrator {
   private readonly afterRunMutationReload: OrchestratorOptions["afterRunMutationReload"];
   private readonly afterDirtyRoleDeltaApplied: OrchestratorOptions["afterDirtyRoleDeltaApplied"];
   private readonly beforeRoleRefPublish: OrchestratorOptions["beforeRoleRefPublish"];
+  private readonly beforeRoleFailureRollback: OrchestratorOptions["beforeRoleFailureRollback"];
+  private readonly afterRoleFailureRollbackObserved: OrchestratorOptions["afterRoleFailureRollbackObserved"];
 
   constructor(
     cwd: string,
@@ -239,6 +245,8 @@ export class Orchestrator {
     this.afterRunMutationReload = options.afterRunMutationReload;
     this.afterDirtyRoleDeltaApplied = options.afterDirtyRoleDeltaApplied;
     this.beforeRoleRefPublish = options.beforeRoleRefPublish;
+    this.beforeRoleFailureRollback = options.beforeRoleFailureRollback;
+    this.afterRoleFailureRollbackObserved = options.afterRoleFailureRollbackObserved;
     if (
       !Number.isSafeInteger(this.automaticTransitionLimit) ||
       this.automaticTransitionLimit <= 0
@@ -815,129 +823,104 @@ export class Orchestrator {
     commitSha: string,
     roleDelta: string,
     dirtyBaseline: boolean,
+    preserveManagedWorkspaceOnFailure: boolean,
   ): Promise<void> {
-    const indexLocation = await gitRun(["rev-parse", "--git-path", "index"], workdir);
-    if (indexLocation.exitCode !== 0) {
-      throw gitCommandFailure("Failed to locate authoritative Git index", indexLocation);
-    }
-    const rawIndexPath = indexLocation.stdout.trim();
-    const indexPath = path.isAbsolute(rawIndexPath)
-      ? rawIndexPath
-      : path.resolve(workdir, rawIndexPath);
-    const recoveryRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-role-index-"));
-    const backupIndexPath = path.join(recoveryRoot, "index");
-    let indexExisted = false;
+    const rollbackBaselineFingerprint = await captureWorkspaceSourceFingerprint(workdir);
+    let deltaApplied = false;
+    let publicationOutcomeUncertain = false;
+    let refPublished = false;
     try {
-      try {
-        const indexStat = await lstat(indexPath);
-        if (!indexStat.isFile()) throw new Error("Authoritative Git index is not a regular file");
-        await copyFile(indexPath, backupIndexPath);
-        indexExisted = true;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      await this.applyGitPatch(
+        workdir,
+        roleDelta,
+        "Failed to apply speculative role changes",
+      );
+      deltaApplied = true;
+      if (dirtyBaseline) await this.afterDirtyRoleDeltaApplied?.();
+      await this.beforeRoleRefPublish?.();
+      const published = await spawnCaptured(
+        "git",
+        ["update-ref", `refs/heads/${branch}`, commitSha, beforeSha],
+        { cwd: workdir, timeoutMs: 120_000 },
+      );
+      publicationOutcomeUncertain = published.timedOut === true;
+      if (published.timedOut) {
+        throw new Error("Authoritative role ref publication timed out after 120000ms");
       }
-      const rollbackBaselineFingerprint = await captureWorkspaceSourceFingerprint(workdir);
+      if (published.exitCode !== 0) {
+        throw gitCommandFailure("Failed to publish authoritative role commit", published);
+      }
+      refPublished = true;
+      const preparedIndex = await gitRun(["read-tree", commitSha], workdir);
+      if (preparedIndex.exitCode !== 0) {
+        throw gitCommandFailure("Failed to prepare authoritative role index", preparedIndex);
+      }
+    } catch (publicationError) {
+      if (refPublished || publicationOutcomeUncertain) {
+        throw new RolePublicationOutcomeUnknownError(
+          [publicationError],
+          "Role publication may have changed the authoritative ref or index; operator reconciliation is required",
+        );
+      }
 
-      let deltaApplied = false;
-      let publicationAttempted = false;
-      let publicationOutcomeUncertain = false;
+      const rollbackErrors: unknown[] = [];
       try {
-        await this.applyGitPatch(
-          workdir,
-          roleDelta,
-          "Failed to apply speculative role changes",
-        );
-        deltaApplied = true;
-        const preparedIndex = await gitRun(["read-tree", commitSha], workdir);
-        if (preparedIndex.exitCode !== 0) {
-          throw gitCommandFailure("Failed to prepare authoritative role index", preparedIndex);
-        }
-        if (dirtyBaseline) await this.afterDirtyRoleDeltaApplied?.();
-        await this.beforeRoleRefPublish?.();
-        publicationAttempted = true;
-        const published = await spawnCaptured(
-          "git",
-          ["update-ref", `refs/heads/${branch}`, commitSha, beforeSha],
-          { cwd: workdir, timeoutMs: 120_000 },
-        );
-        publicationOutcomeUncertain = published.timedOut === true;
-        if (published.timedOut) {
-          throw new Error("Authoritative role ref publication timed out after 120000ms");
-        }
-        if (published.exitCode !== 0) {
-          throw gitCommandFailure("Failed to publish authoritative role commit", published);
-        }
-      } catch (publicationError) {
-        const rollbackErrors: unknown[] = [];
-        if (publicationAttempted) {
-          let actualHeadSha: string | undefined;
-          let workspaceClean: boolean | undefined;
-          try {
-            actualHeadSha = await gitRevParse(workdir);
-            workspaceClean = await isGitWorkspaceClean(workdir);
-          } catch (error) {
-            rollbackErrors.push(error);
-          }
-          if (rollbackErrors.length > 0) {
-            throw new RolePublicationOutcomeUnknownError(
-              [publicationError, ...rollbackErrors],
-              "Role publication lost its branch compare-and-swap and the authoritative workspace could not be observed",
-            );
-          }
-          if (publicationOutcomeUncertain || actualHeadSha !== beforeSha) {
-            throw new RolePublicationOutcomeUnknownError(
-              [publicationError],
-              `Role publication outcome is uncertain; the authoritative checkout was observed at ${actualHeadSha} (${workspaceClean ? "clean" : "dirty"}); operator reconciliation is required`,
-            );
-          }
-        }
-        try {
-          if (indexExisted) await copyFile(backupIndexPath, indexPath);
-          else await rm(indexPath, { force: true });
-        } catch (error) {
-          rollbackErrors.push(error);
-        }
-        if (deltaApplied) {
-          try {
-            await this.applyGitPatch(
-              workdir,
-              roleDelta,
-              "Failed to reverse speculative role changes",
-              true,
-            );
-          } catch (error) {
-            rollbackErrors.push(error);
-          }
-        }
-        let actualHeadSha: string | undefined;
-        let workspaceClean: boolean | undefined;
-        let actualSourceFingerprint: string | undefined;
-        try {
-          actualHeadSha = await gitRevParse(workdir);
-          workspaceClean = await isGitWorkspaceClean(workdir);
-          actualSourceFingerprint = await captureWorkspaceSourceFingerprint(workdir);
-        } catch (error) {
-          rollbackErrors.push(error);
-        }
-        if (rollbackErrors.length > 0) {
-          throw new RolePublicationOutcomeUnknownError(
-            [publicationError, ...rollbackErrors],
-            "Role publication and authoritative workspace rollback failed",
-          );
-        }
-        if (
-          actualHeadSha !== beforeSha ||
-          actualSourceFingerprint !== rollbackBaselineFingerprint
-        ) {
-          throw new RolePublicationOutcomeUnknownError(
-            [publicationError],
-            `Role publication rollback did not restore the exact authoritative baseline at ${actualHeadSha} (${workspaceClean ? "clean" : "dirty"}); operator reconciliation is required`,
-          );
-        }
-        throw publicationError;
+        await this.beforeRoleFailureRollback?.();
+      } catch (error) {
+        rollbackErrors.push(error);
       }
-    } finally {
-      await rm(recoveryRoot, { recursive: true, force: true });
+      if (deltaApplied) {
+        try {
+          await this.applyGitPatch(
+            workdir,
+            roleDelta,
+            "Failed to reverse speculative role changes",
+            true,
+          );
+        } catch (error) {
+          rollbackErrors.push(error);
+        }
+      }
+      let actualHeadSha: string | undefined;
+      let workspaceClean: boolean | undefined;
+      let actualSourceFingerprint: string | undefined;
+      try {
+        actualHeadSha = await gitRevParse(workdir);
+        workspaceClean = await isGitWorkspaceClean(workdir);
+        actualSourceFingerprint = await captureWorkspaceSourceFingerprint(workdir);
+      } catch (error) {
+        rollbackErrors.push(error);
+      }
+      if (rollbackErrors.length > 0) {
+        throw new RolePublicationOutcomeUnknownError(
+          [publicationError, ...rollbackErrors],
+          "Role publication and authoritative workspace rollback failed; operator reconciliation is required",
+        );
+      }
+      if (
+        actualHeadSha !== beforeSha ||
+        actualSourceFingerprint !== rollbackBaselineFingerprint
+      ) {
+        throw new RolePublicationOutcomeUnknownError(
+          [publicationError],
+          `Role publication rollback did not restore the exact authoritative baseline at ${actualHeadSha} (${workspaceClean ? "clean" : "dirty"}); operator reconciliation is required`,
+        );
+      }
+      try {
+        await this.afterRoleFailureRollbackObserved?.();
+      } catch (error) {
+        throw new RolePublicationOutcomeUnknownError(
+          [publicationError, error],
+          "Role publication rollback observation failed; operator reconciliation is required",
+        );
+      }
+      if (preserveManagedWorkspaceOnFailure) {
+        throw new RolePublicationOutcomeUnknownError(
+          [publicationError],
+          "Role publication failed after speculative mutation; the managed workspace was preserved for operator reconciliation",
+        );
+      }
+      throw publicationError;
     }
   }
 
@@ -1737,6 +1720,7 @@ export class Orchestrator {
               committed.headSha,
               roleDelta,
               !authoritativeWasClean,
+              path.resolve(authoritativeWorkdir) !== path.resolve(run.repositoryPath),
             );
           }
           outputHeadSha = publishedHeadSha;

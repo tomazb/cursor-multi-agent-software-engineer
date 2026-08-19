@@ -429,6 +429,50 @@ test("ordinary role ref-lock failure restores the exact clean baseline", async (
   assert.equal(status, "");
 });
 
+test("rejected role publication does not overwrite a reset before rollback", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-role-lock-reset-window-");
+  await writeFile(path.join(cwd, "baseline.txt"), "B\n", "utf8");
+  await execFileAsync("git", ["add", "baseline.txt"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "B"], { cwd });
+  const { stdout: beforeHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  const { stdout: parentHead } = await execFileAsync("git", ["rev-parse", "HEAD^"], { cwd });
+  const { stdout: branch } = await execFileAsync("git", ["branch", "--show-current"], { cwd });
+  const { stdout: rawLockPath } = await execFileAsync(
+    "git",
+    ["rev-parse", "--git-path", `refs/heads/${branch.trim()}.lock`],
+    { cwd },
+  );
+  const lockPath = path.resolve(cwd, rawLockPath.trim());
+  const config = testConfig((c) => {
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+  const orchestrator = new Orchestrator(cwd, config, new EditingBuilderRuntime(), undefined, {
+    beforeRoleRefPublish: async () => {
+      await writeFile(lockPath, "ordinary ref lock failure\n", "utf8");
+    },
+    beforeRoleFailureRollback: async () => {
+      await rm(lockPath, { force: true });
+      await execFileAsync("git", ["reset", "--hard", parentHead.trim()], { cwd });
+    },
+  });
+  t.after(() => rm(lockPath, { force: true }));
+
+  const run = await orchestrator.start(
+    "Role rollback reset window",
+    "Do not overwrite a checkout that wins after ref rejection.",
+  );
+  const { stdout: afterHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  const { stdout: status } = await execFileAsync("git", ["status", "--porcelain"], { cwd });
+
+  assert.equal(run.state, "FAILED");
+  assert.match(run.failure?.message ?? "", /operator reconciliation|rollback failed/i);
+  assert.notEqual(beforeHead.trim(), parentHead.trim());
+  assert.equal(afterHead.trim(), parentHead.trim());
+  assert.equal(status, "");
+});
+
 test("role ref-lock failure preserves a concurrently changed managed worktree", async (t) => {
   const cwd = await initGitRepo(t, "maswe-isolated-role-lock-race-");
   const config = testConfig((c) => {
@@ -505,6 +549,81 @@ test("role ref-lock failure preserves a concurrently changed managed worktree", 
       () => false,
     ),
     false,
+  );
+});
+
+test("managed role publication failure preserves writes after rollback observation", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-isolated-role-late-write-");
+  const config = testConfig((c) => {
+    c.policy.useIsolatedWorktree = true;
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+  let winningWorktreePath: string | undefined;
+  let lockPath: string | undefined;
+  const orchestrator = new Orchestrator(cwd, config, new EditingBuilderRuntime(), undefined, {
+    beforeRoleRefPublish: async () => {
+      const { stdout } = await execFileAsync("git", ["worktree", "list", "--porcelain"], { cwd });
+      winningWorktreePath = stdout
+        .split("\n")
+        .filter((line) => line.startsWith("worktree "))
+        .map((line) => line.slice("worktree ".length))
+        .find((worktreePath) => path.resolve(worktreePath) !== path.resolve(cwd));
+      assert.ok(winningWorktreePath);
+      const { stdout: branch } = await execFileAsync("git", ["branch", "--show-current"], {
+        cwd: winningWorktreePath,
+      });
+      const { stdout: rawLockPath } = await execFileAsync(
+        "git",
+        ["rev-parse", "--git-path", `refs/heads/${branch.trim()}.lock`],
+        { cwd: winningWorktreePath },
+      );
+      lockPath = path.resolve(winningWorktreePath, rawLockPath.trim());
+      await writeFile(lockPath, "ordinary ref lock failure\n", "utf8");
+    },
+    afterRoleFailureRollbackObserved: async () => {
+      assert.ok(winningWorktreePath);
+      await writeFile(
+        path.join(winningWorktreePath, "late-external-change.txt"),
+        "late external winner\n",
+        "utf8",
+      );
+    },
+  });
+
+  const run = await orchestrator.start(
+    "Managed role late-write window",
+    "Preserve a managed checkout changed after rollback observation.",
+  );
+  assert.ok(winningWorktreePath);
+  assert.ok(lockPath);
+  t.after(async () => {
+    await rm(lockPath!, { force: true });
+    await execFileAsync("git", ["worktree", "remove", "--force", winningWorktreePath!], {
+      cwd,
+    }).catch(() => undefined);
+  });
+  const { stdout: registrations } = await execFileAsync(
+    "git",
+    ["worktree", "list", "--porcelain"],
+    { cwd },
+  );
+  const registeredWorktreePaths = registrations
+    .split("\n")
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => path.resolve(line.slice("worktree ".length)))
+    .sort();
+
+  assert.equal(run.state, "FAILED");
+  assert.match(run.failure?.message ?? "", /operator reconciliation/i);
+  assert.deepEqual(
+    registeredWorktreePaths,
+    [cwd, winningWorktreePath].map((worktreePath) => path.resolve(worktreePath)).sort(),
+  );
+  assert.equal(
+    await readFile(path.join(winningWorktreePath, "late-external-change.txt"), "utf8"),
+    "late external winner\n",
   );
 });
 
