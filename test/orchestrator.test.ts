@@ -394,6 +394,41 @@ test("clean speculative publication rejects an intervening authoritative branch 
   assert.notEqual(status, "");
 });
 
+test("ordinary role ref-lock failure restores the exact clean baseline", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-clean-role-lock-failure-");
+  const { stdout: beforeHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  const { stdout: branch } = await execFileAsync("git", ["branch", "--show-current"], { cwd });
+  const { stdout: rawLockPath } = await execFileAsync(
+    "git",
+    ["rev-parse", "--git-path", `refs/heads/${branch.trim()}.lock`],
+    { cwd },
+  );
+  const lockPath = path.resolve(cwd, rawLockPath.trim());
+  const config = testConfig((c) => {
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+  const orchestrator = new Orchestrator(cwd, config, new EditingBuilderRuntime(), undefined, {
+    beforeRoleRefPublish: async () => {
+      await writeFile(lockPath, "ordinary ref lock failure\n", "utf8");
+    },
+  });
+  t.after(() => rm(lockPath, { force: true }));
+
+  const run = await orchestrator.start(
+    "Clean role lock failure",
+    "Restore clean input when Git rejects publication before moving the ref.",
+  );
+  const { stdout: afterHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  const { stdout: status } = await execFileAsync("git", ["status", "--porcelain"], { cwd });
+
+  assert.equal(run.state, "FAILED");
+  assert.match(run.failure?.message ?? "", /failed to publish authoritative role commit/i);
+  assert.equal(afterHead.trim(), beforeHead.trim());
+  assert.equal(status, "");
+});
+
 test("lost role CAS preserves an externally reset winning checkout", async (t) => {
   const cwd = await initGitRepo(t, "maswe-clean-role-reset-cas-");
   await writeFile(path.join(cwd, "baseline.txt"), "B\n", "utf8");

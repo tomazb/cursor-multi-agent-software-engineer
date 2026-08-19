@@ -839,6 +839,7 @@ export class Orchestrator {
 
       let deltaApplied = false;
       let publicationAttempted = false;
+      let publicationOutcomeUncertain = false;
       try {
         await this.applyGitPatch(
           workdir,
@@ -853,10 +854,15 @@ export class Orchestrator {
         if (dirtyBaseline) await this.afterDirtyRoleDeltaApplied?.();
         await this.beforeRoleRefPublish?.();
         publicationAttempted = true;
-        const published = await gitRun(
+        const published = await spawnCaptured(
+          "git",
           ["update-ref", `refs/heads/${branch}`, commitSha, beforeSha],
-          workdir,
+          { cwd: workdir, timeoutMs: 120_000 },
         );
+        publicationOutcomeUncertain = published.timedOut === true;
+        if (published.timedOut) {
+          throw new Error("Authoritative role ref publication timed out after 120000ms");
+        }
         if (published.exitCode !== 0) {
           throw gitCommandFailure("Failed to publish authoritative role commit", published);
         }
@@ -877,10 +883,12 @@ export class Orchestrator {
               "Role publication lost its branch compare-and-swap and the authoritative workspace could not be observed",
             );
           }
-          throw new RolePublicationOutcomeUnknownError(
-            [publicationError],
-            `Role publication lost its branch compare-and-swap attempt; the authoritative checkout was left unchanged at ${actualHeadSha} (${workspaceClean ? "clean" : "dirty"}); operator reconciliation is required`,
-          );
+          if (publicationOutcomeUncertain || actualHeadSha !== beforeSha) {
+            throw new RolePublicationOutcomeUnknownError(
+              [publicationError],
+              `Role publication outcome is uncertain; the authoritative checkout was observed at ${actualHeadSha} (${workspaceClean ? "clean" : "dirty"}); operator reconciliation is required`,
+            );
+          }
         }
         try {
           if (indexExisted) await copyFile(backupIndexPath, indexPath);
