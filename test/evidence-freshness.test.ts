@@ -417,21 +417,6 @@ const currentHeadGateCases: Array<{
     },
   },
   {
-    name: "associated GitHub HEAD mismatch",
-    expected: /GitHub.*HEAD|associated.*HEAD|HEAD.*GitHub/i,
-    arrange: ({ run }) => {
-      assert.ok(run.workspace);
-      run.github = {
-        installationId: 28,
-        repository: "owner/repo",
-        pullRequestNumber: 28,
-        baseSha: run.workspace.baseSha,
-        headSha: HEAD_C,
-        branch: run.workspace.branch,
-      };
-    },
-  },
-  {
     name: "dirty worktree",
     expected: /clean.*worktree|worktree.*dirty/i,
     arrange: async ({ run }) => {
@@ -515,6 +500,48 @@ for (const gate of ["merge-ready", "complete"] as const) {
         );
       });
     }
+  });
+}
+
+for (const gate of ["merge-ready", "complete"] as const) {
+  test(`${gate} routes an associated GitHub HEAD mismatch before final-gate publication`, async (t) => {
+    const fixture = await prepareCurrentHeadGate(t, gate);
+    assert.ok(fixture.run.workspace);
+    fixture.run.github = {
+      installationId: 28,
+      repository: "owner/repo",
+      pullRequestNumber: 28,
+      baseSha: fixture.run.workspace.baseSha,
+      headSha: HEAD_C,
+      branch: fixture.run.workspace.branch,
+      suspended: false,
+    };
+    await fixture.orchestrator.store.save(fixture.run);
+    const before = await fixture.orchestrator.store.load(fixture.run.id);
+
+    await assert.rejects(
+      gate === "merge-ready"
+        ? fixture.orchestrator.markMergeReady(fixture.run.id)
+        : fixture.orchestrator.complete(fixture.run.id),
+      /revalidation|complete requires MERGE_READY/i,
+    );
+
+    const authoritative = await fixture.orchestrator.store.load(fixture.run.id);
+    assert.equal(authoritative.state, "CI_RUNNING");
+    assert.equal(authoritative.evidence, undefined);
+    assert.equal(authoritative.github?.headSha, HEAD_C);
+    assert.equal(authoritative.revalidation?.requestedHeadSha, HEAD_C);
+    assert.equal(authoritative.revalidation?.returnState, "PR_READY");
+    assert.equal(authoritative.revalidation?.generation, 1);
+    assert.equal(
+      authoritative.events.filter((event) => event.type === "REVALIDATE_REQUESTED").length,
+      1,
+    );
+    assert.equal(
+      authoritative.events.filter((event) => event.type === "MARK_MERGE_READY").length,
+      before.events.filter((event) => event.type === "MARK_MERGE_READY").length,
+    );
+    assert.equal(authoritative.events.some((event) => event.type === "COMPLETE"), false);
   });
 }
 

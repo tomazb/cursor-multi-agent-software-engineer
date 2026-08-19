@@ -408,6 +408,59 @@ export class Orchestrator {
     });
   }
 
+  private currentWorkflowTarget(run: RunRecord): string | undefined {
+    return run.revalidation?.requestedHeadSha ?? run.workspace?.headSha;
+  }
+
+  private async preflightCommittedAssociationHead(run: RunRecord): Promise<RunRecord> {
+    let snapshot = run;
+    for (let attempt = 0; attempt < REVALIDATION_STABILITY_ATTEMPTS; attempt += 1) {
+      const github = snapshot.github;
+      if (!github || github.suspended === true) return snapshot;
+      const currentTarget = this.currentWorkflowTarget(snapshot);
+      if (!currentTarget) {
+        throw new Error(
+          `Run ${run.id} has no authoritative workflow target for committed GitHub HEAD ${github.headSha}`,
+        );
+      }
+      if (github.headSha === currentTarget) return snapshot;
+
+      const committedHeadSha = github.headSha;
+      try {
+        await new RevalidationService(this.store).route(run.id, {
+          source: "github",
+          previousHeadSha: currentTarget,
+          requestedHeadSha: committedHeadSha,
+          expectedRunVersion: snapshot.version,
+          actor: "local-runner",
+        });
+      } catch (error) {
+        if (!(error instanceof RevalidationOptimisticConflictError)) throw error;
+        const authoritative = await this.store.load(run.id);
+        if (
+          authoritative.github?.suspended !== true &&
+          authoritative.github?.headSha === committedHeadSha &&
+          this.currentWorkflowTarget(authoritative) === committedHeadSha
+        ) {
+          return authoritative;
+        }
+        snapshot = authoritative;
+        continue;
+      }
+
+      const authoritative = await this.store.load(run.id);
+      if (
+        authoritative.github?.suspended !== true &&
+        authoritative.github?.headSha === committedHeadSha &&
+        this.currentWorkflowTarget(authoritative) === committedHeadSha
+      ) {
+        return authoritative;
+      }
+      snapshot = authoritative;
+    }
+    throw new Error(`Run ${run.id} committed GitHub association target did not stabilize`);
+  }
+
   private async preflightActiveRevalidation(
     run: RunRecord,
   ): Promise<ActiveRevalidationPreflight> {
@@ -601,6 +654,20 @@ export class Orchestrator {
     try {
       this.assertWithinBudget(run);
       let headSha: string | undefined;
+      if (
+        run.state === "BUILDING" ||
+        run.state === "CI_RUNNING" ||
+        run.state === "VERIFYING"
+      ) {
+        run = await this.preflightCommittedAssociationHead(run);
+        if (
+          run.state !== "BUILDING" &&
+          run.state !== "CI_RUNNING" &&
+          run.state !== "VERIFYING"
+        ) {
+          return run;
+        }
+      }
       if (
         run.revalidation &&
         (run.state === "BUILDING" || run.state === "CI_RUNNING" || run.state === "VERIFYING")
@@ -1219,7 +1286,8 @@ export class Orchestrator {
     gate: "merge-ready" | "complete",
     publish: (run: RunRecord, headSha: string) => Promise<RunRecord>,
   ): Promise<RunRecord> {
-    const initial = await this.store.load(runId);
+    const loaded = await this.store.load(runId);
+    const initial = await this.preflightCommittedAssociationHead(loaded);
     return withRunMutationFence(
       initial.repositoryPath,
       runId,

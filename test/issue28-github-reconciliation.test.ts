@@ -7,7 +7,13 @@ import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { mergeConfigForTest } from "../src/config.ts";
-import type { MasweConfig, RunRecord, WorkflowEventType } from "../src/domain.ts";
+import type {
+  MasweConfig,
+  RunRecord,
+  RuntimeRequest,
+  RuntimeResult,
+  WorkflowEventType,
+} from "../src/domain.ts";
 import {
   DurableAtomicWriteOutcomeUnknownError,
   writeDurableAtomic,
@@ -27,6 +33,34 @@ const HEAD_A = "a".repeat(40);
 const HEAD_B = "b".repeat(40);
 const HEAD_C = "c".repeat(40);
 const execFileAsync = promisify(execFile);
+
+function deferred<T = void>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
+
+async function within<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`Timed out waiting for ${label}`)),
+          15_000,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 function config(): MasweConfig {
   return mergeConfigForTest({
@@ -136,6 +170,159 @@ interface AdapterHarness {
   setLiveHead(headSha: string): void;
 }
 
+type AssociationRaceState = "BUILDING" | "CI_RUNNING" | "VERIFYING" | "MERGE_READY";
+
+interface AssociationRaceHarness {
+  cwd: string;
+  config: MasweConfig;
+  store: FileRunStore;
+  runId: string;
+  headB: string;
+  headC: string;
+  adapter: GitHubAppAdapter;
+}
+
+class HeadRecordingRuntime extends MockRuntime {
+  readonly executions: Array<{ role: RuntimeRequest["role"]; headSha: string }> = [];
+
+  override async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    const headSha = (await execFileAsync("git", ["rev-parse", "HEAD"], {
+      cwd: request.cwd,
+    })).stdout.trim();
+    this.executions.push({ role: request.role, headSha });
+    return super.execute(request);
+  }
+}
+
+async function associationRaceHarness(
+  t: test.TestContext,
+  state: AssociationRaceState,
+  afterAssociationCommitBeforeRouting: (runId: string) => Promise<void>,
+): Promise<AssociationRaceHarness> {
+  process.env[SECRET_ENV] = SECRET;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-issue28-association-race-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  await execFileAsync("git", ["init", "-q"], { cwd });
+  await execFileAsync("git", ["config", "user.email", "maswe@example.com"], { cwd });
+  await execFileAsync("git", ["config", "user.name", "MASWE"], { cwd });
+  await writeFile(path.join(cwd, "tracked.txt"), "A\n", "utf8");
+  await execFileAsync("git", ["add", "tracked.txt"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "A"], { cwd });
+  await execFileAsync("git", ["branch", "-M", "maswe/issue-28"], { cwd });
+  const headA = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim();
+  await writeFile(path.join(cwd, "tracked.txt"), "B\n", "utf8");
+  await execFileAsync("git", ["commit", "-qam", "B"], { cwd });
+  const headB = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim();
+  await execFileAsync("git", ["switch", "-qc", "future-c"], { cwd });
+  await writeFile(path.join(cwd, "tracked.txt"), "C\n", "utf8");
+  await execFileAsync("git", ["commit", "-qam", "C"], { cwd });
+  const headC = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim();
+  await execFileAsync("git", ["switch", "maswe/issue-28"], { cwd });
+
+  const value = config();
+  value.policy.useIsolatedWorktree = false;
+  value.quality.commands = [];
+  const store = new FileRunStore(cwd);
+  let run = await store.create("association race", "route C before local work", value);
+  for (const [type, actor] of [
+    ["START", "user"],
+    ["BRAINSTORM_COMPLETED", "brainstormer"],
+    ["APPROVE_BRAINSTORM", "user"],
+    ["DESIGN_COMPLETED", "designer"],
+    ["APPROVE_DESIGN", "user"],
+    ["BUILD_COMPLETED", "builder"],
+    ["CI_PASSED", "quality"],
+    ["VERIFY_PASSED", "verifier"],
+    ["PR_OPENED", "github-app"],
+  ] as Array<[WorkflowEventType, string]>) {
+    run = await store.applyEvent(run, type, actor);
+  }
+  run.workspace = await captureWorkspace(cwd);
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 28,
+    baseSha: headA,
+    headSha: headB,
+    branch: "maswe/issue-28",
+    suspended: false,
+  };
+  run.evidence = {
+    quality: { headSha: headB, passed: true, at: "2026-08-19T09:00:00.000Z" },
+    verification: { headSha: headB, passed: true, at: "2026-08-19T09:01:00.000Z" },
+    mergeReady: { headSha: headB, passed: true, at: "2026-08-19T09:02:00.000Z" },
+  };
+  await store.save(run);
+
+  if (state === "MERGE_READY") {
+    run = await store.applyEvent(run, "MARK_MERGE_READY", "user", { headSha: headB });
+  } else {
+    run = await store.applyEvent(run, "REVIEW_COMMENT_RECEIVED", "github");
+    run = await store.applyEvent(run, "COMMENT_IN_SCOPE", "pr-comment-classifier");
+    run = await store.applyEvent(run, "RESOLUTION_COMPLETED", "prResolver");
+    if (state === "VERIFYING" || state === "BUILDING") {
+      run = await store.applyEvent(run, "CI_PASSED", "quality-runner");
+    }
+    if (state === "BUILDING") {
+      run = await store.applyEvent(run, "VERIFY_FAILED", "verifier");
+    }
+  }
+  assert.equal(run.state, state);
+  assert.equal(run.revalidation, undefined);
+
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  await index.bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 28,
+    baseSha: headA,
+    headSha: headB,
+    branch: "maswe/issue-28",
+  });
+  let nextCheckId = 1;
+  const http: GitHubHttpClient = {
+    async request(method, url) {
+      if (method === "GET" && url.includes("/pulls/")) {
+        return { status: 200, headers: {}, body: { head: { sha: headC }, state: "open" } };
+      }
+      if (method === "GET" && url.includes("/check-runs")) {
+        return { status: 200, headers: {}, body: { check_runs: [] } };
+      }
+      return { status: 201, headers: {}, body: { id: nextCheckId++ } };
+    },
+  };
+  const adapter = new GitHubAppAdapter({
+    cwd,
+    config: value,
+    store,
+    http,
+    tokenProvider: async () => "test-token",
+    synchronousWebhookDispatch: true,
+    afterAssociationCommitBeforeRouting,
+  });
+  return { cwd, config: value, store, runId: run.id, headB, headC, adapter };
+}
+
+async function deliverAssociationRace(
+  harness: AssociationRaceHarness,
+  deliveryId: string,
+): Promise<void> {
+  const current = await harness.store.load(harness.runId);
+  assert.ok(current.github);
+  const rawBody = JSON.stringify(prPayload(harness.headC, current.github.baseSha));
+  await harness.adapter.handleWebhook({
+    deliveryId,
+    eventName: "pull_request",
+    signatureHeader: sign(rawBody),
+    rawBody,
+  });
+}
+
+function initialRevalidationPublications(run: RunRecord): number {
+  return run.events.filter((event) => event.type === "REVALIDATE_REQUESTED").length;
+}
+
 async function adapterHarness(
   t: test.TestContext,
   options: {
@@ -221,6 +408,274 @@ async function adapterHarness(
       liveHead = headSha;
     },
   };
+}
+
+for (const state of ["CI_RUNNING", "VERIFYING", "BUILDING"] as const) {
+  test(`local ${state} entry routes a committed C association before stale B work`, async (t) => {
+    const associationCommitted = deferred();
+    const resumeWebhook = deferred();
+    const harness = await associationRaceHarness(t, state, async () => {
+      associationCommitted.resolve();
+      await resumeWebhook.promise;
+    });
+    const before = await harness.store.load(harness.runId);
+    const runtime = new HeadRecordingRuntime();
+    const orchestrator = new Orchestrator(
+      harness.cwd,
+      harness.config,
+      runtime,
+      harness.store,
+    );
+    const webhook = deliverAssociationRace(
+      harness,
+      `local-${state.toLowerCase()}-association-race`,
+    );
+
+    await within(associationCommitted.promise, `${state} association commit`);
+    let afterLocal: RunRecord;
+    try {
+      await within(orchestrator.advance(harness.runId), `${state} local advance`);
+      afterLocal = await harness.store.load(harness.runId);
+    } finally {
+      resumeWebhook.resolve();
+      await within(webhook, `${state} webhook completion`);
+    }
+
+    assert.equal(
+      runtime.executions.some((execution) => execution.headSha === harness.headB),
+      false,
+      `${state} must not invoke a role against B`,
+    );
+    assert.equal(
+      afterLocal.artifacts.some((artifact) => artifact.logicalName === "05-quality-report.md"),
+      false,
+      `${state} must not publish a quality artifact against B`,
+    );
+    assert.equal(
+      afterLocal.events.filter((event) => event.type === "CI_PASSED").length,
+      before.events.filter((event) => event.type === "CI_PASSED").length,
+      `${state} must not publish a quality result against B`,
+    );
+    assert.equal(afterLocal.github?.headSha, harness.headC);
+    assert.equal(afterLocal.revalidation?.requestedHeadSha, harness.headC);
+    assert.equal(afterLocal.revalidation?.returnState, "PR_REVIEW");
+    assert.equal(afterLocal.revalidation?.generation, 1);
+    assert.equal(initialRevalidationPublications(afterLocal), 1);
+
+    const authoritative = await harness.store.load(harness.runId);
+    assert.equal(authoritative.github?.headSha, harness.headC);
+    assert.equal(authoritative.revalidation?.requestedHeadSha, harness.headC);
+    assert.equal(authoritative.revalidation?.generation, 1);
+    assert.equal(initialRevalidationPublications(authoritative), 1);
+  });
+}
+
+test("local advance repairs a committed C association after the webhook process crashes", async (t) => {
+  const harness = await associationRaceHarness(t, "BUILDING", async () => {
+    throw new Error("simulated webhook crash after association commit");
+  });
+  await assert.rejects(
+    deliverAssociationRace(harness, "crash-before-association-routing"),
+    /webhook crash after association commit/,
+  );
+  const committed = await harness.store.load(harness.runId);
+  assert.equal(committed.github?.headSha, harness.headC);
+  assert.equal(committed.workspace?.headSha, harness.headB);
+  assert.equal(committed.revalidation, undefined);
+
+  const runtime = new HeadRecordingRuntime();
+  await new Orchestrator(
+    harness.cwd,
+    harness.config,
+    runtime,
+    harness.store,
+  ).advance(harness.runId);
+
+  const recovered = await harness.store.load(harness.runId);
+  assert.equal(
+    runtime.executions.some((execution) => execution.headSha === harness.headB),
+    false,
+  );
+  assert.equal(recovered.github?.headSha, harness.headC);
+  assert.equal(recovered.revalidation?.requestedHeadSha, harness.headC);
+  assert.equal(recovered.revalidation?.returnState, "PR_REVIEW");
+  assert.equal(recovered.revalidation?.generation, 1);
+  assert.equal(initialRevalidationPublications(recovered), 1);
+});
+
+test("complete routes a committed C association before stale B merge-ready evidence", async (t) => {
+  const harness = await associationRaceHarness(t, "MERGE_READY", async () => {
+    throw new Error("simulated webhook crash before merge-ready routing");
+  });
+  await assert.rejects(
+    deliverAssociationRace(harness, "merge-ready-crash-before-routing"),
+    /webhook crash before merge-ready routing/,
+  );
+
+  await assert.rejects(new Orchestrator(
+    harness.cwd,
+    harness.config,
+    new HeadRecordingRuntime(),
+    harness.store,
+  ).complete(harness.runId));
+
+  const authoritative = await harness.store.load(harness.runId);
+  assert.equal(authoritative.events.some((event) => event.type === "COMPLETE"), false);
+  assert.equal(authoritative.evidence, undefined);
+  assert.equal(authoritative.github?.headSha, harness.headC);
+  assert.equal(authoritative.revalidation?.requestedHeadSha, harness.headC);
+  assert.equal(authoritative.revalidation?.returnState, "PR_REVIEW");
+  assert.equal(authoritative.revalidation?.generation, 1);
+  assert.equal(initialRevalidationPublications(authoritative), 1);
+});
+
+test("local preflight accepts a webhook-won C route without a duplicate generation", async (t) => {
+  const associationCommitted = deferred();
+  const resumeWebhook = deferred();
+  const harness = await associationRaceHarness(t, "VERIFYING", async () => {
+    associationCommitted.resolve();
+    await resumeWebhook.promise;
+  });
+  const localSnapshotLoaded = deferred();
+  const resumeLocal = deferred();
+  let pauseNextLoad = true;
+  const localStore: RunStore = {
+    create: harness.store.create.bind(harness.store),
+    save: harness.store.save.bind(harness.store),
+    async load(runId) {
+      const snapshot = await harness.store.load(runId);
+      if (pauseNextLoad) {
+        pauseNextLoad = false;
+        localSnapshotLoaded.resolve();
+        await resumeLocal.promise;
+      }
+      return snapshot;
+    },
+    list: harness.store.list.bind(harness.store),
+    applyEvent: harness.store.applyEvent.bind(harness.store),
+    writeArtifact: harness.store.writeArtifact.bind(harness.store),
+    readArtifact: harness.store.readArtifact.bind(harness.store),
+  };
+  const runtime = new HeadRecordingRuntime();
+  const webhook = deliverAssociationRace(harness, "webhook-wins-local-preflight-race");
+
+  await within(associationCommitted.promise, "inversion association commit");
+  const localAdvance = new Orchestrator(
+    harness.cwd,
+    harness.config,
+    runtime,
+    localStore,
+  ).advance(harness.runId);
+  await within(localSnapshotLoaded.promise, "stale local preflight snapshot");
+  resumeWebhook.resolve();
+  await within(webhook, "webhook-winning C route");
+  resumeLocal.resolve();
+  await within(localAdvance, "local optimistic-conflict reconciliation");
+
+  const authoritative = await harness.store.load(harness.runId);
+  assert.equal(
+    runtime.executions.some((execution) => execution.headSha === harness.headB),
+    false,
+  );
+  assert.equal(authoritative.github?.headSha, harness.headC);
+  assert.equal(authoritative.revalidation?.requestedHeadSha, harness.headC);
+  assert.equal(authoritative.revalidation?.returnState, "PR_REVIEW");
+  assert.equal(authoritative.revalidation?.generation, 1);
+  assert.equal(initialRevalidationPublications(authoritative), 1);
+});
+
+for (const winnerState of ["FAILED", "PR_REVIEW"] as const) {
+  test(`local preflight preserves a webhook-won C route that already reached ${winnerState}`, async (t) => {
+    const associationCommitted = deferred();
+    const resumeWebhook = deferred();
+    const harness = await associationRaceHarness(t, "VERIFYING", async () => {
+      associationCommitted.resolve();
+      await resumeWebhook.promise;
+    });
+    const localSnapshotLoaded = deferred();
+    const resumeLocal = deferred();
+    let pauseNextLoad = true;
+    const localStore: RunStore = {
+      create: harness.store.create.bind(harness.store),
+      save: harness.store.save.bind(harness.store),
+      async load(runId) {
+        const snapshot = await harness.store.load(runId);
+        if (pauseNextLoad) {
+          pauseNextLoad = false;
+          localSnapshotLoaded.resolve();
+          await resumeLocal.promise;
+        }
+        return snapshot;
+      },
+      list: harness.store.list.bind(harness.store),
+      applyEvent: harness.store.applyEvent.bind(harness.store),
+      writeArtifact: harness.store.writeArtifact.bind(harness.store),
+      readArtifact: harness.store.readArtifact.bind(harness.store),
+    };
+    const webhook = deliverAssociationRace(
+      harness,
+      `webhook-wins-through-${winnerState.toLowerCase()}`,
+    );
+    await within(associationCommitted.promise, `${winnerState} association commit`);
+    const localAdvance = new Orchestrator(
+      harness.cwd,
+      harness.config,
+      new HeadRecordingRuntime(),
+      localStore,
+    ).advance(harness.runId);
+    await within(localSnapshotLoaded.promise, `${winnerState} stale local snapshot`);
+    resumeWebhook.resolve();
+    await within(webhook, `${winnerState} webhook route`);
+
+    let winner = await harness.store.load(harness.runId);
+    if (winnerState === "FAILED") {
+      winner.failure = {
+        code: "workflow-failure",
+        message: "preserve the winning failure",
+        at: "2026-08-19T14:00:00.000Z",
+        resumeState: "CI_RUNNING",
+      };
+      winner = await harness.store.applyEvent(winner, "FAIL", "winning-worker", {
+        reason: "preserve the winning failure",
+        resumeState: "CI_RUNNING",
+      });
+    } else {
+      await execFileAsync("git", ["merge", "--ff-only", "future-c"], { cwd: harness.cwd });
+      winner.workspace = await captureWorkspace(harness.cwd);
+      winner.evidence = {
+        quality: {
+          headSha: harness.headC,
+          passed: true,
+          at: "2026-08-19T14:00:00.000Z",
+        },
+      };
+      winner = await harness.store.applyEvent(winner, "CI_PASSED", "winning-quality", {
+        headSha: harness.headC,
+        passed: true,
+        required: true,
+      });
+      winner.evidence = {
+        ...winner.evidence,
+        verification: {
+          headSha: harness.headC,
+          passed: true,
+          at: "2026-08-19T14:01:00.000Z",
+        },
+      };
+      delete winner.revalidation;
+      winner = await harness.store.applyEvent(
+        winner,
+        "VERIFY_PASSED_AFTER_REVIEW",
+        "winning-verifier",
+        { headSha: harness.headC },
+      );
+    }
+    const expectedWinner = structuredClone(winner);
+    resumeLocal.resolve();
+    await within(localAdvance, `${winnerState} local adoption`);
+
+    assert.deepEqual(await harness.store.load(harness.runId), expectedWinner);
+  });
 }
 
 async function deleteInstallation(adapter: GitHubAppAdapter, deliveryId: string): Promise<void> {
