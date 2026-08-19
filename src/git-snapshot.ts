@@ -52,7 +52,7 @@ function isRunMutationJournalPath(segments: string[]): boolean {
  * - canonical entries in exact
  *   `runs/<run-id>/.mutation-journal-v1/.lock-journal-v3/` journals
  *   (unexpected or malformed entries remain fingerprint-visible)
- * - `*.tmp` write staging files
+ * - `*.tmp` write staging files outside exact journal namespaces
  *
  * The Git-plane fingerprint pathspec-excludes `.maswe/` entirely; this hasher is
  * the sole `.maswe` input. Other Git-excluded paths outside `.maswe` follow
@@ -107,6 +107,7 @@ async function hashMasweAuthoritativeState(cwd: string, hash: Hash): Promise<voi
     }
     if (
       !journalEntry &&
+      !mutationJournalEntry &&
       fileStat.isFile() &&
       (MASWE_EPHEMERAL_BASENAMES.has(base) || base.endsWith(".tmp"))
     ) {

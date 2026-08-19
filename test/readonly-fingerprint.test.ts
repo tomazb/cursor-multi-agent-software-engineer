@@ -182,6 +182,45 @@ test("only canonical per-run mutation journal churn is fingerprint-excluded", as
   assert.notEqual(await gitWorkspaceFingerprint(cwd), before);
 });
 
+test("a tmp-looking sibling directly under the mutation namespace remains fingerprint-visible", async () => {
+  const cwd = await initRepo();
+  await ensureMasweGitExclude(cwd);
+  const store = new FileRunStore(cwd);
+  const run = await store.create("fp-mutation-tmp-sibling", "request", DEFAULT_CONFIG);
+  await withRunMutationFence(cwd, run.id, "target", async () => undefined);
+  const before = await gitWorkspaceFingerprint(cwd);
+
+  await writeFile(
+    path.join(runMutationJournalRoot(cwd, run.id), "unexpected.tmp"),
+    "authoritative sibling\n",
+  );
+
+  assert.notEqual(await gitWorkspaceFingerprint(cwd), before);
+});
+
+test("tmp-looking malformed and nested mutation journal entries remain fingerprint-visible", async (t) => {
+  const cases = [
+    ["malformed stream", ".lock-journal-v3", "unexpected.tmp"],
+    ["nested claim", ".lock-journal-v3", "data", "claims", "nested", "unexpected.tmp"],
+  ] as const;
+  for (const [label, ...segments] of cases) {
+    await t.test(label, async () => {
+      const cwd = await initRepo();
+      await ensureMasweGitExclude(cwd);
+      const store = new FileRunStore(cwd);
+      const run = await store.create(`fp-mutation-${label}`, "request", DEFAULT_CONFIG);
+      await withRunMutationFence(cwd, run.id, "target", async () => undefined);
+      const unexpected = path.join(runMutationJournalRoot(cwd, run.id), ...segments);
+      await mkdir(path.dirname(unexpected), { recursive: true });
+      const before = await gitWorkspaceFingerprint(cwd);
+
+      await writeFile(unexpected, `${label}\n`);
+
+      assert.notEqual(await gitWorkspaceFingerprint(cwd), before);
+    });
+  }
+});
+
 test("journal exclusion is limited to a run's exact synchronization namespace", async () => {
   const cwd = await initRepo();
   await ensureMasweGitExclude(cwd);

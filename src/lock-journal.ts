@@ -1930,6 +1930,83 @@ async function prepareAndPublishClaim(
   }
 }
 
+async function exactPublishedClaimHandle(
+  runDirectory: string,
+  kind: LockKind,
+  ticket: bigint,
+  canonical: CanonicalRecord<ClaimRecordV3>,
+): Promise<PublishedClaimHandle | undefined> {
+  const finalPath = path.join(
+    journalPaths(runDirectory, kind).claims,
+    `${formatLockTicket(ticket)}.json`,
+  );
+  // Initial absence means there is no final pathname available to release.
+  // Once existence is observed, any disappearance or replacement is
+  // indeterminate and must not release another owner's claim.
+  try {
+    await lstat(finalPath);
+  } catch (error) {
+    if (errno(error) === "ENOENT") return undefined;
+    throw error;
+  }
+  const finalBytes = await readOrdinaryRecord(finalPath);
+  const published = parseClaimBytes(finalBytes, kind, ticket);
+  if (
+    finalBytes !== canonical.bytes ||
+    published.ticket !== canonical.record.ticket ||
+    published.owner !== canonical.record.owner ||
+    published.claimDigest !== canonical.record.claimDigest
+  ) {
+    throw new LockJournalError(
+      "LOCK_OWNERSHIP_LOST",
+      `Published ${kind} claim does not exactly match the failed publication attempt`,
+    );
+  }
+  return {
+    runDirectory,
+    kind,
+    ticket,
+    owner: published.owner,
+    claimDigest: published.claimDigest,
+    claim: published,
+  };
+}
+
+async function releaseExactClaimAfterPublicationFailure(
+  runDirectory: string,
+  kind: LockKind,
+  ticket: bigint,
+  canonical: CanonicalRecord<ClaimRecordV3>,
+  publicationError: unknown,
+  options: PublishClaimOptions,
+): Promise<never> {
+  let handle: PublishedClaimHandle | undefined;
+  try {
+    handle = await exactPublishedClaimHandle(runDirectory, kind, ticket, canonical);
+  } catch (reconciliationError) {
+    throw new AggregateError(
+      [publicationError, reconciliationError],
+      "Lock claim publication failed and exact claim reconciliation was indeterminate",
+      { cause: publicationError },
+    );
+  }
+  if (!handle) throw publicationError;
+
+  const releaseOptions: PublishClaimOptions = options.transition
+    ? { transition: options.transition }
+    : {};
+  try {
+    await publishClaimRelease(handle, releaseOptions);
+  } catch (releaseError) {
+    throw new AggregateError(
+      [publicationError, releaseError],
+      "Lock claim publication and exact claim release both failed",
+      { cause: publicationError },
+    );
+  }
+  throw publicationError;
+}
+
 export async function publishLockClaim(
   runDirectory: string,
   kind: LockKind,
@@ -1968,32 +2045,45 @@ export async function publishLockClaim(
       at: new Date().toISOString(),
       operation,
     });
-    const result = await prepareAndPublishClaim(paths, canonical, options);
-    if (result === "conflict") {
-      await options.transition?.("TICKET_CONFLICT", context);
-      await options.transition?.("TICKET_RESCAN", context);
-      continue;
-    }
-    const finalScan = await scanLockJournal(runDirectory, kind);
-    const published = finalScan.claims.find((claim) => claim.ticket === canonical.record.ticket);
-    if (
-      !published ||
-      published.owner !== owner ||
-      published.claimDigest !== canonical.record.claimDigest
-    ) {
-      throw new LockJournalError(
-        "LOCK_OWNERSHIP_LOST",
-        `Published ${kind} claim failed final journal validation`,
+    try {
+      const result = await prepareAndPublishClaim(paths, canonical, options);
+      if (result === "conflict") {
+        await options.transition?.("TICKET_CONFLICT", context);
+        await options.transition?.("TICKET_RESCAN", context);
+        continue;
+      }
+      const finalScan = await scanLockJournal(runDirectory, kind);
+      const published = finalScan.claims.find(
+        (claim) => claim.ticket === canonical.record.ticket,
+      );
+      if (
+        !published ||
+        published.owner !== owner ||
+        published.claimDigest !== canonical.record.claimDigest
+      ) {
+        throw new LockJournalError(
+          "LOCK_OWNERSHIP_LOST",
+          `Published ${kind} claim failed final journal validation`,
+        );
+      }
+      return {
+        runDirectory,
+        kind,
+        ticket,
+        owner,
+        claimDigest: published.claimDigest,
+        claim: published,
+      };
+    } catch (error) {
+      return releaseExactClaimAfterPublicationFailure(
+        runDirectory,
+        kind,
+        ticket,
+        canonical,
+        error,
+        options,
       );
     }
-    return {
-      runDirectory,
-      kind,
-      ticket,
-      owner,
-      claimDigest: published.claimDigest,
-      claim: published,
-    };
   }
 }
 
