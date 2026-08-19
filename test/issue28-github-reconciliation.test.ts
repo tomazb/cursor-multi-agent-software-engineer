@@ -174,6 +174,8 @@ interface AdapterHarness {
 }
 
 type AssociationRaceState =
+  | "PR_READY"
+  | "PR_REVIEW"
   | "BUILDING"
   | "CI_RUNNING"
   | "VERIFYING"
@@ -334,7 +336,7 @@ async function associationRaceHarness(
   value.quality.commands = [];
   const store = new FileRunStore(cwd);
   let run = await store.create("association race", "route C before local work", value);
-  for (const [type, actor] of [
+  const history = [
     ["START", "user"],
     ["BRAINSTORM_COMPLETED", "brainstormer"],
     ["APPROVE_BRAINSTORM", "user"],
@@ -343,8 +345,9 @@ async function associationRaceHarness(
     ["BUILD_COMPLETED", "builder"],
     ["CI_PASSED", "quality"],
     ["VERIFY_PASSED", "verifier"],
-    ["PR_OPENED", "github-app"],
-  ] as Array<[WorkflowEventType, string]>) {
+  ] as Array<[WorkflowEventType, string]>;
+  if (state !== "PR_READY") history.push(["PR_OPENED", "github-app"]);
+  for (const [type, actor] of history) {
     run = await store.applyEvent(run, type, actor);
   }
   run.workspace = await captureWorkspace(cwd);
@@ -366,7 +369,7 @@ async function associationRaceHarness(
 
   if (state === "MERGE_READY") {
     run = await store.applyEvent(run, "MARK_MERGE_READY", "user", { headSha: headB });
-  } else {
+  } else if (state !== "PR_READY" && state !== "PR_REVIEW") {
     run = await store.applyEvent(run, "REVIEW_COMMENT_RECEIVED", "github");
     run = await store.applyEvent(run, "COMMENT_IN_SCOPE", "pr-comment-classifier");
     if (state !== "RESOLVING") {
@@ -900,6 +903,38 @@ test("local advance repairs a committed C association after the webhook process 
   assert.equal(recovered.revalidation?.generation, 1);
   assert.equal(initialRevalidationPublications(recovered), 1);
 });
+
+for (const state of ["PR_READY", "PR_REVIEW"] as const) {
+  test(`local ${state} gate routes a committed C association before local freshness checks`, async (t) => {
+    const harness = await associationRaceHarness(t, state, async () => {
+      throw new Error("simulated webhook crash before gate routing");
+    });
+    await assert.rejects(
+      deliverAssociationRace(harness, `gate-${state.toLowerCase()}-crash-before-routing`),
+      /webhook crash before gate routing/,
+    );
+    const committed = await harness.store.load(harness.runId);
+    assert.equal(committed.state, state);
+    assert.equal(committed.github?.headSha, harness.headC);
+    assert.equal(committed.workspace?.headSha, harness.headB);
+    assert.equal(committed.revalidation, undefined);
+
+    const recovered = await new Orchestrator(
+      harness.cwd,
+      harness.config,
+      new HeadRecordingRuntime(),
+      harness.store,
+    ).runUntilBlocked(harness.runId);
+
+    assert.equal(recovered.state, "CI_RUNNING");
+    assert.equal(recovered.github?.headSha, harness.headC);
+    assert.equal(recovered.revalidation?.requestedHeadSha, harness.headC);
+    assert.equal(recovered.revalidation?.returnState, state);
+    assert.equal(recovered.revalidation?.generation, 1);
+    assert.equal(initialRevalidationPublications(recovered), 1);
+    assert.equal(recovered.events.some((event) => event.type === "FAIL"), false);
+  });
+}
 
 test("complete routes a committed C association before stale B merge-ready evidence", async (t) => {
   const harness = await associationRaceHarness(t, "MERGE_READY", async () => {

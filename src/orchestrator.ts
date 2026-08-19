@@ -438,6 +438,8 @@ export class Orchestrator {
       if (isHumanGate(run.state)) {
         if (run.state !== "PR_READY" && run.state !== "PR_REVIEW") return run;
         try {
+          run = await this.preflightCommittedAssociationHead(run);
+          if (run.state !== "PR_READY" && run.state !== "PR_REVIEW") return run;
           const preflight = await this.preflightReturnGate(run);
           run = preflight;
           if (run.state !== "PR_READY" && run.state !== "PR_REVIEW") continue;
