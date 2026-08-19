@@ -59,6 +59,7 @@ async function initialRequest(
     source: "local-workspace",
     previousHeadSha: HEAD_A,
     requestedHeadSha: HEAD_B,
+    expectedRunVersion: run.version,
     actor: "local-runner",
     observedWorkspace: workspace(HEAD_B),
     at: REQUESTED_AT,
@@ -80,6 +81,7 @@ for (const gate of ["PR_READY", "PR_REVIEW"] as const) {
       source: "local-workspace",
       previousHeadSha: HEAD_A,
       requestedHeadSha: HEAD_B,
+      expectedRunVersion: run.version,
       actor: "local-runner",
       observedWorkspace: workspace(HEAD_B),
       at: REQUESTED_AT,
@@ -137,6 +139,7 @@ for (const state of ["BUILDING", "CI_RUNNING", "VERIFYING"] as const) {
       source: "github",
       previousHeadSha: HEAD_B,
       requestedHeadSha: HEAD_C,
+      expectedRunVersion: run.version,
       actor: "github-app",
       observedWorkspace: workspace(HEAD_C),
       at: RETARGETED_AT,
@@ -195,6 +198,7 @@ for (const resumeState of ["BUILDING", "CI_RUNNING", "VERIFYING"] as const) {
       source: "github",
       previousHeadSha: HEAD_B,
       requestedHeadSha: HEAD_C,
+      expectedRunVersion: run.version,
       actor: "github-app",
       at: RETARGETED_AT,
     });
@@ -233,8 +237,9 @@ test("same-target routing is event-free and saves only an exact workspace alignm
 
   const saved = await new RevalidationService(store).route(run.id, {
     source: "github",
-    previousHeadSha: HEAD_A,
+    previousHeadSha: HEAD_B,
     requestedHeadSha: HEAD_B,
+    expectedRunVersion: run.version,
     actor: "github-app",
     observedWorkspace: aligned,
     at: RETARGETED_AT,
@@ -248,8 +253,9 @@ test("same-target routing is event-free and saves only an exact workspace alignm
 
   const unchanged = await new RevalidationService(store).route(saved.id, {
     source: "github",
-    previousHeadSha: HEAD_A,
+    previousHeadSha: HEAD_B,
     requestedHeadSha: HEAD_B,
+    expectedRunVersion: saved.version,
     actor: "github-app",
     observedWorkspace: aligned,
     at: "2026-08-18T13:00:00.000Z",
@@ -266,6 +272,7 @@ test("same-target routing rejects an observed workspace at a different HEAD", as
     source: "github",
     previousHeadSha: HEAD_B,
     requestedHeadSha: HEAD_C,
+    expectedRunVersion: atB.version,
     actor: "github-app",
     at: RETARGETED_AT,
   });
@@ -276,10 +283,68 @@ test("same-target routing rejects an observed workspace at a different HEAD", as
       source: "github",
       previousHeadSha: HEAD_C,
       requestedHeadSha: HEAD_C,
+      expectedRunVersion: atC.version,
       actor: "local-runner",
       observedWorkspace: workspace(HEAD_B),
     }),
     /workspace.*HEAD|target.*workspace|alignment/i,
+  );
+
+  assert.deepEqual(await store.load(atC.id), before);
+});
+
+test("active routing rejects a stale expected version after an association-only update", async (t) => {
+  const store = await tempStore(t);
+  const atB = await initialRequest(store);
+  const concurrent = await store.load(atB.id);
+  concurrent.github = {
+    installationId: 1,
+    repository: "owner/repo",
+    pullRequestNumber: 28,
+    baseSha: HEAD_A,
+    headSha: HEAD_C,
+    branch: "maswe/revalidation",
+  };
+  await store.save(concurrent);
+  const before = await store.load(atB.id);
+
+  await assert.rejects(
+    new RevalidationService(store).route(atB.id, {
+      source: "github",
+      previousHeadSha: HEAD_B,
+      requestedHeadSha: HEAD_B,
+      expectedRunVersion: atB.version,
+      actor: "github-app",
+      observedWorkspace: workspace(HEAD_B),
+    }),
+    /stale.*version|optimistic.*version/i,
+  );
+
+  assert.deepEqual(await store.load(atB.id), before);
+});
+
+test("active routing never reverses a newer target when the predecessor is stale", async (t) => {
+  const store = await tempStore(t);
+  const atB = await initialRequest(store);
+  const atC = await new RevalidationService(store).route(atB.id, {
+    source: "github",
+    previousHeadSha: HEAD_B,
+    requestedHeadSha: HEAD_C,
+    expectedRunVersion: atB.version,
+    actor: "github-app",
+    at: RETARGETED_AT,
+  });
+  const before = structuredClone(atC);
+
+  await assert.rejects(
+    new RevalidationService(store).route(atC.id, {
+      source: "github",
+      previousHeadSha: HEAD_B,
+      requestedHeadSha: HEAD_B,
+      expectedRunVersion: atC.version,
+      actor: "github-app",
+    }),
+    /stale.*predecessor|target.*changed|optimistic/i,
   );
 
   assert.deepEqual(await store.load(atC.id), before);
@@ -294,6 +359,7 @@ test("illegal revalidation states and contexts fail closed without publication",
       source: "github",
       previousHeadSha: HEAD_A,
       requestedHeadSha: HEAD_B,
+      expectedRunVersion: noContext.version,
       actor: "github-app",
     }),
     /illegal.*revalidation|active revalidation/i,
@@ -309,6 +375,7 @@ test("illegal revalidation states and contexts fail closed without publication",
       source: "github",
       previousHeadSha: HEAD_B,
       requestedHeadSha: HEAD_C,
+      expectedRunVersion: activeAtIllegalGate.version,
       actor: "github-app",
     }),
     /illegal.*revalidation|active revalidation/i,
@@ -329,6 +396,7 @@ test("illegal revalidation states and contexts fail closed without publication",
       source: "github",
       previousHeadSha: HEAD_B,
       requestedHeadSha: HEAD_C,
+      expectedRunVersion: failed.version,
       actor: "github-app",
     }),
     /illegal.*resume|active revalidation/i,
@@ -345,6 +413,7 @@ test("generation fences reject stale versions and accept the exact current targe
     source: "github",
     previousHeadSha: HEAD_B,
     requestedHeadSha: HEAD_C,
+    expectedRunVersion: atB.version,
     actor: "github-app",
     at: RETARGETED_AT,
   });

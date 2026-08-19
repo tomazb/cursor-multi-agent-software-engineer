@@ -6,7 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
-import type { AgentRuntime, ArtifactReference, MasweConfig, RunRecord, RuntimeDoctorResult, RuntimeRequest, RuntimeResult } from "../src/domain.ts";
+import type { AgentRuntime, ArtifactReference, MasweConfig, RunRecord, RuntimeDoctorResult, RuntimeRequest, RuntimeResult, WorkflowEventType } from "../src/domain.ts";
 import { ensureRunWorkspace, refreshWorkspaceHead } from "../src/git-workspace.ts";
 import { Orchestrator } from "../src/orchestrator.ts";
 import { RevalidationService } from "../src/revalidation.ts";
@@ -93,11 +93,159 @@ class RetargetAfterArtifactStore extends FileRunStore {
         source: "github",
         previousHeadSha: current.revalidation!.requestedHeadSha,
         requestedHeadSha: HEAD_C,
+        expectedRunVersion: current.version,
         actor: "github-app",
       });
     }
     return reference;
   }
+}
+
+class AssociateHeadOnLoadStore extends FileRunStore {
+  private remainingLoads = 0;
+
+  arm(): void {
+    this.remainingLoads = 2;
+  }
+
+  override async load(runId: string): Promise<RunRecord> {
+    if (this.remainingLoads > 0) {
+      this.remainingLoads -= 1;
+      if (this.remainingLoads === 0) {
+        const current = await super.load(runId);
+        assert.ok(current.github);
+        current.github.headSha = HEAD_C;
+        await super.save(current);
+        return super.load(runId);
+      }
+    }
+    return super.load(runId);
+  }
+}
+
+class RetargetOnArtifactFenceLoadStore extends FileRunStore {
+  private remainingLoads = 0;
+  private readonly artifactName: string;
+
+  constructor(cwd: string, artifactName: string) {
+    super(cwd);
+    this.artifactName = artifactName;
+  }
+
+  override async writeArtifact(
+    run: RunRecord,
+    name: string,
+    content: string,
+  ): Promise<ArtifactReference> {
+    const reference = await super.writeArtifact(run, name, content);
+    if (name === this.artifactName) this.remainingLoads = 2;
+    return reference;
+  }
+
+  override async load(runId: string): Promise<RunRecord> {
+    if (this.remainingLoads > 0) {
+      this.remainingLoads -= 1;
+      if (this.remainingLoads === 0) {
+        const current = await super.load(runId);
+        await new RevalidationService(this).route(runId, {
+          source: "github",
+          previousHeadSha: current.revalidation!.requestedHeadSha,
+          requestedHeadSha: HEAD_C,
+          expectedRunVersion: current.version,
+          actor: "github-app",
+        });
+        return super.load(runId);
+      }
+    }
+    return super.load(runId);
+  }
+}
+
+class RetargetOnVerifierPublicationStore extends FileRunStore {
+  private armed = false;
+
+  override async writeArtifact(
+    run: RunRecord,
+    name: string,
+    content: string,
+  ): Promise<ArtifactReference> {
+    const reference = await super.writeArtifact(run, name, content);
+    if (name === "06-verification-report.md") this.armed = true;
+    return reference;
+  }
+
+  override async applyEvent(
+    run: RunRecord,
+    type: WorkflowEventType,
+    actor: string,
+    details?: Record<string, unknown>,
+  ): Promise<RunRecord> {
+    if (
+      this.armed &&
+      (type === "VERIFY_PASSED" ||
+        type === "VERIFY_PASSED_AFTER_REVIEW" ||
+        type === "VERIFY_FAILED")
+    ) {
+      this.armed = false;
+      const current = await super.load(run.id);
+      await new RevalidationService(this).route(run.id, {
+        source: "github",
+        previousHeadSha: current.revalidation!.requestedHeadSha,
+        requestedHeadSha: HEAD_C,
+        expectedRunVersion: current.version,
+        actor: "github-app",
+      });
+    }
+    return super.applyEvent(run, type, actor, details);
+  }
+}
+
+async function prepareActiveRevalidation(
+  cwd: string,
+  store: FileRunStore,
+  state: "CI_RUNNING" | "VERIFYING",
+): Promise<{ run: RunRecord; headA: string; headB: string }> {
+  const value = baseConfig((c) => {
+    c.policy.useIsolatedWorktree = false;
+    c.quality.commands = [];
+  });
+  const run = await store.create("fenced publication", "Publish only current evidence.", value);
+  run.state = "PR_READY";
+  run.workspace = await ensureRunWorkspace(cwd, run);
+  await store.save(run);
+  const headA = run.workspace.headSha;
+
+  await writeFile(path.join(cwd, "head-b.txt"), "head B\n", "utf8");
+  await execFileAsync("git", ["add", "head-b.txt"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "head B"], { cwd });
+  const observed = structuredClone(run);
+  await refreshWorkspaceHead(observed);
+  const headB = observed.workspace!.headSha;
+  let active = await new RevalidationService(store).route(run.id, {
+    source: "local-workspace",
+    previousHeadSha: headA,
+    requestedHeadSha: headB,
+    expectedRunVersion: run.version,
+    actor: "local-runner",
+    observedWorkspace: observed.workspace!,
+  });
+
+  if (state === "VERIFYING") {
+    active.evidence = {
+      quality: {
+        headSha: headB,
+        passed: true,
+        at: "2026-08-19T12:00:00.000Z",
+      },
+    };
+    await store.save(active);
+    active = await store.applyEvent(active, "CI_PASSED", "quality-runner", {
+      passed: true,
+      required: true,
+      headSha: headB,
+    });
+  }
+  return { run: active, headA, headB };
 }
 
 test("quality command that edits a tracked file fails closed before verifier", async () => {
@@ -180,6 +328,7 @@ test("initial revalidation invalidates every stale evidence binding", async () =
     source: "local-workspace",
     previousHeadSha: "a".repeat(40),
     requestedHeadSha: "b".repeat(40),
+    expectedRunVersion: run.version,
     actor: "local-runner",
     at: "2026-08-18T12:01:00.000Z",
   });
@@ -233,6 +382,7 @@ test("an associated target mismatch fails before work and an exact operator alig
     source: "github",
     previousHeadSha: headB,
     requestedHeadSha: headC,
+    expectedRunVersion: run.version,
     actor: "github-app",
   });
 
@@ -261,6 +411,43 @@ test("an associated target mismatch fails before work and an exact operator alig
   assert.equal(runtime.verifierExecutions, 2);
 });
 
+test("active preflight retries an association update injected at the routing load and publishes no stale evidence", async (t) => {
+  const cwd = await initRepo();
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new AssociateHeadOnLoadStore(cwd);
+  const { run, headA, headB } = await prepareActiveRevalidation(cwd, store, "CI_RUNNING");
+  run.github = {
+    installationId: 1,
+    repository: "owner/repo",
+    pullRequestNumber: 28,
+    baseSha: headA,
+    headSha: headB,
+    branch: run.workspace!.branch,
+  };
+  await store.save(run);
+  const historicalEvents = structuredClone(run.events);
+  store.arm();
+
+  await new Orchestrator(cwd, run.config, new MockRuntime(), store).advance(run.id);
+  const authoritative = await store.load(run.id);
+
+  assert.deepEqual(authoritative.events.slice(0, historicalEvents.length), historicalEvents);
+  assert.equal(authoritative.github?.headSha, HEAD_C);
+  assert.equal(authoritative.revalidation?.requestedHeadSha, HEAD_C);
+  assert.equal(authoritative.revalidation?.generation, 2);
+  assert.equal(authoritative.evidence?.quality, undefined);
+  assert.equal(
+    authoritative.events.some(
+      (event) =>
+        (event.type === "CI_PASSED" || event.type === "CI_FAILED") &&
+        event.details?.headSha === headB,
+    ),
+    false,
+  );
+  assert.equal(authoritative.state, "FAILED");
+  assert.equal(authoritative.failure?.resumeState, "CI_RUNNING");
+});
+
 test("a stale builder generation cannot commit after a concurrent retarget", async (t) => {
   const cwd = await initRepo();
   t.after(() => rm(cwd, { recursive: true, force: true }));
@@ -285,6 +472,7 @@ test("a stale builder generation cannot commit after a concurrent retarget", asy
     source: "local-workspace",
     previousHeadSha,
     requestedHeadSha: headB,
+    expectedRunVersion: run.version,
     actor: "local-runner",
     observedWorkspace: observed.workspace!,
   });
@@ -316,5 +504,113 @@ test("a stale builder generation cannot commit after a concurrent retarget", asy
       (artifact) => artifact.logicalName === "04-builder-report.md",
     ).length,
     1,
+  );
+});
+
+test("a quality artifact cannot publish stale evidence or an event after a concurrent retarget", async (t) => {
+  const cwd = await initRepo();
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new RetargetAfterArtifactStore(cwd, "05-quality-report.md");
+  const { run, headB } = await prepareActiveRevalidation(cwd, store, "CI_RUNNING");
+  const historicalEvents = structuredClone(run.events);
+
+  await assert.rejects(
+    new Orchestrator(cwd, run.config, new MockRuntime(), store).advance(run.id),
+    /stale.*fence|version conflict|publication outcome/i,
+  );
+  const authoritative = await store.load(run.id);
+
+  assert.deepEqual(authoritative.events.slice(0, historicalEvents.length), historicalEvents);
+  assert.equal(authoritative.revalidation?.requestedHeadSha, HEAD_C);
+  assert.equal(authoritative.revalidation?.generation, 2);
+  assert.equal(authoritative.evidence?.quality, undefined);
+  assert.equal(
+    authoritative.events.some(
+      (event) =>
+        (event.type === "CI_PASSED" || event.type === "CI_FAILED") &&
+        event.details?.headSha === headB,
+    ),
+    false,
+  );
+});
+
+test("a verifier artifact cannot publish stale evidence or clear the newer context", async (t) => {
+  const cwd = await initRepo();
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new RetargetAfterArtifactStore(cwd, "06-verification-report.md");
+  const { run, headB } = await prepareActiveRevalidation(cwd, store, "VERIFYING");
+  const historicalEvents = structuredClone(run.events);
+
+  await assert.rejects(
+    new Orchestrator(cwd, run.config, new MockRuntime(), store).advance(run.id),
+    /stale.*fence|version conflict|publication outcome/i,
+  );
+  const authoritative = await store.load(run.id);
+
+  assert.deepEqual(authoritative.events.slice(0, historicalEvents.length), historicalEvents);
+  assert.equal(authoritative.revalidation?.requestedHeadSha, HEAD_C);
+  assert.equal(authoritative.revalidation?.generation, 2);
+  assert.equal(authoritative.evidence?.verification, undefined);
+  assert.equal(
+    authoritative.events.some(
+      (event) =>
+        (event.type === "VERIFY_PASSED" || event.type === "VERIFY_PASSED_AFTER_REVIEW") &&
+        event.details?.headSha === headB,
+    ),
+    false,
+  );
+});
+
+test("a verifier publication cannot clear context when retargeted at the final fence", async (t) => {
+  const cwd = await initRepo();
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new RetargetOnArtifactFenceLoadStore(cwd, "06-verification-report.md");
+  const { run, headB } = await prepareActiveRevalidation(cwd, store, "VERIFYING");
+  const historicalEvents = structuredClone(run.events);
+
+  await assert.rejects(
+    new Orchestrator(cwd, run.config, new MockRuntime(), store).advance(run.id),
+    /stale.*fence|version conflict|publication outcome/i,
+  );
+  const authoritative = await store.load(run.id);
+
+  assert.deepEqual(authoritative.events.slice(0, historicalEvents.length), historicalEvents);
+  assert.equal(authoritative.revalidation?.requestedHeadSha, HEAD_C);
+  assert.equal(authoritative.revalidation?.generation, 2);
+  assert.equal(authoritative.evidence?.verification, undefined);
+  assert.equal(
+    authoritative.events.some(
+      (event) =>
+        (event.type === "VERIFY_PASSED" || event.type === "VERIFY_PASSED_AFTER_REVIEW") &&
+        event.details?.headSha === headB,
+    ),
+    false,
+  );
+});
+
+test("a verifier event publication cannot clear context after a concurrent retarget", async (t) => {
+  const cwd = await initRepo();
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new RetargetOnVerifierPublicationStore(cwd);
+  const { run, headB } = await prepareActiveRevalidation(cwd, store, "VERIFYING");
+  const historicalEvents = structuredClone(run.events);
+
+  await assert.rejects(
+    new Orchestrator(cwd, run.config, new MockRuntime(), store).advance(run.id),
+    /version conflict|publication outcome/i,
+  );
+  const authoritative = await store.load(run.id);
+
+  assert.deepEqual(authoritative.events.slice(0, historicalEvents.length), historicalEvents);
+  assert.equal(authoritative.revalidation?.requestedHeadSha, HEAD_C);
+  assert.equal(authoritative.revalidation?.generation, 2);
+  assert.equal(authoritative.evidence?.verification, undefined);
+  assert.equal(
+    authoritative.events.some(
+      (event) =>
+        (event.type === "VERIFY_PASSED" || event.type === "VERIFY_PASSED_AFTER_REVIEW") &&
+        event.details?.headSha === headB,
+    ),
+    false,
   );
 });

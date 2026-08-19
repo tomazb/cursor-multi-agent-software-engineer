@@ -28,6 +28,7 @@ import {
 import { captureWorkspaceBootstrapIntent } from "../src/workspace-bootstrap.ts";
 
 const execFileAsync = promisify(execFile);
+const HEAD_C = "c".repeat(40);
 let publicationCwd = "";
 
 before(async () => {
@@ -161,6 +162,28 @@ class RetryInjectionStore implements RunStore {
 
   readArtifact(run: RunRecord, name: string): Promise<string | undefined> {
     return this.delegate.readArtifact(run, name);
+  }
+}
+
+class AssociateHeadDuringRetryStore extends FileRunStore {
+  private remainingLoads = 0;
+
+  arm(): void {
+    this.remainingLoads = 2;
+  }
+
+  override async load(runId: string): Promise<RunRecord> {
+    if (this.remainingLoads > 0) {
+      this.remainingLoads -= 1;
+      if (this.remainingLoads === 0) {
+        const current = await super.load(runId);
+        assert.ok(current.github);
+        current.github.headSha = HEAD_C;
+        await super.save(current);
+        return super.load(runId);
+      }
+    }
+    return super.load(runId);
   }
 }
 
@@ -705,6 +728,7 @@ test("retry retargets a failed revalidation to the associated HEAD before public
     source: "local-workspace",
     previousHeadSha: headA,
     requestedHeadSha: observedB.workspace!.headSha,
+    expectedRunVersion: run.version,
     actor: "local-runner",
     observedWorkspace: observedB.workspace!,
   });
@@ -759,4 +783,86 @@ test("retry retargets a failed revalidation to the associated HEAD before public
   assert.equal(authoritative.evidence?.quality?.headSha, headC);
   assert.equal(authoritative.evidence?.verification?.headSha, headC);
   assert.equal(authoritative.revalidation, undefined);
+});
+
+test("failed retry stabilizes an association update injected at the routing load before publication", async (t) => {
+  const cwd = await initGitRepo();
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const value = config();
+  const store = new AssociateHeadDuringRetryStore(cwd);
+  const run = await store.create("Failed retry race", "Retry only the latest target.", value);
+  run.state = "PR_READY";
+  run.workspace = await captureWorkspace(cwd);
+  await store.save(run);
+  const headA = run.workspace.headSha;
+
+  await writeFile(path.join(cwd, "head-b.txt"), "head B\n", "utf8");
+  await execFileAsync("git", ["add", "head-b.txt"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "head B"], { cwd });
+  const observedB = structuredClone(run);
+  await refreshWorkspaceHead(observedB);
+  const headB = observedB.workspace!.headSha;
+  let failed = await new RevalidationService(store).route(run.id, {
+    source: "local-workspace",
+    previousHeadSha: headA,
+    requestedHeadSha: headB,
+    expectedRunVersion: run.version,
+    actor: "local-runner",
+    observedWorkspace: observedB.workspace!,
+  });
+  failed.github = {
+    installationId: 1,
+    repository: "owner/repo",
+    pullRequestNumber: 28,
+    baseSha: headA,
+    headSha: headB,
+    branch: failed.workspace!.branch,
+  };
+  await store.save(failed);
+  failed.failure = {
+    code: "workflow-failure",
+    message: "retry the current generation",
+    at: "2026-08-19T12:00:00.000Z",
+    resumeState: "CI_RUNNING",
+  };
+  failed = await store.applyEvent(failed, "FAIL", "orchestrator", {
+    reason: failed.failure.message,
+    resumeState: failed.failure.resumeState,
+  });
+  const historicalEvents = structuredClone(failed.events);
+  store.arm();
+
+  await new Orchestrator(cwd, value, new MockRuntime(), store).retryFromFailed(run.id);
+  const authoritative = await store.load(run.id);
+  const retargetIndex = authoritative.events.findIndex(
+    (event, index) =>
+      index >= historicalEvents.length && event.type === "REVALIDATION_RETARGETED",
+  );
+  const retryIndex = authoritative.events.findIndex(
+    (event, index) => index >= historicalEvents.length && event.type === "RETRY_FROM_FAILED",
+  );
+
+  assert.deepEqual(authoritative.events.slice(0, historicalEvents.length), historicalEvents);
+  assert.equal(authoritative.github?.headSha, HEAD_C);
+  assert.equal(authoritative.revalidation?.requestedHeadSha, HEAD_C);
+  assert.equal(authoritative.revalidation?.generation, 2);
+  assert.ok(retargetIndex >= historicalEvents.length);
+  assert.ok(retryIndex > retargetIndex);
+  assert.equal(authoritative.events[retargetIndex]?.from, "FAILED");
+  assert.equal(authoritative.events[retargetIndex]?.to, "FAILED");
+  assert.equal(
+    authoritative.events[retargetIndex]?.details?.previousResumeState,
+    "CI_RUNNING",
+  );
+  assert.equal(authoritative.events[retryIndex]?.details?.resumeState, "CI_RUNNING");
+  assert.equal(
+    authoritative.events.some(
+      (event) =>
+        (event.type === "CI_PASSED" || event.type === "CI_FAILED") &&
+        event.details?.headSha === headB,
+    ),
+    false,
+  );
+  assert.equal(authoritative.state, "FAILED");
+  assert.equal(authoritative.failure?.resumeState, "CI_RUNNING");
 });

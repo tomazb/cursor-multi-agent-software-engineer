@@ -28,6 +28,7 @@ import { FileRunStore, type RunStore } from "./store.ts";
 import {
   assertRevalidationFence,
   captureRevalidationFence,
+  RevalidationOptimisticConflictError,
   RevalidationService,
   type RevalidationFence,
 } from "./revalidation.ts";
@@ -112,6 +113,8 @@ interface ActiveRevalidationPreflight {
   headSha: string | undefined;
   alignmentError?: Error;
 }
+
+const REVALIDATION_STABILITY_ATTEMPTS = 8;
 
 export class Orchestrator {
   readonly store: RunStore;
@@ -385,6 +388,7 @@ export class Orchestrator {
       source: "local-workspace",
       previousHeadSha,
       requestedHeadSha,
+      expectedRunVersion: run.version,
       actor: "local-runner",
       observedWorkspace: observed.workspace!,
     });
@@ -393,33 +397,83 @@ export class Orchestrator {
   private async preflightActiveRevalidation(
     run: RunRecord,
   ): Promise<ActiveRevalidationPreflight> {
-    if (!run.revalidation) {
-      return { run, headSha: (await this.syncWorkspace(run)) ?? run.workspace?.headSha };
+    let snapshot = run;
+    for (let attempt = 0; attempt < REVALIDATION_STABILITY_ATTEMPTS; attempt += 1) {
+      if (!snapshot.revalidation) {
+        return {
+          run: snapshot,
+          headSha: (await this.syncWorkspace(snapshot)) ?? snapshot.workspace?.headSha,
+        };
+      }
+      const observed = structuredClone(snapshot);
+      const observedHeadSha = await this.observeRevalidationWorkspace(observed);
+      if (!observedHeadSha || !observed.workspace) {
+        throw new Error(`Run ${run.id} has no observable revalidation workspace HEAD`);
+      }
+      const source = snapshot.github ? "github" : "local-workspace";
+      const requiredHeadSha = snapshot.github?.headSha ?? observedHeadSha;
+      if (
+        snapshot.revalidation.requestedHeadSha === requiredHeadSha &&
+        observedHeadSha !== requiredHeadSha
+      ) {
+        return {
+          run: snapshot,
+          headSha: observedHeadSha,
+          alignmentError: new Error(
+            `Required revalidation target ${requiredHeadSha} does not match workspace HEAD ${observedHeadSha}`,
+          ),
+        };
+      }
+
+      let routed: RunRecord;
+      try {
+        routed = await new RevalidationService(this.store).route(run.id, {
+          source,
+          previousHeadSha: snapshot.revalidation.requestedHeadSha,
+          requestedHeadSha: requiredHeadSha,
+          expectedRunVersion: snapshot.version,
+          actor: source === "github" ? "github-app" : "local-runner",
+          observedWorkspace: observed.workspace,
+        });
+      } catch (error) {
+        if (!(error instanceof RevalidationOptimisticConflictError)) throw error;
+        snapshot = await this.store.load(run.id);
+        continue;
+      }
+
+      const authoritative = await this.store.load(run.id);
+      if (!this.recordsEqual(authoritative, routed)) {
+        snapshot = authoritative;
+        continue;
+      }
+      if (!authoritative.revalidation) {
+        return {
+          run: authoritative,
+          headSha: authoritative.workspace?.headSha,
+        };
+      }
+      const stableObserved = structuredClone(authoritative);
+      const stableObservedHeadSha = await this.observeRevalidationWorkspace(stableObserved);
+      if (!stableObservedHeadSha || !stableObserved.workspace) {
+        throw new Error(`Run ${run.id} has no observable revalidation workspace HEAD`);
+      }
+      const stableRequiredHeadSha = authoritative.github?.headSha ?? stableObservedHeadSha;
+      if (authoritative.revalidation.requestedHeadSha !== stableRequiredHeadSha) {
+        snapshot = authoritative;
+        continue;
+      }
+      if (stableObservedHeadSha !== stableRequiredHeadSha) {
+        return {
+          run: authoritative,
+          headSha: stableObservedHeadSha,
+          alignmentError: new Error(
+            `Required revalidation target ${stableRequiredHeadSha} does not match workspace HEAD ${stableObservedHeadSha}`,
+          ),
+        };
+      }
+      return { run: authoritative, headSha: stableObservedHeadSha };
     }
-    const observedHeadSha = await this.observeRevalidationWorkspace(run);
-    if (!observedHeadSha || !run.workspace) {
-      throw new Error(`Run ${run.id} has no observable revalidation workspace HEAD`);
-    }
-    const source = run.github ? "github" : "local-workspace";
-    const requiredHeadSha = run.github?.headSha ?? observedHeadSha;
-    const previousRequestedHeadSha = run.revalidation.requestedHeadSha;
-    const routed = await new RevalidationService(this.store).route(run.id, {
-      source,
-      previousHeadSha: previousRequestedHeadSha,
-      requestedHeadSha: requiredHeadSha,
-      actor: source === "github" ? "github-app" : "local-runner",
-      observedWorkspace: run.workspace,
-    });
-    if (observedHeadSha !== requiredHeadSha) {
-      return {
-        run: routed,
-        headSha: observedHeadSha,
-        alignmentError: new Error(
-          `Required revalidation target ${requiredHeadSha} does not match workspace HEAD ${observedHeadSha}`,
-        ),
-      };
-    }
-    return { run: routed, headSha: observedHeadSha };
+    throw new Error(`Run ${run.id} revalidation target did not stabilize`);
   }
 
   private captureOptionalRevalidationFence(run: RunRecord): RevalidationFence | undefined {
@@ -516,6 +570,14 @@ export class Orchestrator {
           const workdir = workingDirectoryFor(run);
           const evaluatedSha =
             (await refreshWorkspaceHead(run)) ?? headSha ?? "not-a-git-repository";
+          if (
+            run.revalidation &&
+            evaluatedSha !== run.revalidation.requestedHeadSha
+          ) {
+            throw new Error(
+              `CI revalidation target ${run.revalidation.requestedHeadSha} does not match evaluated HEAD ${evaluatedSha}`,
+            );
+          }
           if (evaluatedSha !== "not-a-git-repository" && !(await isGitWorkspaceClean(workdir))) {
             throw new Error(`CI requires a clean worktree at ${evaluatedSha}`);
           }
@@ -553,6 +615,14 @@ export class Orchestrator {
           const workdir = workingDirectoryFor(run);
           const evaluatedSha =
             (await refreshWorkspaceHead(run)) ?? headSha ?? "not-a-git-repository";
+          if (
+            run.revalidation &&
+            evaluatedSha !== run.revalidation.requestedHeadSha
+          ) {
+            throw new Error(
+              `Verifier revalidation target ${run.revalidation.requestedHeadSha} does not match evaluated HEAD ${evaluatedSha}`,
+            );
+          }
           if (evaluatedSha !== "not-a-git-repository" && !(await isGitWorkspaceClean(workdir))) {
             throw new Error(`Verifier requires a clean worktree at ${evaluatedSha}`);
           }
@@ -1052,26 +1122,56 @@ export class Orchestrator {
   }
 
   private async reconcileFailedRevalidationTarget(prior: RunRecord): Promise<RunRecord> {
-    if (!prior.revalidation) return prior;
-    const observed = structuredClone(prior);
-    const observedHeadSha = await this.observeRevalidationWorkspace(observed);
-    if (!observedHeadSha || !observed.workspace) {
-      throw new Error(`Run ${prior.id} has no exact retry revalidation workspace`);
+    let snapshot = prior;
+    for (let attempt = 0; attempt < REVALIDATION_STABILITY_ATTEMPTS; attempt += 1) {
+      if (!snapshot.revalidation) return snapshot;
+      const observed = structuredClone(snapshot);
+      const observedHeadSha = await this.observeRevalidationWorkspace(observed);
+      if (!observedHeadSha || !observed.workspace) {
+        throw new Error(`Run ${prior.id} has no exact retry revalidation workspace`);
+      }
+      const exactWorkspace = await reconcileRetryWorkspace(this.cwd, observed);
+      if (!exactWorkspace) {
+        throw new Error(`Run ${prior.id} has no exact retry revalidation workspace`);
+      }
+      const source = snapshot.github ? "github" : "local-workspace";
+      const requiredHeadSha = snapshot.github?.headSha ?? observedHeadSha;
+      const workspaceForRoute =
+        snapshot.revalidation.requestedHeadSha === requiredHeadSha &&
+        exactWorkspace.headSha !== requiredHeadSha
+          ? undefined
+          : exactWorkspace;
+
+      let routed: RunRecord;
+      try {
+        routed = await new RevalidationService(this.store).route(prior.id, {
+          source,
+          previousHeadSha: snapshot.revalidation.requestedHeadSha,
+          requestedHeadSha: requiredHeadSha,
+          expectedRunVersion: snapshot.version,
+          actor: source === "github" ? "github-app" : "local-runner",
+          ...(workspaceForRoute ? { observedWorkspace: workspaceForRoute } : {}),
+        });
+      } catch (error) {
+        if (!(error instanceof RevalidationOptimisticConflictError)) throw error;
+        snapshot = await this.store.load(prior.id);
+        continue;
+      }
+
+      const authoritative = await this.store.load(prior.id);
+      if (!this.recordsEqual(authoritative, routed)) {
+        snapshot = authoritative;
+        continue;
+      }
+      if (!authoritative.revalidation) return authoritative;
+      const stableRequiredHeadSha = authoritative.github?.headSha ?? observedHeadSha;
+      if (authoritative.revalidation.requestedHeadSha !== stableRequiredHeadSha) {
+        snapshot = authoritative;
+        continue;
+      }
+      return authoritative;
     }
-    const exactWorkspace = await reconcileRetryWorkspace(this.cwd, observed);
-    if (!exactWorkspace) {
-      throw new Error(`Run ${prior.id} has no exact retry revalidation workspace`);
-    }
-    const source = prior.github ? "github" : "local-workspace";
-    const requiredHeadSha = prior.github?.headSha ?? observedHeadSha;
-    await new RevalidationService(this.store).route(prior.id, {
-      source,
-      previousHeadSha: prior.revalidation.requestedHeadSha,
-      requestedHeadSha: requiredHeadSha,
-      actor: source === "github" ? "github-app" : "local-runner",
-      observedWorkspace: exactWorkspace,
-    });
-    return this.store.load(prior.id);
+    throw new Error(`Run ${prior.id} retry revalidation target did not stabilize`);
   }
 
   async retryFromFailed(runId: string): Promise<RunRecord> {
@@ -1086,12 +1186,14 @@ export class Orchestrator {
     }
     const previousFailure = structuredClone(prior.failure);
     const priorEventIds = new Set(prior.events.map((event) => event.id));
+    const retryFence = this.captureOptionalRevalidationFence(prior);
     const candidate = structuredClone(prior);
     const workspace = await reconcileRetryWorkspace(this.cwd, candidate);
     if (workspace) candidate.workspace = workspace;
     else delete candidate.workspace;
     delete candidate.failure;
     await this.beforeRetryPublication?.(candidate);
+    await this.assertOptionalRevalidationFence(prior, retryFence);
     const publicationCandidate = structuredClone(candidate);
 
     let resumed: RunRecord;

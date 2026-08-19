@@ -13,6 +13,7 @@ export interface RevalidationTargetInput {
   source: RevalidationSource;
   previousHeadSha: string;
   requestedHeadSha: string;
+  expectedRunVersion: number;
   actor: string;
   observedWorkspace?: RunWorkspace;
   at?: string;
@@ -30,12 +31,22 @@ const ACTIVE_REVALIDATION_STATES: WorkflowState[] = [
   "VERIFYING",
 ];
 
+export class RevalidationOptimisticConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RevalidationOptimisticConflictError";
+  }
+}
+
 function requireTargetInput(input: RevalidationTargetInput): void {
   if (!input.previousHeadSha.trim()) {
     throw new Error("Revalidation previous head SHA is required");
   }
   if (!input.requestedHeadSha.trim()) {
     throw new Error("Revalidation requested head SHA is required");
+  }
+  if (!Number.isSafeInteger(input.expectedRunVersion) || input.expectedRunVersion <= 0) {
+    throw new Error("Revalidation expected run version must be a positive safe integer");
   }
   if (!input.actor.trim()) {
     throw new Error("Revalidation actor is required");
@@ -65,10 +76,20 @@ export class RevalidationService {
   async route(runId: string, input: RevalidationTargetInput): Promise<RunRecord> {
     requireTargetInput(input);
     const run = await this.store.load(runId);
+    if (run.version !== input.expectedRunVersion) {
+      throw new RevalidationOptimisticConflictError(
+        `Revalidation optimistic version conflict for run ${runId}: expected ${input.expectedRunVersion}, authoritative ${run.version}`,
+      );
+    }
 
     const revalidation = run.revalidation;
     if (revalidation === undefined) {
       return this.requestInitial(run, input);
+    }
+    if (revalidation.requestedHeadSha !== input.previousHeadSha) {
+      throw new RevalidationOptimisticConflictError(
+        `Revalidation optimistic predecessor conflict for run ${runId}: expected ${input.previousHeadSha}, authoritative target ${revalidation.requestedHeadSha}`,
+      );
     }
     return this.routeActive(run, revalidation, input);
   }
