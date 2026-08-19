@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -67,6 +67,15 @@ class CountingRuntime implements AgentRuntime {
 
   listModels(): Promise<string[]> {
     return this.delegate.listModels();
+  }
+}
+
+class EditingBuilderRuntime extends MockRuntime {
+  override async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    if (request.role === "builder") {
+      await writeFile(path.join(request.cwd, "builder-change.txt"), "builder delta\n", "utf8");
+    }
+    return super.execute(request);
   }
 }
 
@@ -200,6 +209,118 @@ test("dirty git workspaces are rejected by default", async () => {
     orchestrator.start("Unsafe start", "Do not run against a dirty workspace."),
     /Workspace is dirty/,
   );
+});
+
+test("allowed dirty workspace changes are included in speculative builder publication", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-allowed-dirty-builder-");
+  await writeFile(path.join(cwd, "README.md"), "# operator baseline\n", "utf8");
+  await execFileAsync("git", ["add", "README.md"], { cwd });
+  await writeFile(path.join(cwd, "operator-change.txt"), "preserve me\n", "utf8");
+  const config = testConfig((c) => {
+    c.policy.allowDirtyWorkspace = true;
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+  const run = await new Orchestrator(cwd, config, new EditingBuilderRuntime()).start(
+    "Allowed dirty build",
+    "Preserve and publish the allowed workspace baseline.",
+  );
+  const { stdout: published } = await execFileAsync(
+    "git",
+    ["show", "HEAD:operator-change.txt"],
+    { cwd },
+  );
+  const { stdout: builderDelta } = await execFileAsync(
+    "git",
+    ["show", "HEAD:builder-change.txt"],
+    { cwd },
+  );
+  const { stdout: stagedBaseline } = await execFileAsync(
+    "git",
+    ["show", "HEAD:README.md"],
+    { cwd },
+  );
+  const { stdout: status } = await execFileAsync("git", ["status", "--porcelain"], { cwd });
+
+  assert.equal(run.state, "PR_READY");
+  assert.equal(published, "preserve me\n");
+  assert.equal(builderDelta, "builder delta\n");
+  assert.equal(stagedBaseline, "# operator baseline\n");
+  assert.equal(status, "");
+});
+
+test("failed dirty builder publication restores the exact allowed baseline", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-dirty-builder-rollback-");
+  await writeFile(path.join(cwd, "README.md"), "# staged operator baseline\n", "utf8");
+  await execFileAsync("git", ["add", "README.md"], { cwd });
+  await writeFile(path.join(cwd, "operator-change.txt"), "untracked operator baseline\n", "utf8");
+  const { stdout: beforeHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  const { stdout: beforeStatus } = await execFileAsync(
+    "git",
+    ["status", "--porcelain=v1"],
+    { cwd },
+  );
+  const config = testConfig((c) => {
+    c.policy.allowDirtyWorkspace = true;
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+  const orchestrator = new Orchestrator(cwd, config, new EditingBuilderRuntime(), undefined, {
+    afterDirtyBuilderDeltaApplied: async () => {
+      throw new Error("simulated dirty builder publication failure");
+    },
+  });
+
+  const run = await orchestrator.start(
+    "Rollback dirty build",
+    "Restore the exact operator baseline if publication fails.",
+  );
+  const { stdout: afterHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  const { stdout: afterStatus } = await execFileAsync(
+    "git",
+    ["status", "--porcelain=v1"],
+    { cwd },
+  );
+
+  assert.equal(run.state, "FAILED");
+  assert.match(run.failure?.message ?? "", /simulated dirty builder publication failure/i);
+  assert.equal(afterHead.trim(), beforeHead.trim());
+  assert.equal(afterStatus, beforeStatus);
+  assert.doesNotMatch(afterStatus, /builder-change\.txt/);
+});
+
+test("tracked MASWE control-plane changes are never included in builder publication", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-tracked-control-plane-");
+  await mkdir(path.join(cwd, ".maswe"), { recursive: true });
+  await writeFile(path.join(cwd, ".maswe", "tracked.txt"), "committed control\n", "utf8");
+  await execFileAsync("git", ["add", "-f", ".maswe/tracked.txt"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "track control plane fixture"], { cwd });
+  const { stdout: beforeHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  await writeFile(path.join(cwd, ".maswe", "tracked.txt"), "private runtime state\n", "utf8");
+  const config = testConfig((c) => {
+    c.policy.allowDirtyWorkspace = true;
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+
+  const run = await new Orchestrator(cwd, config, new MockRuntime()).start(
+    "Protected control plane",
+    "Never publish MASWE state.",
+  );
+  const { stdout: afterHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  const { stdout: committedControl } = await execFileAsync(
+    "git",
+    ["show", "HEAD:.maswe/tracked.txt"],
+    { cwd },
+  );
+
+  assert.equal(run.state, "FAILED");
+  assert.match(run.failure?.message ?? "", /MASWE control-plane/i);
+  assert.equal(afterHead.trim(), beforeHead.trim());
+  assert.equal(committedControl, "committed control\n");
 });
 
 test("review comment is classified, resolved, and independently re-verified", async () => {

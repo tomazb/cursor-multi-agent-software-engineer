@@ -10,6 +10,7 @@ import type {
 } from "./domain.ts";
 import { buildCommentClassifierPrompt, buildRolePrompt } from "./prompt-builder.ts";
 import {
+  captureWorkspaceSourceFingerprint,
   gitRevParse,
   gitRun,
   gitWorkspaceFingerprint,
@@ -66,8 +67,18 @@ import {
 } from "./failure-diagnostics.ts";
 import path from "node:path";
 import os from "node:os";
-import { mkdtemp, rm } from "node:fs/promises";
+import {
+  chmod,
+  copyFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readlink,
+  rm,
+  symlink,
+} from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
+import { spawnCaptured } from "./process.ts";
 import {
   RunMutationSupersededError,
   withRunMutationFence,
@@ -126,6 +137,8 @@ export interface OrchestratorOptions {
     phase: "builder" | "resolver" | "quality" | "verifier" | "merge-ready" | "complete",
     authoritative: RunRecord,
   ) => Promise<void>;
+  /** Failure seam after a dirty baseline receives the speculative builder delta. */
+  afterDirtyBuilderDeltaApplied?: () => Promise<void>;
 }
 
 interface ActiveRevalidationPreflight {
@@ -135,6 +148,7 @@ interface ActiveRevalidationPreflight {
 }
 
 const REVALIDATION_STABILITY_ATTEMPTS = 8;
+const MASWE_SOURCE_PATHSPEC = [".", ":(exclude).maswe", ":(exclude).maswe/**"] as const;
 
 interface SpeculativeBuilderWorktree {
   repositoryWorkdir: string;
@@ -160,6 +174,7 @@ export class Orchestrator {
   private readonly afterWorkspaceCheckpoint: ((run: RunRecord) => Promise<void>) | undefined;
   private readonly beforeRetryPublication: ((candidate: RunRecord) => Promise<void>) | undefined;
   private readonly afterRunMutationReload: OrchestratorOptions["afterRunMutationReload"];
+  private readonly afterDirtyBuilderDeltaApplied: OrchestratorOptions["afterDirtyBuilderDeltaApplied"];
 
   constructor(
     cwd: string,
@@ -178,6 +193,7 @@ export class Orchestrator {
     this.afterWorkspaceCheckpoint = options.afterWorkspaceCheckpoint;
     this.beforeRetryPublication = options.beforeRetryPublication;
     this.afterRunMutationReload = options.afterRunMutationReload;
+    this.afterDirtyBuilderDeltaApplied = options.afterDirtyBuilderDeltaApplied;
     if (
       !Number.isSafeInteger(this.automaticTransitionLimit) ||
       this.automaticTransitionLimit <= 0
@@ -737,6 +753,203 @@ export class Orchestrator {
     }
   }
 
+  private async applyGitPatch(
+    workdir: string,
+    patchContent: string,
+    label: string,
+    reverse = false,
+  ): Promise<void> {
+    if (patchContent.length === 0) return;
+    const applied = await spawnCaptured(
+      "git",
+      ["apply", ...(reverse ? ["--reverse"] : []), "--binary", "--whitespace=nowarn"],
+      { cwd: workdir, input: patchContent, timeoutMs: 120_000 },
+    );
+    if (applied.timedOut) {
+      throw new Error(`${label}: git apply timed out after 120000ms`);
+    }
+    if (applied.exitCode !== 0) throw gitCommandFailure(label, applied);
+  }
+
+  private async publishDirtyBuilderCommit(
+    workdir: string,
+    branch: string,
+    beforeSha: string,
+    commitSha: string,
+    builderDelta: string,
+  ): Promise<void> {
+    const indexLocation = await gitRun(["rev-parse", "--git-path", "index"], workdir);
+    if (indexLocation.exitCode !== 0) {
+      throw gitCommandFailure("Failed to locate authoritative Git index", indexLocation);
+    }
+    const rawIndexPath = indexLocation.stdout.trim();
+    const indexPath = path.isAbsolute(rawIndexPath)
+      ? rawIndexPath
+      : path.resolve(workdir, rawIndexPath);
+    const recoveryRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-builder-index-"));
+    const backupIndexPath = path.join(recoveryRoot, "index");
+    let indexExisted = false;
+    try {
+      try {
+        const indexStat = await lstat(indexPath);
+        if (!indexStat.isFile()) throw new Error("Authoritative Git index is not a regular file");
+        await copyFile(indexPath, backupIndexPath);
+        indexExisted = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+
+      let deltaApplied = false;
+      try {
+        await this.applyGitPatch(
+          workdir,
+          builderDelta,
+          "Failed to apply speculative builder changes",
+        );
+        deltaApplied = true;
+        const preparedIndex = await gitRun(["read-tree", commitSha], workdir);
+        if (preparedIndex.exitCode !== 0) {
+          throw gitCommandFailure("Failed to prepare authoritative builder index", preparedIndex);
+        }
+        await this.afterDirtyBuilderDeltaApplied?.();
+        const published = await gitRun(
+          ["update-ref", `refs/heads/${branch}`, commitSha, beforeSha],
+          workdir,
+        );
+        if (published.exitCode !== 0) {
+          throw gitCommandFailure("Failed to publish authoritative builder commit", published);
+        }
+      } catch (publicationError) {
+        const rollbackErrors: unknown[] = [];
+        try {
+          if (indexExisted) await copyFile(backupIndexPath, indexPath);
+          else await rm(indexPath, { force: true });
+        } catch (error) {
+          rollbackErrors.push(error);
+        }
+        if (deltaApplied) {
+          try {
+            await this.applyGitPatch(
+              workdir,
+              builderDelta,
+              "Failed to reverse speculative builder changes",
+              true,
+            );
+          } catch (error) {
+            rollbackErrors.push(error);
+          }
+        }
+        if (rollbackErrors.length > 0) {
+          throw new AggregateError(
+            [publicationError, ...rollbackErrors],
+            "Builder publication and authoritative workspace rollback failed",
+          );
+        }
+        throw publicationError;
+      }
+    } finally {
+      await rm(recoveryRoot, { recursive: true, force: true });
+    }
+  }
+
+  private resolveSpeculativePath(rootPath: string, relativePath: string): string {
+    const root = path.resolve(rootPath);
+    const candidate = path.resolve(root, relativePath);
+    if (candidate === root || !candidate.startsWith(`${root}${path.sep}`)) {
+      throw new Error(`Git returned an unsafe workspace path: ${relativePath}`);
+    }
+    return candidate;
+  }
+
+  private async seedSpeculativeBuilderWorktree(
+    speculative: SpeculativeBuilderWorktree,
+    beforeSha: string,
+  ): Promise<string> {
+    const tracked = await gitRun(
+      [
+        "diff",
+        "--binary",
+        "--full-index",
+        "--no-ext-diff",
+        "--no-renames",
+        "HEAD",
+        "--",
+        ...MASWE_SOURCE_PATHSPEC,
+      ],
+      speculative.repositoryWorkdir,
+    );
+    if (tracked.exitCode !== 0) {
+      throw gitCommandFailure("Failed to capture the authoritative builder baseline", tracked);
+    }
+    await this.applyGitPatch(
+      speculative.worktreePath,
+      tracked.stdout,
+      "Failed to seed tracked builder baseline changes",
+    );
+
+    const untracked = await gitRun(
+      [
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        ...MASWE_SOURCE_PATHSPEC,
+      ],
+      speculative.repositoryWorkdir,
+    );
+    if (untracked.exitCode !== 0) {
+      throw gitCommandFailure("Failed to enumerate untracked builder baseline paths", untracked);
+    }
+    for (const relativePath of untracked.stdout.split("\0").filter(Boolean)) {
+      const sourcePath = this.resolveSpeculativePath(
+        speculative.repositoryWorkdir,
+        relativePath,
+      );
+      const destinationPath = this.resolveSpeculativePath(
+        speculative.worktreePath,
+        relativePath,
+      );
+      const sourceStat = await lstat(sourcePath);
+      await mkdir(path.dirname(destinationPath), { recursive: true });
+      if (sourceStat.isSymbolicLink()) {
+        await symlink(await readlink(sourcePath), destinationPath);
+      } else if (sourceStat.isFile()) {
+        await copyFile(sourcePath, destinationPath);
+        await chmod(destinationPath, sourceStat.mode & 0o777);
+      } else {
+        throw new Error(`Unsupported untracked builder baseline path: ${relativePath}`);
+      }
+    }
+
+    const staged = await gitRun(["add", "-A"], speculative.worktreePath);
+    if (staged.exitCode !== 0) {
+      throw gitCommandFailure("Failed to stage the speculative builder baseline", staged);
+    }
+    const tree = await gitRun(["write-tree"], speculative.worktreePath);
+    if (tree.exitCode !== 0) {
+      throw gitCommandFailure("Failed to snapshot the speculative builder baseline", tree);
+    }
+    const restoredIndex = await gitRun(["read-tree", beforeSha], speculative.worktreePath);
+    if (restoredIndex.exitCode !== 0) {
+      throw gitCommandFailure("Failed to restore the speculative builder index", restoredIndex);
+    }
+    return tree.stdout.trim();
+  }
+
+  private async assertNoMasweControlPlaneChanges(workdir: string): Promise<void> {
+    const status = await gitRun(
+      ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".maswe"],
+      workdir,
+    );
+    if (status.exitCode !== 0) {
+      throw gitCommandFailure("git status failed while inspecting MASWE control-plane paths", status);
+    }
+    if (status.stdout.length > 0) {
+      throw new Error("Builder publication refuses tracked .maswe control-plane changes");
+    }
+  }
+
   private async syncWorkspace(run: RunRecord): Promise<string | undefined> {
     if (!run.workspace || run.workspace.baseSha === "not-a-git-repository") return undefined;
     const workdir = workingDirectoryFor(run);
@@ -1135,6 +1348,9 @@ export class Orchestrator {
         ? await gitRevParse(authoritativeWorkdir)
         : undefined);
     let speculative: SpeculativeBuilderWorktree | undefined;
+    let baselineTreeSha: string | undefined;
+    let authoritativeSourceFingerprint: string | undefined;
+    let authoritativeWasClean = true;
     let completed: RunRecord | undefined;
     let primaryError: unknown;
     let hasPrimaryError = false;
@@ -1142,15 +1358,29 @@ export class Orchestrator {
     let hasCleanupError = false;
     try {
       if (run.workspace && run.workspace.baseSha !== "not-a-git-repository" && beforeSha) {
-        await this.assertExactGitPublicationState(
+        await this.assertExpectedGitPublicationInput(
           run,
           beforeSha,
           "Builder speculative execution",
         );
+        authoritativeSourceFingerprint = await captureWorkspaceSourceFingerprint(
+          authoritativeWorkdir,
+        );
+        authoritativeWasClean = await isGitWorkspaceClean(authoritativeWorkdir);
         speculative = await this.createSpeculativeBuilderWorktree(
           authoritativeWorkdir,
           beforeSha,
         );
+        baselineTreeSha = await this.seedSpeculativeBuilderWorktree(
+          speculative,
+          beforeSha,
+        );
+        const stableSourceFingerprint = await captureWorkspaceSourceFingerprint(
+          authoritativeWorkdir,
+        );
+        if (stableSourceFingerprint !== authoritativeSourceFingerprint) {
+          throw new Error("Authoritative builder baseline changed while it was being captured");
+        }
       }
       const builderWorkdir = speculative?.worktreePath ?? authoritativeWorkdir;
       const prompt = await buildRolePrompt("builder", run, this.store);
@@ -1176,6 +1406,7 @@ export class Orchestrator {
             "HEAD moved during builder execution (model-created commit, reset, or rebase is not allowed)",
           );
         }
+        await this.assertNoMasweControlPlaneChanges(builderWorkdir);
         await assertWorkingTreeScope(builderWorkdir, run.config.policy.allowedPathGlobs);
       }
       completed = await this.withRunPublicationFence(run, "builder", fence, async () => {
@@ -1198,21 +1429,67 @@ export class Orchestrator {
               run.config.policy.allowedPathGlobs,
             );
           }
+          let builderDelta = "";
+          if (!authoritativeWasClean) {
+            if (!baselineTreeSha) {
+              throw new Error("Dirty builder publication has no captured baseline tree");
+            }
+            const delta = await gitRun(
+              [
+                "diff",
+                "--binary",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-renames",
+                baselineTreeSha,
+                committed.headSha,
+                "--",
+                ...MASWE_SOURCE_PATHSPEC,
+              ],
+              builderWorkdir,
+            );
+            if (delta.exitCode !== 0) {
+              throw gitCommandFailure("Failed to capture speculative builder changes", delta);
+            }
+            builderDelta = delta.stdout;
+          }
           await this.cleanupSpeculativeBuilderWorktree(speculative);
-          await this.assertExactGitPublicationState(
+          await this.assertExpectedGitPublicationInput(
             run,
             beforeSha,
             "Builder commit publication",
           );
-          if (committed.headSha !== beforeSha) {
-            await this.fastForwardBuilderCommit(authoritativeWorkdir, committed.headSha);
+          const currentSourceFingerprint = await captureWorkspaceSourceFingerprint(
+            authoritativeWorkdir,
+          );
+          if (currentSourceFingerprint !== authoritativeSourceFingerprint) {
+            throw new Error("Authoritative builder baseline changed before publication");
           }
-          outputHeadSha = committed.headSha;
-          run.workspace.headSha = committed.headSha;
-          invalidateStaleEvidence(run, committed.headSha);
+          await this.assertNoMasweControlPlaneChanges(authoritativeWorkdir);
+          let publishedHeadSha = committed.headSha;
+          if (authoritativeWasClean) {
+            if (!(await isGitWorkspaceClean(authoritativeWorkdir))) {
+              throw new Error("Builder commit publication requires its captured clean baseline");
+            }
+            if (committed.headSha !== beforeSha) {
+              await this.fastForwardBuilderCommit(authoritativeWorkdir, committed.headSha);
+            }
+          } else {
+            await this.publishDirtyBuilderCommit(
+              authoritativeWorkdir,
+              run.workspace.branch,
+              beforeSha,
+              committed.headSha,
+              builderDelta,
+            );
+            publishedHeadSha = committed.headSha;
+          }
+          outputHeadSha = publishedHeadSha;
+          run.workspace.headSha = publishedHeadSha;
+          invalidateStaleEvidence(run, publishedHeadSha);
           await this.assertExactGitPublicationState(
             run,
-            committed.headSha,
+            publishedHeadSha,
             "Builder event publication",
           );
         }
