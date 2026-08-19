@@ -165,10 +165,14 @@ export interface OrchestratorOptions {
   afterDirtyRoleDeltaApplied?: () => Promise<void>;
   /** Deterministic barrier immediately before mutable-role ref publication. */
   beforeRoleRefPublish?: () => Promise<void>;
+  /** Deterministic barrier after speculative cleanup and before authoritative publication checks. */
+  afterSpeculativeRoleCleanupBeforePublication?: () => Promise<void>;
   /** Deterministic barrier before reversing a rejected mutable-role publication. */
   beforeRoleFailureRollback?: () => Promise<void>;
   /** Deterministic barrier after rollback safety observation and before failure propagation. */
   afterRoleFailureRollbackObserved?: () => Promise<void>;
+  /** Test-only timeout for mutable-role ref publication. */
+  roleRefPublishTimeoutMs?: number;
 }
 
 interface ActiveRevalidationPreflight {
@@ -223,8 +227,10 @@ export class Orchestrator {
   private readonly afterRunMutationReload: OrchestratorOptions["afterRunMutationReload"];
   private readonly afterDirtyRoleDeltaApplied: OrchestratorOptions["afterDirtyRoleDeltaApplied"];
   private readonly beforeRoleRefPublish: OrchestratorOptions["beforeRoleRefPublish"];
+  private readonly afterSpeculativeRoleCleanupBeforePublication: OrchestratorOptions["afterSpeculativeRoleCleanupBeforePublication"];
   private readonly beforeRoleFailureRollback: OrchestratorOptions["beforeRoleFailureRollback"];
   private readonly afterRoleFailureRollbackObserved: OrchestratorOptions["afterRoleFailureRollbackObserved"];
+  private readonly roleRefPublishTimeoutMs: number;
 
   constructor(
     cwd: string,
@@ -245,13 +251,19 @@ export class Orchestrator {
     this.afterRunMutationReload = options.afterRunMutationReload;
     this.afterDirtyRoleDeltaApplied = options.afterDirtyRoleDeltaApplied;
     this.beforeRoleRefPublish = options.beforeRoleRefPublish;
+    this.afterSpeculativeRoleCleanupBeforePublication =
+      options.afterSpeculativeRoleCleanupBeforePublication;
     this.beforeRoleFailureRollback = options.beforeRoleFailureRollback;
     this.afterRoleFailureRollbackObserved = options.afterRoleFailureRollbackObserved;
+    this.roleRefPublishTimeoutMs = options.roleRefPublishTimeoutMs ?? 120_000;
     if (
       !Number.isSafeInteger(this.automaticTransitionLimit) ||
       this.automaticTransitionLimit <= 0
     ) {
       throw new Error("automaticTransitionLimit must be a positive safe integer");
+    }
+    if (!Number.isSafeInteger(this.roleRefPublishTimeoutMs) || this.roleRefPublishTimeoutMs <= 0) {
+      throw new Error("roleRefPublishTimeoutMs must be a positive safe integer");
     }
   }
 
@@ -841,11 +853,13 @@ export class Orchestrator {
       const published = await spawnCaptured(
         "git",
         ["update-ref", `refs/heads/${branch}`, commitSha, beforeSha],
-        { cwd: workdir, timeoutMs: 120_000 },
+        { cwd: workdir, timeoutMs: this.roleRefPublishTimeoutMs },
       );
       publicationOutcomeUncertain = published.timedOut === true;
       if (published.timedOut) {
-        throw new Error("Authoritative role ref publication timed out after 120000ms");
+        throw new Error(
+          `Authoritative role ref publication timed out after ${this.roleRefPublishTimeoutMs}ms`,
+        );
       }
       if (published.exitCode !== 0) {
         throw gitCommandFailure("Failed to publish authoritative role commit", published);
@@ -1562,6 +1576,8 @@ export class Orchestrator {
     spec: MutableRolePublicationSpec,
   ): Promise<RunRecord> {
     const authoritativeWorkdir = workingDirectoryFor(run);
+    const managedAuthoritativeWorkdir =
+      path.resolve(authoritativeWorkdir) !== path.resolve(run.repositoryPath);
     const beforeSha =
       inputHeadSha ??
       (run.workspace && run.workspace.baseSha !== "not-a-git-repository"
@@ -1571,6 +1587,7 @@ export class Orchestrator {
     let baselineTreeSha: string | undefined;
     let ignoredInputPaths: string[] = [];
     let authoritativeSourceFingerprint: string | undefined;
+    let managedBaselineCaptured = false;
     let authoritativeWasClean = true;
     let completed: RunRecord | undefined;
     let primaryError: unknown;
@@ -1587,6 +1604,7 @@ export class Orchestrator {
         authoritativeSourceFingerprint = await captureWorkspaceSourceFingerprint(
           authoritativeWorkdir,
         );
+        managedBaselineCaptured = managedAuthoritativeWorkdir;
         authoritativeWasClean = await isGitWorkspaceClean(authoritativeWorkdir);
         speculative = await this.createSpeculativeRoleWorktree(
           authoritativeWorkdir,
@@ -1690,6 +1708,7 @@ export class Orchestrator {
           }
           roleDelta = delta.stdout;
           await this.cleanupSpeculativeRoleWorktree(speculative);
+          await this.afterSpeculativeRoleCleanupBeforePublication?.();
           await this.assertExpectedGitPublicationInput(
             run,
             beforeSha,
@@ -1720,7 +1739,7 @@ export class Orchestrator {
               committed.headSha,
               roleDelta,
               !authoritativeWasClean,
-              path.resolve(authoritativeWorkdir) !== path.resolve(run.repositoryPath),
+              managedAuthoritativeWorkdir,
             );
           }
           outputHeadSha = publishedHeadSha;
@@ -1755,14 +1774,23 @@ export class Orchestrator {
         }
       }
     }
+    const preserveManagedFailure = (error: unknown): unknown =>
+      managedBaselineCaptured && !requiresWorkspacePreservation(error)
+        ? new RolePublicationOutcomeUnknownError(
+            [error],
+            `${runFailureMessage(error)}; ${spec.label} failed after the managed authoritative baseline was captured, so the workspace was preserved for operator reconciliation`,
+          )
+        : error;
     if (hasPrimaryError && hasCleanupError) {
-      throw new AggregateError(
-        [primaryError, cleanupError],
-        `${spec.label} execution and speculative worktree cleanup failed`,
+      throw preserveManagedFailure(
+        new AggregateError(
+          [primaryError, cleanupError],
+          `${spec.label} execution and speculative worktree cleanup failed`,
+        ),
       );
     }
-    if (hasCleanupError) throw cleanupError;
-    if (hasPrimaryError) throw primaryError;
+    if (hasCleanupError) throw preserveManagedFailure(cleanupError);
+    if (hasPrimaryError) throw preserveManagedFailure(primaryError);
     if (!completed) {
       throw new Error(`${spec.label} publication completed without a run record`);
     }

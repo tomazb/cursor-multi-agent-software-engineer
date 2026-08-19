@@ -148,6 +148,16 @@ final branch, cleanliness, and exact-HEAD assertion inside the durable per-run p
 Deterministic commits name their exact expected parent and advance the branch only through an
 expected-old-SHA compare-and-swap; unexpected Git movement is preserved and fails closed.
 
+Mutable builder and resolver work is prepared in a disposable speculative worktree. Publication
+applies only the role delta to the authoritative worktree before the ref compare-and-swap and
+prepares the authoritative index only after that ref update succeeds. A definite ref rejection
+reverses the role delta before the final safety observation and performs no authoritative mutation
+afterward; a timeout, changed ref, failed rollback, or post-ref index failure is outcome-unknown.
+Once a MASWE-managed authoritative baseline has been captured, any failure in the mutable-role flow
+preserves that managed worktree for retry reconciliation instead of force-removing it. Retry must
+re-establish the recorded branch, head, cleanliness, and fingerprint through the normal recovery
+checks; a mismatch requires operator reconciliation.
+
 It does not contain Cursor SDK implementation details, shell output parsing, or persistence internals.
 
 ### 3.6 Run and artifact store

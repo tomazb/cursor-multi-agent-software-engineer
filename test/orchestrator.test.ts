@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -624,6 +624,178 @@ test("managed role publication failure preserves writes after rollback observati
   assert.equal(
     await readFile(path.join(winningWorktreePath, "late-external-change.txt"), "utf8"),
     "late external winner\n",
+  );
+});
+
+test("managed role flow preserves a source write before publication checks", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-isolated-role-prepublication-write-");
+  const config = testConfig((c) => {
+    c.policy.useIsolatedWorktree = true;
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+  let winningWorktreePath: string | undefined;
+  const orchestrator = new Orchestrator(cwd, config, new EditingBuilderRuntime(), undefined, {
+    afterSpeculativeRoleCleanupBeforePublication: async () => {
+      const { stdout } = await execFileAsync("git", ["worktree", "list", "--porcelain"], { cwd });
+      winningWorktreePath = stdout
+        .split("\n")
+        .filter((line) => line.startsWith("worktree "))
+        .map((line) => line.slice("worktree ".length))
+        .find((worktreePath) => path.resolve(worktreePath) !== path.resolve(cwd));
+      assert.ok(winningWorktreePath);
+      await writeFile(
+        path.join(winningWorktreePath, "prepublication-external-change.txt"),
+        "external winner before publication\n",
+        "utf8",
+      );
+    },
+  });
+
+  const run = await orchestrator.start(
+    "Managed role prepublication write",
+    "Preserve a managed checkout changed before publication checks.",
+  );
+  assert.ok(winningWorktreePath);
+  t.after(async () => {
+    await execFileAsync("git", ["worktree", "remove", "--force", winningWorktreePath!], {
+      cwd,
+    }).catch(() => undefined);
+  });
+  const { stdout: registrations } = await execFileAsync(
+    "git",
+    ["worktree", "list", "--porcelain"],
+    { cwd },
+  );
+  const registeredWorktreePaths = registrations
+    .split("\n")
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => path.resolve(line.slice("worktree ".length)))
+    .sort();
+
+  assert.equal(run.state, "FAILED");
+  assert.match(run.failure?.message ?? "", /managed workspace|operator reconciliation/i);
+  assert.deepEqual(
+    registeredWorktreePaths,
+    [cwd, winningWorktreePath].map((worktreePath) => path.resolve(worktreePath)).sort(),
+  );
+  assert.equal(
+    await readFile(
+      path.join(winningWorktreePath, "prepublication-external-change.txt"),
+      "utf8",
+    ),
+    "external winner before publication\n",
+  );
+});
+
+test("timed out role ref publication preserves the managed worktree", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-isolated-role-ref-timeout-");
+  const config = testConfig((c) => {
+    c.policy.useIsolatedWorktree = true;
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+  let winningWorktreePath: string | undefined;
+  let transactionHookPath: string | undefined;
+  const orchestrator = new Orchestrator(cwd, config, new EditingBuilderRuntime(), undefined, {
+    roleRefPublishTimeoutMs: 100,
+    beforeRoleRefPublish: async () => {
+      const { stdout } = await execFileAsync("git", ["worktree", "list", "--porcelain"], { cwd });
+      winningWorktreePath = stdout
+        .split("\n")
+        .filter((line) => line.startsWith("worktree "))
+        .map((line) => line.slice("worktree ".length))
+        .find((worktreePath) => path.resolve(worktreePath) !== path.resolve(cwd));
+      assert.ok(winningWorktreePath);
+      const { stdout: rawHookPath } = await execFileAsync(
+        "git",
+        ["rev-parse", "--git-path", "hooks/reference-transaction"],
+        { cwd: winningWorktreePath },
+      );
+      transactionHookPath = path.resolve(winningWorktreePath, rawHookPath.trim());
+      await writeFile(transactionHookPath, "#!/bin/sh\nsleep 5\n", "utf8");
+      await chmod(transactionHookPath, 0o755);
+    },
+  });
+
+  const run = await orchestrator.start(
+    "Managed role ref timeout",
+    "Preserve a managed checkout when ref publication times out.",
+  );
+  assert.ok(winningWorktreePath);
+  assert.ok(transactionHookPath);
+  t.after(async () => {
+    await rm(transactionHookPath!, { force: true });
+    await execFileAsync("git", ["worktree", "remove", "--force", winningWorktreePath!], {
+      cwd,
+    }).catch(() => undefined);
+  });
+  const { stdout: registrations } = await execFileAsync(
+    "git",
+    ["worktree", "list", "--porcelain"],
+    { cwd },
+  );
+
+  assert.equal(run.state, "FAILED");
+  assert.match(run.failure?.message ?? "", /may have changed|operator reconciliation/i);
+  assert.ok(registrations.includes(`worktree ${winningWorktreePath}\n`));
+});
+
+test("post-ref index preparation failure preserves the managed worktree", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-isolated-role-index-failure-");
+  const config = testConfig((c) => {
+    c.policy.useIsolatedWorktree = true;
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+  let winningWorktreePath: string | undefined;
+  let indexLockPath: string | undefined;
+  const orchestrator = new Orchestrator(cwd, config, new EditingBuilderRuntime(), undefined, {
+    beforeRoleRefPublish: async () => {
+      const { stdout } = await execFileAsync("git", ["worktree", "list", "--porcelain"], { cwd });
+      winningWorktreePath = stdout
+        .split("\n")
+        .filter((line) => line.startsWith("worktree "))
+        .map((line) => line.slice("worktree ".length))
+        .find((worktreePath) => path.resolve(worktreePath) !== path.resolve(cwd));
+      assert.ok(winningWorktreePath);
+      const { stdout: rawIndexPath } = await execFileAsync(
+        "git",
+        ["rev-parse", "--git-path", "index"],
+        { cwd: winningWorktreePath },
+      );
+      indexLockPath = `${path.resolve(winningWorktreePath, rawIndexPath.trim())}.lock`;
+      await writeFile(indexLockPath, "block authoritative read-tree\n", "utf8");
+    },
+  });
+
+  const run = await orchestrator.start(
+    "Managed role index failure",
+    "Preserve a managed checkout after its ref wins but index preparation fails.",
+  );
+  assert.ok(winningWorktreePath);
+  assert.ok(indexLockPath);
+  t.after(async () => {
+    await rm(indexLockPath!, { force: true });
+    await execFileAsync("git", ["worktree", "remove", "--force", winningWorktreePath!], {
+      cwd,
+    }).catch(() => undefined);
+  });
+  const { stdout: registrations } = await execFileAsync(
+    "git",
+    ["worktree", "list", "--porcelain"],
+    { cwd },
+  );
+
+  assert.equal(run.state, "FAILED");
+  assert.match(run.failure?.message ?? "", /may have changed|operator reconciliation/i);
+  assert.ok(registrations.includes(`worktree ${winningWorktreePath}\n`));
+  assert.equal(
+    await readFile(path.join(winningWorktreePath, "builder-change.txt"), "utf8"),
+    "builder delta\n",
   );
 });
 
