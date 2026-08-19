@@ -411,6 +411,86 @@ async function adapterHarness(
 }
 
 for (const state of ["CI_RUNNING", "VERIFYING", "BUILDING"] as const) {
+  test(`local ${state} entry reloads authority after an association commits beyond its initial snapshot`, async (t) => {
+    const associationCommitted = deferred();
+    const resumeWebhook = deferred();
+    const harness = await associationRaceHarness(t, state, async () => {
+      associationCommitted.resolve();
+      await resumeWebhook.promise;
+    });
+    const before = await harness.store.load(harness.runId);
+    const localSnapshotLoaded = deferred();
+    const resumeLocal = deferred();
+    let pauseNextLoad = true;
+    const localStore: RunStore = {
+      create: harness.store.create.bind(harness.store),
+      save: harness.store.save.bind(harness.store),
+      async load(runId) {
+        const snapshot = await harness.store.load(runId);
+        if (pauseNextLoad) {
+          pauseNextLoad = false;
+          localSnapshotLoaded.resolve();
+          await resumeLocal.promise;
+        }
+        return snapshot;
+      },
+      list: harness.store.list.bind(harness.store),
+      applyEvent: harness.store.applyEvent.bind(harness.store),
+      writeArtifact: harness.store.writeArtifact.bind(harness.store),
+      readArtifact: harness.store.readArtifact.bind(harness.store),
+    };
+    const runtime = new HeadRecordingRuntime();
+    const localAdvance = new Orchestrator(
+      harness.cwd,
+      harness.config,
+      runtime,
+      localStore,
+    ).advance(harness.runId).then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+
+    await within(localSnapshotLoaded.promise, "local B snapshot");
+    const webhook = deliverAssociationRace(
+      harness,
+      `association-commits-after-local-${state.toLowerCase()}-load`,
+    );
+    await within(associationCommitted.promise, "association C commit");
+    resumeLocal.resolve();
+    let localOutcome: Awaited<typeof localAdvance>;
+    try {
+      localOutcome = await within(localAdvance, "local committed-association reconciliation");
+    } finally {
+      resumeWebhook.resolve();
+      await within(webhook, "webhook completion after local reconciliation");
+    }
+
+    const authoritative = await harness.store.load(harness.runId);
+    assert.equal(
+      runtime.executions.some((execution) => execution.headSha === harness.headB),
+      false,
+      "local work must reload committed association authority before executing on B",
+    );
+    if ("error" in localOutcome) throw localOutcome.error;
+    assert.equal(
+      authoritative.artifacts.some((artifact) => artifact.logicalName === "05-quality-report.md"),
+      false,
+      `${state} must not publish a quality artifact against B`,
+    );
+    assert.equal(
+      authoritative.events.filter((event) => event.type === "CI_PASSED").length,
+      before.events.filter((event) => event.type === "CI_PASSED").length,
+      `${state} must not publish a quality result against B`,
+    );
+    assert.equal(authoritative.github?.headSha, harness.headC);
+    assert.equal(authoritative.revalidation?.requestedHeadSha, harness.headC);
+    assert.equal(authoritative.revalidation?.returnState, "PR_REVIEW");
+    assert.equal(authoritative.revalidation?.generation, 1);
+    assert.equal(initialRevalidationPublications(authoritative), 1);
+  });
+}
+
+for (const state of ["CI_RUNNING", "VERIFYING", "BUILDING"] as const) {
   test(`local ${state} entry routes a committed C association before stale B work`, async (t) => {
     const associationCommitted = deferred();
     const resumeWebhook = deferred();

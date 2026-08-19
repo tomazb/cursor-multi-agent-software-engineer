@@ -64,6 +64,7 @@ import { isDeepStrictEqual } from "node:util";
 import {
   RunMutationSupersededError,
   withRunMutationFence,
+  type RunMutationLease,
 } from "./run-mutation.ts";
 
 function isCanonicalFileStoreTimestamp(value: string): boolean {
@@ -559,24 +560,27 @@ export class Orchestrator {
     phase: "builder" | "resolver" | "quality" | "verifier",
     fence: RevalidationFence | undefined,
     publish: () => Promise<T>,
+    ownedLease?: RunMutationLease,
   ): Promise<T> {
+    const publishUnderLease = async (lease: RunMutationLease): Promise<T> => {
+      const authoritative = fence
+        ? await assertRevalidationFence(this.store, run.id, fence)
+        : await this.store.load(run.id);
+      if (!fence && authoritative.version !== run.version) {
+        throw new Error(
+          `Run ${run.id} changed before ${phase} publication: expected ${run.version}, authoritative ${authoritative.version}`,
+        );
+      }
+      await this.afterRunMutationReload?.(phase, authoritative);
+      await lease.assertNoQueuedTargetMutation();
+      return publish();
+    };
+    if (ownedLease) return publishUnderLease(ownedLease);
     return withRunMutationFence(
       run.repositoryPath,
       run.id,
       "publication",
-      async (lease) => {
-        const authoritative = fence
-          ? await assertRevalidationFence(this.store, run.id, fence)
-          : await this.store.load(run.id);
-        if (!fence && authoritative.version !== run.version) {
-          throw new Error(
-            `Run ${run.id} changed before ${phase} publication: expected ${run.version}, authoritative ${authoritative.version}`,
-          );
-        }
-        await this.afterRunMutationReload?.(phase, authoritative);
-        await lease.assertNoQueuedTargetMutation();
-        return publish();
-      },
+      publishUnderLease,
     );
   }
 
@@ -649,37 +653,276 @@ export class Orchestrator {
     };
   }
 
+  private async advanceGitDependentAutomaticWork(
+    run: RunRecord,
+    headSha: string | undefined,
+  ): Promise<
+    | { kind: "completed"; run: RunRecord }
+    | { kind: "retry"; run: RunRecord }
+  > {
+    return withRunMutationFence(
+      run.repositoryPath,
+      run.id,
+      "publication",
+      async (lease) => {
+        const authoritative = await this.store.load(run.id);
+        if (authoritative.repositoryPath !== run.repositoryPath) {
+          throw new Error(`Run ${run.id} repository path changed before automatic work`);
+        }
+        if (
+          authoritative.version !== run.version ||
+          authoritative.state !== run.state
+        ) {
+          return { kind: "retry", run: authoritative };
+        }
+        const github = authoritative.github;
+        if (github?.suspended !== true) {
+          const currentTarget = this.currentWorkflowTarget(authoritative);
+          if (github && !currentTarget) {
+            throw new Error(
+              `Run ${run.id} has no authoritative workflow target for committed GitHub HEAD ${github.headSha}`,
+            );
+          }
+          if (github && github.headSha !== currentTarget) {
+            return { kind: "retry", run: authoritative };
+          }
+        }
+        await lease.assertNoQueuedTargetMutation();
+
+        switch (run.state) {
+          case "BUILDING": {
+            run.counters.buildVerifyCycles += 1;
+            if (run.counters.buildVerifyCycles > run.config.policy.maxBuildVerifyCycles) {
+              return {
+                kind: "completed",
+                run: await this.failRun(run, "Maximum build/verify cycles exceeded."),
+              };
+            }
+            return {
+              kind: "completed",
+              run: await this.executeBuilderWithPublish(run, headSha, lease),
+            };
+          }
+          case "CI_RUNNING": {
+            const workdir = workingDirectoryFor(run);
+            const evaluatedSha =
+              (await refreshWorkspaceHead(run)) ?? headSha ?? "not-a-git-repository";
+            if (
+              run.revalidation &&
+              evaluatedSha !== run.revalidation.requestedHeadSha
+            ) {
+              throw new Error(
+                `CI revalidation target ${run.revalidation.requestedHeadSha} does not match evaluated HEAD ${evaluatedSha}`,
+              );
+            }
+            if (
+              evaluatedSha !== "not-a-git-repository" &&
+              !(await isGitWorkspaceClean(workdir))
+            ) {
+              throw new Error(`CI requires a clean worktree at ${evaluatedSha}`);
+            }
+            const report = await runQualityChecks(workdir, run.config.quality.commands, {
+              timeoutMs: run.config.policy.commandTimeoutMs,
+            });
+            if (evaluatedSha !== "not-a-git-repository") {
+              if (!(await isGitWorkspaceClean(workdir))) {
+                throw new Error(
+                  "Quality commands left the worktree dirty; evidence is not trustworthy.",
+                );
+              }
+              const afterQualitySha = await gitRevParse(workdir);
+              if (afterQualitySha !== evaluatedSha) {
+                throw new Error(
+                  `HEAD moved during quality commands (before ${evaluatedSha}, after ${afterQualitySha})`,
+                );
+              }
+            }
+            await this.store.writeArtifact(
+              run,
+              "05-quality-report.md",
+              renderQualityReport(report),
+            );
+            const fence = this.captureOptionalRevalidationFence(run);
+            const accepted = report.passed || !run.config.gates.requireCiPass;
+            const completed = await this.withRunPublicationFence(
+              run,
+              "quality",
+              fence,
+              async () => {
+                await this.assertExactGitPublicationState(
+                  run,
+                  evaluatedSha,
+                  "Quality publication",
+                );
+                this.bindEvidence(run, "quality", evaluatedSha, report.passed);
+                return this.store.applyEvent(
+                  run,
+                  accepted ? "CI_PASSED" : "CI_FAILED",
+                  "quality-runner",
+                  {
+                    passed: report.passed,
+                    required: run.config.gates.requireCiPass,
+                    headSha: evaluatedSha,
+                  },
+                );
+              },
+              lease,
+            );
+            return { kind: "completed", run: completed };
+          }
+          case "VERIFYING": {
+            const workdir = workingDirectoryFor(run);
+            const evaluatedSha =
+              (await refreshWorkspaceHead(run)) ?? headSha ?? "not-a-git-repository";
+            if (
+              run.revalidation &&
+              evaluatedSha !== run.revalidation.requestedHeadSha
+            ) {
+              throw new Error(
+                `Verifier revalidation target ${run.revalidation.requestedHeadSha} does not match evaluated HEAD ${evaluatedSha}`,
+              );
+            }
+            if (
+              evaluatedSha !== "not-a-git-repository" &&
+              !(await isGitWorkspaceClean(workdir))
+            ) {
+              throw new Error(`Verifier requires a clean worktree at ${evaluatedSha}`);
+            }
+            if (run.config.gates.requireCiPass) {
+              if (
+                !run.evidence?.quality ||
+                !run.evidence.quality.passed ||
+                run.evidence.quality.headSha !== evaluatedSha
+              ) {
+                throw new Error(
+                  "VERIFYING requires present, passing quality evidence for the current HEAD",
+                );
+              }
+            } else if (
+              run.evidence?.quality?.headSha &&
+              run.evidence.quality.headSha !== evaluatedSha
+            ) {
+              throw new Error(
+                `Quality evidence is stale for head SHA ${evaluatedSha}; re-run CI before verification.`,
+              );
+            }
+            const prompt = await buildRolePrompt("verifier", run, this.store);
+            const result = await this.executeAgent(run, "verifier", prompt);
+            if (evaluatedSha !== "not-a-git-repository") {
+              if (!(await isGitWorkspaceClean(workdir))) {
+                throw new Error(
+                  "Verifier left the worktree dirty; evidence is not trustworthy.",
+                );
+              }
+              const afterVerifySha = await gitRevParse(workdir);
+              if (afterVerifySha !== evaluatedSha) {
+                throw new Error(
+                  `HEAD moved during verification (before ${evaluatedSha}, after ${afterVerifySha})`,
+                );
+              }
+            }
+            const markers = parseRoleMarker("verifier", result.output);
+            if (!markers.ok) throw new Error(markers.message);
+            await this.store.writeArtifact(run, "06-verification-report.md", result.output);
+            const passed = markers.value === "PASS";
+            if (!passed && run.config.gates.requireVerifierPass) {
+              await this.store.writeArtifact(
+                run,
+                "10-verifier-defects.md",
+                extractVerifierDefects(result.output),
+              );
+            }
+            const fence = this.captureOptionalRevalidationFence(run);
+            const accepted = passed || !run.config.gates.requireVerifierPass;
+            const completed = await this.withRunPublicationFence(
+              run,
+              "verifier",
+              fence,
+              async () => {
+                await this.assertExactGitPublicationState(
+                  run,
+                  evaluatedSha,
+                  "Verification publication",
+                );
+                this.bindEvidence(run, "verification", evaluatedSha, passed);
+                const successEvent =
+                  run.revalidation?.returnState === "PR_READY"
+                    ? "VERIFY_PASSED"
+                    : run.revalidation?.returnState === "PR_REVIEW"
+                      ? "VERIFY_PASSED_AFTER_REVIEW"
+                      : hasEnteredPullRequestReview(run)
+                        ? "VERIFY_PASSED_AFTER_REVIEW"
+                        : "VERIFY_PASSED";
+                if (accepted && run.revalidation) delete run.revalidation;
+                return this.store.applyEvent(
+                  run,
+                  accepted ? successEvent : "VERIFY_FAILED",
+                  "verifier",
+                  {
+                    passed,
+                    required: run.config.gates.requireVerifierPass,
+                    ...runtimeEventIdentityDetails(result),
+                    headSha: evaluatedSha,
+                    marker: markers.marker,
+                  },
+                );
+              },
+              lease,
+            );
+            return { kind: "completed", run: completed };
+          }
+          default:
+            throw new Error(`State ${run.state} is not Git-dependent automatic work`);
+        }
+      },
+    );
+  }
+
   async advance(runId: string): Promise<RunRecord> {
     let run = await this.store.load(runId);
     try {
-      this.assertWithinBudget(run);
-      let headSha: string | undefined;
-      if (
-        run.state === "BUILDING" ||
-        run.state === "CI_RUNNING" ||
-        run.state === "VERIFYING"
-      ) {
-        run = await this.preflightCommittedAssociationHead(run);
+      for (let entryAttempt = 0; ; entryAttempt += 1) {
+        this.assertWithinBudget(run);
+        let headSha: string | undefined;
         if (
-          run.state !== "BUILDING" &&
-          run.state !== "CI_RUNNING" &&
-          run.state !== "VERIFYING"
+          run.state === "BUILDING" ||
+          run.state === "CI_RUNNING" ||
+          run.state === "VERIFYING"
         ) {
-          return run;
+          run = await this.preflightCommittedAssociationHead(run);
+          if (
+            run.state !== "BUILDING" &&
+            run.state !== "CI_RUNNING" &&
+            run.state !== "VERIFYING"
+          ) {
+            return run;
+          }
         }
-      }
-      if (
-        run.revalidation &&
-        (run.state === "BUILDING" || run.state === "CI_RUNNING" || run.state === "VERIFYING")
-      ) {
-        const preflight = await this.preflightActiveRevalidation(run);
-        run = preflight.run;
-        headSha = preflight.headSha;
-        if (preflight.alignmentError) throw preflight.alignmentError;
-      } else {
-        headSha = (await this.syncWorkspace(run)) ?? run.workspace?.headSha;
-      }
-      switch (run.state) {
+        if (
+          run.revalidation &&
+          (run.state === "BUILDING" || run.state === "CI_RUNNING" || run.state === "VERIFYING")
+        ) {
+          const preflight = await this.preflightActiveRevalidation(run);
+          run = preflight.run;
+          headSha = preflight.headSha;
+          if (preflight.alignmentError) throw preflight.alignmentError;
+        } else {
+          headSha = (await this.syncWorkspace(run)) ?? run.workspace?.headSha;
+        }
+        if (
+          run.state === "BUILDING" ||
+          run.state === "CI_RUNNING" ||
+          run.state === "VERIFYING"
+        ) {
+          const attempt = await this.advanceGitDependentAutomaticWork(run, headSha);
+          if (attempt.kind === "completed") return attempt.run;
+          run = attempt.run;
+          if (entryAttempt + 1 >= REVALIDATION_STABILITY_ATTEMPTS) {
+            throw new Error(`Run ${run.id} automatic work authority did not stabilize`);
+          }
+          continue;
+        }
+        switch (run.state) {
         case "BRAINSTORMING": {
           const completed = await this.executeRole(
             run,
@@ -707,153 +950,6 @@ export class Orchestrator {
             return this.store.applyEvent(completed, "APPROVE_DESIGN", "policy");
           }
           return completed;
-        }
-        case "BUILDING": {
-          run.counters.buildVerifyCycles += 1;
-          if (run.counters.buildVerifyCycles > run.config.policy.maxBuildVerifyCycles) {
-            return this.failRun(run, "Maximum build/verify cycles exceeded.");
-          }
-          return await this.executeBuilderWithPublish(run, headSha);
-        }
-        case "CI_RUNNING": {
-          const workdir = workingDirectoryFor(run);
-          const evaluatedSha =
-            (await refreshWorkspaceHead(run)) ?? headSha ?? "not-a-git-repository";
-          if (
-            run.revalidation &&
-            evaluatedSha !== run.revalidation.requestedHeadSha
-          ) {
-            throw new Error(
-              `CI revalidation target ${run.revalidation.requestedHeadSha} does not match evaluated HEAD ${evaluatedSha}`,
-            );
-          }
-          if (evaluatedSha !== "not-a-git-repository" && !(await isGitWorkspaceClean(workdir))) {
-            throw new Error(`CI requires a clean worktree at ${evaluatedSha}`);
-          }
-          const report = await runQualityChecks(workdir, run.config.quality.commands, {
-            timeoutMs: run.config.policy.commandTimeoutMs,
-          });
-          if (evaluatedSha !== "not-a-git-repository") {
-            if (!(await isGitWorkspaceClean(workdir))) {
-              throw new Error("Quality commands left the worktree dirty; evidence is not trustworthy.");
-            }
-            const afterQualitySha = await gitRevParse(workdir);
-            if (afterQualitySha !== evaluatedSha) {
-              throw new Error(
-                `HEAD moved during quality commands (before ${evaluatedSha}, after ${afterQualitySha})`,
-              );
-            }
-          }
-          await this.store.writeArtifact(run, "05-quality-report.md", renderQualityReport(report));
-          const fence = this.captureOptionalRevalidationFence(run);
-          const accepted = report.passed || !run.config.gates.requireCiPass;
-          return await this.withRunPublicationFence(run, "quality", fence, async () => {
-            await this.assertExactGitPublicationState(
-              run,
-              evaluatedSha,
-              "Quality publication",
-            );
-            this.bindEvidence(run, "quality", evaluatedSha, report.passed);
-            return this.store.applyEvent(
-              run,
-              accepted ? "CI_PASSED" : "CI_FAILED",
-              "quality-runner",
-              {
-                passed: report.passed,
-                required: run.config.gates.requireCiPass,
-                headSha: evaluatedSha,
-              },
-            );
-          });
-        }
-        case "VERIFYING": {
-          const workdir = workingDirectoryFor(run);
-          const evaluatedSha =
-            (await refreshWorkspaceHead(run)) ?? headSha ?? "not-a-git-repository";
-          if (
-            run.revalidation &&
-            evaluatedSha !== run.revalidation.requestedHeadSha
-          ) {
-            throw new Error(
-              `Verifier revalidation target ${run.revalidation.requestedHeadSha} does not match evaluated HEAD ${evaluatedSha}`,
-            );
-          }
-          if (evaluatedSha !== "not-a-git-repository" && !(await isGitWorkspaceClean(workdir))) {
-            throw new Error(`Verifier requires a clean worktree at ${evaluatedSha}`);
-          }
-          if (run.config.gates.requireCiPass) {
-            if (
-              !run.evidence?.quality ||
-              !run.evidence.quality.passed ||
-              run.evidence.quality.headSha !== evaluatedSha
-            ) {
-              throw new Error(
-                "VERIFYING requires present, passing quality evidence for the current HEAD",
-              );
-            }
-          } else if (
-            run.evidence?.quality?.headSha &&
-            run.evidence.quality.headSha !== evaluatedSha
-          ) {
-            throw new Error(
-              `Quality evidence is stale for head SHA ${evaluatedSha}; re-run CI before verification.`,
-            );
-          }
-          const prompt = await buildRolePrompt("verifier", run, this.store);
-          const result = await this.executeAgent(run, "verifier", prompt);
-          if (evaluatedSha !== "not-a-git-repository") {
-            if (!(await isGitWorkspaceClean(workdir))) {
-              throw new Error("Verifier left the worktree dirty; evidence is not trustworthy.");
-            }
-            const afterVerifySha = await gitRevParse(workdir);
-            if (afterVerifySha !== evaluatedSha) {
-              throw new Error(
-                `HEAD moved during verification (before ${evaluatedSha}, after ${afterVerifySha})`,
-              );
-            }
-          }
-          const markers = parseRoleMarker("verifier", result.output);
-          if (!markers.ok) throw new Error(markers.message);
-          await this.store.writeArtifact(run, "06-verification-report.md", result.output);
-          const passed = markers.value === "PASS";
-          if (!passed && run.config.gates.requireVerifierPass) {
-            await this.store.writeArtifact(
-              run,
-              "10-verifier-defects.md",
-              extractVerifierDefects(result.output),
-            );
-          }
-          const fence = this.captureOptionalRevalidationFence(run);
-          const accepted = passed || !run.config.gates.requireVerifierPass;
-          return await this.withRunPublicationFence(run, "verifier", fence, async () => {
-            await this.assertExactGitPublicationState(
-              run,
-              evaluatedSha,
-              "Verification publication",
-            );
-            this.bindEvidence(run, "verification", evaluatedSha, passed);
-            const successEvent =
-              run.revalidation?.returnState === "PR_READY"
-                ? "VERIFY_PASSED"
-                : run.revalidation?.returnState === "PR_REVIEW"
-                  ? "VERIFY_PASSED_AFTER_REVIEW"
-                  : hasEnteredPullRequestReview(run)
-                    ? "VERIFY_PASSED_AFTER_REVIEW"
-                    : "VERIFY_PASSED";
-            if (accepted && run.revalidation) delete run.revalidation;
-            return this.store.applyEvent(
-              run,
-              accepted ? successEvent : "VERIFY_FAILED",
-              "verifier",
-              {
-                passed,
-                required: run.config.gates.requireVerifierPass,
-                ...runtimeEventIdentityDetails(result),
-                headSha: evaluatedSha,
-                marker: markers.marker,
-              },
-            );
-          });
         }
         case "CLASSIFYING_COMMENT": {
           const comment = (await this.store.readArtifact(run, "07-review-comment.md")) ?? "";
@@ -884,6 +980,7 @@ export class Orchestrator {
         }
         default:
           throw new Error(`State ${run.state} requires a user or integration event.`);
+        }
       }
     } catch (error) {
       if (error instanceof RunMutationSupersededError) throw error;
@@ -900,6 +997,7 @@ export class Orchestrator {
   private async executeBuilderWithPublish(
     run: RunRecord,
     inputHeadSha: string | undefined,
+    ownedLease?: RunMutationLease,
   ): Promise<RunRecord> {
     const workdir = workingDirectoryFor(run);
     const beforeSha =
@@ -957,7 +1055,7 @@ export class Orchestrator {
           ? { headSha: evaluatedHeadSha, outputHeadSha: evaluatedHeadSha }
           : {}),
       });
-    });
+    }, ownedLease);
   }
 
   private async executeResolverWithPublish(

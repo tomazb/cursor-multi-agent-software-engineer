@@ -18,6 +18,7 @@ import type {
 import { ensureRunWorkspace, refreshWorkspaceHead } from "../src/git-workspace.ts";
 import { Orchestrator } from "../src/orchestrator.ts";
 import { RevalidationService } from "../src/revalidation.ts";
+import { RunMutationSupersededError } from "../src/run-mutation.ts";
 import { MockRuntime } from "../src/runtimes/mock.ts";
 import { FileRunStore } from "../src/store.ts";
 
@@ -137,6 +138,8 @@ class TrackingRuntime extends EditingBuilder {
 
 class RetargetAfterArtifactStore extends FileRunStore {
   private retargeted = false;
+  private retargetCompletion: Promise<void> | undefined;
+  private retargetError: unknown;
   private readonly artifactName: string;
 
   constructor(cwd: string, artifactName: string) {
@@ -153,15 +156,33 @@ class RetargetAfterArtifactStore extends FileRunStore {
     if (name === this.artifactName && !this.retargeted) {
       this.retargeted = true;
       const current = await this.load(run.id);
-      await new RevalidationService(this).route(run.id, {
+      const claimPublished = deferred();
+      this.retargetCompletion = new RevalidationService(this, undefined, {
+        mutationFenceOptions: {
+          transition: async (event) => {
+            if (event === "CLAIM_PUBLISHED") claimPublished.resolve();
+          },
+        },
+      }).route(run.id, {
         source: "github",
         previousHeadSha: current.revalidation!.requestedHeadSha,
         requestedHeadSha: HEAD_C,
         expectedRunVersion: current.version,
         actor: "github-app",
-      });
+      }).then(
+        () => undefined,
+        (error: unknown) => {
+          this.retargetError = error;
+        },
+      );
+      await within(claimPublished.promise, "artifact-triggered retarget claim");
     }
     return reference;
+  }
+
+  async waitForRetarget(): Promise<void> {
+    await this.retargetCompletion;
+    if (this.retargetError !== undefined) throw this.retargetError;
   }
 }
 
@@ -1013,8 +1034,9 @@ test("a stale builder generation cannot commit after a concurrent retarget", asy
   const orchestrator = new Orchestrator(cwd, config, new EditingBuilder(), store);
   await assert.rejects(
     orchestrator.advance(run.id),
-    /stale.*fence|version conflict|publication outcome/i,
+    RunMutationSupersededError,
   );
+  await store.waitForRetarget();
   const authoritative = await store.load(run.id);
   const { stdout: actualHeadOutput } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
 
@@ -1166,8 +1188,9 @@ test("a quality artifact cannot publish stale evidence or an event after a concu
 
   await assert.rejects(
     new Orchestrator(cwd, run.config, new MockRuntime(), store).advance(run.id),
-    /stale.*fence|version conflict|publication outcome/i,
+    RunMutationSupersededError,
   );
+  await store.waitForRetarget();
   const authoritative = await store.load(run.id);
 
   assert.deepEqual(authoritative.events.slice(0, historicalEvents.length), historicalEvents);
@@ -1193,8 +1216,9 @@ test("a verifier artifact cannot publish stale evidence or clear the newer conte
 
   await assert.rejects(
     new Orchestrator(cwd, run.config, new MockRuntime(), store).advance(run.id),
-    /stale.*fence|version conflict|publication outcome/i,
+    RunMutationSupersededError,
   );
+  await store.waitForRetarget();
   const authoritative = await store.load(run.id);
 
   assert.deepEqual(authoritative.events.slice(0, historicalEvents.length), historicalEvents);
