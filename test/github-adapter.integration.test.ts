@@ -45,6 +45,7 @@ async function setup(options: {
   liveState?: "open" | "closed";
   afterManualRunLoaded?: (runId: string) => Promise<void>;
   beforeAssociationTransaction?: (deliveryId: string) => Promise<void>;
+  afterAssociationCommitBeforeRouting?: (runId: string) => Promise<void>;
   beforeCheckPost?: (headSha: string) => Promise<void>;
   associationWriteRecords?: (filePath: string, content: string) => Promise<void>;
   wrapStore?: (store: FileRunStore) => RunStore;
@@ -133,6 +134,9 @@ async function setup(options: {
       : {}),
     ...(options.beforeAssociationTransaction
       ? { beforeAssociationTransaction: options.beforeAssociationTransaction }
+      : {}),
+    ...(options.afterAssociationCommitBeforeRouting
+      ? { afterAssociationCommitBeforeRouting: options.afterAssociationCommitBeforeRouting }
       : {}),
     ...(options.associationWriteRecords
       ? { associationWriteRecords: options.associationWriteRecords }
@@ -386,6 +390,68 @@ test("integration: new head SHA invalidates prior success conclusions", async ()
   const loaded = await store.load(run.id);
   assert.equal(loaded.evidence?.quality, undefined);
   assert.equal(loaded.github?.headSha, "sha2");
+});
+
+test("integration: the post-association seam observes an event-free snapshot before head routing", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  let authoritativeStore: FileRunStore;
+  let snapshotAtSeam: Awaited<ReturnType<FileRunStore["load"]>> | undefined;
+  const { adapter, store, cwd } = await setup({
+    liveHead: "sha-routed",
+    afterAssociationCommitBeforeRouting: async (runId) => {
+      snapshotAtSeam = await authoritativeStore.load(runId);
+    },
+  });
+  authoritativeStore = store;
+  const run = await store.create("association-routing-seam", "req", testConfig());
+  run.state = "PR_REVIEW";
+  run.workspace = {
+    baseSha: "base",
+    headSha: "sha-routed",
+    branch: "maswe/run-1",
+    fingerprint: "fp-routed",
+    remote: "https://github.com/owner/repo.git",
+  };
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-prior",
+    branch: "maswe/run-1",
+    suspended: false,
+  };
+  run.evidence = {
+    quality: { headSha: "sha-prior", passed: true, at: "t" },
+    verification: { headSha: "sha-prior", passed: true, at: "t" },
+  };
+  await store.save(run);
+  await new GitHubAssociationIndex(path.join(cwd, ".maswe", "github")).bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-prior",
+    branch: "maswe/run-1",
+  });
+  const priorEvents = structuredClone(run.events);
+  const body = JSON.stringify(prPayload("sha-routed"));
+
+  await adapter.handleWebhook({
+    deliveryId: "del-association-routing-seam",
+    eventName: "pull_request",
+    signatureHeader: sign(body),
+    rawBody: body,
+  });
+
+  assert.equal(snapshotAtSeam?.github?.headSha, "sha-routed");
+  assert.equal(snapshotAtSeam?.evidence, undefined);
+  assert.equal(snapshotAtSeam?.revalidation, undefined);
+  assert.deepEqual(snapshotAtSeam?.events, priorEvents);
+  const routed = await store.load(run.id);
+  assert.equal(routed.state, "CI_RUNNING");
+  assert.equal(routed.events.at(-1)?.type, "REVALIDATE_REQUESTED");
 });
 
 test("integration: retry remembers every old head until cancellation publication succeeds", async () => {

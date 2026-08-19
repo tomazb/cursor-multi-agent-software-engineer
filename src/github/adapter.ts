@@ -1,5 +1,7 @@
 import type { GitHubAppConfig, MasweConfig, RunRecord } from "../domain.ts";
+import { DurableAtomicWriteOutcomeUnknownError } from "../durable-file.ts";
 import { invalidateStaleEvidence } from "../git-workspace.ts";
+import { RevalidationService } from "../revalidation.ts";
 import type { RunStore } from "../store.ts";
 import {
   GitHubAssociationIndex,
@@ -35,6 +37,27 @@ export {
   type GitHubWebhookDiagnosticCode,
 } from "./webhook-diagnostic.ts";
 
+function eventHistoryIdentity(events: RunRecord["events"]): string {
+  return JSON.stringify(events.map((event) => ({
+    id: event.id,
+    at: event.at,
+    type: event.type,
+    actor: event.actor,
+    from: event.from,
+    to: event.to,
+    details: event.details,
+  })));
+}
+
+function associationRollbackInvariant(run: RunRecord): string {
+  const record = structuredClone(run) as unknown as Record<string, unknown>;
+  delete record.version;
+  delete record.updatedAt;
+  delete record.github;
+  delete record.evidence;
+  return JSON.stringify(record);
+}
+
 export class GitHubAppAdapter {
   private readonly cwd: string;
   private readonly config: MasweConfig;
@@ -47,6 +70,8 @@ export class GitHubAppAdapter {
   private readonly root: string;
   private readonly afterManualRunLoaded: ((runId: string) => Promise<void>) | undefined;
   private readonly beforeAssociationTransaction: ((deliveryId: string) => Promise<void>) | undefined;
+  private readonly afterAssociationCommitBeforeRouting:
+    ((runId: string) => Promise<void>) | undefined;
   private journalInitialization: Promise<void> | undefined;
   private inboxInitialization: Promise<void> | undefined;
   private readonly webhookWorker: GitHubWebhookWorker;
@@ -74,6 +99,8 @@ export class GitHubAppAdapter {
     afterManualRunLoaded?: (runId: string) => Promise<void>;
     /** Deterministic barrier before a PR association transaction is acquired. */
     beforeAssociationTransaction?: (deliveryId: string) => Promise<void>;
+    /** Deterministic crash seam after association commit and before workflow routing. */
+    afterAssociationCommitBeforeRouting?: (runId: string) => Promise<void>;
     /** Deterministic test seam for association index commit failures. */
     associationWriteRecords?: (filePath: string, content: string) => Promise<void>;
   }) {
@@ -84,6 +111,7 @@ export class GitHubAppAdapter {
     this.tokenProvider = options.tokenProvider;
     this.afterManualRunLoaded = options.afterManualRunLoaded;
     this.beforeAssociationTransaction = options.beforeAssociationTransaction;
+    this.afterAssociationCommitBeforeRouting = options.afterAssociationCommitBeforeRouting;
     const root = githubStateRoot(options.cwd);
     this.root = root;
     this.inbox = new GitHubDeliveryInbox(root, options.inboxOptions);
@@ -356,20 +384,25 @@ export class GitHubAppAdapter {
             headSha: liveHead,
             branch: run.github.branch,
           });
-          return { run, pendingHeadShas };
+          return { run, previousHeadSha, pendingHeadShas };
         });
-        await this.publishChecks(
-          publication.run,
-          publication.run.github!.repository,
-          publication.run.github!.pullRequestNumber,
+        const routed = await this.routeAssociationHead(
+          publication.run.id,
+          publication.previousHeadSha,
           liveHead,
-          publication.run.github!.installationId,
+        );
+        await this.publishChecks(
+          routed,
+          routed.github!.repository,
+          routed.github!.pullRequestNumber,
+          liveHead,
+          routed.github!.installationId,
           publication.pendingHeadShas,
         );
         return this.clearPublishedCancellationHeads(
-          publication.run.id,
-          publication.run.github!.repository,
-          publication.run.github!.pullRequestNumber,
+          routed.id,
+          routed.github!.repository,
+          routed.github!.pullRequestNumber,
           liveHead,
           publication.pendingHeadShas,
         );
@@ -402,8 +435,19 @@ export class GitHubAppAdapter {
         `Run ${before.id} changed before association rollback: expected ${attempted.version}, on disk ${current.version}`,
       );
     }
-    const rollback = structuredClone(before);
-    rollback.version = current.version;
+    if (
+      eventHistoryIdentity(current.events) !== eventHistoryIdentity(attempted.events) ||
+      associationRollbackInvariant(current) !== associationRollbackInvariant(attempted)
+    ) {
+      throw new Error(
+        `Run ${before.id} changed before association rollback: attempted snapshot no longer matches`,
+      );
+    }
+    const rollback = structuredClone(current);
+    if (before.github === undefined) delete rollback.github;
+    else rollback.github = structuredClone(before.github);
+    if (before.evidence === undefined) delete rollback.evidence;
+    else rollback.evidence = structuredClone(before.evidence);
     await this.store.save(rollback);
   }
 
@@ -412,9 +456,18 @@ export class GitHubAppAdapter {
     run: RunRecord,
     transaction: GitHubAssociationTransaction,
   ): Promise<void> {
+    if (
+      eventHistoryIdentity(run.events) !== eventHistoryIdentity(before.events) ||
+      associationRollbackInvariant(run) !== associationRollbackInvariant(before)
+    ) {
+      throw new Error(
+        `Run ${before.id} association transaction changed fields outside github/evidence`,
+      );
+    }
     try {
       await this.store.save(run);
     } catch (error) {
+      if (error instanceof DurableAtomicWriteOutcomeUnknownError) throw error;
       try {
         await this.rollbackRunMutation(before, run);
       } catch (rollbackError) {
@@ -428,6 +481,53 @@ export class GitHubAppAdapter {
     }
     const attempted = structuredClone(run);
     transaction.onRollback(() => this.rollbackRunMutation(before, attempted));
+  }
+
+  private async routeAssociationHead(
+    runId: string,
+    previousHeadSha: string | undefined,
+    requestedHeadSha: string,
+  ): Promise<RunRecord> {
+    await this.afterAssociationCommitBeforeRouting?.(runId);
+    const authoritative = await this.store.load(runId);
+    const priorAssociationHeadSha =
+      previousHeadSha !== requestedHeadSha ? previousHeadSha : undefined;
+    const priorWorkspaceHeadSha =
+      authoritative.workspace?.headSha !== requestedHeadSha
+        ? authoritative.workspace?.headSha
+        : undefined;
+    const pendingPredecessor = authoritative.github?.pendingCancellationHeadShas?.find(
+      (headSha) => headSha !== requestedHeadSha,
+    );
+    const routingPreviousHeadSha =
+      authoritative.revalidation?.requestedHeadSha ??
+      priorAssociationHeadSha ??
+      priorWorkspaceHeadSha ??
+      pendingPredecessor ??
+      previousHeadSha ??
+      authoritative.workspace?.headSha;
+    if (!routingPreviousHeadSha) return authoritative;
+    if (
+      authoritative.revalidation === undefined &&
+      authoritative.state !== "PR_READY" &&
+      authoritative.state !== "PR_REVIEW"
+    ) {
+      return authoritative;
+    }
+    if (
+      authoritative.revalidation === undefined &&
+      routingPreviousHeadSha === requestedHeadSha
+    ) {
+      return authoritative;
+    }
+    await new RevalidationService(this.store).route(runId, {
+      source: "github",
+      previousHeadSha: routingPreviousHeadSha,
+      requestedHeadSha,
+      expectedRunVersion: authoritative.version,
+      actor: "github-app",
+    });
+    return this.store.load(runId);
   }
 
   private async clearPublishedCancellationHeads(
@@ -744,12 +844,17 @@ export class GitHubAppAdapter {
           headSha,
           branch: run.github.branch,
         });
-        return { kind: "publish", run, pendingHeadShas } as const;
+        return { kind: "publish", run, previousHeadSha, pendingHeadShas } as const;
       });
 
       if (publication.kind === "publish") {
+        const routed = await this.routeAssociationHead(
+          publication.run.id,
+          publication.previousHeadSha,
+          headSha,
+        );
         await this.publishChecks(
-          publication.run,
+          routed,
           repository,
           pullRequestNumber,
           headSha,
@@ -757,7 +862,7 @@ export class GitHubAppAdapter {
           publication.pendingHeadShas,
         );
         await this.clearPublishedCancellationHeads(
-          publication.run.id,
+          routed.id,
           repository,
           pullRequestNumber,
           headSha,

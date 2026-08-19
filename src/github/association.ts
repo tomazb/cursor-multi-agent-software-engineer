@@ -115,6 +115,7 @@ export interface GitHubAssociationTransaction {
     pullRequestNumber: number,
     reason: "pull-request-closed" | "authorization-revoked",
   ): AssociationRecord | undefined;
+  /** Compensate only a known transaction failure; callbacks run in reverse registration order. */
   onRollback(callback: () => Promise<void>): void;
 }
 
@@ -246,9 +247,9 @@ export class GitHubAssociationIndex {
           throw error;
         }
         const rollbackErrors: unknown[] = [];
-        for (const rollback of rollbacks.reverse()) {
+        for (let index = rollbacks.length - 1; index >= 0; index -= 1) {
           try {
-            await rollback();
+            await rollbacks[index]!();
           } catch (rollbackError) {
             rollbackErrors.push(rollbackError);
           }
