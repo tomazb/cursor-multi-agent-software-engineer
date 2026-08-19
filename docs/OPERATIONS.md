@@ -551,9 +551,17 @@ recoverable failed generation. MASWE restarts at deterministic quality and fresh
 returns only to the recorded gate. Never copy earlier quality, verification, or merge-ready
 evidence into the new generation, and never delete historical request/retarget/failure events.
 
+Retarget and final stage publication ownership is retained in
+`.maswe/runs/<run-id>/.mutation-journal-v1/.lock-journal-v3/`. Its acquisition order is GitHub
+per-PR publication, per-PR association identity, per-run mutation, global association, then run
+store. A crashed owner is recovered automatically only when same-host PID probing proves `ESRCH`;
+a live owner remains blocking until the bounded acquisition timeout. Claims and releases are
+immutable and retained. Do not delete, compact, rename, or hand-repair this journal; corrupt or
+uncertain ownership fails closed.
+
 ### Read-only violation
 
-The run fails if a read-only role changes fingerprinted workspace state. In Git checkouts that includes git status/diffs/untracked content. In both Git and non-Git working directories it also includes authoritative `.maswe` run records, durable artifacts, and project config under the fingerprinted working directory (Git excludes do not hide that state from the fingerprint). Inspect `git status` (when applicable) and `.maswe/runs/<id>/`, and revert only changes attributable to that role. Preserve unrelated user work. Ephemeral `.lock` / `.admin.lock` / `.admin.lock.recovering` / `*.tmp` churn under `.maswe` is excluded from the fingerprint by design. The fingerprint is a before/after mutation detector, not an OS sandbox.
+The run fails if a read-only role changes fingerprinted workspace state. In Git checkouts that includes git status/diffs/untracked content. In both Git and non-Git working directories it also includes authoritative `.maswe` run records, durable artifacts, and project config under the fingerprinted working directory (Git excludes do not hide that state from the fingerprint). Inspect `git status` (when applicable) and `.maswe/runs/<id>/`, and revert only changes attributable to that role. Preserve unrelated user work. Ephemeral `.lock` / `.admin.lock` / `.admin.lock.recovering` / `*.tmp` churn and validated immutable run/mutation journal records under their exact paths are excluded from the fingerprint by design. The fingerprint is a before/after mutation detector, not an OS sandbox.
 
 ## 8. File-store backup and privacy
 

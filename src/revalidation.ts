@@ -8,6 +8,10 @@ import type {
 } from "./domain.ts";
 import { invalidateStaleEvidence } from "./git-workspace.ts";
 import type { RunStore } from "./store.ts";
+import {
+  withRunMutationFence,
+  type RunMutationFenceOptions,
+} from "./run-mutation.ts";
 
 export interface RevalidationTargetInput {
   source: RevalidationSource;
@@ -67,31 +71,53 @@ function candidateWithObservedWorkspace(
 export class RevalidationService {
   private readonly store: RunStore;
   private readonly now: () => string;
+  private readonly mutationFenceOptions: RunMutationFenceOptions;
 
-  constructor(store: RunStore, now: () => string = () => new Date().toISOString()) {
+  constructor(
+    store: RunStore,
+    now: (() => string) | undefined = () => new Date().toISOString(),
+    options: { mutationFenceOptions?: RunMutationFenceOptions } = {},
+  ) {
     this.store = store;
     this.now = now;
+    this.mutationFenceOptions = options.mutationFenceOptions ?? {};
   }
 
   async route(runId: string, input: RevalidationTargetInput): Promise<RunRecord> {
     requireTargetInput(input);
-    const run = await this.store.load(runId);
-    if (run.version !== input.expectedRunVersion) {
-      throw new RevalidationOptimisticConflictError(
-        `Revalidation optimistic version conflict for run ${runId}: expected ${input.expectedRunVersion}, authoritative ${run.version}`,
-      );
-    }
+    const location = await this.store.load(runId);
+    return withRunMutationFence(
+      location.repositoryPath,
+      runId,
+      "target",
+      async () => {
+        // The preliminary read is path discovery only. All target decisions use
+        // authority reloaded after durable mutation ownership is entered.
+        const run = await this.store.load(runId);
+        if (run.repositoryPath !== location.repositoryPath) {
+          throw new RevalidationOptimisticConflictError(
+            `Revalidation repository path changed for run ${runId}`,
+          );
+        }
+        if (run.version !== input.expectedRunVersion) {
+          throw new RevalidationOptimisticConflictError(
+            `Revalidation optimistic version conflict for run ${runId}: expected ${input.expectedRunVersion}, authoritative ${run.version}`,
+          );
+        }
 
-    const revalidation = run.revalidation;
-    if (revalidation === undefined) {
-      return this.requestInitial(run, input);
-    }
-    if (revalidation.requestedHeadSha !== input.previousHeadSha) {
-      throw new RevalidationOptimisticConflictError(
-        `Revalidation optimistic predecessor conflict for run ${runId}: expected ${input.previousHeadSha}, authoritative target ${revalidation.requestedHeadSha}`,
-      );
-    }
-    return this.routeActive(run, revalidation, input);
+        const revalidation = run.revalidation;
+        if (revalidation === undefined) {
+          return this.requestInitial(run, input);
+        }
+        if (revalidation.requestedHeadSha !== input.previousHeadSha) {
+          throw new RevalidationOptimisticConflictError(
+            `Revalidation optimistic predecessor conflict for run ${runId}: expected ${input.previousHeadSha}, authoritative target ${revalidation.requestedHeadSha}`,
+          );
+        }
+        return this.routeActive(run, revalidation, input);
+      },
+      this.mutationFenceOptions,
+    );
   }
 
   private async requestInitial(

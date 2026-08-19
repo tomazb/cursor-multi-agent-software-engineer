@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   appendFile,
   mkdtemp,
@@ -17,8 +18,16 @@ import { gitWorkspaceFingerprint } from "../src/git-snapshot.ts";
 import { ensureMasweGitExclude, ensureRunWorkspace } from "../src/git-workspace.ts";
 import { publishLockClaim } from "../src/lock-journal.ts";
 import { FileRunStore } from "../src/store.ts";
+import { runMutationJournalRoot, withRunMutationFence } from "../src/run-mutation.ts";
 
 const execFileAsync = promisify(execFile);
+
+const FROZEN_SCHEMA_V1_GIT_FINGERPRINT_BYTES = Buffer.from(
+  "2e6d617377652f636f6e6669672e6a736f6e0066696c65007b2276657273696f6e223a317d0a",
+  "hex",
+);
+const FROZEN_SCHEMA_V1_GIT_FINGERPRINT =
+  "a4b2410ea3e8b463fae30a293b71718815ca9fa93547f6aea66ddc8264047bb6";
 
 async function initRepo(): Promise<string> {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-fp-"));
@@ -30,6 +39,19 @@ async function initRepo(): Promise<string> {
   await execFileAsync("git", ["commit", "-qm", "init"], { cwd });
   return cwd;
 }
+
+test("schema-v1 Git fingerprint preserves the frozen legacy raw-byte digest", async () => {
+  const cwd = await initRepo();
+  await mkdir(path.join(cwd, ".maswe"), { recursive: true });
+  await writeFile(path.join(cwd, ".maswe", "config.json"), '{"version":1}\n', "utf8");
+
+  assert.equal(
+    createHash("sha256").update(FROZEN_SCHEMA_V1_GIT_FINGERPRINT_BYTES).digest("hex"),
+    FROZEN_SCHEMA_V1_GIT_FINGERPRINT,
+    "the frozen expected digest must be derived from literal legacy input bytes",
+  );
+  assert.equal(await gitWorkspaceFingerprint(cwd), FROZEN_SCHEMA_V1_GIT_FINGERPRINT);
+});
 
 test("useIsolatedWorktree=false: mutating run.json changes fingerprint", async () => {
   const cwd = await initRepo();
@@ -137,6 +159,27 @@ test("lock and temp churn under .maswe does not change fingerprint", async () =>
   );
   const after = await gitWorkspaceFingerprint(cwd);
   assert.equal(before, after, "ephemeral lock/temp files must not affect fingerprint");
+});
+
+test("only canonical per-run mutation journal churn is fingerprint-excluded", async () => {
+  const cwd = await initRepo();
+  await ensureMasweGitExclude(cwd);
+  const store = new FileRunStore(cwd);
+  const run = await store.create("fp-mutation-journal", "request", DEFAULT_CONFIG);
+  const before = await gitWorkspaceFingerprint(cwd);
+
+  await withRunMutationFence(cwd, run.id, "target", async () => undefined);
+  assert.equal(
+    await gitWorkspaceFingerprint(cwd),
+    before,
+    "validated immutable mutation records are synchronization churn",
+  );
+
+  await writeFile(
+    path.join(runMutationJournalRoot(cwd, run.id), "unexpected-authoritative"),
+    "must stay visible\n",
+  );
+  assert.notEqual(await gitWorkspaceFingerprint(cwd), before);
 });
 
 test("journal exclusion is limited to a run's exact synchronization namespace", async () => {

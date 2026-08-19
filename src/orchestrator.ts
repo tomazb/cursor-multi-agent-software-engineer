@@ -60,6 +60,10 @@ import {
 } from "./failure-diagnostics.ts";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import {
+  RunMutationSupersededError,
+  withRunMutationFence,
+} from "./run-mutation.ts";
 
 function isCanonicalFileStoreTimestamp(value: string): boolean {
   if (value.length !== 24) return false;
@@ -108,6 +112,11 @@ export interface OrchestratorOptions {
   afterWorkspaceCheckpoint?: (run: RunRecord) => Promise<void>;
   /** Test seam immediately before the single retry event publication. */
   beforeRetryPublication?: (candidate: RunRecord) => Promise<void>;
+  /** Deterministic barrier after final authority reload under the mutation fence. */
+  afterRunMutationReload?: (
+    phase: "builder" | "resolver" | "quality" | "verifier",
+    authoritative: RunRecord,
+  ) => Promise<void>;
 }
 
 interface ActiveRevalidationPreflight {
@@ -128,6 +137,7 @@ export class Orchestrator {
   private readonly bootstrapHooks: WorkspaceBootstrapHooks;
   private readonly afterWorkspaceCheckpoint: ((run: RunRecord) => Promise<void>) | undefined;
   private readonly beforeRetryPublication: ((candidate: RunRecord) => Promise<void>) | undefined;
+  private readonly afterRunMutationReload: OrchestratorOptions["afterRunMutationReload"];
 
   constructor(
     cwd: string,
@@ -145,6 +155,7 @@ export class Orchestrator {
     this.bootstrapHooks = options.bootstrapHooks ?? {};
     this.afterWorkspaceCheckpoint = options.afterWorkspaceCheckpoint;
     this.beforeRetryPublication = options.beforeRetryPublication;
+    this.afterRunMutationReload = options.afterRunMutationReload;
     if (
       !Number.isSafeInteger(this.automaticTransitionLimit) ||
       this.automaticTransitionLimit <= 0
@@ -489,6 +500,32 @@ export class Orchestrator {
     if (fence) await assertRevalidationFence(this.store, run.id, fence);
   }
 
+  private async withRunPublicationFence<T>(
+    run: RunRecord,
+    phase: "builder" | "resolver" | "quality" | "verifier",
+    fence: RevalidationFence | undefined,
+    publish: () => Promise<T>,
+  ): Promise<T> {
+    return withRunMutationFence(
+      run.repositoryPath,
+      run.id,
+      "publication",
+      async (lease) => {
+        const authoritative = fence
+          ? await assertRevalidationFence(this.store, run.id, fence)
+          : await this.store.load(run.id);
+        if (!fence && authoritative.version !== run.version) {
+          throw new Error(
+            `Run ${run.id} changed before ${phase} publication: expected ${run.version}, authoritative ${authoritative.version}`,
+          );
+        }
+        await this.afterRunMutationReload?.(phase, authoritative);
+        await lease.assertNoQueuedTargetMutation();
+        return publish();
+      },
+    );
+  }
+
   private async syncWorkspace(run: RunRecord): Promise<string | undefined> {
     if (!run.workspace || run.workspace.baseSha === "not-a-git-repository") return undefined;
     const workdir = workingDirectoryFor(run);
@@ -600,18 +637,19 @@ export class Orchestrator {
           await this.store.writeArtifact(run, "05-quality-report.md", renderQualityReport(report));
           const fence = this.captureOptionalRevalidationFence(run);
           const accepted = report.passed || !run.config.gates.requireCiPass;
-          await this.assertOptionalRevalidationFence(run, fence);
-          this.bindEvidence(run, "quality", evaluatedSha, report.passed);
-          return this.store.applyEvent(
-            run,
-            accepted ? "CI_PASSED" : "CI_FAILED",
-            "quality-runner",
-            {
-              passed: report.passed,
-              required: run.config.gates.requireCiPass,
-              headSha: evaluatedSha,
-            },
-          );
+          return this.withRunPublicationFence(run, "quality", fence, async () => {
+            this.bindEvidence(run, "quality", evaluatedSha, report.passed);
+            return this.store.applyEvent(
+              run,
+              accepted ? "CI_PASSED" : "CI_FAILED",
+              "quality-runner",
+              {
+                passed: report.passed,
+                required: run.config.gates.requireCiPass,
+                headSha: evaluatedSha,
+              },
+            );
+          });
         }
         case "VERIFYING": {
           const workdir = workingDirectoryFor(run);
@@ -672,32 +710,30 @@ export class Orchestrator {
           }
           const fence = this.captureOptionalRevalidationFence(run);
           const accepted = passed || !run.config.gates.requireVerifierPass;
-          await this.assertOptionalRevalidationFence(run, fence);
-          this.bindEvidence(run, "verification", evaluatedSha, passed);
-          const successEvent =
-            run.revalidation?.returnState === "PR_READY"
-              ? "VERIFY_PASSED"
-              : run.revalidation?.returnState === "PR_REVIEW"
-                ? "VERIFY_PASSED_AFTER_REVIEW"
-                : run.counters.commentResolutionCycles > 0
+          return this.withRunPublicationFence(run, "verifier", fence, async () => {
+            this.bindEvidence(run, "verification", evaluatedSha, passed);
+            const successEvent =
+              run.revalidation?.returnState === "PR_READY"
+                ? "VERIFY_PASSED"
+                : run.revalidation?.returnState === "PR_REVIEW"
                   ? "VERIFY_PASSED_AFTER_REVIEW"
-                  : "VERIFY_PASSED";
-          if (accepted && run.revalidation) {
-            await this.assertOptionalRevalidationFence(run, fence);
-            delete run.revalidation;
-          }
-          return this.store.applyEvent(
-            run,
-            accepted ? successEvent : "VERIFY_FAILED",
-            "verifier",
-            {
-              passed,
-              required: run.config.gates.requireVerifierPass,
-              ...runtimeEventIdentityDetails(result),
-              headSha: evaluatedSha,
-              marker: markers.marker,
-            },
-          );
+                  : run.counters.commentResolutionCycles > 0
+                    ? "VERIFY_PASSED_AFTER_REVIEW"
+                    : "VERIFY_PASSED";
+            if (accepted && run.revalidation) delete run.revalidation;
+            return this.store.applyEvent(
+              run,
+              accepted ? successEvent : "VERIFY_FAILED",
+              "verifier",
+              {
+                passed,
+                required: run.config.gates.requireVerifierPass,
+                ...runtimeEventIdentityDetails(result),
+                headSha: evaluatedSha,
+                marker: markers.marker,
+              },
+            );
+          });
         }
         case "CLASSIFYING_COMMENT": {
           const comment = (await this.store.readArtifact(run, "07-review-comment.md")) ?? "";
@@ -730,6 +766,7 @@ export class Orchestrator {
           throw new Error(`State ${run.state} requires a user or integration event.`);
       }
     } catch (error) {
+      if (error instanceof RunMutationSupersededError) throw error;
       return this.failRun(
         run,
         runFailureMessage(error),
@@ -768,30 +805,31 @@ export class Orchestrator {
         );
       }
       await assertWorkingTreeScope(workdir, run.config.policy.allowedPathGlobs);
-      await this.assertOptionalRevalidationFence(run, fence);
-      const committed = await createDeterministicCommit(workdir, "maswe: builder changes", {
-        allowedPathGlobs: run.config.policy.allowedPathGlobs,
-      });
-      if (!(await isGitWorkspaceClean(workdir))) {
-        throw new Error("worktree remained dirty after deterministic commit");
-      }
-      if (committed.files.length > 0) {
-        await assertChangeScope(workdir, run.workspace.baseSha, run.config.policy.allowedPathGlobs);
-      }
-      outputHeadSha = committed.headSha;
-      run.workspace.headSha = committed.headSha;
-      invalidateStaleEvidence(run, committed.headSha);
     }
-
-    const evaluatedHeadSha = outputHeadSha ?? beforeSha ?? run.workspace?.headSha;
-    await this.assertOptionalRevalidationFence(run, fence);
-    return this.store.applyEvent(run, "BUILD_COMPLETED", "builder", {
-      ...runtimeEventIdentityDetails(result),
-      marker: markers.marker,
-      ...(beforeSha ? { inputHeadSha: beforeSha } : {}),
-      ...(evaluatedHeadSha
-        ? { headSha: evaluatedHeadSha, outputHeadSha: evaluatedHeadSha }
-        : {}),
+    return this.withRunPublicationFence(run, "builder", fence, async () => {
+      if (run.workspace && run.workspace.baseSha !== "not-a-git-repository" && beforeSha) {
+        const committed = await createDeterministicCommit(workdir, "maswe: builder changes", {
+          allowedPathGlobs: run.config.policy.allowedPathGlobs,
+        });
+        if (!(await isGitWorkspaceClean(workdir))) {
+          throw new Error("worktree remained dirty after deterministic commit");
+        }
+        if (committed.files.length > 0) {
+          await assertChangeScope(workdir, run.workspace.baseSha, run.config.policy.allowedPathGlobs);
+        }
+        outputHeadSha = committed.headSha;
+        run.workspace.headSha = committed.headSha;
+        invalidateStaleEvidence(run, committed.headSha);
+      }
+      const evaluatedHeadSha = outputHeadSha ?? beforeSha ?? run.workspace?.headSha;
+      return this.store.applyEvent(run, "BUILD_COMPLETED", "builder", {
+        ...runtimeEventIdentityDetails(result),
+        marker: markers.marker,
+        ...(beforeSha ? { inputHeadSha: beforeSha } : {}),
+        ...(evaluatedHeadSha
+          ? { headSha: evaluatedHeadSha, outputHeadSha: evaluatedHeadSha }
+          : {}),
+      });
     });
   }
 
@@ -823,27 +861,28 @@ export class Orchestrator {
         );
       }
       await assertWorkingTreeScope(workdir, run.config.policy.allowedPathGlobs);
-      await this.assertOptionalRevalidationFence(run, fence);
-      const committed = await createDeterministicCommit(workdir, "maswe: resolve review comment", {
-        allowedPathGlobs: run.config.policy.allowedPathGlobs,
-      });
-      if (!(await isGitWorkspaceClean(workdir))) {
-        throw new Error("worktree remained dirty after deterministic commit");
-      }
-      outputHeadSha = committed.headSha;
-      run.workspace.headSha = committed.headSha;
-      invalidateStaleEvidence(run, committed.headSha);
     }
-
-    const evaluatedHeadSha = outputHeadSha ?? beforeSha ?? run.workspace?.headSha;
-    await this.assertOptionalRevalidationFence(run, fence);
-    return this.store.applyEvent(run, "RESOLUTION_COMPLETED", "prResolver", {
-      ...runtimeEventIdentityDetails(result),
-      marker: markers.marker,
-      ...(beforeSha ? { inputHeadSha: beforeSha } : {}),
-      ...(evaluatedHeadSha
-        ? { headSha: evaluatedHeadSha, outputHeadSha: evaluatedHeadSha }
-        : {}),
+    return this.withRunPublicationFence(run, "resolver", fence, async () => {
+      if (run.workspace && run.workspace.baseSha !== "not-a-git-repository" && beforeSha) {
+        const committed = await createDeterministicCommit(workdir, "maswe: resolve review comment", {
+          allowedPathGlobs: run.config.policy.allowedPathGlobs,
+        });
+        if (!(await isGitWorkspaceClean(workdir))) {
+          throw new Error("worktree remained dirty after deterministic commit");
+        }
+        outputHeadSha = committed.headSha;
+        run.workspace.headSha = committed.headSha;
+        invalidateStaleEvidence(run, committed.headSha);
+      }
+      const evaluatedHeadSha = outputHeadSha ?? beforeSha ?? run.workspace?.headSha;
+      return this.store.applyEvent(run, "RESOLUTION_COMPLETED", "prResolver", {
+        ...runtimeEventIdentityDetails(result),
+        marker: markers.marker,
+        ...(beforeSha ? { inputHeadSha: beforeSha } : {}),
+        ...(evaluatedHeadSha
+          ? { headSha: evaluatedHeadSha, outputHeadSha: evaluatedHeadSha }
+          : {}),
+      });
     });
   }
 

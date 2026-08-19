@@ -206,6 +206,13 @@ generation. Evidence from a superseded generation is unusable. The associated Gi
 required target: quality and verification cannot publish for a worktree head that has not been
 aligned to it, and merge-ready/completion require exact workspace/GitHub head equality.
 
+Manual and webhook Phase A follow one lock order: per-PR publication, per-PR association identity,
+per-run target mutation, global association index, then run-store data. Authorization suspension
+uses the applicable suffix (identity, association, store). The run mutation fence is released
+before checks are posted; routing itself reacquires it through the shared revalidation service.
+This prevents a builder/resolver publication from committing against the prior head between the
+association update and the durable request/retarget event.
+
 Association state is exact-schema validated and permits one active PR per run ID. PR closure uses
 a distinct suspension reason, so a valid `reopened` event can reactivate it. Installation deletion
 or repository removal uses authorization suspension, which no PR event may clear.
@@ -237,6 +244,10 @@ If association commit or rollback reports an outcome-unknown failure, publicatio
 workflow event. After an association has committed, a request/retarget publication failure is
 retried against authoritative state; the committed association is not rolled back across an
 already-published event.
+
+An `authorization-revoked` association-index suspension is monotonic. Manual publication checks
+it while identity-fenced before any bind or run mutation, and installation/repository suspension
+continues through every association before aggregating failures.
 
 ## Approval model
 

@@ -134,6 +134,7 @@ async function adapterHarness(
   t: test.TestContext,
   options: {
     wrapStore?: (store: FileRunStore) => RunStore;
+    bindAssociation?: boolean;
     associationWriteRecords?: (filePath: string, content: string) => Promise<void>;
     afterAssociationCommitBeforeRouting?: (runId: string) => Promise<void>;
     afterAssociationValidatedBeforeRouting?: (runId: string) => Promise<void>;
@@ -148,15 +149,17 @@ async function adapterHarness(
   const run = await advanceToPrReview(store);
   const githubRoot = path.join(cwd, ".maswe", "github");
   const index = new GitHubAssociationIndex(githubRoot);
-  await index.bind({
-    runId: run.id,
-    installationId: 44,
-    repository: "owner/repo",
-    pullRequestNumber: 28,
-    baseSha: HEAD_A,
-    headSha: HEAD_A,
-    branch: "maswe/issue-28",
-  });
+  if (options.bindAssociation !== false) {
+    await index.bind({
+      runId: run.id,
+      installationId: 44,
+      repository: "owner/repo",
+      pullRequestNumber: 28,
+      baseSha: HEAD_A,
+      headSha: HEAD_A,
+      branch: "maswe/issue-28",
+    });
+  }
 
   let liveHead = HEAD_A;
   let nextCheckId = 1;
@@ -235,6 +238,48 @@ async function deliver(harness: AdapterHarness, headSha: string, deliveryId: str
     rawBody,
   });
 }
+
+test("manual Phase A preserves index-only authorization suspension before bind", async (t) => {
+  const harness = await adapterHarness(t);
+  const before = await harness.store.load(harness.runId);
+  await harness.index.suspend("owner/repo", 28, "authorization-revoked");
+
+  await assert.rejects(
+    harness.adapter.publishChecksForRun(harness.runId),
+    /authorization.*revoked|association.*suspended/i,
+  );
+
+  assert.deepEqual(await harness.store.load(harness.runId), before);
+  const indexed = await harness.index.find("owner/repo", 28);
+  assert.equal(indexed?.suspended, true);
+  assert.equal(indexed?.suspensionReason, "authorization-revoked");
+  assert.equal(harness.posts.length, 0);
+});
+
+test("webhook does not mutate a run discovered only after its fenced identity snapshot", async (t) => {
+  let listCalls = 0;
+  const harness = await adapterHarness(t, {
+    bindAssociation: false,
+    wrapStore: (store) => ({
+      create: store.create.bind(store),
+      save: store.save.bind(store),
+      load: store.load.bind(store),
+      list: async () => {
+        listCalls += 1;
+        return listCalls === 1 ? [] : store.list();
+      },
+      applyEvent: store.applyEvent.bind(store),
+      writeArtifact: store.writeArtifact.bind(store),
+      readArtifact: store.readArtifact.bind(store),
+    }),
+  });
+  const before = await harness.store.load(harness.runId);
+
+  await deliver(harness, HEAD_B, "late-run-after-identity-snapshot");
+
+  assert.deepEqual(await harness.store.load(harness.runId), before);
+  assert.equal(await harness.index.find("owner/repo", 28), undefined);
+});
 
 test("github association failure matrix never rewrites an already-published workflow event", async (t) => {
   await t.test("run-save failure leaves the authoritative association and events unchanged", async (t) => {
@@ -677,3 +722,51 @@ test("association outcome unknown never invokes registered rollback callbacks", 
   );
   assert.deepEqual(rollbacks, []);
 });
+
+for (const nesting of ["AggregateError.errors", "Error.cause"] as const) {
+  test(`association transaction treats nested outcome uncertainty in ${nesting} as non-compensable`, async (t) => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-issue28-nested-unknown-"));
+    t.after(async () => rm(cwd, { recursive: true, force: true }));
+    const outcomeUnknown = new DurableAtomicWriteOutcomeUnknownError(
+      "GitHub association index",
+      new Error("simulated directory sync failure"),
+    );
+    let nested: Error;
+    if (nesting === "AggregateError.errors") {
+      const aggregate = new AggregateError(
+        [new Error("release failed"), outcomeUnknown],
+        "association publication and release failed",
+      );
+      Object.defineProperty(aggregate, "cause", { value: aggregate });
+      nested = aggregate;
+    } else {
+      nested = new Error("association publication wrapper", { cause: outcomeUnknown });
+      Object.defineProperty(outcomeUnknown, "cause", { value: nested });
+    }
+    let rollbackCalls = 0;
+    const index = new GitHubAssociationIndex(path.join(cwd, "github"), {
+      writeRecords: async () => {
+        throw nested;
+      },
+    });
+
+    await assert.rejects(
+      index.withTransaction(async (transaction) => {
+        transaction.onRollback(async () => {
+          rollbackCalls += 1;
+        });
+        transaction.bind({
+          runId: `run-nested-${nesting === "Error.cause" ? "cause" : "aggregate"}`,
+          installationId: 44,
+          repository: "owner/repo",
+          pullRequestNumber: 28,
+          baseSha: HEAD_A,
+          headSha: HEAD_B,
+          branch: "maswe/issue-28",
+        });
+      }),
+      (error: unknown) => error === nested,
+    );
+    assert.equal(rollbackCalls, 0);
+  });
+}

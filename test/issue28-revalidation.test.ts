@@ -399,7 +399,7 @@ test("active routing never reverses a newer target when the predecessor is stale
   assert.deepEqual(await store.load(atC.id), before);
 });
 
-test("illegal revalidation states and contexts fail closed without publication", async (t) => {
+test("illegal revalidation requests and persisted contexts fail closed without publication", async (t) => {
   const store = await tempStore(t);
   const noContext = await runInState(store, "BUILDING");
   const noContextVersion = noContext.version;
@@ -416,20 +416,13 @@ test("illegal revalidation states and contexts fail closed without publication",
   assert.equal((await store.load(noContext.id)).version, noContextVersion);
 
   const activeAtIllegalGate = await initialRequest(store);
+  const activeVersion = activeAtIllegalGate.version;
   activeAtIllegalGate.state = "PR_REVIEW";
-  await store.save(activeAtIllegalGate);
-  const illegalVersion = activeAtIllegalGate.version;
   await assert.rejects(
-    new RevalidationService(store).route(activeAtIllegalGate.id, {
-      source: "github",
-      previousHeadSha: HEAD_B,
-      requestedHeadSha: HEAD_C,
-      expectedRunVersion: activeAtIllegalGate.version,
-      actor: "github-app",
-    }),
-    /illegal.*revalidation|active revalidation/i,
+    store.save(activeAtIllegalGate),
+    /revalidation state.*invalid/i,
   );
-  assert.equal((await store.load(activeAtIllegalGate.id)).version, illegalVersion);
+  assert.equal((await store.load(activeAtIllegalGate.id)).version, activeVersion);
 
   const failed = await runInState(store, "FAILED");
   assert.ok(activeAtIllegalGate.revalidation);
@@ -439,16 +432,9 @@ test("illegal revalidation states and contexts fail closed without publication",
     at: REQUESTED_AT,
     resumeState: "PR_READY",
   };
-  await store.save(failed);
   await assert.rejects(
-    new RevalidationService(store).route(failed.id, {
-      source: "github",
-      previousHeadSha: HEAD_B,
-      requestedHeadSha: HEAD_C,
-      expectedRunVersion: failed.version,
-      actor: "github-app",
-    }),
-    /illegal.*resume|active revalidation/i,
+    store.save(failed),
+    /revalidation.*invalid.*resume/i,
   );
 });
 

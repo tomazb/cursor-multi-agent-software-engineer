@@ -256,14 +256,14 @@ test("persisted run records satisfy run-record schema required shape", async (t)
   assertMatches(schema, schema, run, "run");
 });
 
-test("run-record schema and migration accept exact recovery metadata", async (t) => {
+test("run-record schema and migration accept exact legal recovery metadata", async (t) => {
   const schema = JSON.parse(
     await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
   ) as JsonSchema;
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-recovery-"));
   t.after(async () => rm(cwd, { recursive: true, force: true }));
   const store = new FileRunStore(cwd);
-  const run = await store.create("schema", "recovery contracts", DEFAULT_CONFIG);
+  const run = await store.create("schema", "bootstrap recovery contract", DEFAULT_CONFIG);
   const sourceSha = randomBytes(20).toString("hex");
   const originSha = randomBytes(20).toString("hex");
   const requestedSha = randomBytes(20).toString("hex");
@@ -275,7 +275,19 @@ test("run-record schema and migration accept exact recovery metadata", async (t)
     remote: "https://github.com/owner/repo.git",
     plannedAt: "2026-08-18T12:00:00.000Z",
   };
-  run.revalidation = {
+  await store.save(run);
+  const persistedBootstrap = await store.load(run.id);
+  assert.doesNotThrow(() => assertMatches(schema, schema, persistedBootstrap, "bootstrap run"));
+  assert.doesNotThrow(() => migrateRunRecord(persistedBootstrap));
+  assert.equal(persistedBootstrap.workspaceBootstrap?.sourceBaseSha, sourceSha);
+
+  const revalidationRun = await store.create(
+    "schema",
+    "revalidation recovery contract",
+    DEFAULT_CONFIG,
+  );
+  revalidationRun.state = "CI_RUNNING";
+  revalidationRun.revalidation = {
     returnState: "PR_REVIEW",
     source: "github",
     originHeadSha: originSha,
@@ -284,18 +296,11 @@ test("run-record schema and migration accept exact recovery metadata", async (t)
     requestedAt: "2026-08-18T12:01:00.000Z",
     updatedAt: "2026-08-18T12:02:00.000Z",
   };
-  run.failure = {
-    code: "automatic-transition-limit-exceeded",
-    message: "automatic transition limit exceeded",
-    at: "2026-08-18T12:03:00.000Z",
-    resumeState: "CI_RUNNING",
-  };
-  await store.save(run);
-  const persisted = await store.load(run.id);
+  await store.save(revalidationRun);
+  const persisted = await store.load(revalidationRun.id);
 
   assert.doesNotThrow(() => assertMatches(schema, schema, persisted, "run"));
   assert.doesNotThrow(() => migrateRunRecord(persisted));
-  assert.equal(persisted.workspaceBootstrap?.sourceBaseSha, sourceSha);
   assert.equal(persisted.revalidation?.originHeadSha, originSha);
   assert.equal(persisted.revalidation?.requestedHeadSha, requestedSha);
 

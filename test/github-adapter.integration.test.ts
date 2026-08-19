@@ -394,10 +394,12 @@ test("integration: new head SHA invalidates prior success conclusions", async ()
 
 test("integration: the post-association seam observes an event-free snapshot before head routing", async () => {
   process.env[SECRET_ENV] = SECRET;
+  const priorHead = "a".repeat(40);
+  const routedHead = "b".repeat(40);
   let authoritativeStore: FileRunStore;
   let snapshotAtSeam: Awaited<ReturnType<FileRunStore["load"]>> | undefined;
   const { adapter, store, cwd } = await setup({
-    liveHead: "sha-routed",
+    liveHead: routedHead,
     afterAssociationCommitBeforeRouting: async (runId) => {
       snapshotAtSeam = await authoritativeStore.load(runId);
     },
@@ -407,9 +409,9 @@ test("integration: the post-association seam observes an event-free snapshot bef
   run.state = "PR_REVIEW";
   run.workspace = {
     baseSha: "base",
-    headSha: "sha-routed",
+    headSha: routedHead,
     branch: "maswe/run-1",
-    fingerprint: "fp-routed",
+    fingerprint: "f".repeat(64),
     remote: "https://github.com/owner/repo.git",
   };
   run.github = {
@@ -417,13 +419,13 @@ test("integration: the post-association seam observes an event-free snapshot bef
     repository: "owner/repo",
     pullRequestNumber: 9,
     baseSha: "base",
-    headSha: "sha-prior",
+    headSha: priorHead,
     branch: "maswe/run-1",
     suspended: false,
   };
   run.evidence = {
-    quality: { headSha: "sha-prior", passed: true, at: "t" },
-    verification: { headSha: "sha-prior", passed: true, at: "t" },
+    quality: { headSha: priorHead, passed: true, at: "t" },
+    verification: { headSha: priorHead, passed: true, at: "t" },
   };
   await store.save(run);
   await new GitHubAssociationIndex(path.join(cwd, ".maswe", "github")).bind({
@@ -432,11 +434,11 @@ test("integration: the post-association seam observes an event-free snapshot bef
     repository: "owner/repo",
     pullRequestNumber: 9,
     baseSha: "base",
-    headSha: "sha-prior",
+    headSha: priorHead,
     branch: "maswe/run-1",
   });
   const priorEvents = structuredClone(run.events);
-  const body = JSON.stringify(prPayload("sha-routed"));
+  const body = JSON.stringify(prPayload(routedHead));
 
   await adapter.handleWebhook({
     deliveryId: "del-association-routing-seam",
@@ -445,7 +447,7 @@ test("integration: the post-association seam observes an event-free snapshot bef
     rawBody: body,
   });
 
-  assert.equal(snapshotAtSeam?.github?.headSha, "sha-routed");
+  assert.equal(snapshotAtSeam?.github?.headSha, routedHead);
   assert.equal(snapshotAtSeam?.evidence, undefined);
   assert.equal(snapshotAtSeam?.revalidation, undefined);
   assert.deepEqual(snapshotAtSeam?.events, priorEvents);

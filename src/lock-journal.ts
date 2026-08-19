@@ -67,7 +67,9 @@ export type ClaimOperation =
   | "github-association"
   | "github-check-create"
   | "github-delivery"
-  | "github-publication";
+  | "github-publication"
+  | "run-target-mutation"
+  | "run-publication";
 
 export interface ClaimProcessIdentity {
   startedAt: string;
@@ -214,6 +216,8 @@ const CLAIM_OPERATIONS: ClaimOperation[] = [
   "github-check-create",
   "github-delivery",
   "github-publication",
+  "run-target-mutation",
+  "run-publication",
 ];
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;

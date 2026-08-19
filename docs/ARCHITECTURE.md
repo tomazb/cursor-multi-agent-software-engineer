@@ -141,6 +141,7 @@ It does not contain Cursor SDK implementation details, shell output parsing, or 
 ```text
 .maswe/runs/<run-id>/
 ├── run.json
+├── .mutation-journal-v1/.lock-journal-v3/
 └── artifacts/
     ├── 02-brainstorm.md
     ├── 03-specification-and-design.md
@@ -157,6 +158,14 @@ for audit and recovery in a single-host local deployment. Mutating operations us
 per-run `.lock-journal-v3/` ticket journal described below. `writeArtifact` still rejects stale
 caller versions and only mutates authoritative on-disk state, so the lock change does not weaken
 optimistic versions or atomic run/artifact publication.
+
+Target retargeting and final stage publication use a second durable per-run journal beneath
+`.mutation-journal-v1/`. Target claims serialize every revalidation route and GitHub association
+head mutation with the final authoritative reload, builder/resolver commit, evidence/event
+publication, and successful verifier context clear. A publication performs one final successor
+scan after its reload: an already-published queued target claim wins; a target claim published
+after that scan observes the completed publication. The journal is separate from the store journal
+so protected callbacks can take ordinary run data locks without recursive acquisition.
 
 Artifacts are SHA-256 hashed when written. A future store can place content in object storage and keep the same reference contract.
 
@@ -212,7 +221,8 @@ the original values before those copies are constructed.
 
 Intentionally excluded from the MASWE portion (expected orchestration churn): `.lock`,
 `.admin.lock`, `.admin.lock.recovering`, canonical protocol entries beneath exact
-`runs/<run-id>/.lock-journal-v3/` paths, and ordinary `*.tmp` staging files. Unexpected or
+`runs/<run-id>/.lock-journal-v3/` and
+`runs/<run-id>/.mutation-journal-v1/.lock-journal-v3/` paths, and ordinary `*.tmp` staging files. Unexpected or
 malformed journal entries remain fingerprint-visible and also fail journal validation. The
 journal exclusion is deliberately path-specific; a `.lock-journal-v3` name elsewhere under
 `.maswe` remains fingerprinted. Isolated worktrees fingerprint their own `cwd` (typically without
@@ -366,6 +376,12 @@ Phase B adds push/PR writes, comment replies, and digest-bound GitHub approvals.
 
 v0.2 uses optimistic `version` checks and atomic writes per run. Concurrent writers against the
 same run still fail closed rather than merge updates.
+
+The cross-system acquisition order is fixed: GitHub per-PR publication journal, GitHub per-PR
+association-identity journal, per-run mutation journal, global GitHub association journal, then
+per-run store data journal. Paths that need only a suffix of this order start at that suffix.
+No callback reacquires a journal it already owns. This ordering lets manual and webhook Phase A
+mutations share the same target boundary as local retargets without deadlocking store writes.
 
 ### 9.1 Immutable local lock journals
 

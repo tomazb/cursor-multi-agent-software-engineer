@@ -2,6 +2,10 @@ import { createHash, type Hash } from "node:crypto";
 import { lstat, readdir, readFile, readlink } from "node:fs/promises";
 import path from "node:path";
 import { isCanonicalJournalFingerprintEntry } from "./lock-journal.ts";
+import {
+  RUN_MUTATION_JOURNAL_DIRECTORY,
+  runMutationJournalRoot,
+} from "./run-mutation.ts";
 import { spawnCaptured } from "./process.ts";
 
 interface ProcessResult {
@@ -27,6 +31,15 @@ function isRunJournalPath(segments: string[]): boolean {
   );
 }
 
+function isRunMutationJournalPath(segments: string[]): boolean {
+  return (
+    segments.length >= 3 &&
+    segments[0] === "runs" &&
+    segments[1] !== "" &&
+    segments[2] === RUN_MUTATION_JOURNAL_DIRECTORY
+  );
+}
+
 /**
  * Authoritative MASWE paths included in the read-only fingerprint (under `cwd/.maswe`):
  * - project config files
@@ -36,6 +49,8 @@ function isRunJournalPath(segments: string[]): boolean {
  * Intentionally excluded (ephemeral / self-churn):
  * - `.lock`, `.admin.lock`, `.admin.lock.recovering`
  * - canonical entries in exact `runs/<run-id>/.lock-journal-v3/` journals
+ * - canonical entries in exact
+ *   `runs/<run-id>/.mutation-journal-v1/.lock-journal-v3/` journals
  *   (unexpected or malformed entries remain fingerprint-visible)
  * - `*.tmp` write staging files
  *
@@ -69,6 +84,7 @@ async function hashMasweAuthoritativeState(cwd: string, hash: Hash): Promise<voi
     const segments = relative.split("/");
     const base = path.posix.basename(relative);
     const journalEntry = isRunJournalPath(segments);
+    const mutationJournalEntry = isRunMutationJournalPath(segments);
     if (
       journalEntry &&
       await isCanonicalJournalFingerprintEntry(
@@ -77,6 +93,17 @@ async function hashMasweAuthoritativeState(cwd: string, hash: Hash): Promise<voi
       )
     ) {
       continue;
+    }
+    if (mutationJournalEntry) {
+      const mutationRoot = runMutationJournalRoot(cwd, segments[1]!);
+      if (segments.length === 3) {
+        if (fileStat.isDirectory() && !fileStat.isSymbolicLink()) continue;
+      } else if (
+        segments[3] === ".lock-journal-v3" &&
+        await isCanonicalJournalFingerprintEntry(mutationRoot, segments.slice(4))
+      ) {
+        continue;
+      }
     }
     if (
       !journalEntry &&
@@ -170,7 +197,27 @@ const NON_GIT_FINGERPRINT_NAMESPACE = "maswe:workspace-fingerprint:non-git\0";
 
 const WORKSPACE_SOURCE_FINGERPRINT_NAMESPACE = "maswe:workspace-source-fingerprint:v1\0";
 
-async function hashGitWorkspaceSource(
+function updateLengthFramed(hash: Hash, value: string | Uint8Array): void {
+  const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : value;
+  const length = Buffer.alloc(8);
+  length.writeBigUInt64BE(BigInt(bytes.byteLength));
+  hash.update(length);
+  hash.update(bytes);
+}
+
+/** Fixed three-field records make path/type/payload concatenation injective. */
+function updateSourceRecord(
+  hash: Hash,
+  identity: string,
+  type: string,
+  payload: string | Uint8Array = "",
+): void {
+  updateLengthFramed(hash, identity);
+  updateLengthFramed(hash, type);
+  updateLengthFramed(hash, payload);
+}
+
+async function hashLegacyGitWorkspaceSource(
   cwd: string,
   hash: Hash,
   timeoutMs: number,
@@ -209,13 +256,47 @@ async function hashGitWorkspaceSource(
   }
 }
 
-async function hashNonGitWorkspaceSource(cwd: string, hash: Hash): Promise<void> {
-  let entries: string[];
-  try {
-    entries = await readdir(cwd, { recursive: true });
-  } catch {
-    return;
+async function hashFramedGitWorkspaceSource(
+  cwd: string,
+  hash: Hash,
+  timeoutMs: number,
+): Promise<void> {
+  const commands = [
+    ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...MASWE_GIT_PATHSPEC_EXCLUDES],
+    ["diff", "--binary", "--", ...MASWE_GIT_PATHSPEC_EXCLUDES],
+    ["diff", "--cached", "--binary", "--", ...MASWE_GIT_PATHSPEC_EXCLUDES],
+  ];
+  for (const args of commands) {
+    const result = await run("git", args, cwd, timeoutMs);
+    if (result.exitCode !== 0) throw gitFailure(args, result);
+    const identity = JSON.stringify(args);
+    updateSourceRecord(hash, identity, "stdout", result.stdout);
+    updateSourceRecord(hash, identity, "stderr", result.stderr);
   }
+
+  const untrackedArgs = [
+    "ls-files",
+    "--others",
+    "--exclude-standard",
+    "-z",
+    "--",
+    ...MASWE_GIT_PATHSPEC_EXCLUDES,
+  ];
+  const untracked = await run("git", untrackedArgs, cwd, timeoutMs);
+  if (untracked.exitCode !== 0) throw gitFailure(untrackedArgs, untracked);
+  for (const relative of untracked.stdout.split("\0").filter(Boolean).sort()) {
+    try {
+      updateSourceRecord(hash, relative, "file", await readFile(path.join(cwd, relative)));
+    } catch {
+      updateSourceRecord(hash, relative, "unreadable");
+    }
+  }
+}
+
+async function hashNonGitWorkspaceSource(cwd: string, hash: Hash): Promise<void> {
+  // Root enumeration is authoritative for a non-Git source tree. Propagate any
+  // failure rather than hashing an inaccessible tree as though it were empty.
+  const entries = await readdir(cwd, { recursive: true });
 
   const relativePaths = entries
     .map((entry) => (path.sep === "\\" ? entry.replace(/\\/g, "/") : entry))
@@ -228,28 +309,26 @@ async function hashNonGitWorkspaceSource(cwd: string, hash: Hash): Promise<void>
     try {
       fileStat = await lstat(absolute);
     } catch {
-      hash.update(`${relative}\0unreadable\0`);
+      updateSourceRecord(hash, relative, "unreadable");
       continue;
     }
 
     if (fileStat.isSymbolicLink()) {
-      hash.update(`${relative}\0symlink\0`);
       try {
-        hash.update(await readlink(absolute));
+        updateSourceRecord(hash, relative, "symlink", await readlink(absolute));
       } catch {
-        hash.update("unreadable");
+        updateSourceRecord(hash, relative, "symlink-unreadable");
       }
     } else if (fileStat.isFile()) {
-      hash.update(`${relative}\0file\0`);
       try {
-        hash.update(await readFile(absolute));
+        updateSourceRecord(hash, relative, "file", await readFile(absolute));
       } catch {
-        hash.update("unreadable");
+        updateSourceRecord(hash, relative, "file-unreadable");
       }
     } else if (fileStat.isDirectory()) {
-      hash.update(`${relative}\0directory\0`);
+      updateSourceRecord(hash, relative, "directory");
     } else {
-      hash.update(`${relative}\0other\0`);
+      updateSourceRecord(hash, relative, "other");
     }
   }
 }
@@ -268,7 +347,7 @@ export async function captureWorkspaceSourceFingerprint(
   hash.update(WORKSPACE_SOURCE_FINGERPRINT_NAMESPACE);
 
   if (await isGitRepository(cwd, timeoutMs)) {
-    await hashGitWorkspaceSource(cwd, hash, timeoutMs);
+    await hashFramedGitWorkspaceSource(cwd, hash, timeoutMs);
   } else {
     hash.update(NON_GIT_FINGERPRINT_NAMESPACE);
     await hashNonGitWorkspaceSource(cwd, hash);
@@ -282,9 +361,12 @@ export async function gitWorkspaceFingerprint(
   timeoutMs = GIT_TIMEOUT_MS,
 ): Promise<string> {
   const hash = createHash("sha256");
-  const sourceFingerprint = await captureWorkspaceSourceFingerprint(cwd, timeoutMs);
   if (await isGitRepository(cwd, timeoutMs)) {
-    hash.update(sourceFingerprint);
+    // Schema-v1 compatibility contract: keep the historical raw Git probe and
+    // untracked-file bytes as the authoritative fingerprint input. The
+    // separately namespaced source-only digest is intentionally not nested
+    // here because doing so changes every persisted Git workspace fingerprint.
+    await hashLegacyGitWorkspaceSource(cwd, hash, timeoutMs);
   } else {
     // Preserve the read-only non-Git contract: ordinary source files are not
     // authoritative state. Bootstrap source identity above still includes them.

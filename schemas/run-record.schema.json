@@ -92,11 +92,20 @@
       ],
       "properties": {
         "mode": { "enum": ["operator-checkout", "isolated-worktree"] },
-        "sourceBaseSha": { "type": "string" },
-        "sourceBranch": { "type": "string" },
-        "sourceTreeFingerprint": { "type": "string" },
-        "remote": { "type": "string" },
-        "plannedAt": { "type": "string" }
+        "sourceBaseSha": {
+          "type": "string",
+          "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64}|not-a-git-repository)$"
+        },
+        "sourceBranch": { "type": "string", "pattern": "^\\S(?:.*\\S)?$" },
+        "sourceTreeFingerprint": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "remote": { "type": "string", "pattern": "^\\S(?:.*\\S)?$" },
+        "plannedAt": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+        }
       }
     },
     "revalidation": {
@@ -114,11 +123,23 @@
       "properties": {
         "returnState": { "enum": ["PR_READY", "PR_REVIEW"] },
         "source": { "enum": ["local-workspace", "github"] },
-        "originHeadSha": { "type": "string" },
-        "requestedHeadSha": { "type": "string" },
+        "originHeadSha": {
+          "type": "string",
+          "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$"
+        },
+        "requestedHeadSha": {
+          "type": "string",
+          "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$"
+        },
         "generation": { "type": "integer", "minimum": 1 },
-        "requestedAt": { "type": "string" },
-        "updatedAt": { "type": "string" }
+        "requestedAt": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+        },
+        "updatedAt": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+        }
       }
     },
     "evidence": {

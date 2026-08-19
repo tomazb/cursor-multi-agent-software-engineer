@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -295,6 +295,43 @@ test("non-Git bootstrap source fingerprint excludes .maswe and tracks source fil
     await captureWorkspaceSourceFingerprint(cwd),
     sourceBefore,
     "non-Git source content must affect bootstrap source identity",
+  );
+});
+
+test("non-Git source fingerprint fails closed when the source root cannot be enumerated", {
+  skip: process.platform === "win32",
+}, async (t) => {
+  const cwd = await nonGitDir();
+  t.after(async () => {
+    await chmod(cwd, 0o700);
+    await rm(cwd, { recursive: true, force: true });
+  });
+  await chmod(cwd, 0o111);
+
+  await assert.rejects(
+    captureWorkspaceSourceFingerprint(cwd),
+    /EACCES|permission denied|enumerat/i,
+  );
+});
+
+test("non-Git source fingerprint length framing separates an embedded-record adversarial pair", async (t) => {
+  const single = await nonGitDir();
+  const split = await nonGitDir();
+  t.after(async () => {
+    await rm(single, { recursive: true, force: true });
+    await rm(split, { recursive: true, force: true });
+  });
+  await writeFile(
+    path.join(single, "a"),
+    Buffer.concat([Buffer.from("left"), Buffer.from("b\0file\0right")]),
+  );
+  await writeFile(path.join(split, "a"), "left");
+  await writeFile(path.join(split, "b"), "right");
+
+  assert.notEqual(
+    await captureWorkspaceSourceFingerprint(single),
+    await captureWorkspaceSourceFingerprint(split),
+    "distinct trees must not collide when file payload bytes mimic the next path/type record",
   );
 });
 

@@ -1,6 +1,6 @@
 import path from "node:path";
 import {
-  DurableAtomicWriteOutcomeUnknownError,
+  containsDurableAtomicWriteOutcomeUnknown,
   MAX_AUTHORITATIVE_FILE_BYTES,
   readBoundedOrdinaryFile,
   requireOrdinaryDirectory,
@@ -241,7 +241,7 @@ export class GitHubAssociationIndex {
         if (dirty) await this.writeAll(records);
         return result;
       } catch (error) {
-        if (error instanceof DurableAtomicWriteOutcomeUnknownError) {
+        if (containsDurableAtomicWriteOutcomeUnknown(error)) {
           // Rename already published the exact intended index. Retrying is required because the
           // parent sync failed, but rolling back the run would create known cross-file divergence.
           throw error;
