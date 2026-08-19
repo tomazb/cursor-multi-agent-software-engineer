@@ -114,6 +114,12 @@ Any nonterminal state may transition to `FAILED` or `CANCELLED` through the gene
 committed GitHub association moved to a different head and stale evidence was invalidated. The
 return gate comes from append-only workflow history: a run that entered `PR_REVIEW` returns there;
 otherwise recovery returns to `PR_READY`. Recovery never returns directly to `MERGE_READY`.
+At either return gate, the orchestrator routes a mismatched committed GitHub association before
+checking local workspace freshness, then reloads authoritative state before returning an equality
+snapshot. A GitHub-routed checkpoint is returned without starting automatic work until the local
+workspace reaches that requested head; local-head routing may continue immediately because its
+observed workspace is already aligned. Optimistic races are retried through the bounded target
+reconciliation loop, and an unstable target fails closed.
 `REVALIDATION_RETARGETED` preserves all earlier events while moving an active generation back to
 `CI_RUNNING`; for a recoverable `FAILED` run it updates the retained resume state to `CI_RUNNING`
 without rewriting the historical `FAIL`. A newer authenticated or local head retargets an active

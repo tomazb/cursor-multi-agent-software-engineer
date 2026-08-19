@@ -936,6 +936,90 @@ for (const state of ["PR_READY", "PR_REVIEW"] as const) {
   });
 }
 
+for (const state of ["PR_READY", "PR_REVIEW"] as const) {
+  test(`local ${state} gate rechecks association authority after an equality snapshot`, async (t) => {
+    const harness = await associationRaceHarness(t, state, async () => {
+      throw new Error("simulated webhook crash after stale gate load");
+    });
+    let injectAssociation = true;
+    const localStore: RunStore = {
+      create: harness.store.create.bind(harness.store),
+      save: harness.store.save.bind(harness.store),
+      async load(runId) {
+        const snapshot = await harness.store.load(runId);
+        if (injectAssociation) {
+          injectAssociation = false;
+          await assert.rejects(
+            deliverAssociationRace(
+              harness,
+              `gate-${state.toLowerCase()}-association-after-equality-load`,
+            ),
+            /webhook crash after stale gate load/,
+          );
+        }
+        return snapshot;
+      },
+      list: harness.store.list.bind(harness.store),
+      applyEvent: harness.store.applyEvent.bind(harness.store),
+      writeArtifact: harness.store.writeArtifact.bind(harness.store),
+      readArtifact: harness.store.readArtifact.bind(harness.store),
+    };
+
+    const recovered = await new Orchestrator(
+      harness.cwd,
+      harness.config,
+      new HeadRecordingRuntime(),
+      localStore,
+    ).runUntilBlocked(harness.runId);
+
+    assert.equal(recovered.state, "CI_RUNNING");
+    assert.equal(recovered.github?.headSha, harness.headC);
+    assert.equal(recovered.revalidation?.requestedHeadSha, harness.headC);
+    assert.equal(recovered.revalidation?.returnState, state);
+    assert.equal(recovered.revalidation?.generation, 1);
+    assert.equal(initialRevalidationPublications(recovered), 1);
+    assert.equal(recovered.events.some((event) => event.type === "FAIL"), false);
+  });
+}
+
+test("return-gate preflight accepts a webhook-won target conflict without duplication", async (t) => {
+  const harness = await associationRaceHarness(t, "PR_REVIEW", async () => undefined);
+  await execFileAsync("git", ["merge", "--ff-only", "future-c"], { cwd: harness.cwd });
+  let loadCount = 0;
+  const localStore: RunStore = {
+    create: harness.store.create.bind(harness.store),
+    save: harness.store.save.bind(harness.store),
+    async load(runId) {
+      const snapshot = await harness.store.load(runId);
+      loadCount += 1;
+      if (loadCount === 2) {
+        await deliverAssociationRace(harness, "webhook-wins-return-gate-route");
+      }
+      return snapshot;
+    },
+    list: harness.store.list.bind(harness.store),
+    applyEvent: harness.store.applyEvent.bind(harness.store),
+    writeArtifact: harness.store.writeArtifact.bind(harness.store),
+    readArtifact: harness.store.readArtifact.bind(harness.store),
+  };
+
+  const recovered = await new Orchestrator(
+    harness.cwd,
+    harness.config,
+    new HeadRecordingRuntime(),
+    localStore,
+  ).runUntilBlocked(harness.runId);
+  const authoritative = await harness.store.load(harness.runId);
+
+  assert.equal(recovered.state, "CI_RUNNING");
+  assert.equal(authoritative.github?.headSha, harness.headC);
+  assert.equal(authoritative.revalidation?.requestedHeadSha, harness.headC);
+  assert.equal(authoritative.revalidation?.returnState, "PR_REVIEW");
+  assert.equal(authoritative.revalidation?.generation, 1);
+  assert.equal(initialRevalidationPublications(authoritative), 1);
+  assert.equal(authoritative.events.some((event) => event.type === "FAIL"), false);
+});
+
 test("complete routes a committed C association before stale B merge-ready evidence", async (t) => {
   const harness = await associationRaceHarness(t, "MERGE_READY", async () => {
     throw new Error("simulated webhook crash before merge-ready routing");

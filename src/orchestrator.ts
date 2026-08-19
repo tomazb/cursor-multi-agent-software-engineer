@@ -438,11 +438,9 @@ export class Orchestrator {
       if (isHumanGate(run.state)) {
         if (run.state !== "PR_READY" && run.state !== "PR_REVIEW") return run;
         try {
-          run = await this.preflightCommittedAssociationHead(run);
-          if (run.state !== "PR_READY" && run.state !== "PR_REVIEW") return run;
-          const preflight = await this.preflightReturnGate(run);
-          run = preflight;
-          if (run.state !== "PR_READY" && run.state !== "PR_REVIEW") continue;
+          const preflight = await this.preflightStableReturnGate(run);
+          run = preflight.run;
+          if (preflight.continueAutomaticWork) continue;
           return run;
         } catch (error) {
           return this.failRun(
@@ -510,6 +508,43 @@ export class Orchestrator {
       actor: "local-runner",
       observedWorkspace: observed.workspace!,
     });
+  }
+
+  private async preflightStableReturnGate(
+    run: RunRecord,
+  ): Promise<{ run: RunRecord; continueAutomaticWork: boolean }> {
+    let snapshot = run;
+    for (let attempt = 0; attempt < REVALIDATION_STABILITY_ATTEMPTS; attempt += 1) {
+      if (snapshot.state !== "PR_READY" && snapshot.state !== "PR_REVIEW") {
+        return { run: snapshot, continueAutomaticWork: false };
+      }
+      snapshot = await this.preflightCommittedAssociationHead(snapshot);
+      if (snapshot.state !== "PR_READY" && snapshot.state !== "PR_REVIEW") {
+        // A GitHub route may target a commit that is not checked out locally yet.
+        // Publish and return that checkpoint; continuing here would immediately
+        // fail revalidation alignment instead of waiting for the workspace at C.
+        return { run: snapshot, continueAutomaticWork: false };
+      }
+
+      let localPreflight: RunRecord;
+      try {
+        localPreflight = await this.preflightReturnGate(snapshot);
+      } catch (error) {
+        if (!(error instanceof RevalidationOptimisticConflictError)) throw error;
+        snapshot = await this.store.load(run.id);
+        continue;
+      }
+      if (localPreflight.state !== "PR_READY" && localPreflight.state !== "PR_REVIEW") {
+        return { run: localPreflight, continueAutomaticWork: true };
+      }
+
+      const authoritative = await this.store.load(run.id);
+      if (this.recordsEqual(authoritative, localPreflight)) {
+        return { run: authoritative, continueAutomaticWork: false };
+      }
+      snapshot = authoritative;
+    }
+    throw new Error(`Run ${run.id} return-gate authority did not stabilize`);
   }
 
   private currentWorkflowTarget(run: RunRecord): string | undefined {
