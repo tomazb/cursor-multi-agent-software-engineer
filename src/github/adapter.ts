@@ -454,8 +454,8 @@ export class GitHubAppAdapter {
   ): Promise<T> {
     return withGitHubJournal(
       this.root,
-      "publication",
-      `association:${repository.toLowerCase()}#${pullRequestNumber}`,
+      "association-identity",
+      `${repository.toLowerCase()}#${pullRequestNumber}`,
       callback,
       { timeoutMs: 60_000 },
     );
@@ -565,7 +565,11 @@ export class GitHubAppAdapter {
     if (
       authoritative.revalidation === undefined &&
       authoritative.state !== "PR_READY" &&
-      authoritative.state !== "PR_REVIEW"
+      authoritative.state !== "PR_REVIEW" &&
+      authoritative.state !== "BUILDING" &&
+      authoritative.state !== "CI_RUNNING" &&
+      authoritative.state !== "VERIFYING" &&
+      authoritative.state !== "MERGE_READY"
     ) {
       return authoritative;
     }
@@ -806,7 +810,6 @@ export class GitHubAppAdapter {
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === "ENOENT") return;
-      if (error instanceof Error && /not found|missing/i.test(error.message)) return;
       throw error;
     }
     if (!run.github) return;

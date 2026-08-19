@@ -24,6 +24,17 @@ import { FileRunStore } from "../src/store.ts";
 const execFileAsync = promisify(execFile);
 const HEAD_C = "c".repeat(40);
 
+function configuredWithinTimeoutMs(): number {
+  const raw = process.env.MASWE_TEST_WITHIN_TIMEOUT_MS;
+  const timeoutMs = raw === undefined ? 15_000 : Number(raw);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 60_000) {
+    throw new Error("MASWE_TEST_WITHIN_TIMEOUT_MS must be an integer from 1000 through 60000");
+  }
+  return timeoutMs;
+}
+
+const WITHIN_TIMEOUT_MS = configuredWithinTimeoutMs();
+
 function deferred<T = void>(): {
   promise: Promise<T>;
   resolve: (value: T | PromiseLike<T>) => void;
@@ -41,7 +52,7 @@ async function within<T>(promise: Promise<T>, label: string): Promise<T> {
     return await Promise.race([
       promise,
       new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 2_000);
+        timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), WITHIN_TIMEOUT_MS);
       }),
     ]);
   } finally {

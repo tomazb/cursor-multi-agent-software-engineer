@@ -30,6 +30,7 @@ import { FileRunStore, type RunStore } from "./store.ts";
 import {
   assertRevalidationFence,
   captureRevalidationFence,
+  hasEnteredPullRequestReview,
   RevalidationOptimisticConflictError,
   RevalidationService,
   type RevalidationFence,
@@ -769,7 +770,7 @@ export class Orchestrator {
                 ? "VERIFY_PASSED"
                 : run.revalidation?.returnState === "PR_REVIEW"
                   ? "VERIFY_PASSED_AFTER_REVIEW"
-                  : run.counters.commentResolutionCycles > 0
+                  : hasEnteredPullRequestReview(run)
                     ? "VERIFY_PASSED_AFTER_REVIEW"
                     : "VERIFY_PASSED";
             if (accepted && run.revalidation) delete run.revalidation;

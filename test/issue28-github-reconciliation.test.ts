@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import test from "node:test";
 import { mergeConfigForTest } from "../src/config.ts";
 import type { MasweConfig, RunRecord, WorkflowEventType } from "../src/domain.ts";
@@ -13,6 +15,9 @@ import {
 import { GitHubAppAdapter } from "../src/github/adapter.ts";
 import { GitHubAssociationIndex } from "../src/github/association.ts";
 import type { GitHubHttpClient } from "../src/github/checks.ts";
+import { captureWorkspace } from "../src/git-workspace.ts";
+import { Orchestrator } from "../src/orchestrator.ts";
+import { MockRuntime } from "../src/runtimes/mock.ts";
 import type { RunStore } from "../src/store.ts";
 import { FileRunStore } from "../src/store.ts";
 
@@ -21,6 +26,7 @@ const SECRET_ENV = "MASWE_TEST_ISSUE_28_GITHUB_RECONCILIATION_SECRET";
 const HEAD_A = "a".repeat(40);
 const HEAD_B = "b".repeat(40);
 const HEAD_C = "c".repeat(40);
+const execFileAsync = promisify(execFile);
 
 function config(): MasweConfig {
   return mergeConfigForTest({
@@ -41,7 +47,7 @@ function sign(body: string): string {
   return `sha256=${createHmac("sha256", SECRET).update(body, "utf8").digest("hex")}`;
 }
 
-function prPayload(headSha: string) {
+function prPayload(headSha: string, baseSha = HEAD_A) {
   return {
     action: "synchronize",
     installation: { id: 44 },
@@ -49,7 +55,7 @@ function prPayload(headSha: string) {
     pull_request: {
       number: 28,
       head: { sha: headSha, ref: "maswe/issue-28" },
-      base: { sha: HEAD_A },
+      base: { sha: baseSha },
     },
   };
 }
@@ -237,6 +243,41 @@ async function deliver(harness: AdapterHarness, headSha: string, deliveryId: str
     signatureHeader: sign(rawBody),
     rawBody,
   });
+}
+
+async function advancePostReviewWithoutRevalidation(
+  harness: AdapterHarness,
+  state: "CI_RUNNING" | "VERIFYING" | "MERGE_READY",
+): Promise<RunRecord> {
+  let run = await harness.store.load(harness.runId);
+  run.workspace = { ...run.workspace!, headSha: HEAD_B };
+  run.github = { ...run.github!, headSha: HEAD_B };
+  run.evidence = {
+    quality: { headSha: HEAD_B, passed: true, at: "2026-08-19T09:00:00.000Z" },
+    verification: { headSha: HEAD_B, passed: true, at: "2026-08-19T09:01:00.000Z" },
+    mergeReady: { headSha: HEAD_B, passed: true, at: "2026-08-19T09:02:00.000Z" },
+  };
+  await harness.store.save(run);
+  await harness.index.bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 28,
+    baseSha: HEAD_A,
+    headSha: HEAD_B,
+    branch: "maswe/issue-28",
+  });
+  run = await harness.store.load(run.id);
+  if (state === "MERGE_READY") {
+    return harness.store.applyEvent(run, "MARK_MERGE_READY", "user", { headSha: HEAD_B });
+  }
+  run = await harness.store.applyEvent(run, "REVIEW_COMMENT_RECEIVED", "github");
+  run = await harness.store.applyEvent(run, "COMMENT_IN_SCOPE", "pr-comment-classifier");
+  run = await harness.store.applyEvent(run, "RESOLUTION_COMPLETED", "prResolver");
+  if (state === "VERIFYING") {
+    run = await harness.store.applyEvent(run, "CI_PASSED", "quality-runner");
+  }
+  return run;
 }
 
 test("manual Phase A preserves index-only authorization suspension before bind", async (t) => {
@@ -516,6 +557,162 @@ test("github B then C at zero cycles retargets generation two without publishing
     bBoundQualityOrVerification.some((post) => post.conclusion === "success"),
     false,
   );
+});
+
+test("github head movement starts post-review recovery without an active revalidation", async (t) => {
+  for (const state of ["CI_RUNNING", "VERIFYING", "MERGE_READY"] as const) {
+    await t.test(state, async (t) => {
+      const harness = await adapterHarness(t);
+      const before = await advancePostReviewWithoutRevalidation(harness, state);
+      assert.equal(before.state, state);
+      assert.equal(before.revalidation, undefined);
+      assert.equal(before.counters.commentResolutionCycles, 0);
+
+      await deliver(harness, HEAD_C, `head-c-from-${state.toLowerCase()}`);
+
+      const recovered = await harness.store.load(harness.runId);
+      assert.equal(recovered.state, "CI_RUNNING");
+      assert.equal(recovered.workspace?.headSha, HEAD_B, "GitHub routing must not move local refs");
+      assert.equal(recovered.github?.headSha, HEAD_C);
+      assert.equal(recovered.revalidation?.returnState, "PR_REVIEW");
+      assert.equal(recovered.revalidation?.originHeadSha, HEAD_B);
+      assert.equal(recovered.revalidation?.requestedHeadSha, HEAD_C);
+      assert.equal(recovered.revalidation?.generation, 1);
+      assert.equal(recovered.evidence, undefined);
+      assert.equal(
+        recovered.events.filter((event) => event.type === "REVALIDATE_REQUESTED").length,
+        1,
+      );
+    });
+  }
+});
+
+test("association identity fencing has a journal namespace distinct from publication", async (t) => {
+  const harness = await adapterHarness(t);
+  await harness.adapter.publishChecksForRun(harness.runId);
+  const kinds = await readdir(path.join(harness.cwd, ".maswe", "github", "journals"));
+  assert.ok(kinds.includes("publication"));
+  assert.ok(kinds.includes("association-identity"));
+});
+
+test("delivery reruns converge to current head C and revalidation returns to PR_REVIEW", async (t) => {
+  process.env[SECRET_ENV] = SECRET;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-issue28-github-current-head-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  await execFileAsync("git", ["init", "-q"], { cwd });
+  await execFileAsync("git", ["config", "user.email", "maswe@example.com"], { cwd });
+  await execFileAsync("git", ["config", "user.name", "MASWE"], { cwd });
+  await writeFile(path.join(cwd, "tracked.txt"), "A\n", "utf8");
+  await execFileAsync("git", ["add", "tracked.txt"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "A"], { cwd });
+  await execFileAsync("git", ["branch", "-M", "maswe/issue-28"], { cwd });
+  const headA = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim();
+  await writeFile(path.join(cwd, "tracked.txt"), "B\n", "utf8");
+  await execFileAsync("git", ["commit", "-qam", "B"], { cwd });
+  const headB = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim();
+  await execFileAsync("git", ["switch", "-qc", "future-c"], { cwd });
+  await writeFile(path.join(cwd, "tracked.txt"), "C\n", "utf8");
+  await execFileAsync("git", ["commit", "-qam", "C"], { cwd });
+  const headC = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim();
+  await execFileAsync("git", ["switch", "maswe/issue-28"], { cwd });
+
+  const value = config();
+  value.policy.useIsolatedWorktree = false;
+  const store = new FileRunStore(cwd);
+  let run = await store.create("current head recovery", "return to review", value);
+  for (const [type, actor] of [
+    ["START", "user"],
+    ["BRAINSTORM_COMPLETED", "brainstormer"],
+    ["APPROVE_BRAINSTORM", "user"],
+    ["DESIGN_COMPLETED", "designer"],
+    ["APPROVE_DESIGN", "user"],
+    ["BUILD_COMPLETED", "builder"],
+    ["CI_PASSED", "quality"],
+    ["VERIFY_PASSED", "verifier"],
+    ["PR_OPENED", "github-app"],
+    ["REVIEW_COMMENT_RECEIVED", "github"],
+    ["COMMENT_IN_SCOPE", "pr-comment-classifier"],
+    ["RESOLUTION_COMPLETED", "prResolver"],
+  ] as Array<[WorkflowEventType, string]>) {
+    run = await store.applyEvent(run, type, actor);
+  }
+  run.workspace = await captureWorkspace(cwd);
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 28,
+    baseSha: headA,
+    headSha: headB,
+    branch: "maswe/issue-28",
+    suspended: false,
+  };
+  run.evidence = {
+    quality: { headSha: headB, passed: true, at: "2026-08-19T09:00:00.000Z" },
+    verification: { headSha: headB, passed: true, at: "2026-08-19T09:01:00.000Z" },
+  };
+  await store.save(run);
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  await index.bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 28,
+    baseSha: headA,
+    headSha: headB,
+    branch: "maswe/issue-28",
+  });
+  const http: GitHubHttpClient = {
+    async request(method, url) {
+      if (method === "GET" && url.includes("/pulls/")) {
+        return { status: 200, headers: {}, body: { head: { sha: headC }, state: "open" } };
+      }
+      if (method === "GET" && url.includes("/check-runs")) {
+        return { status: 200, headers: {}, body: { check_runs: [] } };
+      }
+      return { status: 201, headers: {}, body: { id: 1 } };
+    },
+  };
+  const adapter = new GitHubAppAdapter({
+    cwd,
+    config: value,
+    store,
+    http,
+    tokenProvider: async () => "test-token",
+    synchronousWebhookDispatch: true,
+  });
+
+  const body = JSON.stringify(prPayload(headC, headA));
+  for (const deliveryId of ["current-head-c-first", "current-head-c-rerun"]) {
+    await adapter.handleWebhook({
+      deliveryId,
+      eventName: "pull_request",
+      signatureHeader: sign(body),
+      rawBody: body,
+    });
+  }
+  const routed = await store.load(run.id);
+  assert.equal(routed.state, "CI_RUNNING");
+  assert.equal(routed.revalidation?.requestedHeadSha, headC);
+  assert.equal(routed.revalidation?.returnState, "PR_REVIEW");
+  assert.equal(routed.revalidation?.generation, 1);
+  assert.equal(
+    routed.events.filter((event) => event.type === "REVALIDATE_REQUESTED").length,
+    1,
+  );
+
+  await execFileAsync("git", ["merge", "--ff-only", "future-c"], { cwd });
+  const completed = await new Orchestrator(
+    cwd,
+    value,
+    new MockRuntime(),
+    store,
+  ).runUntilBlocked(run.id);
+  assert.equal(completed.state, "PR_REVIEW");
+  assert.equal(completed.revalidation, undefined);
+  assert.equal(completed.workspace?.headSha, headC);
+  assert.equal(completed.evidence?.quality?.headSha, headC);
+  assert.equal(completed.evidence?.verification?.headSha, headC);
+  assert.equal(completed.counters.commentResolutionCycles, 0);
 });
 
 test("post-commit association fence blocks routing when authoritative identity changes", async (t) => {

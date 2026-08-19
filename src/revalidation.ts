@@ -35,6 +35,36 @@ const ACTIVE_REVALIDATION_STATES: WorkflowState[] = [
   "VERIFYING",
 ];
 
+const ASSOCIATED_HEAD_RECOVERY_STATES: WorkflowState[] = [
+  ...ACTIVE_REVALIDATION_STATES,
+  "MERGE_READY",
+];
+
+export function hasEnteredPullRequestReview(run: RunRecord): boolean {
+  return (
+    run.state === "PR_REVIEW" ||
+    run.events.some((event) => event.to === "PR_REVIEW")
+  );
+}
+
+function initialReturnState(
+  run: RunRecord,
+  input: RevalidationTargetInput,
+): "PR_READY" | "PR_REVIEW" {
+  if (run.state === "PR_READY" || run.state === "PR_REVIEW") return run.state;
+  if (
+    input.source !== "github" ||
+    run.github === undefined ||
+    run.github.headSha !== input.requestedHeadSha ||
+    !ASSOCIATED_HEAD_RECOVERY_STATES.includes(run.state)
+  ) {
+    throw new Error(
+      `Illegal revalidation request without active revalidation from state ${run.state}`,
+    );
+  }
+  return hasEnteredPullRequestReview(run) ? "PR_REVIEW" : "PR_READY";
+}
+
 export class RevalidationOptimisticConflictError extends Error {
   constructor(message: string) {
     super(message);
@@ -124,16 +154,15 @@ export class RevalidationService {
     run: RunRecord,
     input: RevalidationTargetInput,
   ): Promise<RunRecord> {
-    if (run.state !== "PR_READY" && run.state !== "PR_REVIEW") {
-      throw new Error(
-        `Illegal revalidation request without active revalidation from state ${run.state}`,
-      );
+    if (input.previousHeadSha === input.requestedHeadSha) {
+      throw new Error("Initial revalidation target is unchanged");
     }
+    const returnState = initialReturnState(run, input);
 
     const at = input.at ?? this.now();
     const candidate = candidateWithObservedWorkspace(run, input.observedWorkspace);
     candidate.revalidation = {
-      returnState: run.state,
+      returnState,
       source: input.source,
       originHeadSha: input.previousHeadSha,
       requestedHeadSha: input.requestedHeadSha,
@@ -147,7 +176,7 @@ export class RevalidationService {
       previousHeadSha: input.previousHeadSha,
       requestedHeadSha: input.requestedHeadSha,
       generation: 1,
-      returnState: run.state,
+      returnState,
       source: input.source,
     });
   }

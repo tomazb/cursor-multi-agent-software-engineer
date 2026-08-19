@@ -59,6 +59,9 @@ export async function captureWorkspaceBootstrapIntent(
     gitCurrentBranch(repositoryPath),
     gitRemoteUrl(repositoryPath),
   ]);
+  if (sourceBranch === "HEAD") {
+    throw new Error("Workspace bootstrap requires an attached branch; repository HEAD is detached");
+  }
   return {
     mode,
     sourceBaseSha,
@@ -109,6 +112,9 @@ async function assertBootstrapSourceExact(
       gitRevParse(repositoryPath, "HEAD"),
       gitCurrentBranch(repositoryPath),
     ]);
+    if (branch === "HEAD" || intent.sourceBranch === "HEAD") {
+      throw new Error(`Run ${run.id} bootstrap requires an attached source branch`);
+    }
     if (headSha !== intent.sourceBaseSha) {
       throw new Error(
         `Run ${run.id} bootstrap source HEAD drifted from ${intent.sourceBaseSha} to ${headSha}`,

@@ -188,3 +188,75 @@ for (const eventKind of ["installation", "repository-removal"] as const) {
     assert.equal((await store.load(runs[1]!.id)).github?.suspensionReason, "authorization-revoked");
   });
 }
+
+test("authorization suspension only treats ENOENT as a missing run", async (t) => {
+  process.env[SECRET_ENV] = SECRET;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-suspend-load-error-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const config = mergeConfigForTest({
+    runtime: { kind: "mock" },
+    quality: { commands: [] },
+    githubApp: {
+      enabled: true,
+      readOnlyChecks: true,
+      webhookSecretEnv: SECRET_ENV,
+      appIdEnv: "MASWE_TEST_GITHUB_APP_ID",
+      privateKeyEnv: "MASWE_TEST_GITHUB_APP_PRIVATE_KEY",
+      allowedRepositories: ["owner/one"],
+    },
+  });
+  const run = await store.create("load failure", "do not swallow corruption", config);
+  run.github = {
+    installationId: 44,
+    repository: "owner/one",
+    pullRequestNumber: 1,
+    baseSha: "b",
+    headSha: "h",
+    branch: "a",
+    suspended: false,
+  };
+  await store.save(run);
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  await index.bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/one",
+    pullRequestNumber: 1,
+    baseSha: "b",
+    headSha: "h",
+    branch: "a",
+  });
+  const corruptingStore: RunStore = {
+    create: store.create.bind(store),
+    save: store.save.bind(store),
+    load: async () => {
+      throw new Error("run record required field is missing");
+    },
+    list: store.list.bind(store),
+    applyEvent: store.applyEvent.bind(store),
+    writeArtifact: store.writeArtifact.bind(store),
+    readArtifact: store.readArtifact.bind(store),
+  };
+  const adapter = new GitHubAppAdapter({
+    cwd,
+    config,
+    store: corruptingStore,
+    http: { async request() { return { status: 200, headers: {}, body: {} }; } },
+    tokenProvider: async () => "token",
+    synchronousWebhookDispatch: true,
+  });
+  const body = JSON.stringify({ action: "deleted", installation: { id: 44 } });
+
+  await assert.rejects(
+    adapter.handleWebhook({
+      deliveryId: "del-suspend-load-error",
+      eventName: "installation",
+      signatureHeader: sign(body),
+      rawBody: body,
+    }),
+    (error: unknown) =>
+      error instanceof AggregateError &&
+      error.errors.some((nested) => /required field is missing/.test(String(nested))),
+  );
+});

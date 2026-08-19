@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -115,6 +115,47 @@ test("createDeterministicCommit rejects an unexpected parent without moving or d
       })
     ).stdout,
     /src\/pending\.ts/,
+  );
+});
+
+test("createDeterministicCommit rejects detached HEAD before changing the index or worktree", async (t) => {
+  const cwd = await initRepo();
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const expectedParentSha = (
+    await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })
+  ).stdout.trim();
+  await execFileAsync("git", ["checkout", "--detach", "-q", "HEAD"], { cwd });
+  await mkdir(path.join(cwd, "src"), { recursive: true });
+  await writeFile(path.join(cwd, "src", "staged.ts"), "export const staged = true;\n", "utf8");
+  await execFileAsync("git", ["add", "src/staged.ts"], { cwd });
+  await writeFile(path.join(cwd, "README.md"), "# unstaged edit\n", "utf8");
+  await writeFile(path.join(cwd, "src", "untracked.ts"), "export const untracked = true;\n", "utf8");
+  const statusBefore = (
+    await execFileAsync("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd })
+  ).stdout;
+  const stagedBefore = (await execFileAsync("git", ["diff", "--cached", "--binary"], { cwd })).stdout;
+  const unstagedBefore = (await execFileAsync("git", ["diff", "--binary"], { cwd })).stdout;
+
+  await assert.rejects(
+    createDeterministicCommit(cwd, "must not publish", {
+      allowedPathGlobs: ["**"],
+      expectedParentSha,
+    }),
+    /detached.*HEAD|attached branch/i,
+  );
+
+  assert.equal(
+    (await execFileAsync("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd })).stdout,
+    statusBefore,
+  );
+  assert.equal(
+    (await execFileAsync("git", ["diff", "--cached", "--binary"], { cwd })).stdout,
+    stagedBefore,
+  );
+  assert.equal((await execFileAsync("git", ["diff", "--binary"], { cwd })).stdout, unstagedBefore);
+  assert.equal(
+    (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim(),
+    expectedParentSha,
   );
 });
 

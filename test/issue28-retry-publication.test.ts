@@ -29,7 +29,7 @@ import { captureWorkspaceBootstrapIntent } from "../src/workspace-bootstrap.ts";
 
 const execFileAsync = promisify(execFile);
 const HEAD_C = "c".repeat(40);
-const LEGACY_EMPTY_GIT_FINGERPRINT =
+const CLEAN_EMPTY_GIT_FINGERPRINT =
   "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 let publicationCwd = "";
 
@@ -591,13 +591,13 @@ test("retry rejects a dirty isolated worktree without cleaning or removing it", 
   assert.equal(await readFile(dirtyPath, "utf8"), "do not discard\n");
 });
 
-test("unchanged historical FAILED isolated run retries with its schema-v1 Git fingerprint", async (t) => {
+test("unchanged clean FAILED isolated run retries with its empty Git fingerprint", async (t) => {
   const cwd = await initGitRepo();
   t.after(async () => cleanupGitRepo(cwd));
   const value = config(true);
   const { run, store } = await createFailedRun(cwd, value);
   assert.ok(run.workspace?.worktreePath);
-  run.workspace.fingerprint = LEGACY_EMPTY_GIT_FINGERPRINT;
+  run.workspace.fingerprint = CLEAN_EMPTY_GIT_FINGERPRINT;
   await store.save(run);
 
   const retried = await new Orchestrator(cwd, value, new MockRuntime(), store).retryFromFailed(

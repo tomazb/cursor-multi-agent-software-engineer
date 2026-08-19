@@ -561,6 +561,11 @@ clean, then run `maswe run <run-id>` for an active generation or `maswe retry <r
 recoverable failed generation. MASWE restarts at deterministic quality and fresh verification and
 returns only to the recorded gate. Never copy earlier quality, verification, or merge-ready
 evidence into the new generation, and never delete historical request/retarget/failure events.
+If an associated head moves after review while the run is in `BUILDING`, `CI_RUNNING`,
+`VERIFYING`, or `MERGE_READY` with no active generation, a delivery retry or manual check rerun
+creates the missing generation. Durable event history selects `PR_REVIEW` after review entry and
+`PR_READY` otherwise. The recovery pass never restores `MERGE_READY`; mark it again only after
+current-head quality and verification succeed.
 
 Retarget and final stage publication ownership is retained in
 `.maswe/runs/<run-id>/.mutation-journal-v1/.lock-journal-v3/`. Its acquisition order is GitHub

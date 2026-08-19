@@ -1,4 +1,8 @@
-import type { WorkflowEventType, WorkflowState } from "./domain.ts";
+import type {
+  RevalidationReturnState,
+  WorkflowEventType,
+  WorkflowState,
+} from "./domain.ts";
 
 const TRANSITIONS: Partial<Record<WorkflowState, Partial<Record<WorkflowEventType, WorkflowState>>>> = {
   CREATED: { START: "BRAINSTORMING" },
@@ -8,17 +12,20 @@ const TRANSITIONS: Partial<Record<WorkflowState, Partial<Record<WorkflowEventTyp
   WAITING_FOR_DESIGN_APPROVAL: { APPROVE_DESIGN: "BUILDING" },
   BUILDING: {
     BUILD_COMPLETED: "CI_RUNNING",
+    REVALIDATE_REQUESTED: "CI_RUNNING",
     REVALIDATION_RETARGETED: "CI_RUNNING",
   },
   CI_RUNNING: {
     CI_PASSED: "VERIFYING",
     CI_FAILED: "BUILDING",
+    REVALIDATE_REQUESTED: "CI_RUNNING",
     REVALIDATION_RETARGETED: "CI_RUNNING",
   },
   VERIFYING: {
     VERIFY_PASSED: "PR_READY",
     VERIFY_PASSED_AFTER_REVIEW: "PR_REVIEW",
     VERIFY_FAILED: "BUILDING",
+    REVALIDATE_REQUESTED: "CI_RUNNING",
     REVALIDATION_RETARGETED: "CI_RUNNING",
   },
   PR_READY: {
@@ -37,7 +44,10 @@ const TRANSITIONS: Partial<Record<WorkflowState, Partial<Record<WorkflowEventTyp
   },
   RESOLVING: { RESOLUTION_COMPLETED: "CI_RUNNING" },
   WAITING_FOR_HUMAN: { HUMAN_RESUME: "PR_REVIEW" },
-  MERGE_READY: { COMPLETE: "COMPLETED" },
+  MERGE_READY: {
+    COMPLETE: "COMPLETED",
+    REVALIDATE_REQUESTED: "CI_RUNNING",
+  },
 };
 
 const TERMINAL_STATES: WorkflowState[] = ["COMPLETED", "FAILED", "CANCELLED"];
@@ -63,6 +73,17 @@ export interface TransitionContext {
   retryResumeState?: WorkflowState;
   failureResumeState?: WorkflowState;
   hasRevalidation?: boolean;
+  associatedHeadRecovery?: boolean;
+  revalidationReturnState?: RevalidationReturnState;
+}
+
+function hasAssociatedHeadRecoveryContext(context: TransitionContext): boolean {
+  return (
+    context.hasRevalidation === true &&
+    context.associatedHeadRecovery === true &&
+    (context.revalidationReturnState === "PR_READY" ||
+      context.revalidationReturnState === "PR_REVIEW")
+  );
 }
 
 export function transition(
@@ -82,6 +103,9 @@ export function transition(
     }
     return context.retryResumeState;
   }
+  if (event === "REVALIDATION_RETARGETED" && !context.hasRevalidation) {
+    throw new Error("REVALIDATION_RETARGETED requires active revalidation");
+  }
   if (event === "REVALIDATION_RETARGETED" && state === "FAILED") {
     if (
       !context.hasRevalidation ||
@@ -93,6 +117,16 @@ export function transition(
       );
     }
     return "FAILED";
+  }
+  if (
+    event === "REVALIDATE_REQUESTED" &&
+    state !== "PR_READY" &&
+    state !== "PR_REVIEW" &&
+    !hasAssociatedHeadRecoveryContext(context)
+  ) {
+    throw new Error(
+      "REVALIDATE_REQUESTED outside a PR gate requires associated GitHub head recovery context",
+    );
   }
   const next = TRANSITIONS[state]?.[event];
   if (!next) throw new Error(`Event ${event} is not allowed from state ${state}`);
@@ -114,7 +148,14 @@ export function allowedEvents(
     return failedEvents;
   }
   if (TERMINAL_STATES.includes(state)) return [];
-  const events = Object.keys(TRANSITIONS[state] ?? {}) as WorkflowEventType[];
+  const events = (Object.keys(TRANSITIONS[state] ?? {}) as WorkflowEventType[]).filter(
+    (event) =>
+      (event !== "REVALIDATION_RETARGETED" || context.hasRevalidation === true) &&
+      (event !== "REVALIDATE_REQUESTED" ||
+        state === "PR_READY" ||
+        state === "PR_REVIEW" ||
+        hasAssociatedHeadRecoveryContext(context)),
+  );
   return [...events, "FAIL", "CANCEL"];
 }
 

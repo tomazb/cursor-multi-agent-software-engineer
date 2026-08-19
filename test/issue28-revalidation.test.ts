@@ -123,6 +123,68 @@ for (const gate of ["PR_READY", "PR_REVIEW"] as const) {
   });
 }
 
+test("initial revalidation rejects an unchanged target before publication", async (t) => {
+  const store = await tempStore(t);
+  const run = await runInState(store, "PR_REVIEW");
+  const before = structuredClone(run);
+
+  await assert.rejects(
+    new RevalidationService(store).route(run.id, {
+      source: "github",
+      previousHeadSha: HEAD_A,
+      requestedHeadSha: HEAD_A,
+      expectedRunVersion: run.version,
+      actor: "github-app",
+      at: REQUESTED_AT,
+    }),
+    /unchanged|different.*head|same.*head/i,
+  );
+
+  assert.deepEqual(await store.load(run.id), before);
+});
+
+test("associated recovery before PR_REVIEW returns to PR_READY, including from MERGE_READY", async (t) => {
+  for (const sourceState of ["CI_RUNNING", "MERGE_READY"] as const) {
+    await t.test(sourceState, async (t) => {
+      const store = await tempStore(t);
+      let run = await runInState(store, sourceState === "MERGE_READY" ? "PR_READY" : sourceState);
+      if (sourceState === "MERGE_READY") {
+        run = await store.applyEvent(run, "MARK_MERGE_READY", "user", { headSha: HEAD_A });
+      }
+      run.workspace = workspace(HEAD_A);
+      run.github = {
+        installationId: 44,
+        repository: "owner/repo",
+        pullRequestNumber: 28,
+        baseSha: HEAD_A,
+        headSha: HEAD_B,
+        branch: "maswe/revalidation",
+        suspended: false,
+      };
+      run.evidence = {
+        quality: { headSha: HEAD_A, passed: true, at: REQUESTED_AT },
+        verification: { headSha: HEAD_A, passed: true, at: REQUESTED_AT },
+      };
+      await store.save(run);
+
+      const routed = await new RevalidationService(store).route(run.id, {
+        source: "github",
+        previousHeadSha: HEAD_A,
+        requestedHeadSha: HEAD_B,
+        expectedRunVersion: run.version,
+        actor: "github-app",
+        at: REQUESTED_AT,
+      });
+
+      assert.equal(routed.state, "CI_RUNNING");
+      assert.equal(routed.revalidation?.returnState, "PR_READY");
+      assert.equal(routed.revalidation?.requestedHeadSha, HEAD_B);
+      assert.equal(routed.events.at(-1)?.from, sourceState);
+      assert.equal(routed.events.at(-1)?.type, "REVALIDATE_REQUESTED");
+    });
+  }
+});
+
 for (const state of ["BUILDING", "CI_RUNNING", "VERIFYING"] as const) {
   test(`active ${state} revalidation retargets only to the new generation`, async (t) => {
     const store = await tempStore(t);

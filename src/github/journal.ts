@@ -24,6 +24,7 @@ import {
 
 export type GitHubJournalKind =
   | "association"
+  | "association-identity"
   | "check-create"
   | "delivery"
   | "publication";
@@ -104,12 +105,14 @@ const MAX_LEGACY_BYTES = 1024 * 1024;
 const STRICT_UTF8 = new TextDecoder("utf-8", { fatal: true });
 const JOURNAL_KINDS: GitHubJournalKind[] = [
   "association",
+  "association-identity",
   "check-create",
   "delivery",
   "publication",
 ];
 const OPERATION_BY_KIND: Record<GitHubJournalKind, ClaimOperation> = {
   association: "github-association",
+  "association-identity": "github-association",
   "check-create": "github-check-create",
   delivery: "github-delivery",
   publication: "github-publication",

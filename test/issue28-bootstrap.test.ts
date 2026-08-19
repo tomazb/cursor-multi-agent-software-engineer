@@ -357,6 +357,39 @@ test("start persists complete bootstrap intent before any Git bootstrap side eff
   await assertNoBootstrapGitSideEffects(cwd, run.id);
 });
 
+test("start rejects detached Git HEAD before persisting bootstrap intent or mutating Git", async (t) => {
+  const cwd = await initRepo();
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  await execFileAsync("git", ["checkout", "--detach", "-q", "HEAD"], { cwd });
+  const refsBefore = (
+    await execFileAsync("git", ["for-each-ref", "--format=%(refname):%(objectname)"], { cwd })
+  ).stdout;
+  const statusBefore = (
+    await execFileAsync("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd })
+  ).stdout;
+  const indexBefore = (await execFileAsync("git", ["diff", "--cached", "--binary"], { cwd })).stdout;
+  const orchestrator = new Orchestrator(cwd, isolatedConfig(), new MockRuntime());
+
+  await assert.rejects(
+    orchestrator.start("Detached planning", "Do not persist a run."),
+    /detached.*HEAD|attached branch/i,
+  );
+
+  assert.deepEqual(await orchestrator.store.list(), []);
+  assert.equal(
+    (await execFileAsync("git", ["for-each-ref", "--format=%(refname):%(objectname)"], { cwd })).stdout,
+    refsBefore,
+  );
+  assert.equal(
+    (await execFileAsync("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd })).stdout,
+    statusBefore,
+  );
+  assert.equal(
+    (await execFileAsync("git", ["diff", "--cached", "--binary"], { cwd })).stdout,
+    indexBefore,
+  );
+});
+
 test("supersede persists linked bootstrap intent before any Git bootstrap side effect", async () => {
   const cwd = await initRepo();
   const config = isolatedConfig();

@@ -89,6 +89,9 @@ stateDiagram-v2
   PR_READY --> PR_REVIEW: PR_OPENED
   PR_READY --> CI_RUNNING: REVALIDATE_REQUESTED
   PR_REVIEW --> CI_RUNNING: REVALIDATE_REQUESTED
+  BUILDING --> CI_RUNNING: REVALIDATE_REQUESTED (associated head recovery)
+  CI_RUNNING --> CI_RUNNING: REVALIDATE_REQUESTED (associated head recovery)
+  VERIFYING --> CI_RUNNING: REVALIDATE_REQUESTED (associated head recovery)
   BUILDING --> CI_RUNNING: REVALIDATION_RETARGETED
   CI_RUNNING --> CI_RUNNING: REVALIDATION_RETARGETED
   VERIFYING --> CI_RUNNING: REVALIDATION_RETARGETED
@@ -99,12 +102,17 @@ stateDiagram-v2
   RESOLVING --> CI_RUNNING: RESOLUTION_COMPLETED
   PR_READY --> MERGE_READY: MARK_MERGE_READY
   PR_REVIEW --> MERGE_READY: MARK_MERGE_READY
+  MERGE_READY --> CI_RUNNING: REVALIDATE_REQUESTED (associated head recovery)
   MERGE_READY --> COMPLETED: COMPLETE
 ```
 
 Any nonterminal state may transition to `FAILED` or `CANCELLED` through the generic events. Terminal states accept no further events.
 
-`REVALIDATE_REQUESTED` records the first current-head generation and its return gate.
+`REVALIDATE_REQUESTED` records the first current-head generation and its return gate. Outside
+`PR_READY` and `PR_REVIEW`, it is legal only when explicit transition context proves that a
+committed GitHub association moved to a different head and stale evidence was invalidated. The
+return gate comes from append-only workflow history: a run that entered `PR_REVIEW` returns there;
+otherwise recovery returns to `PR_READY`. Recovery never returns directly to `MERGE_READY`.
 `REVALIDATION_RETARGETED` preserves all earlier events while moving an active generation back to
 `CI_RUNNING`; for a recoverable `FAILED` run it updates the retained resume state to `CI_RUNNING`
 without rewriting the historical `FAIL`. A newer authenticated or local head retargets an active
@@ -371,7 +379,7 @@ Phase A (read-only checks) lives in `src/github/` and calls public orchestrator/
   sanitized local diagnostics. Manual publication never reclaims the listener's inbox leases.
 
 GitHub journals live beneath
-`.maswe/github/journals/{association,check-create,delivery,publication}/<logical-key-sha256>/.lock-journal-v3/`
+`.maswe/github/journals/{association,association-identity,check-create,delivery,publication}/<logical-key-sha256>/.lock-journal-v3/`
 and use the same claims/releases/tmp layout as local journals. The Phase A concurrency boundary is
 one listener plus simultaneous manual publishers on one host and one coherent local filesystem
 with atomic no-clobber hard links. Legacy association/check-create/delivery migration requires all

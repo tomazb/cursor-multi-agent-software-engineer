@@ -381,6 +381,9 @@ export async function createDeterministicCommit(
   options: { allowedPathGlobs: string[]; expectedParentSha: string },
 ): Promise<{ headSha: string; files: string[] }> {
   const branch = await gitCurrentBranch(cwd);
+  if (branch === "HEAD") {
+    throw new Error("Deterministic commit requires an attached branch; workspace HEAD is detached");
+  }
   const initialHeadSha = await gitRevParse(cwd, "HEAD");
   if (initialHeadSha !== options.expectedParentSha) {
     throw new Error(

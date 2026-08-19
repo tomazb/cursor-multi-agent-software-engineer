@@ -827,6 +827,14 @@ export class FileRunStore implements RunStore {
   ): Promise<RunRecord> {
     const from = run.state;
     const safeDetails = sanitizeEventDetails(type, details);
+    const requestedHeadSha = run.revalidation?.requestedHeadSha;
+    const evidenceBindings = Object.values(run.evidence ?? {});
+    const associatedHeadRecovery =
+      run.github !== undefined &&
+      run.revalidation?.source === "github" &&
+      run.revalidation.originHeadSha !== requestedHeadSha &&
+      run.github.headSha === requestedHeadSha &&
+      evidenceBindings.every((binding) => binding?.headSha === requestedHeadSha);
     const to = transition(from, type, {
       ...(safeDetails?.resumeState !== undefined
         ? { retryResumeState: safeDetails.resumeState as WorkflowState }
@@ -835,6 +843,10 @@ export class FileRunStore implements RunStore {
         ? { failureResumeState: run.failure.resumeState }
         : {}),
       hasRevalidation: run.revalidation !== undefined,
+      associatedHeadRecovery,
+      ...(run.revalidation?.returnState !== undefined
+        ? { revalidationReturnState: run.revalidation.returnState }
+        : {}),
     });
     run.state = to;
     run.events.push({

@@ -1992,9 +1992,10 @@ async function releaseExactClaimAfterPublicationFailure(
   }
   if (!handle) throw publicationError;
 
-  const releaseOptions: PublishClaimOptions = options.transition
-    ? { transition: options.transition }
-    : {};
+  const releaseOptions: PublishClaimOptions = {
+    ...(options.transition ? { transition: options.transition } : {}),
+    ...(options.linkFile ? { linkFile: options.linkFile } : {}),
+  };
   try {
     await publishClaimRelease(handle, releaseOptions);
   } catch (releaseError) {

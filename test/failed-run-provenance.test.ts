@@ -93,7 +93,10 @@ test("failed run keeps branch ref and can recreate worktree from headSha on retr
   const previousFailure = retryEvent?.details?.previousFailure as
     | { resumeState?: string }
     | undefined;
-  assert.ok(["PR_READY", "FAILED", "BUILDING", "CI_RUNNING", "VERIFYING"].includes(retried.state));
+  assert.ok(
+    ["PR_READY", "BUILDING", "CI_RUNNING", "VERIFYING"].includes(retried.state),
+    `retry must leave FAILED, found ${retried.state}: ${retried.failure?.message ?? ""}`,
+  );
   assert.deepEqual(authoritative.failure, retried.failure);
   assert.equal(previousFailure?.resumeState, "CI_RUNNING");
   assert.ok(retried.workspace?.worktreePath);

@@ -205,6 +205,11 @@ A newer authenticated or local head retargets an active or recoverable failed re
 generation. Evidence from a superseded generation is unusable. The associated GitHub head is the
 required target: quality and verification cannot publish for a worktree head that has not been
 aligned to it, and merge-ready/completion require exact workspace/GitHub head equality.
+If association publication invalidates evidence while no revalidation is active, the adapter may
+request recovery from `BUILDING`, `CI_RUNNING`, `VERIFYING`, or `MERGE_READY` only through the
+context-fenced associated-head path. Append-only events determine the return gate: prior entry into
+`PR_REVIEW` returns there, otherwise recovery returns to `PR_READY`; stale-head recovery never
+restores `MERGE_READY` directly.
 
 Manual and webhook Phase A follow one lock order: per-PR publication, per-PR association identity,
 per-run target mutation, global association index, then run-store data. Authorization suspension

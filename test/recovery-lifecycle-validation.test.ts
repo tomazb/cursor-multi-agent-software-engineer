@@ -164,6 +164,7 @@ test("recovery metadata rejects policy-mode contradictions, simultaneous lifecyc
       run.workspaceBootstrap = bootstrap("operator-checkout");
     }],
     ["both lifecycles", (run) => {
+      run.state = "CANCELLED";
       run.workspaceBootstrap = bootstrap();
       run.revalidation = revalidation();
     }],
