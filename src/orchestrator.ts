@@ -855,10 +855,24 @@ export class Orchestrator {
             rollbackErrors.push(error);
           }
         }
+        let actualHeadSha: string | undefined;
+        let workspaceClean: boolean | undefined;
+        try {
+          actualHeadSha = await gitRevParse(workdir);
+          workspaceClean = await isGitWorkspaceClean(workdir);
+        } catch (error) {
+          rollbackErrors.push(error);
+        }
         if (rollbackErrors.length > 0) {
           throw new AggregateError(
             [publicationError, ...rollbackErrors],
             "Role publication and authoritative workspace rollback failed",
+          );
+        }
+        if (actualHeadSha !== beforeSha && workspaceClean === false) {
+          throw new AggregateError(
+            [publicationError],
+            `Role publication lost its branch compare-and-swap: the authoritative checkout preserves pre-publication tree ${beforeSha}, but the branch moved to ${actualHeadSha}; operator reconciliation is required`,
           );
         }
         throw publicationError;

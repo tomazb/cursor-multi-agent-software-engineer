@@ -386,10 +386,12 @@ test("clean speculative publication rejects an intervening authoritative branch 
     "Never overwrite an intervening branch move.",
   );
   const { stdout: afterHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  const { stdout: status } = await execFileAsync("git", ["status", "--porcelain"], { cwd });
 
   assert.equal(run.state, "FAILED");
-  assert.match(run.failure?.message ?? "", /publish.*commit|expected.*head|ref/i);
+  assert.match(run.failure?.message ?? "", /operator reconciliation/i);
   assert.equal(afterHead.trim(), parentHead.trim());
+  assert.notEqual(status, "");
 });
 
 test("failed dirty builder publication restores the exact allowed baseline", async (t) => {
