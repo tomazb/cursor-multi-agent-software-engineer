@@ -434,6 +434,71 @@ test("lost role CAS preserves an externally reset winning checkout", async (t) =
   assert.equal(builderChangeExists, false);
 });
 
+test("lost role CAS preserves a winning managed worktree", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-isolated-role-reset-cas-");
+  await writeFile(path.join(cwd, "baseline.txt"), "B\n", "utf8");
+  await execFileAsync("git", ["add", "baseline.txt"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "B"], { cwd });
+  const { stdout: parentHead } = await execFileAsync("git", ["rev-parse", "HEAD^"], { cwd });
+  const config = testConfig((c) => {
+    c.policy.useIsolatedWorktree = true;
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+  let winningWorktreePath: string | undefined;
+  const orchestrator = new Orchestrator(cwd, config, new EditingBuilderRuntime(), undefined, {
+    beforeRoleRefPublish: async () => {
+      const { stdout } = await execFileAsync("git", ["worktree", "list", "--porcelain"], { cwd });
+      winningWorktreePath = stdout
+        .split("\n")
+        .filter((line) => line.startsWith("worktree "))
+        .map((line) => line.slice("worktree ".length))
+        .find((worktreePath) => path.resolve(worktreePath) !== path.resolve(cwd));
+      assert.ok(winningWorktreePath);
+      await execFileAsync("git", ["reset", "--hard", parentHead.trim()], {
+        cwd: winningWorktreePath,
+      });
+    },
+  });
+
+  const run = await orchestrator.start(
+    "Managed winning checkout compare-and-swap",
+    "Preserve a managed checkout that wins publication.",
+  );
+  assert.ok(winningWorktreePath);
+  t.after(async () => {
+    await execFileAsync("git", ["worktree", "remove", "--force", winningWorktreePath!], {
+      cwd,
+    }).catch(() => undefined);
+  });
+  const { stdout: registrations } = await execFileAsync(
+    "git",
+    ["worktree", "list", "--porcelain"],
+    { cwd },
+  );
+  const registeredWorktreePaths = registrations
+    .split("\n")
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => path.resolve(line.slice("worktree ".length)))
+    .sort();
+
+  assert.equal(run.state, "FAILED");
+  assert.match(run.failure?.message ?? "", /operator reconciliation/i);
+  assert.deepEqual(
+    registeredWorktreePaths,
+    [cwd, winningWorktreePath].map((worktreePath) => path.resolve(worktreePath)).sort(),
+  );
+  assert.equal(
+    (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: winningWorktreePath })).stdout.trim(),
+    parentHead.trim(),
+  );
+  assert.equal(
+    (await execFileAsync("git", ["status", "--porcelain"], { cwd: winningWorktreePath })).stdout,
+    "",
+  );
+});
+
 test("failed dirty builder publication restores the exact allowed baseline", async (t) => {
   const cwd = await initGitRepo(t, "maswe-dirty-builder-rollback-");
   await writeFile(path.join(cwd, "README.md"), "# staged operator baseline\n", "utf8");

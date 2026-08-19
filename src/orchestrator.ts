@@ -86,6 +86,29 @@ import {
   type RunMutationLease,
 } from "./run-mutation.ts";
 
+class RolePublicationOutcomeUnknownError extends AggregateError {
+  constructor(errors: Iterable<unknown>, message: string) {
+    super(errors, message);
+    this.name = "RolePublicationOutcomeUnknownError";
+  }
+}
+
+function requiresWorkspacePreservation(error: unknown): boolean {
+  const pending: unknown[] = [error];
+  const seen = new Set<unknown>();
+  while (pending.length > 0) {
+    const candidate = pending.pop();
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    if (candidate instanceof RolePublicationOutcomeUnknownError) return true;
+    if (candidate instanceof AggregateError) pending.push(...candidate.errors);
+    if (candidate instanceof Error && candidate.cause !== undefined) {
+      pending.push(candidate.cause);
+    }
+  }
+  return false;
+}
+
 function isCanonicalFileStoreTimestamp(value: string): boolean {
   if (value.length !== 24) return false;
   const parsed = Date.parse(value);
@@ -849,12 +872,12 @@ export class Orchestrator {
             rollbackErrors.push(error);
           }
           if (rollbackErrors.length > 0) {
-            throw new AggregateError(
+            throw new RolePublicationOutcomeUnknownError(
               [publicationError, ...rollbackErrors],
               "Role publication lost its branch compare-and-swap and the authoritative workspace could not be observed",
             );
           }
-          throw new AggregateError(
+          throw new RolePublicationOutcomeUnknownError(
             [publicationError],
             `Role publication lost its branch compare-and-swap attempt; the authoritative checkout was left unchanged at ${actualHeadSha} (${workspaceClean ? "clean" : "dirty"}); operator reconciliation is required`,
           );
@@ -886,15 +909,15 @@ export class Orchestrator {
           rollbackErrors.push(error);
         }
         if (rollbackErrors.length > 0) {
-          throw new AggregateError(
+          throw new RolePublicationOutcomeUnknownError(
             [publicationError, ...rollbackErrors],
             "Role publication and authoritative workspace rollback failed",
           );
         }
-        if (actualHeadSha !== beforeSha && workspaceClean === false) {
-          throw new AggregateError(
+        if (actualHeadSha !== beforeSha) {
+          throw new RolePublicationOutcomeUnknownError(
             [publicationError],
-            `Role publication lost its branch compare-and-swap: the authoritative checkout preserves pre-publication tree ${beforeSha}, but the branch moved to ${actualHeadSha}; operator reconciliation is required`,
+            `Role publication rollback observed the authoritative branch move from ${beforeSha} to ${actualHeadSha} (${workspaceClean ? "clean" : "dirty"}); operator reconciliation is required`,
           );
         }
         throw publicationError;
@@ -1168,7 +1191,10 @@ export class Orchestrator {
                   runFailureMessage(error),
                   runFailureCode(error),
                   runFailureRuntime(error),
-                  { preserveWorkspace: run.revalidation !== undefined },
+                  {
+                    preserveWorkspace:
+                      run.revalidation !== undefined || requiresWorkspacePreservation(error),
+                  },
                 ),
               };
             }
@@ -1199,7 +1225,10 @@ export class Orchestrator {
                   runFailureMessage(error),
                   runFailureCode(error),
                   runFailureRuntime(error),
-                  { preserveWorkspace: run.revalidation !== undefined },
+                  {
+                    preserveWorkspace:
+                      run.revalidation !== undefined || requiresWorkspacePreservation(error),
+                  },
                 ),
               };
             }
@@ -1489,7 +1518,10 @@ export class Orchestrator {
         runFailureMessage(error),
         runFailureCode(error),
         runFailureRuntime(error),
-        { preserveWorkspace: run.revalidation !== undefined },
+        {
+          preserveWorkspace:
+            run.revalidation !== undefined || requiresWorkspacePreservation(error),
+        },
       );
     }
   }
