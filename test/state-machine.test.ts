@@ -53,7 +53,7 @@ test("revalidation transitions are centralized", () => {
 });
 
 test("associated-head recovery requests are context-fenced outside PR gates", () => {
-  for (const state of ["BUILDING", "CI_RUNNING", "VERIFYING"] as const) {
+  for (const state of ["BUILDING", "CI_RUNNING", "VERIFYING", "RESOLVING"] as const) {
     for (const returnState of ["PR_READY", "PR_REVIEW"] as const) {
       assert.equal(
         transition(state, "REVALIDATE_REQUESTED", {

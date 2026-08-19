@@ -173,7 +173,12 @@ interface AdapterHarness {
   setLiveHead(headSha: string): void;
 }
 
-type AssociationRaceState = "BUILDING" | "CI_RUNNING" | "VERIFYING" | "MERGE_READY";
+type AssociationRaceState =
+  | "BUILDING"
+  | "CI_RUNNING"
+  | "VERIFYING"
+  | "RESOLVING"
+  | "MERGE_READY";
 
 interface AssociationRaceHarness {
   cwd: string;
@@ -243,6 +248,36 @@ class PausingEditingBuilder extends MockRuntime {
           },
         };
       }
+    }
+    return super.execute(request);
+  }
+}
+
+class PausingEditingResolver extends MockRuntime {
+  readonly executions: Array<{ role: RuntimeRequest["role"]; headSha: string }> = [];
+  private readonly signalStarted: () => void;
+  private readonly resume: Promise<void>;
+
+  constructor(signalStarted: () => void, resume: Promise<void>) {
+    super();
+    this.signalStarted = signalStarted;
+    this.resume = resume;
+  }
+
+  override async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    const headSha = (await execFileAsync("git", ["rev-parse", "HEAD"], {
+      cwd: request.cwd,
+    })).stdout.trim();
+    this.executions.push({ role: request.role, headSha });
+    if (request.role === "prResolver") {
+      await mkdir(path.join(request.cwd, "src"), { recursive: true });
+      await writeFile(
+        path.join(request.cwd, "src", "queued-resolver.ts"),
+        "export const queuedResolver = true;\n",
+        "utf8",
+      );
+      this.signalStarted();
+      await this.resume;
     }
     return super.execute(request);
   }
@@ -334,12 +369,14 @@ async function associationRaceHarness(
   } else {
     run = await store.applyEvent(run, "REVIEW_COMMENT_RECEIVED", "github");
     run = await store.applyEvent(run, "COMMENT_IN_SCOPE", "pr-comment-classifier");
-    run = await store.applyEvent(run, "RESOLUTION_COMPLETED", "prResolver");
-    if (state === "VERIFYING" || state === "BUILDING") {
-      run = await store.applyEvent(run, "CI_PASSED", "quality-runner");
-    }
-    if (state === "BUILDING") {
-      run = await store.applyEvent(run, "VERIFY_FAILED", "verifier");
+    if (state !== "RESOLVING") {
+      run = await store.applyEvent(run, "RESOLUTION_COMPLETED", "prResolver");
+      if (state === "VERIFYING" || state === "BUILDING") {
+        run = await store.applyEvent(run, "CI_PASSED", "quality-runner");
+      }
+      if (state === "BUILDING") {
+        run = await store.applyEvent(run, "VERIFY_FAILED", "verifier");
+      }
     }
   }
   assert.equal(run.state, state);
@@ -543,6 +580,97 @@ test("a queued GitHub association supersedes speculative builder publication", a
   assert.equal(initialRevalidationPublications(authoritative), 1);
 });
 
+test("a queued GitHub association supersedes resolver publication and discards B edits", async (t) => {
+  const associationCommitted = deferred();
+  let associationWasCommitted = false;
+  const harness = await associationRaceHarness(t, "RESOLVING", async () => {
+    associationWasCommitted = true;
+    associationCommitted.resolve();
+  });
+  const resolverStarted = deferred();
+  const resumeResolver = deferred();
+  const runtime = new PausingEditingResolver(
+    () => resolverStarted.resolve(),
+    resumeResolver.promise,
+  );
+  const before = await harness.store.load(harness.runId);
+  const localAdvance = new Orchestrator(
+    harness.cwd,
+    harness.config,
+    runtime,
+    harness.store,
+  ).advance(harness.runId).then(
+    (value) => ({ value }),
+    (error: unknown) => ({ error }),
+  );
+
+  await within(resolverStarted.promise, "resolver edit before association claim");
+  const webhook = deliverAssociationRace(
+    harness,
+    "association-queues-during-resolver",
+  ).then(
+    () => ({ ok: true as const }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
+  const mutationRoot = runMutationJournalRoot(harness.cwd, harness.runId);
+  const claimDeadline = Date.now() + 15_000;
+  for (;;) {
+    let targetQueued = false;
+    try {
+      const scan = await scanLockJournal(mutationRoot, "data");
+      targetQueued = scan.claims.some(
+        (claim) =>
+          claim.operation === "run-target-mutation" && !scan.releases.has(claim.ticket),
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (associationWasCommitted || targetQueued) break;
+    if (Date.now() >= claimDeadline) {
+      throw new Error("Timed out waiting for the resolver/association race barrier");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  resumeResolver.resolve();
+  const localResult = await within(localAdvance, "superseded resolver publication");
+  const webhookResult = await within(webhook, "post-resolver association routing");
+  assert.equal(
+    webhookResult.ok,
+    true,
+    `queued association must route after resolver: ${"error" in webhookResult ? String(webhookResult.error) : ""}`,
+  );
+  await within(associationCommitted.promise, "post-resolver association commit");
+
+  const authoritative = await harness.store.load(harness.runId);
+  const { stdout: actualHead } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: harness.cwd,
+  });
+  assert.ok("error" in localResult);
+  assert.match(String(localResult.error), /superseded.*target|target.*superseded/i);
+  assert.equal(
+    runtime.executions.some(
+      (execution) => execution.role === "prResolver" && execution.headSha === harness.headB,
+    ),
+    true,
+  );
+  assert.equal(actualHead.trim(), harness.headB);
+  assert.equal(
+    await isGitWorkspaceClean(harness.cwd),
+    true,
+    "superseded resolver edits must not cross the target-ownership handoff",
+  );
+  assert.equal(
+    authoritative.events.filter((event) => event.type === "RESOLUTION_COMPLETED").length,
+    before.events.filter((event) => event.type === "RESOLUTION_COMPLETED").length,
+  );
+  assert.equal(authoritative.github?.headSha, harness.headC);
+  assert.equal(authoritative.revalidation?.requestedHeadSha, harness.headC);
+  assert.equal(authoritative.revalidation?.returnState, "PR_REVIEW");
+  assert.equal(authoritative.revalidation?.generation, 1);
+  assert.equal(initialRevalidationPublications(authoritative), 1);
+});
+
 test("a failed builder yields a clean workspace to a queued GitHub association", async (t) => {
   const harness = await associationRaceHarness(t, "BUILDING", async () => undefined);
   const builderStarted = deferred();
@@ -600,7 +728,7 @@ test("a failed builder yields a clean workspace to a queued GitHub association",
   assert.equal(initialRevalidationPublications(authoritative), 1);
 });
 
-for (const state of ["CI_RUNNING", "VERIFYING", "BUILDING"] as const) {
+for (const state of ["CI_RUNNING", "VERIFYING", "BUILDING", "RESOLVING"] as const) {
   test(`local ${state} entry reloads authority after an association commits beyond its initial snapshot`, async (t) => {
     const associationCommitted = deferred();
     const resumeWebhook = deferred();
@@ -680,7 +808,7 @@ for (const state of ["CI_RUNNING", "VERIFYING", "BUILDING"] as const) {
   });
 }
 
-for (const state of ["CI_RUNNING", "VERIFYING", "BUILDING"] as const) {
+for (const state of ["CI_RUNNING", "VERIFYING", "BUILDING", "RESOLVING"] as const) {
   test(`local ${state} entry routes a committed C association before stale B work`, async (t) => {
     const associationCommitted = deferred();
     const resumeWebhook = deferred();
@@ -972,7 +1100,7 @@ async function deliver(harness: AdapterHarness, headSha: string, deliveryId: str
 
 async function advancePostReviewWithoutRevalidation(
   harness: AdapterHarness,
-  state: "CI_RUNNING" | "VERIFYING" | "MERGE_READY",
+  state: "CI_RUNNING" | "VERIFYING" | "RESOLVING" | "MERGE_READY",
 ): Promise<RunRecord> {
   let run = await harness.store.load(harness.runId);
   run.workspace = { ...run.workspace!, headSha: HEAD_B };
@@ -998,6 +1126,7 @@ async function advancePostReviewWithoutRevalidation(
   }
   run = await harness.store.applyEvent(run, "REVIEW_COMMENT_RECEIVED", "github");
   run = await harness.store.applyEvent(run, "COMMENT_IN_SCOPE", "pr-comment-classifier");
+  if (state === "RESOLVING") return run;
   run = await harness.store.applyEvent(run, "RESOLUTION_COMPLETED", "prResolver");
   if (state === "VERIFYING") {
     run = await harness.store.applyEvent(run, "CI_PASSED", "quality-runner");
@@ -1285,7 +1414,7 @@ test("github B then C at zero cycles retargets generation two without publishing
 });
 
 test("github head movement starts post-review recovery without an active revalidation", async (t) => {
-  for (const state of ["CI_RUNNING", "VERIFYING", "MERGE_READY"] as const) {
+  for (const state of ["CI_RUNNING", "VERIFYING", "RESOLVING", "MERGE_READY"] as const) {
     await t.test(state, async (t) => {
       const harness = await adapterHarness(t);
       const before = await advancePostReviewWithoutRevalidation(harness, state);

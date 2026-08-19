@@ -569,6 +569,7 @@ export class GitHubAppAdapter {
       authoritative.state !== "BUILDING" &&
       authoritative.state !== "CI_RUNNING" &&
       authoritative.state !== "VERIFYING" &&
+      authoritative.state !== "RESOLVING" &&
       authoritative.state !== "MERGE_READY"
     ) {
       return authoritative;

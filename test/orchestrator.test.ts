@@ -79,6 +79,18 @@ class EditingBuilderRuntime extends MockRuntime {
   }
 }
 
+class EditingResolverRuntime extends MockRuntime {
+  override async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    if (
+      request.role === "prResolver" &&
+      !request.prompt.includes("Role: PR comment scope classifier")
+    ) {
+      await writeFile(path.join(request.cwd, "resolver-change.txt"), "resolver delta\n", "utf8");
+    }
+    return super.execute(request);
+  }
+}
+
 async function initGitRepo(t: test.TestContext, prefix: string): Promise<string> {
   const cwd = await mkdtemp(path.join(os.tmpdir(), prefix));
   t.after(() => rm(cwd, { recursive: true, force: true }));
@@ -268,7 +280,7 @@ test("failed dirty builder publication restores the exact allowed baseline", asy
     c.quality.commands = [];
   });
   const orchestrator = new Orchestrator(cwd, config, new EditingBuilderRuntime(), undefined, {
-    afterDirtyBuilderDeltaApplied: async () => {
+    afterDirtyRoleDeltaApplied: async () => {
       throw new Error("simulated dirty builder publication failure");
     },
   });
@@ -289,6 +301,98 @@ test("failed dirty builder publication restores the exact allowed baseline", asy
   assert.equal(afterHead.trim(), beforeHead.trim());
   assert.equal(afterStatus, beforeStatus);
   assert.doesNotMatch(afterStatus, /builder-change\.txt/);
+});
+
+test("allowed dirty workspace changes are included in speculative resolver publication", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-allowed-dirty-resolver-");
+  const config = testConfig((c) => {
+    c.policy.allowDirtyWorkspace = true;
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+  const orchestrator = new Orchestrator(cwd, config, new EditingResolverRuntime());
+  let run = await orchestrator.start(
+    "Allowed dirty resolution",
+    "Preserve and publish the allowed workspace baseline.",
+  );
+  run = await orchestrator.markPrOpened(run.id);
+  await writeFile(path.join(cwd, "README.md"), "# operator resolver baseline\n", "utf8");
+  await execFileAsync("git", ["add", "README.md"], { cwd });
+  await writeFile(path.join(cwd, "operator-change.txt"), "preserve resolver baseline\n", "utf8");
+
+  run = await orchestrator.receiveReviewComment(run.id, "Please apply the resolver change.");
+  const { stdout: published } = await execFileAsync(
+    "git",
+    ["show", "HEAD:operator-change.txt"],
+    { cwd },
+  );
+  const { stdout: resolverDelta } = await execFileAsync(
+    "git",
+    ["show", "HEAD:resolver-change.txt"],
+    { cwd },
+  );
+  const { stdout: stagedBaseline } = await execFileAsync(
+    "git",
+    ["show", "HEAD:README.md"],
+    { cwd },
+  );
+  const { stdout: status } = await execFileAsync("git", ["status", "--porcelain"], { cwd });
+
+  assert.equal(run.state, "PR_REVIEW");
+  assert.equal(published, "preserve resolver baseline\n");
+  assert.equal(resolverDelta, "resolver delta\n");
+  assert.equal(stagedBaseline, "# operator resolver baseline\n");
+  assert.equal(status, "");
+});
+
+test("failed dirty resolver publication restores the exact allowed baseline", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-dirty-resolver-rollback-");
+  const config = testConfig((c) => {
+    c.policy.allowDirtyWorkspace = true;
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+  const orchestrator = new Orchestrator(
+    cwd,
+    config,
+    new EditingResolverRuntime(),
+    undefined,
+    {
+      afterDirtyRoleDeltaApplied: async () => {
+        throw new Error("simulated dirty resolver publication failure");
+      },
+    },
+  );
+  let run = await orchestrator.start(
+    "Rollback dirty resolution",
+    "Restore the exact operator baseline if resolver publication fails.",
+  );
+  run = await orchestrator.markPrOpened(run.id);
+  await writeFile(path.join(cwd, "README.md"), "# staged resolver baseline\n", "utf8");
+  await execFileAsync("git", ["add", "README.md"], { cwd });
+  await writeFile(path.join(cwd, "operator-change.txt"), "untracked resolver baseline\n", "utf8");
+  const { stdout: beforeHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  const { stdout: beforeStatus } = await execFileAsync(
+    "git",
+    ["status", "--porcelain=v1"],
+    { cwd },
+  );
+
+  run = await orchestrator.receiveReviewComment(run.id, "Please apply the resolver change.");
+  const { stdout: afterHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  const { stdout: afterStatus } = await execFileAsync(
+    "git",
+    ["status", "--porcelain=v1"],
+    { cwd },
+  );
+
+  assert.equal(run.state, "FAILED");
+  assert.match(run.failure?.message ?? "", /simulated dirty resolver publication failure/i);
+  assert.equal(afterHead.trim(), beforeHead.trim());
+  assert.equal(afterStatus, beforeStatus);
+  assert.doesNotMatch(afterStatus, /resolver-change\.txt/);
 });
 
 test("tracked MASWE control-plane changes are never included in builder publication", async (t) => {

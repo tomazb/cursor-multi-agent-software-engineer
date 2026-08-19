@@ -137,8 +137,8 @@ export interface OrchestratorOptions {
     phase: "builder" | "resolver" | "quality" | "verifier" | "merge-ready" | "complete",
     authoritative: RunRecord,
   ) => Promise<void>;
-  /** Failure seam after a dirty baseline receives the speculative builder delta. */
-  afterDirtyBuilderDeltaApplied?: () => Promise<void>;
+  /** Failure seam after a dirty baseline receives a speculative mutable-role delta. */
+  afterDirtyRoleDeltaApplied?: () => Promise<void>;
 }
 
 interface ActiveRevalidationPreflight {
@@ -150,7 +150,19 @@ interface ActiveRevalidationPreflight {
 const REVALIDATION_STABILITY_ATTEMPTS = 8;
 const MASWE_SOURCE_PATHSPEC = [".", ":(exclude).maswe", ":(exclude).maswe/**"] as const;
 
-interface SpeculativeBuilderWorktree {
+type MutableRoleId = "builder" | "prResolver";
+
+interface MutableRolePublicationSpec {
+  role: MutableRoleId;
+  phase: "builder" | "resolver";
+  artifactName: "04-builder-report.md" | "09-resolution-report.md";
+  commitMessage: string;
+  successEvent: "BUILD_COMPLETED" | "RESOLUTION_COMPLETED";
+  actor: "builder" | "prResolver";
+  label: "Builder" | "Resolver";
+}
+
+interface SpeculativeRoleWorktree {
   repositoryWorkdir: string;
   rootPath: string;
   worktreePath: string;
@@ -174,7 +186,7 @@ export class Orchestrator {
   private readonly afterWorkspaceCheckpoint: ((run: RunRecord) => Promise<void>) | undefined;
   private readonly beforeRetryPublication: ((candidate: RunRecord) => Promise<void>) | undefined;
   private readonly afterRunMutationReload: OrchestratorOptions["afterRunMutationReload"];
-  private readonly afterDirtyBuilderDeltaApplied: OrchestratorOptions["afterDirtyBuilderDeltaApplied"];
+  private readonly afterDirtyRoleDeltaApplied: OrchestratorOptions["afterDirtyRoleDeltaApplied"];
 
   constructor(
     cwd: string,
@@ -193,7 +205,7 @@ export class Orchestrator {
     this.afterWorkspaceCheckpoint = options.afterWorkspaceCheckpoint;
     this.beforeRetryPublication = options.beforeRetryPublication;
     this.afterRunMutationReload = options.afterRunMutationReload;
-    this.afterDirtyBuilderDeltaApplied = options.afterDirtyBuilderDeltaApplied;
+    this.afterDirtyRoleDeltaApplied = options.afterDirtyRoleDeltaApplied;
     if (
       !Number.isSafeInteger(this.automaticTransitionLimit) ||
       this.automaticTransitionLimit <= 0
@@ -662,17 +674,19 @@ export class Orchestrator {
     }
   }
 
-  private async createSpeculativeBuilderWorktree(
+  private async createSpeculativeRoleWorktree(
     repositoryWorkdir: string,
     beforeSha: string,
-  ): Promise<SpeculativeBuilderWorktree> {
-    const rootPath = await mkdtemp(path.join(os.tmpdir(), "maswe-builder-generation-"));
+    role: MutableRoleId,
+  ): Promise<SpeculativeRoleWorktree> {
+    const roleName = role === "prResolver" ? "resolver" : role;
+    const rootPath = await mkdtemp(path.join(os.tmpdir(), `maswe-${roleName}-generation-`));
     const suffix = path.basename(rootPath).replace(/[^A-Za-z0-9._-]/g, "-");
-    const speculative: SpeculativeBuilderWorktree = {
+    const speculative: SpeculativeRoleWorktree = {
       repositoryWorkdir,
       rootPath,
       worktreePath: path.join(rootPath, "worktree"),
-      branch: `maswe/speculative-builder/${suffix}`,
+      branch: `maswe/speculative-${roleName}/${suffix}`,
       ownsBranch: false,
       cleaned: false,
     };
@@ -682,7 +696,7 @@ export class Orchestrator {
     );
     if (branchCreated.exitCode !== 0) {
       await rm(rootPath, { recursive: true, force: true });
-      throw gitCommandFailure("Failed to create speculative builder branch", branchCreated);
+      throw gitCommandFailure(`Failed to create speculative ${roleName} branch`, branchCreated);
     }
     speculative.ownsBranch = true;
     const added = await gitRun(
@@ -691,20 +705,20 @@ export class Orchestrator {
     );
     if (added.exitCode === 0) return speculative;
 
-    const primary = gitCommandFailure("Failed to create speculative builder worktree", added);
+    const primary = gitCommandFailure(`Failed to create speculative ${roleName} worktree`, added);
     try {
-      await this.cleanupSpeculativeBuilderWorktree(speculative);
+      await this.cleanupSpeculativeRoleWorktree(speculative);
     } catch (cleanupError) {
       throw new AggregateError(
         [primary, cleanupError],
-        "Speculative builder worktree creation and cleanup failed",
+        `Speculative ${roleName} worktree creation and cleanup failed`,
       );
     }
     throw primary;
   }
 
-  private async cleanupSpeculativeBuilderWorktree(
-    speculative: SpeculativeBuilderWorktree,
+  private async cleanupSpeculativeRoleWorktree(
+    speculative: SpeculativeRoleWorktree,
   ): Promise<void> {
     if (speculative.cleaned) return;
     const branchRef = `refs/heads/${speculative.branch}`;
@@ -725,7 +739,7 @@ export class Orchestrator {
         speculative.repositoryWorkdir,
       );
       if (removed.exitCode !== 0) {
-        throw gitCommandFailure("Failed to remove speculative builder worktree", removed);
+        throw gitCommandFailure("Failed to remove speculative role worktree", removed);
       }
     }
     if (branchHead?.exitCode === 0) {
@@ -735,7 +749,7 @@ export class Orchestrator {
         speculative.repositoryWorkdir,
       );
       if (deleted.exitCode !== 0) {
-        throw gitCommandFailure("Failed to delete speculative builder branch", deleted);
+        throw gitCommandFailure("Failed to delete speculative role branch", deleted);
       }
       speculative.ownsBranch = false;
     }
@@ -743,13 +757,13 @@ export class Orchestrator {
     speculative.cleaned = true;
   }
 
-  private async fastForwardBuilderCommit(
+  private async fastForwardRoleCommit(
     workdir: string,
     commitSha: string,
   ): Promise<void> {
     const merged = await gitRun(["merge", "--ff-only", commitSha], workdir);
     if (merged.exitCode !== 0) {
-      throw gitCommandFailure("Failed to fast-forward authoritative builder worktree", merged);
+      throw gitCommandFailure("Failed to fast-forward authoritative role worktree", merged);
     }
   }
 
@@ -771,12 +785,12 @@ export class Orchestrator {
     if (applied.exitCode !== 0) throw gitCommandFailure(label, applied);
   }
 
-  private async publishDirtyBuilderCommit(
+  private async publishDirtyRoleCommit(
     workdir: string,
     branch: string,
     beforeSha: string,
     commitSha: string,
-    builderDelta: string,
+    roleDelta: string,
   ): Promise<void> {
     const indexLocation = await gitRun(["rev-parse", "--git-path", "index"], workdir);
     if (indexLocation.exitCode !== 0) {
@@ -786,7 +800,7 @@ export class Orchestrator {
     const indexPath = path.isAbsolute(rawIndexPath)
       ? rawIndexPath
       : path.resolve(workdir, rawIndexPath);
-    const recoveryRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-builder-index-"));
+    const recoveryRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-role-index-"));
     const backupIndexPath = path.join(recoveryRoot, "index");
     let indexExisted = false;
     try {
@@ -803,21 +817,21 @@ export class Orchestrator {
       try {
         await this.applyGitPatch(
           workdir,
-          builderDelta,
-          "Failed to apply speculative builder changes",
+          roleDelta,
+          "Failed to apply speculative role changes",
         );
         deltaApplied = true;
         const preparedIndex = await gitRun(["read-tree", commitSha], workdir);
         if (preparedIndex.exitCode !== 0) {
-          throw gitCommandFailure("Failed to prepare authoritative builder index", preparedIndex);
+          throw gitCommandFailure("Failed to prepare authoritative role index", preparedIndex);
         }
-        await this.afterDirtyBuilderDeltaApplied?.();
+        await this.afterDirtyRoleDeltaApplied?.();
         const published = await gitRun(
           ["update-ref", `refs/heads/${branch}`, commitSha, beforeSha],
           workdir,
         );
         if (published.exitCode !== 0) {
-          throw gitCommandFailure("Failed to publish authoritative builder commit", published);
+          throw gitCommandFailure("Failed to publish authoritative role commit", published);
         }
       } catch (publicationError) {
         const rollbackErrors: unknown[] = [];
@@ -831,8 +845,8 @@ export class Orchestrator {
           try {
             await this.applyGitPatch(
               workdir,
-              builderDelta,
-              "Failed to reverse speculative builder changes",
+              roleDelta,
+              "Failed to reverse speculative role changes",
               true,
             );
           } catch (error) {
@@ -842,7 +856,7 @@ export class Orchestrator {
         if (rollbackErrors.length > 0) {
           throw new AggregateError(
             [publicationError, ...rollbackErrors],
-            "Builder publication and authoritative workspace rollback failed",
+            "Role publication and authoritative workspace rollback failed",
           );
         }
         throw publicationError;
@@ -861,8 +875,8 @@ export class Orchestrator {
     return candidate;
   }
 
-  private async seedSpeculativeBuilderWorktree(
-    speculative: SpeculativeBuilderWorktree,
+  private async seedSpeculativeRoleWorktree(
+    speculative: SpeculativeRoleWorktree,
     beforeSha: string,
   ): Promise<string> {
     const tracked = await gitRun(
@@ -879,12 +893,12 @@ export class Orchestrator {
       speculative.repositoryWorkdir,
     );
     if (tracked.exitCode !== 0) {
-      throw gitCommandFailure("Failed to capture the authoritative builder baseline", tracked);
+      throw gitCommandFailure("Failed to capture the authoritative role baseline", tracked);
     }
     await this.applyGitPatch(
       speculative.worktreePath,
       tracked.stdout,
-      "Failed to seed tracked builder baseline changes",
+      "Failed to seed tracked role baseline changes",
     );
 
     const untracked = await gitRun(
@@ -899,7 +913,7 @@ export class Orchestrator {
       speculative.repositoryWorkdir,
     );
     if (untracked.exitCode !== 0) {
-      throw gitCommandFailure("Failed to enumerate untracked builder baseline paths", untracked);
+      throw gitCommandFailure("Failed to enumerate untracked role baseline paths", untracked);
     }
     for (const relativePath of untracked.stdout.split("\0").filter(Boolean)) {
       const sourcePath = this.resolveSpeculativePath(
@@ -918,17 +932,17 @@ export class Orchestrator {
         await copyFile(sourcePath, destinationPath);
         await chmod(destinationPath, sourceStat.mode & 0o777);
       } else {
-        throw new Error(`Unsupported untracked builder baseline path: ${relativePath}`);
+        throw new Error(`Unsupported untracked role baseline path: ${relativePath}`);
       }
     }
 
     const staged = await gitRun(["add", "-A"], speculative.worktreePath);
     if (staged.exitCode !== 0) {
-      throw gitCommandFailure("Failed to stage the speculative builder baseline", staged);
+      throw gitCommandFailure("Failed to stage the speculative role baseline", staged);
     }
     const tree = await gitRun(["write-tree"], speculative.worktreePath);
     if (tree.exitCode !== 0) {
-      throw gitCommandFailure("Failed to snapshot the speculative builder baseline", tree);
+      throw gitCommandFailure("Failed to snapshot the speculative role baseline", tree);
     }
     const restoredIndex = await gitRun(["read-tree", beforeSha], speculative.worktreePath);
     if (restoredIndex.exitCode !== 0) {
@@ -946,7 +960,7 @@ export class Orchestrator {
       throw gitCommandFailure("git status failed while inspecting MASWE control-plane paths", status);
     }
     if (status.stdout.length > 0) {
-      throw new Error("Builder publication refuses tracked .maswe control-plane changes");
+      throw new Error("Role publication refuses tracked .maswe control-plane changes");
     }
   }
 
@@ -1014,6 +1028,40 @@ export class Orchestrator {
         await lease.assertNoQueuedTargetMutation();
 
         switch (run.state) {
+          case "RESOLVING": {
+            run.counters.commentResolutionCycles += 1;
+            if (
+              run.counters.commentResolutionCycles >
+              run.config.policy.maxCommentResolutionCycles
+            ) {
+              return {
+                kind: "completed",
+                run: await this.failRun(
+                  run,
+                  "Maximum PR comment resolution cycles exceeded.",
+                ),
+              };
+            }
+            try {
+              return {
+                kind: "completed",
+                run: await this.executeResolverWithPublish(run, headSha, lease),
+              };
+            } catch (error) {
+              if (error instanceof RunMutationSupersededError) throw error;
+              await lease.assertNoQueuedTargetMutation();
+              return {
+                kind: "completed",
+                run: await this.failRun(
+                  run,
+                  runFailureMessage(error),
+                  runFailureCode(error),
+                  runFailureRuntime(error),
+                  { preserveWorkspace: run.revalidation !== undefined },
+                ),
+              };
+            }
+          }
           case "BUILDING": {
             run.counters.buildVerifyCycles += 1;
             if (run.counters.buildVerifyCycles > run.config.policy.maxBuildVerifyCycles) {
@@ -1229,20 +1277,25 @@ export class Orchestrator {
         if (
           run.state === "BUILDING" ||
           run.state === "CI_RUNNING" ||
-          run.state === "VERIFYING"
+          run.state === "VERIFYING" ||
+          run.state === "RESOLVING"
         ) {
           run = await this.preflightCommittedAssociationHead(run);
           if (
             run.state !== "BUILDING" &&
             run.state !== "CI_RUNNING" &&
-            run.state !== "VERIFYING"
+            run.state !== "VERIFYING" &&
+            run.state !== "RESOLVING"
           ) {
             return run;
           }
         }
         if (
           run.revalidation &&
-          (run.state === "BUILDING" || run.state === "CI_RUNNING" || run.state === "VERIFYING")
+          (run.state === "BUILDING" ||
+            run.state === "CI_RUNNING" ||
+            run.state === "VERIFYING" ||
+            run.state === "RESOLVING")
         ) {
           const preflight = await this.preflightActiveRevalidation(run);
           run = preflight.run;
@@ -1254,7 +1307,8 @@ export class Orchestrator {
         if (
           run.state === "BUILDING" ||
           run.state === "CI_RUNNING" ||
-          run.state === "VERIFYING"
+          run.state === "VERIFYING" ||
+          run.state === "RESOLVING"
         ) {
           const attempt = await this.advanceGitDependentAutomaticWork(run, headSha);
           if (attempt.kind === "completed") return attempt.run;
@@ -1313,13 +1367,6 @@ export class Orchestrator {
             },
           );
         }
-        case "RESOLVING": {
-          run.counters.commentResolutionCycles += 1;
-          if (run.counters.commentResolutionCycles > run.config.policy.maxCommentResolutionCycles) {
-            return this.failRun(run, "Maximum PR comment resolution cycles exceeded.");
-          }
-          return await this.executeResolverWithPublish(run, headSha);
-        }
         default:
           throw new Error(`State ${run.state} requires a user or integration event.`);
         }
@@ -1341,13 +1388,46 @@ export class Orchestrator {
     inputHeadSha: string | undefined,
     ownedLease?: RunMutationLease,
   ): Promise<RunRecord> {
+    return this.executeMutableRoleWithPublish(run, inputHeadSha, ownedLease, {
+      role: "builder",
+      phase: "builder",
+      artifactName: "04-builder-report.md",
+      commitMessage: "maswe: builder changes",
+      successEvent: "BUILD_COMPLETED",
+      actor: "builder",
+      label: "Builder",
+    });
+  }
+
+  private async executeResolverWithPublish(
+    run: RunRecord,
+    inputHeadSha: string | undefined,
+    ownedLease?: RunMutationLease,
+  ): Promise<RunRecord> {
+    return this.executeMutableRoleWithPublish(run, inputHeadSha, ownedLease, {
+      role: "prResolver",
+      phase: "resolver",
+      artifactName: "09-resolution-report.md",
+      commitMessage: "maswe: resolve review comment",
+      successEvent: "RESOLUTION_COMPLETED",
+      actor: "prResolver",
+      label: "Resolver",
+    });
+  }
+
+  private async executeMutableRoleWithPublish(
+    run: RunRecord,
+    inputHeadSha: string | undefined,
+    ownedLease: RunMutationLease | undefined,
+    spec: MutableRolePublicationSpec,
+  ): Promise<RunRecord> {
     const authoritativeWorkdir = workingDirectoryFor(run);
     const beforeSha =
       inputHeadSha ??
       (run.workspace && run.workspace.baseSha !== "not-a-git-repository"
         ? await gitRevParse(authoritativeWorkdir)
         : undefined);
-    let speculative: SpeculativeBuilderWorktree | undefined;
+    let speculative: SpeculativeRoleWorktree | undefined;
     let baselineTreeSha: string | undefined;
     let authoritativeSourceFingerprint: string | undefined;
     let authoritativeWasClean = true;
@@ -1361,17 +1441,18 @@ export class Orchestrator {
         await this.assertExpectedGitPublicationInput(
           run,
           beforeSha,
-          "Builder speculative execution",
+          `${spec.label} speculative execution`,
         );
         authoritativeSourceFingerprint = await captureWorkspaceSourceFingerprint(
           authoritativeWorkdir,
         );
         authoritativeWasClean = await isGitWorkspaceClean(authoritativeWorkdir);
-        speculative = await this.createSpeculativeBuilderWorktree(
+        speculative = await this.createSpeculativeRoleWorktree(
           authoritativeWorkdir,
           beforeSha,
+          spec.role,
         );
-        baselineTreeSha = await this.seedSpeculativeBuilderWorktree(
+        baselineTreeSha = await this.seedSpeculativeRoleWorktree(
           speculative,
           beforeSha,
         );
@@ -1379,60 +1460,66 @@ export class Orchestrator {
           authoritativeWorkdir,
         );
         if (stableSourceFingerprint !== authoritativeSourceFingerprint) {
-          throw new Error("Authoritative builder baseline changed while it was being captured");
+          throw new Error(
+            `Authoritative ${spec.label.toLowerCase()} baseline changed while it was being captured`,
+          );
         }
       }
-      const builderWorkdir = speculative?.worktreePath ?? authoritativeWorkdir;
-      const prompt = await buildRolePrompt("builder", run, this.store);
+      const roleWorkdir = speculative?.worktreePath ?? authoritativeWorkdir;
+      const prompt = await buildRolePrompt(spec.role, run, this.store);
       const result = await this.executeAgent(
         run,
-        "builder",
+        spec.role,
         prompt,
         undefined,
-        builderWorkdir,
+        roleWorkdir,
         speculative !== undefined,
       );
-      const markers = parseRoleMarker("builder", result.output);
+      const markers = parseRoleMarker(spec.role, result.output);
       if (!markers.ok) throw new Error(markers.message);
-      await this.store.writeArtifact(run, "04-builder-report.md", result.output);
+      await this.store.writeArtifact(run, spec.artifactName, result.output);
       const fence = this.captureOptionalRevalidationFence(run);
 
       let outputHeadSha = beforeSha;
       if (speculative && beforeSha) {
-        await assertExpectedBranch(builderWorkdir, speculative.branch);
-        const afterBuilderSha = await gitRevParse(builderWorkdir);
-        if (afterBuilderSha !== beforeSha) {
+        await assertExpectedBranch(roleWorkdir, speculative.branch);
+        const afterRoleSha = await gitRevParse(roleWorkdir);
+        if (afterRoleSha !== beforeSha) {
           throw new Error(
-            "HEAD moved during builder execution (model-created commit, reset, or rebase is not allowed)",
+            `HEAD moved during ${spec.label.toLowerCase()} execution (model-created commit, reset, or rebase is not allowed)`,
           );
         }
-        await this.assertNoMasweControlPlaneChanges(builderWorkdir);
-        await assertWorkingTreeScope(builderWorkdir, run.config.policy.allowedPathGlobs);
+        await this.assertNoMasweControlPlaneChanges(roleWorkdir);
+        await assertWorkingTreeScope(roleWorkdir, run.config.policy.allowedPathGlobs);
       }
-      completed = await this.withRunPublicationFence(run, "builder", fence, async () => {
+      completed = await this.withRunPublicationFence(run, spec.phase, fence, async () => {
         if (speculative && run.workspace && beforeSha) {
           const committed = await createDeterministicCommit(
-            builderWorkdir,
-            "maswe: builder changes",
+            roleWorkdir,
+            spec.commitMessage,
             {
               allowedPathGlobs: run.config.policy.allowedPathGlobs,
               expectedParentSha: beforeSha,
             },
           );
-          if (!(await isGitWorkspaceClean(builderWorkdir))) {
-            throw new Error("speculative builder worktree remained dirty after deterministic commit");
+          if (!(await isGitWorkspaceClean(roleWorkdir))) {
+            throw new Error(
+              `Speculative ${spec.label.toLowerCase()} worktree remained dirty after deterministic commit`,
+            );
           }
           if (committed.files.length > 0) {
             await assertChangeScope(
-              builderWorkdir,
+              roleWorkdir,
               run.workspace.baseSha,
               run.config.policy.allowedPathGlobs,
             );
           }
-          let builderDelta = "";
+          let roleDelta = "";
           if (!authoritativeWasClean) {
             if (!baselineTreeSha) {
-              throw new Error("Dirty builder publication has no captured baseline tree");
+              throw new Error(
+                `Dirty ${spec.label.toLowerCase()} publication has no captured baseline tree`,
+              );
             }
             const delta = await gitRun(
               [
@@ -1446,41 +1533,48 @@ export class Orchestrator {
                 "--",
                 ...MASWE_SOURCE_PATHSPEC,
               ],
-              builderWorkdir,
+              roleWorkdir,
             );
             if (delta.exitCode !== 0) {
-              throw gitCommandFailure("Failed to capture speculative builder changes", delta);
+              throw gitCommandFailure(
+                `Failed to capture speculative ${spec.label.toLowerCase()} changes`,
+                delta,
+              );
             }
-            builderDelta = delta.stdout;
+            roleDelta = delta.stdout;
           }
-          await this.cleanupSpeculativeBuilderWorktree(speculative);
+          await this.cleanupSpeculativeRoleWorktree(speculative);
           await this.assertExpectedGitPublicationInput(
             run,
             beforeSha,
-            "Builder commit publication",
+            `${spec.label} commit publication`,
           );
           const currentSourceFingerprint = await captureWorkspaceSourceFingerprint(
             authoritativeWorkdir,
           );
           if (currentSourceFingerprint !== authoritativeSourceFingerprint) {
-            throw new Error("Authoritative builder baseline changed before publication");
+            throw new Error(
+              `Authoritative ${spec.label.toLowerCase()} baseline changed before publication`,
+            );
           }
           await this.assertNoMasweControlPlaneChanges(authoritativeWorkdir);
           let publishedHeadSha = committed.headSha;
           if (authoritativeWasClean) {
             if (!(await isGitWorkspaceClean(authoritativeWorkdir))) {
-              throw new Error("Builder commit publication requires its captured clean baseline");
+              throw new Error(
+                `${spec.label} commit publication requires its captured clean baseline`,
+              );
             }
             if (committed.headSha !== beforeSha) {
-              await this.fastForwardBuilderCommit(authoritativeWorkdir, committed.headSha);
+              await this.fastForwardRoleCommit(authoritativeWorkdir, committed.headSha);
             }
           } else {
-            await this.publishDirtyBuilderCommit(
+            await this.publishDirtyRoleCommit(
               authoritativeWorkdir,
               run.workspace.branch,
               beforeSha,
               committed.headSha,
-              builderDelta,
+              roleDelta,
             );
             publishedHeadSha = committed.headSha;
           }
@@ -1490,11 +1584,11 @@ export class Orchestrator {
           await this.assertExactGitPublicationState(
             run,
             publishedHeadSha,
-            "Builder event publication",
+            `${spec.label} event publication`,
           );
         }
         const evaluatedHeadSha = outputHeadSha ?? beforeSha ?? run.workspace?.headSha;
-        return this.store.applyEvent(run, "BUILD_COMPLETED", "builder", {
+        return this.store.applyEvent(run, spec.successEvent, spec.actor, {
           ...runtimeEventIdentityDetails(result),
           marker: markers.marker,
           ...(beforeSha ? { inputHeadSha: beforeSha } : {}),
@@ -1509,7 +1603,7 @@ export class Orchestrator {
     } finally {
       if (speculative && !speculative.cleaned) {
         try {
-          await this.cleanupSpeculativeBuilderWorktree(speculative);
+          await this.cleanupSpeculativeRoleWorktree(speculative);
         } catch (error) {
           cleanupError = error;
           hasCleanupError = true;
@@ -1519,73 +1613,15 @@ export class Orchestrator {
     if (hasPrimaryError && hasCleanupError) {
       throw new AggregateError(
         [primaryError, cleanupError],
-        "Builder execution and speculative worktree cleanup failed",
+        `${spec.label} execution and speculative worktree cleanup failed`,
       );
     }
     if (hasCleanupError) throw cleanupError;
     if (hasPrimaryError) throw primaryError;
-    if (!completed) throw new Error("Builder publication completed without a run record");
-    return completed;
-  }
-
-  private async executeResolverWithPublish(
-    run: RunRecord,
-    inputHeadSha: string | undefined,
-  ): Promise<RunRecord> {
-    const workdir = workingDirectoryFor(run);
-    const beforeSha =
-      inputHeadSha ??
-      (run.workspace && run.workspace.baseSha !== "not-a-git-repository"
-        ? await gitRevParse(workdir)
-        : undefined);
-
-    const prompt = await buildRolePrompt("prResolver", run, this.store);
-    const result = await this.executeAgent(run, "prResolver", prompt);
-    const markers = parseRoleMarker("prResolver", result.output);
-    if (!markers.ok) throw new Error(markers.message);
-    await this.store.writeArtifact(run, "09-resolution-report.md", result.output);
-    const fence = this.captureOptionalRevalidationFence(run);
-
-    let outputHeadSha = beforeSha;
-    if (run.workspace && run.workspace.baseSha !== "not-a-git-repository" && beforeSha) {
-      await assertExpectedBranch(workdir, run.workspace.branch);
-      const afterSha = await gitRevParse(workdir);
-      if (afterSha !== beforeSha) {
-        throw new Error(
-          "HEAD moved during resolver execution (model-created commit, reset, or rebase is not allowed)",
-        );
-      }
-      await assertWorkingTreeScope(workdir, run.config.policy.allowedPathGlobs);
+    if (!completed) {
+      throw new Error(`${spec.label} publication completed without a run record`);
     }
-    return this.withRunPublicationFence(run, "resolver", fence, async () => {
-      if (run.workspace && run.workspace.baseSha !== "not-a-git-repository" && beforeSha) {
-        await this.assertExpectedGitPublicationInput(run, beforeSha, "Resolver commit publication");
-        const committed = await createDeterministicCommit(workdir, "maswe: resolve review comment", {
-          allowedPathGlobs: run.config.policy.allowedPathGlobs,
-          expectedParentSha: beforeSha,
-        });
-        if (!(await isGitWorkspaceClean(workdir))) {
-          throw new Error("worktree remained dirty after deterministic commit");
-        }
-        outputHeadSha = committed.headSha;
-        run.workspace.headSha = committed.headSha;
-        invalidateStaleEvidence(run, committed.headSha);
-        await this.assertExactGitPublicationState(
-          run,
-          committed.headSha,
-          "Resolver event publication",
-        );
-      }
-      const evaluatedHeadSha = outputHeadSha ?? beforeSha ?? run.workspace?.headSha;
-      return this.store.applyEvent(run, "RESOLUTION_COMPLETED", "prResolver", {
-        ...runtimeEventIdentityDetails(result),
-        marker: markers.marker,
-        ...(beforeSha ? { inputHeadSha: beforeSha } : {}),
-        ...(evaluatedHeadSha
-          ? { headSha: evaluatedHeadSha, outputHeadSha: evaluatedHeadSha }
-          : {}),
-      });
-    });
+    return completed;
   }
 
   private async failRun(
