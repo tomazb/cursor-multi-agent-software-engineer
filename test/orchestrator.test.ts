@@ -79,6 +79,28 @@ class EditingBuilderRuntime extends MockRuntime {
   }
 }
 
+class ExhaustingBuilderRuntime extends MockRuntime {
+  override async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    if (request.role !== "builder") return super.execute(request);
+    return {
+      status: "error",
+      output: `builder rejected ${request.roleConfig.model}`,
+      requestedModel: request.roleConfig.model,
+      actualModel: request.roleConfig.model,
+      failure: {
+        code: "runtime-error",
+        message: `builder rejected ${request.roleConfig.model}`,
+        requestedModel: request.roleConfig.model,
+        exitCode: 29,
+        timedOut: false,
+        durationMs: 11,
+        stderrPresent: true,
+        truncated: false,
+      },
+    };
+  }
+}
+
 class EditingResolverRuntime extends MockRuntime {
   override async execute(request: RuntimeRequest): Promise<RuntimeResult> {
     if (
@@ -549,6 +571,41 @@ test("role ref-lock failure preserves a concurrently changed managed worktree", 
       () => false,
     ),
     false,
+  );
+});
+
+test("managed builder exhaustion preserves typed runtime diagnostics", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-isolated-builder-exhaustion-");
+  const config = testConfig((c) => {
+    c.policy.useIsolatedWorktree = true;
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+  const orchestrator = new Orchestrator(cwd, config, new ExhaustingBuilderRuntime());
+
+  const run = await orchestrator.start(
+    "Managed builder exhaustion",
+    "Keep structured runtime diagnostics while preserving the failed workspace.",
+  );
+  const runtime = run.failure?.runtime;
+  const { stdout: registrations } = await execFileAsync(
+    "git",
+    ["worktree", "list", "--porcelain"],
+    { cwd },
+  );
+
+  assert.equal(run.state, "FAILED");
+  assert.equal(run.failure?.code, "runtime-models-exhausted");
+  assert.ok(runtime);
+  assert.equal(runtime.totalAttempts >= 1, true);
+  assert.equal(runtime.attempts[0]?.code, "runtime-error");
+  assert.equal(runtime.attempts[0]?.exitCode, 29);
+  assert.equal(
+    registrations
+      .split("\n")
+      .filter((line) => line.startsWith("worktree ")).length,
+    2,
   );
 });
 

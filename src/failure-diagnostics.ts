@@ -337,7 +337,8 @@ export function reportOmittedFailureAttempts(
 }
 
 export function runFailureCode(error: unknown): RunFailureCode {
-  if (error instanceof RuntimeModelsExhaustedError) return error.code;
+  const runtimeFailure = findRuntimeModelsExhaustedError(error);
+  if (runtimeFailure) return runtimeFailure.code;
   return "workflow-failure";
 }
 
@@ -351,9 +352,28 @@ export function runFailureMessage(error: unknown): string {
 export function runFailureRuntime(
   error: unknown,
 ): DurableRuntimeFailureSummary | undefined {
-  return error instanceof RuntimeModelsExhaustedError
-    ? sanitizeDurableRuntimeFailureSummary(error.runtime)
+  const runtimeFailure = findRuntimeModelsExhaustedError(error);
+  return runtimeFailure
+    ? sanitizeDurableRuntimeFailureSummary(runtimeFailure.runtime)
     : undefined;
+}
+
+function findRuntimeModelsExhaustedError(
+  error: unknown,
+): RuntimeModelsExhaustedError | undefined {
+  const pending: unknown[] = [error];
+  const seen = new Set<unknown>();
+  while (pending.length > 0) {
+    const candidate = pending.pop();
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    if (candidate instanceof RuntimeModelsExhaustedError) return candidate;
+    if (candidate instanceof AggregateError) pending.push(...candidate.errors);
+    if (candidate instanceof Error && candidate.cause !== undefined) {
+      pending.push(candidate.cause);
+    }
+  }
+  return undefined;
 }
 
 export function runFailureDetails(
