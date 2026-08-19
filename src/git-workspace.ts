@@ -395,6 +395,13 @@ export async function createDeterministicCommit(
   const status = await gitExec("git", ["status", "--porcelain=v1", "--untracked-files=all"], cwd);
   if (status.exitCode !== 0) throw new Error(`git status failed: ${status.stderr}`);
   if (!status.stdout.trim()) {
+    const currentBranch = await gitCurrentBranch(cwd);
+    const currentHeadSha = await gitRevParse(cwd, "HEAD");
+    if (currentBranch !== branch || currentHeadSha !== options.expectedParentSha) {
+      throw new Error(
+        `Deterministic commit input moved: expected ${branch}@${options.expectedParentSha}, found ${currentBranch}@${currentHeadSha}`,
+      );
+    }
     return { headSha: options.expectedParentSha, files: [] };
   }
 

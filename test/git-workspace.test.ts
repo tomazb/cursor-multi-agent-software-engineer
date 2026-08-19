@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -82,6 +82,54 @@ test("createDeterministicCommit and assertChangeScope accept in-scope edits", as
   );
   const files = await assertChangeScope(cwd, base, ["src/**"]);
   assert.deepEqual(files, ["src/ok.ts"]);
+});
+
+test("createDeterministicCommit no-op rejects a HEAD move after status", async (t) => {
+  const cwd = await initRepo();
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  await execFileAsync("git", ["commit", "--allow-empty", "-qm", "expected parent"], { cwd });
+  const expectedParentSha = (
+    await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })
+  ).stdout.trim();
+  const winningHeadSha = (
+    await execFileAsync("git", ["rev-parse", "HEAD^"], { cwd })
+  ).stdout.trim();
+  const branch = (
+    await execFileAsync("git", ["branch", "--show-current"], { cwd })
+  ).stdout.trim();
+  const realGit = (
+    await execFileAsync("sh", ["-c", "command -v git"])
+  ).stdout.trim();
+  const shimRoot = await mkdtemp(path.join(os.tmpdir(), "maswe-git-status-race-"));
+  t.after(async () => rm(shimRoot, { recursive: true, force: true }));
+  const shimPath = path.join(shimRoot, "git");
+  const markerPath = path.join(shimRoot, "moved");
+  await writeFile(
+    shimPath,
+    `#!/bin/sh\n"${realGit}" "$@"\ncode=$?\nif [ "$1" = "status" ] && [ "$code" -eq 0 ] && [ ! -e "${markerPath}" ]; then\n  : > "${markerPath}"\n  "${realGit}" update-ref "refs/heads/${branch}" "${winningHeadSha}" "${expectedParentSha}"\nfi\nexit "$code"\n`,
+    "utf8",
+  );
+  await chmod(shimPath, 0o755);
+  const previousPath = process.env.PATH;
+
+  try {
+    process.env.PATH = `${shimRoot}${path.delimiter}${previousPath ?? ""}`;
+    await assert.rejects(
+      createDeterministicCommit(cwd, "must not accept stale no-op", {
+        allowedPathGlobs: ["**"],
+        expectedParentSha,
+      }),
+      /input moved|expected.*HEAD|HEAD moved/i,
+    );
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+  }
+
+  assert.equal(
+    (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim(),
+    winningHeadSha,
+  );
 });
 
 test("createDeterministicCommit rejects an unexpected parent without moving or discarding it", async () => {

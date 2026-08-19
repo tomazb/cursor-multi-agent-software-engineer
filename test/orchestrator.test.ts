@@ -394,6 +394,46 @@ test("clean speculative publication rejects an intervening authoritative branch 
   assert.notEqual(status, "");
 });
 
+test("lost role CAS preserves an externally reset winning checkout", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-clean-role-reset-cas-");
+  await writeFile(path.join(cwd, "baseline.txt"), "B\n", "utf8");
+  await execFileAsync("git", ["add", "baseline.txt"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "B"], { cwd });
+  const { stdout: parentHead } = await execFileAsync("git", ["rev-parse", "HEAD^"], { cwd });
+  const config = testConfig((c) => {
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+  const orchestrator = new Orchestrator(cwd, config, new EditingBuilderRuntime(), undefined, {
+    beforeRoleRefPublish: async () => {
+      await execFileAsync("git", ["reset", "--hard", parentHead.trim()], { cwd });
+    },
+  });
+
+  const run = await orchestrator.start(
+    "Winning checkout compare-and-swap",
+    "Never mutate an external checkout that wins publication.",
+  );
+  const { stdout: afterHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  const { stdout: status } = await execFileAsync("git", ["status", "--porcelain"], { cwd });
+  const baselineExists = await readFile(path.join(cwd, "baseline.txt"), "utf8").then(
+    () => true,
+    () => false,
+  );
+  const builderChangeExists = await readFile(path.join(cwd, "builder-change.txt"), "utf8").then(
+    () => true,
+    () => false,
+  );
+
+  assert.equal(run.state, "FAILED");
+  assert.match(run.failure?.message ?? "", /operator reconciliation/i);
+  assert.equal(afterHead.trim(), parentHead.trim());
+  assert.equal(status, "");
+  assert.equal(baselineExists, false);
+  assert.equal(builderChangeExists, false);
+});
+
 test("failed dirty builder publication restores the exact allowed baseline", async (t) => {
   const cwd = await initGitRepo(t, "maswe-dirty-builder-rollback-");
   await writeFile(path.join(cwd, "README.md"), "# staged operator baseline\n", "utf8");

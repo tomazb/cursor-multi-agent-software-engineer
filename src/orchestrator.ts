@@ -815,6 +815,7 @@ export class Orchestrator {
       }
 
       let deltaApplied = false;
+      let publicationAttempted = false;
       try {
         await this.applyGitPatch(
           workdir,
@@ -828,6 +829,7 @@ export class Orchestrator {
         }
         if (dirtyBaseline) await this.afterDirtyRoleDeltaApplied?.();
         await this.beforeRoleRefPublish?.();
+        publicationAttempted = true;
         const published = await gitRun(
           ["update-ref", `refs/heads/${branch}`, commitSha, beforeSha],
           workdir,
@@ -837,6 +839,26 @@ export class Orchestrator {
         }
       } catch (publicationError) {
         const rollbackErrors: unknown[] = [];
+        if (publicationAttempted) {
+          let actualHeadSha: string | undefined;
+          let workspaceClean: boolean | undefined;
+          try {
+            actualHeadSha = await gitRevParse(workdir);
+            workspaceClean = await isGitWorkspaceClean(workdir);
+          } catch (error) {
+            rollbackErrors.push(error);
+          }
+          if (rollbackErrors.length > 0) {
+            throw new AggregateError(
+              [publicationError, ...rollbackErrors],
+              "Role publication lost its branch compare-and-swap and the authoritative workspace could not be observed",
+            );
+          }
+          throw new AggregateError(
+            [publicationError],
+            `Role publication lost its branch compare-and-swap attempt; the authoritative checkout was left unchanged at ${actualHeadSha} (${workspaceClean ? "clean" : "dirty"}); operator reconciliation is required`,
+          );
+        }
         try {
           if (indexExisted) await copyFile(backupIndexPath, indexPath);
           else await rm(indexPath, { force: true });
