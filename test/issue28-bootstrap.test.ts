@@ -388,6 +388,90 @@ test("supersede persists linked bootstrap intent before any Git bootstrap side e
   await assertNoBootstrapGitSideEffects(cwd, replacement.id);
 });
 
+for (const useIsolatedWorktree of [false, true]) {
+  test(`supersede rejects a dirty source before replacement or original mutation (isolated=${useIsolatedWorktree})`, async (t) => {
+    const cwd = await initRepo();
+    t.after(async () => rm(cwd, { recursive: true, force: true }));
+    const config = isolatedConfig();
+    config.policy.useIsolatedWorktree = useIsolatedWorktree;
+    config.policy.allowDirtyWorkspace = false;
+    const store = new FileRunStore(cwd);
+    const original = await store.create(
+      "Dirty supersede source",
+      "Reject before publishing a replacement.",
+      config,
+    );
+    original.approvals = { brainstorm: true, design: true };
+    original.counters = { buildVerifyCycles: 3, commentResolutionCycles: 2 };
+    original.evidence = {
+      quality: {
+        headSha: "a".repeat(40),
+        passed: false,
+        at: "2026-08-19T10:00:00.000Z",
+      },
+    };
+    original.failure = {
+      code: "workflow-failure",
+      message: "preserve this failure",
+      at: "2026-08-19T10:01:00.000Z",
+      resumeState: "CREATED",
+    };
+    await store.save(original);
+    const before = await store.load(original.id);
+    const branchesBefore = (
+      await execFileAsync("git", ["for-each-ref", "--format=%(refname):%(objectname)", "refs/heads"], {
+        cwd,
+      })
+    ).stdout;
+    const registrationsBefore = await listGitWorktreeRegistrations(cwd);
+    await writeFile(path.join(cwd, "operator-dirty.txt"), "do not discard\n", "utf8");
+
+    const orchestrator = new Orchestrator(cwd, config, new MockRuntime(), store);
+    await assert.rejects(
+      orchestrator.supersede(original.id),
+      /workspace is dirty|allowDirtyWorkspace/i,
+    );
+
+    assert.deepEqual(await store.load(original.id), before);
+    assert.deepEqual((await store.list()).map((run) => run.id), [original.id]);
+    assert.equal(
+      (
+        await execFileAsync("git", ["for-each-ref", "--format=%(refname):%(objectname)", "refs/heads"], {
+          cwd,
+        })
+      ).stdout,
+      branchesBefore,
+    );
+    assert.deepEqual(await listGitWorktreeRegistrations(cwd), registrationsBefore);
+  });
+}
+
+test("supersede retains explicitly configured dirty-source behavior", async (t) => {
+  const cwd = await initRepo();
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const config = isolatedConfig();
+  config.policy.useIsolatedWorktree = false;
+  config.policy.allowDirtyWorkspace = true;
+  const store = new FileRunStore(cwd);
+  const original = await store.create(
+    "Allowed dirty supersede source",
+    "Create a replacement from the explicitly allowed source.",
+    config,
+  );
+  await writeFile(path.join(cwd, "operator-dirty.txt"), "explicitly retained\n", "utf8");
+
+  const replacement = await new Orchestrator(
+    cwd,
+    config,
+    new MockRuntime(),
+    store,
+  ).supersede(original.id);
+
+  assert.equal(replacement.supersedes, original.id);
+  assert.equal((await store.load(original.id)).supersededBy, replacement.id);
+  assert.equal((await readFile(path.join(cwd, "operator-dirty.txt"), "utf8")), "explicitly retained\n");
+});
+
 test("bootstrap barriers fail from authoritative CREATED state without running a role", async (t) => {
   for (const barrier of [
     "beforeBranchCreate",

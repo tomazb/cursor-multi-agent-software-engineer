@@ -128,9 +128,16 @@ or recoverable failed revalidation generation. Evidence from a superseded genera
 Merge-ready and completion share one exact current-head assertion. It requires no active
 revalidation, a known head, the recorded branch in a clean MASWE-managed isolated worktree,
 workspace/GitHub head equality for an associated run, and current passing quality and verification
-evidence when configured. Completion additionally requires current passing merge-ready evidence.
-The assertion is read-only on rejection and returns the observed exact head used in event details;
-historical success events never substitute for current evidence.
+evidence unconditionally. Completion additionally requires current passing merge-ready evidence.
+`requireCiPass` and `requireVerifierPass` can make results nonblocking only on the path to
+`PR_READY`; they never relax `MARK_MERGE_READY` or `COMPLETE`. The assertion is read-only on
+rejection and returns the observed exact head used in event details; historical success events
+never substitute for current evidence.
+
+Builder, resolver, quality, verification, merge-ready, and completion publication each perform a
+final branch, cleanliness, and exact-HEAD assertion inside the durable per-run publication fence.
+Deterministic commits name their exact expected parent and advance the branch only through an
+expected-old-SHA compare-and-swap; unexpected Git movement is preserved and fails closed.
 
 It does not contain Cursor SDK implementation details, shell output parsing, or persistence internals.
 

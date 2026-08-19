@@ -40,6 +40,7 @@ async function createRunInState(
 
 type FailureInjection =
   | "unchanged-prior"
+  | "unchanged-prior-reordered"
   | "partial-failure-metadata"
   | "failure-metadata"
   | "fail-event-details"
@@ -48,6 +49,7 @@ type FailureInjection =
 class FailureInjectionStore implements RunStore {
   private readonly delegate: FileRunStore;
   private readonly injection: FailureInjection;
+  private reorderNextLoad = false;
 
   constructor(
     delegate: FileRunStore,
@@ -65,8 +67,11 @@ class FailureInjectionStore implements RunStore {
     return this.delegate.save(run);
   }
 
-  load(runId: string): Promise<RunRecord> {
-    return this.delegate.load(runId);
+  async load(runId: string): Promise<RunRecord> {
+    const run = await this.delegate.load(runId);
+    if (!this.reorderNextLoad) return run;
+    this.reorderNextLoad = false;
+    return Object.fromEntries(Object.entries(run).reverse()) as unknown as RunRecord;
   }
 
   list(): Promise<RunRecord[]> {
@@ -80,7 +85,8 @@ class FailureInjectionStore implements RunStore {
     details?: Record<string, unknown>,
   ): Promise<RunRecord> {
     if (type !== "FAIL") return this.delegate.applyEvent(run, type, actor, details);
-    if (this.injection === "unchanged-prior") {
+    if (this.injection === "unchanged-prior" || this.injection === "unchanged-prior-reordered") {
+      this.reorderNextLoad = this.injection === "unchanged-prior-reordered";
       throw new Error("simulated pre-publication failure");
     }
 
@@ -238,6 +244,29 @@ test("failure recovery rethrows only an unchanged prior automatic record", async
   assert.equal(reloaded.state, "DESIGNING");
   assert.equal(reloaded.failure, undefined);
   assert.equal(reloaded.events.at(-1)?.type, "APPROVE_BRAINSTORM");
+});
+
+test("failure recovery classifies structurally equal reordered prior records as unchanged", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-transition-prior-reordered-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const value = config((current) => {
+    current.gates.requireBrainstormApproval = false;
+  });
+  const store = new FileRunStore(cwd);
+  const initial = await createRunInState(store, value, "BRAINSTORMING");
+  const orchestrator = new Orchestrator(
+    cwd,
+    value,
+    new MockRuntime(),
+    new FailureInjectionStore(store, "unchanged-prior-reordered"),
+    { automaticTransitionLimit: 1 },
+  );
+
+  await assert.rejects(
+    orchestrator.runUntilBlocked(initial.id),
+    /simulated pre-publication failure/,
+  );
+  assert.equal((await store.load(initial.id)).state, "DESIGNING");
 });
 
 test("failure recovery rejects every altered failed publication shape", async (t) => {

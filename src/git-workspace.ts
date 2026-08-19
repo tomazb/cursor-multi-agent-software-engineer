@@ -378,14 +378,21 @@ export async function ensureRunWorkspace(
 export async function createDeterministicCommit(
   cwd: string,
   message: string,
-  options: { allowedPathGlobs: string[] },
+  options: { allowedPathGlobs: string[]; expectedParentSha: string },
 ): Promise<{ headSha: string; files: string[] }> {
+  const branch = await gitCurrentBranch(cwd);
+  const initialHeadSha = await gitRevParse(cwd, "HEAD");
+  if (initialHeadSha !== options.expectedParentSha) {
+    throw new Error(
+      `Deterministic commit expected parent ${options.expectedParentSha}, but HEAD moved to ${initialHeadSha}`,
+    );
+  }
   await assertWorkingTreeScope(cwd, options.allowedPathGlobs);
 
   const status = await gitExec("git", ["status", "--porcelain=v1", "--untracked-files=all"], cwd);
   if (status.exitCode !== 0) throw new Error(`git status failed: ${status.stderr}`);
   if (!status.stdout.trim()) {
-    return { headSha: await gitRevParse(cwd, "HEAD"), files: [] };
+    return { headSha: options.expectedParentSha, files: [] };
   }
 
   const add = await gitExec("git", ["add", "-A"], cwd);
@@ -398,20 +405,59 @@ export async function createDeterministicCommit(
     .filter(Boolean);
   const disallowed = files.filter((file) => !pathAllowed(file, options.allowedPathGlobs));
   if (disallowed.length > 0) {
-    await gitExec("git", ["reset", "HEAD"], cwd);
     throw new Error(`Change-scope violation: ${disallowed.join(", ")}`);
   }
 
-  const commit = await gitExec("git", ["-c", "core.hooksPath=/dev/null", "commit", "-m", message], cwd);
+  const tree = await gitExec("git", ["write-tree"], cwd);
+  if (tree.exitCode !== 0) {
+    throw new Error(`git write-tree failed: ${tree.stderr || tree.stdout}`);
+  }
+  const currentBranch = await gitCurrentBranch(cwd);
+  const currentHeadSha = await gitRevParse(cwd, "HEAD");
+  if (currentBranch !== branch || currentHeadSha !== options.expectedParentSha) {
+    throw new Error(
+      `Deterministic commit input moved: expected ${branch}@${options.expectedParentSha}, found ${currentBranch}@${currentHeadSha}`,
+    );
+  }
+
+  const commit = await gitExec(
+    "git",
+    ["commit-tree", tree.stdout.trim(), "-p", options.expectedParentSha, "-m", message],
+    cwd,
+  );
   if (commit.exitCode !== 0) {
-    throw new Error(`git commit failed: ${commit.stderr || commit.stdout}`);
+    throw new Error(`git commit-tree failed: ${commit.stderr || commit.stdout}`);
+  }
+  const commitSha = commit.stdout.trim().toLowerCase();
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commitSha)) {
+    throw new Error("git commit-tree returned a malformed commit object name");
+  }
+  const publishedParentSha = await gitRevParse(cwd, `${commitSha}^`);
+  if (publishedParentSha !== options.expectedParentSha) {
+    throw new Error(
+      `Deterministic commit parent ${publishedParentSha} does not match expected input ${options.expectedParentSha}`,
+    );
+  }
+
+  const update = await gitExec(
+    "git",
+    ["update-ref", `refs/heads/${branch}`, commitSha, options.expectedParentSha],
+    cwd,
+  );
+  if (update.exitCode !== 0) {
+    throw new Error(
+      `Deterministic commit publication lost its expected-old-SHA fence: ${update.stderr || update.stdout}`,
+    );
+  }
+  if ((await gitCurrentBranch(cwd)) !== branch || (await gitRevParse(cwd, "HEAD")) !== commitSha) {
+    throw new Error("Deterministic commit publication did not retain the expected branch and HEAD");
   }
 
   if (!(await isGitWorkspaceClean(cwd))) {
     throw new Error("worktree remained dirty after deterministic commit");
   }
 
-  return { headSha: await gitRevParse(cwd, "HEAD"), files };
+  return { headSha: commitSha, files };
 }
 
 export async function assertChangeScope(

@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
+import { WORKFLOW_EVENTS, WORKFLOW_STATES } from "../src/domain.ts";
 import type { MasweConfig, RuntimeFailureCode } from "../src/domain.ts";
 import { FileRunStore, migrateRunRecord } from "../src/store.ts";
 import os from "node:os";
@@ -310,6 +311,10 @@ test("run-record schema and migration accept exact legal recovery metadata", asy
   assert.throws(() => assertMatches(schema, schema, persisted, "run"), /generation/);
   assert.throws(() => migrateRunRecord(persisted), /generation/);
   revalidation.generation = 2;
+  revalidation.generation = Number.MAX_SAFE_INTEGER + 1;
+  assert.throws(() => assertMatches(schema, schema, persisted, "run"), /generation/);
+  assert.throws(() => migrateRunRecord(persisted), /generation/);
+  revalidation.generation = 2;
   delete revalidation.requestedAt;
   assert.throws(() => assertMatches(schema, schema, persisted, "run"), /requestedAt.*required/);
   assert.throws(() => migrateRunRecord(persisted), /requestedAt.*required/);
@@ -317,6 +322,92 @@ test("run-record schema and migration accept exact legal recovery metadata", asy
   revalidation.unknown = true;
   assert.throws(() => assertMatches(schema, schema, persisted, "run"), /additionalProperties/);
   assert.throws(() => migrateRunRecord(persisted), /unsupported.*revalidation.*unknown/i);
+});
+
+test("run-record schema workflow enums and exact event records stay synchronized with runtime validation", async (t) => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  assert.deepEqual(
+    [...(schema.$defs?.workflowState?.enum ?? [])].sort(),
+    [...WORKFLOW_STATES].sort(),
+  );
+  assert.deepEqual(
+    [...(schema.$defs?.workflowEvent?.enum ?? [])].sort(),
+    [...WORKFLOW_EVENTS].sort(),
+  );
+  assert.equal(schema.properties?.state?.$ref, "#/$defs/workflowState");
+  assert.equal(
+    schema.properties?.failure?.properties?.resumeState?.$ref,
+    "#/$defs/workflowState",
+  );
+  const eventSchema = resolveRef(schema, schema.properties?.events?.items ?? {});
+  assert.equal(eventSchema.additionalProperties, false);
+  assert.deepEqual(eventSchema.required, ["id", "at", "type", "actor", "from", "to"]);
+  assert.equal(eventSchema.properties?.type?.$ref, "#/$defs/workflowEvent");
+  assert.equal(eventSchema.properties?.from?.$ref, "#/$defs/workflowState");
+  assert.equal(eventSchema.properties?.to?.$ref, "#/$defs/workflowState");
+
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-workflow-enums-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const run = await new FileRunStore(cwd).create(
+    "exact workflow schema",
+    "reject public/runtime drift",
+    DEFAULT_CONFIG,
+  );
+  run.events = [
+    {
+      id: "event-1",
+      at: "2026-08-19T12:00:00.000Z",
+      type: "START",
+      actor: "user",
+      from: "CREATED",
+      to: "BRAINSTORMING",
+      details: { source: "test" },
+    },
+  ];
+  assert.doesNotThrow(() => assertMatches(schema, schema, run, "valid run"));
+  assert.doesNotThrow(() => migrateRunRecord(run));
+
+  for (const invalid of [
+    {
+      label: "unknown state",
+      mutate: (candidate: Record<string, unknown>) => {
+        candidate.state = "UNKNOWN_STATE";
+      },
+    },
+    {
+      label: "unknown event type",
+      mutate: (candidate: Record<string, unknown>) => {
+        ((candidate.events as Array<Record<string, unknown>>)[0]!).type = "UNKNOWN_EVENT";
+      },
+    },
+    {
+      label: "missing required event field",
+      mutate: (candidate: Record<string, unknown>) => {
+        delete ((candidate.events as Array<Record<string, unknown>>)[0]!).actor;
+      },
+    },
+    {
+      label: "extra event field",
+      mutate: (candidate: Record<string, unknown>) => {
+        ((candidate.events as Array<Record<string, unknown>>)[0]!).secret = "not public";
+      },
+    },
+  ]) {
+    const candidate = structuredClone(run) as unknown as Record<string, unknown>;
+    invalid.mutate(candidate);
+    assert.throws(
+      () => assertMatches(schema, schema, candidate, invalid.label),
+      /enum|required|additionalProperties|state|event/i,
+      invalid.label,
+    );
+    assert.throws(
+      () => migrateRunRecord(candidate),
+      /invalid|required|unsupported/i,
+      invalid.label,
+    );
+  }
 });
 
 test("persisted run config uses the exact config schema and rejects nested secrets", async (t) => {

@@ -50,12 +50,18 @@ test("ensureRunWorkspace creates an isolated branch worktree", async () => {
 
 test("createDeterministicCommit rejects out-of-scope paths", async () => {
   const cwd = await initRepo();
+  const expectedParentSha = (
+    await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })
+  ).stdout.trim();
   await mkdir(path.join(cwd, "src"), { recursive: true });
   await writeFile(path.join(cwd, "src", "ok.ts"), "export {}\n", "utf8");
   await writeFile(path.join(cwd, "secret.env"), "TOKEN=1\n", "utf8");
 
   await assert.rejects(
-    createDeterministicCommit(cwd, "bad", { allowedPathGlobs: ["src/**"] }),
+    createDeterministicCommit(cwd, "bad", {
+      allowedPathGlobs: ["src/**"],
+      expectedParentSha,
+    }),
     /Change-scope violation/,
   );
 });
@@ -67,10 +73,49 @@ test("createDeterministicCommit and assertChangeScope accept in-scope edits", as
   await writeFile(path.join(cwd, "src", "ok.ts"), "export const x = 1;\n", "utf8");
   const committed = await createDeterministicCommit(cwd, "feat: ok", {
     allowedPathGlobs: ["src/**"],
+    expectedParentSha: base,
   });
   assert.ok(committed.files.includes("src/ok.ts"));
+  assert.equal(
+    (await execFileAsync("git", ["rev-parse", "HEAD^"], { cwd })).stdout.trim(),
+    base,
+  );
   const files = await assertChangeScope(cwd, base, ["src/**"]);
   assert.deepEqual(files, ["src/ok.ts"]);
+});
+
+test("createDeterministicCommit rejects an unexpected parent without moving or discarding it", async () => {
+  const cwd = await initRepo();
+  const expectedParentSha = (
+    await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })
+  ).stdout.trim();
+  await mkdir(path.join(cwd, "src"), { recursive: true });
+  await writeFile(path.join(cwd, "src", "pending.ts"), "export const pending = true;\n", "utf8");
+  await execFileAsync("git", ["commit", "--allow-empty", "-qm", "operator movement"], { cwd });
+  const unexpectedHeadSha = (
+    await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })
+  ).stdout.trim();
+
+  await assert.rejects(
+    createDeterministicCommit(cwd, "must not publish", {
+      allowedPathGlobs: ["src/**"],
+      expectedParentSha,
+    }),
+    /expected parent|unexpected HEAD|moved/i,
+  );
+
+  assert.equal(
+    (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim(),
+    unexpectedHeadSha,
+  );
+  assert.match(
+    (
+      await execFileAsync("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
+        cwd,
+      })
+    ).stdout,
+    /src\/pending\.ts/,
+  );
 });
 
 test("assertSafeRunId rejects path traversal run ids", async () => {

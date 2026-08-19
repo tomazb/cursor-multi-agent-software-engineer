@@ -213,15 +213,26 @@ function waitForMessage(
   predicate: (message: WorkerMessage) => boolean,
 ): Promise<WorkerMessage> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("mutation worker watchdog expired")), 10_000);
-    const onMessage = (message: WorkerMessage): void => {
-      if (!predicate(message)) return;
+    const cleanup = (): void => {
       clearTimeout(timer);
       child.off("message", onMessage);
+      child.off("error", onError);
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    const onMessage = (message: WorkerMessage): void => {
+      if (!predicate(message)) return;
+      cleanup();
       resolve(message);
     };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("mutation worker watchdog expired"));
+    }, 10_000);
     child.on("message", onMessage);
-    child.once("error", reject);
+    child.on("error", onError);
   });
 }
 

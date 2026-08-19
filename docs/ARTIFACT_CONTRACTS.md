@@ -71,6 +71,11 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
 
 Build, quality, and verification events include the evaluated `headSha`. When `headSha` changes, prior quality/verification evidence is invalidated and merge-ready fails closed until CI and verification are re-run.
 
+`requireCiPass` and `requireVerifierPass` govern whether failed evidence blocks progress before
+`PR_READY`. They do not change the final artifact contract: `MARK_MERGE_READY` and `COMPLETE`
+always require present, passing quality and verification bindings for the exact current head, and
+`COMPLETE` also requires a present, passing merge-ready binding for that head.
+
 Optional `github` association binds a run to a GitHub App installation, repository, and pull request for check-run mirroring. `suspended` is set when the installation loses access; Phase A does not auto-start runs from webhooks.
 
 The run's configuration is a snapshot. Changing `.maswe/config.json` affects only later runs unless a future migration command explicitly updates a run.
@@ -359,6 +364,11 @@ shared current-head gate. `COMPLETE` records that same exact head as both `headS
 `mergeReadySha`. These details are audit history only: an earlier passing event never recreates
 missing, failed, or stale `evidence`, and completion never falls back to a historical
 `MARK_MERGE_READY` event.
+
+Every Git-dependent authoritative publication performs its final branch, clean-worktree, and
+exact-expected-HEAD assertion inside the same per-run mutation section that writes the event or
+evidence. Builder and resolver commits additionally prove the exact expected parent and publish
+the branch ref with an expected-old-SHA compare-and-swap.
 
 GitHub association publication is event-free and rollback-capable; workflow request and retarget
 events publish only after association commit and are never rolled back. Association-only saves may

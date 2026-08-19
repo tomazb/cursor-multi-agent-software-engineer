@@ -9,7 +9,7 @@ import type {
   WorkflowState,
 } from "./domain.ts";
 import { buildCommentClassifierPrompt, buildRolePrompt } from "./prompt-builder.ts";
-import { gitRevParse, isGitWorkspaceClean } from "./git-snapshot.ts";
+import { gitRevParse, gitWorkspaceFingerprint, isGitWorkspaceClean } from "./git-snapshot.ts";
 import {
   assertChangeScope,
   assertExpectedBranch,
@@ -114,7 +114,7 @@ export interface OrchestratorOptions {
   beforeRetryPublication?: (candidate: RunRecord) => Promise<void>;
   /** Deterministic barrier after final authority reload under the mutation fence. */
   afterRunMutationReload?: (
-    phase: "builder" | "resolver" | "quality" | "verifier",
+    phase: "builder" | "resolver" | "quality" | "verifier" | "merge-ready" | "complete",
     authoritative: RunRecord,
   ) => Promise<void>;
 }
@@ -170,6 +170,9 @@ export class Orchestrator {
     config: MasweConfig,
     options: { supersedes?: string } = {},
   ): Promise<RunRecord> {
+    if (!config.policy.allowDirtyWorkspace && !(await isGitWorkspaceClean(this.cwd))) {
+      throw new Error("Workspace is dirty. Commit, stash, or set policy.allowDirtyWorkspace=true.");
+    }
     const workspaceBootstrap = await captureWorkspaceBootstrapIntent(this.cwd, config);
     const run = await this.store.create(title, request, config, {
       workspaceBootstrap,
@@ -306,9 +309,6 @@ export class Orchestrator {
   }
 
   async start(title: string, request: string): Promise<RunRecord> {
-    if (!this.config.policy.allowDirtyWorkspace && !(await isGitWorkspaceClean(this.cwd))) {
-      throw new Error("Workspace is dirty. Commit, stash, or set policy.allowDirtyWorkspace=true.");
-    }
     const catalogue = await this.runtime.listModels();
     const resolvedConfig = resolveProjectModels(this.config, catalogue);
     const planned = await this.createPlannedRun(title, request, resolvedConfig);
@@ -526,6 +526,48 @@ export class Orchestrator {
     );
   }
 
+  private async assertExpectedGitPublicationInput(
+    run: RunRecord,
+    expectedHeadSha: string,
+    label: string,
+  ): Promise<void> {
+    if (!run.workspace || run.workspace.baseSha === "not-a-git-repository") return;
+    const workdir = workingDirectoryFor(run);
+    await assertExpectedBranch(workdir, run.workspace.branch);
+    const actualHeadSha = await gitRevParse(workdir, "HEAD");
+    if (actualHeadSha !== expectedHeadSha) {
+      run.workspace.headSha = actualHeadSha;
+      run.workspace.fingerprint = await gitWorkspaceFingerprint(workdir);
+      invalidateStaleEvidence(run, actualHeadSha);
+      throw new Error(
+        `${label} expected HEAD ${expectedHeadSha}, but authoritative publication observed ${actualHeadSha}`,
+      );
+    }
+  }
+
+  private async assertExactGitPublicationState(
+    run: RunRecord,
+    expectedHeadSha: string,
+    label: string,
+  ): Promise<void> {
+    await this.assertExpectedGitPublicationInput(run, expectedHeadSha, label);
+    if (!run.workspace || run.workspace.baseSha === "not-a-git-repository") return;
+    const workdir = workingDirectoryFor(run);
+    if (!(await isGitWorkspaceClean(workdir))) {
+      throw new Error(`${label} requires a clean worktree at ${expectedHeadSha}`);
+    }
+    await assertExpectedBranch(workdir, run.workspace.branch);
+    const finalHeadSha = await gitRevParse(workdir, "HEAD");
+    if (finalHeadSha !== expectedHeadSha) {
+      run.workspace.headSha = finalHeadSha;
+      run.workspace.fingerprint = await gitWorkspaceFingerprint(workdir);
+      invalidateStaleEvidence(run, finalHeadSha);
+      throw new Error(
+        `${label} final HEAD moved from ${expectedHeadSha} to ${finalHeadSha}`,
+      );
+    }
+  }
+
   private async syncWorkspace(run: RunRecord): Promise<string | undefined> {
     if (!run.workspace || run.workspace.baseSha === "not-a-git-repository") return undefined;
     const workdir = workingDirectoryFor(run);
@@ -637,7 +679,12 @@ export class Orchestrator {
           await this.store.writeArtifact(run, "05-quality-report.md", renderQualityReport(report));
           const fence = this.captureOptionalRevalidationFence(run);
           const accepted = report.passed || !run.config.gates.requireCiPass;
-          return this.withRunPublicationFence(run, "quality", fence, async () => {
+          return await this.withRunPublicationFence(run, "quality", fence, async () => {
+            await this.assertExactGitPublicationState(
+              run,
+              evaluatedSha,
+              "Quality publication",
+            );
             this.bindEvidence(run, "quality", evaluatedSha, report.passed);
             return this.store.applyEvent(
               run,
@@ -710,7 +757,12 @@ export class Orchestrator {
           }
           const fence = this.captureOptionalRevalidationFence(run);
           const accepted = passed || !run.config.gates.requireVerifierPass;
-          return this.withRunPublicationFence(run, "verifier", fence, async () => {
+          return await this.withRunPublicationFence(run, "verifier", fence, async () => {
+            await this.assertExactGitPublicationState(
+              run,
+              evaluatedSha,
+              "Verification publication",
+            );
             this.bindEvidence(run, "verification", evaluatedSha, passed);
             const successEvent =
               run.revalidation?.returnState === "PR_READY"
@@ -808,8 +860,10 @@ export class Orchestrator {
     }
     return this.withRunPublicationFence(run, "builder", fence, async () => {
       if (run.workspace && run.workspace.baseSha !== "not-a-git-repository" && beforeSha) {
+        await this.assertExpectedGitPublicationInput(run, beforeSha, "Builder commit publication");
         const committed = await createDeterministicCommit(workdir, "maswe: builder changes", {
           allowedPathGlobs: run.config.policy.allowedPathGlobs,
+          expectedParentSha: beforeSha,
         });
         if (!(await isGitWorkspaceClean(workdir))) {
           throw new Error("worktree remained dirty after deterministic commit");
@@ -820,6 +874,11 @@ export class Orchestrator {
         outputHeadSha = committed.headSha;
         run.workspace.headSha = committed.headSha;
         invalidateStaleEvidence(run, committed.headSha);
+        await this.assertExactGitPublicationState(
+          run,
+          committed.headSha,
+          "Builder event publication",
+        );
       }
       const evaluatedHeadSha = outputHeadSha ?? beforeSha ?? run.workspace?.headSha;
       return this.store.applyEvent(run, "BUILD_COMPLETED", "builder", {
@@ -864,8 +923,10 @@ export class Orchestrator {
     }
     return this.withRunPublicationFence(run, "resolver", fence, async () => {
       if (run.workspace && run.workspace.baseSha !== "not-a-git-repository" && beforeSha) {
+        await this.assertExpectedGitPublicationInput(run, beforeSha, "Resolver commit publication");
         const committed = await createDeterministicCommit(workdir, "maswe: resolve review comment", {
           allowedPathGlobs: run.config.policy.allowedPathGlobs,
+          expectedParentSha: beforeSha,
         });
         if (!(await isGitWorkspaceClean(workdir))) {
           throw new Error("worktree remained dirty after deterministic commit");
@@ -873,6 +934,11 @@ export class Orchestrator {
         outputHeadSha = committed.headSha;
         run.workspace.headSha = committed.headSha;
         invalidateStaleEvidence(run, committed.headSha);
+        await this.assertExactGitPublicationState(
+          run,
+          committed.headSha,
+          "Resolver event publication",
+        );
       }
       const evaluatedHeadSha = outputHeadSha ?? beforeSha ?? run.workspace?.headSha;
       return this.store.applyEvent(run, "RESOLUTION_COMPLETED", "prResolver", {
@@ -929,11 +995,11 @@ export class Orchestrator {
       const observedEvent = newEvents[0];
       const expectedNewEvents = candidate.events.filter((event) => !priorEventIds.has(event.id));
       const expectedEvent = expectedNewEvents[0];
-      const priorRecordIsUnchanged = JSON.stringify(observed) === JSON.stringify(prior);
+      const priorRecordIsUnchanged = this.recordsEqual(observed, prior);
       if (priorRecordIsUnchanged) throw error;
 
       const completePublication =
-        JSON.stringify(observed) === JSON.stringify(candidate) &&
+        this.recordsEqual(observed, candidate) &&
         newEvents.length === 1 &&
         expectedNewEvents.length === 1 &&
         observedEvent !== undefined &&
@@ -1112,36 +1178,25 @@ export class Orchestrator {
     ) {
       throw new Error(`${label} requires the registered path and branch to identify the same worktree.`);
     }
-    if (pathRegistration.headSha !== run.workspace.headSha) {
+    const expectedHeadSha = run.workspace.headSha;
+    if (pathRegistration.headSha !== expectedHeadSha) {
       throw new Error(
-        `${label} rejected: registered HEAD ${pathRegistration.headSha} does not match recorded workspace HEAD ${run.workspace.headSha}.`,
+        `${label} rejected: registered HEAD ${pathRegistration.headSha} does not match recorded workspace HEAD ${expectedHeadSha}.`,
       );
     }
-
-    const workdir = workingDirectoryFor(run);
-    await assertExpectedBranch(workdir, run.workspace.branch);
-    if (!(await isGitWorkspaceClean(workdir))) {
-      throw new Error(`${label} requires a clean worktree for the current HEAD.`);
-    }
-    const headSha = await gitRevParse(workdir, "HEAD");
-    if (headSha !== run.workspace.headSha) {
-      throw new Error(
-        `${label} rejected: current HEAD ${headSha} does not match recorded workspace HEAD ${run.workspace.headSha}.`,
-      );
-    }
+    await this.assertExactGitPublicationState(run, expectedHeadSha, label);
+    const headSha = expectedHeadSha;
     if (run.github && run.github.headSha !== headSha) {
       throw new Error(
         `${label} rejected: associated GitHub HEAD ${run.github.headSha} does not match workspace HEAD ${headSha}.`,
       );
     }
     if (
-      run.config.gates.requireCiPass &&
       (!run.evidence?.quality?.passed || run.evidence.quality.headSha !== headSha)
     ) {
       throw new Error(`${label} requires present, passing quality evidence for the current HEAD.`);
     }
     if (
-      run.config.gates.requireVerifierPass &&
       (!run.evidence?.verification?.passed || run.evidence.verification.headSha !== headSha)
     ) {
       throw new Error(
@@ -1154,35 +1209,66 @@ export class Orchestrator {
     ) {
       throw new Error("Complete requires current, passing merge-ready evidence for the current HEAD.");
     }
+    await this.assertExactGitPublicationState(run, headSha, label);
     return headSha;
   }
 
-  async markMergeReady(runId: string): Promise<RunRecord> {
-    const run = await this.store.load(runId);
-    const mergeReadySha = await this.assertExactCurrentHeadGate(run, "merge-ready");
-    run.evidence = {
-      ...(run.evidence ?? {}),
-      mergeReady: {
-        headSha: mergeReadySha,
-        passed: true,
-        at: new Date().toISOString(),
+  private async withFinalGatePublicationFence(
+    runId: string,
+    gate: "merge-ready" | "complete",
+    publish: (run: RunRecord, headSha: string) => Promise<RunRecord>,
+  ): Promise<RunRecord> {
+    const initial = await this.store.load(runId);
+    return withRunMutationFence(
+      initial.repositoryPath,
+      runId,
+      "publication",
+      async (lease) => {
+        const authoritative = await this.store.load(runId);
+        if (
+          authoritative.repositoryPath !== initial.repositoryPath ||
+          authoritative.version !== initial.version
+        ) {
+          throw new Error(
+            `Run ${runId} changed before ${gate} publication: expected version ${initial.version}, authoritative ${authoritative.version}`,
+          );
+        }
+        if (gate === "complete" && authoritative.state !== "MERGE_READY") {
+          throw new Error(`complete requires MERGE_READY, currently ${authoritative.state}`);
+        }
+        await this.afterRunMutationReload?.(gate, authoritative);
+        await lease.assertNoQueuedTargetMutation();
+        const headSha = await this.assertExactCurrentHeadGate(authoritative, gate);
+        return publish(authoritative, headSha);
       },
-    };
-    return this.store.applyEvent(run, "MARK_MERGE_READY", "user", {
-      headSha: mergeReadySha,
+    );
+  }
+
+  async markMergeReady(runId: string): Promise<RunRecord> {
+    return this.withFinalGatePublicationFence(runId, "merge-ready", async (run, headSha) => {
+      run.evidence = {
+        ...(run.evidence ?? {}),
+        mergeReady: {
+          headSha,
+          passed: true,
+          at: new Date().toISOString(),
+        },
+      };
+      return this.store.applyEvent(run, "MARK_MERGE_READY", "user", {
+        headSha,
+      });
     });
   }
 
   async complete(runId: string): Promise<RunRecord> {
-    const run = await this.store.load(runId);
-    if (run.state !== "MERGE_READY") {
-      throw new Error(`complete requires MERGE_READY, currently ${run.state}`);
-    }
-    const headSha = await this.assertExactCurrentHeadGate(run, "complete");
-    const completed = await this.store.applyEvent(run, "COMPLETE", "user", {
-      headSha,
-      mergeReadySha: headSha,
-    });
+    const completed = await this.withFinalGatePublicationFence(
+      runId,
+      "complete",
+      async (run, headSha) => this.store.applyEvent(run, "COMPLETE", "user", {
+        headSha,
+        mergeReadySha: headSha,
+      }),
+    );
     return this.finalizeTerminal(completed);
   }
 

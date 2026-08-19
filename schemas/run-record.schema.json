@@ -27,7 +27,7 @@
     "title": { "type": "string" },
     "request": { "type": "string" },
     "repositoryPath": { "type": "string" },
-    "state": { "type": "string" },
+    "state": { "$ref": "#/$defs/workflowState" },
     "createdAt": { "type": "string" },
     "updatedAt": { "type": "string" },
     "approvals": {
@@ -67,7 +67,10 @@
         }
       }
     },
-    "events": { "type": "array" },
+    "events": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/workflowEventRecord" }
+    },
     "workspace": {
       "type": "object",
       "required": ["baseSha", "headSha", "branch", "fingerprint"],
@@ -131,7 +134,11 @@
           "type": "string",
           "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$"
         },
-        "generation": { "type": "integer", "minimum": 1 },
+        "generation": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
         "requestedAt": {
           "type": "string",
           "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
@@ -208,12 +215,75 @@
         },
         "message": { "type": "string" },
         "at": { "type": "string" },
-        "resumeState": { "type": "string" },
+        "resumeState": { "$ref": "#/$defs/workflowState" },
         "runtime": { "$ref": "#/$defs/durableRuntimeFailureSummary" }
       }
     }
   },
   "$defs": {
+    "workflowState": {
+      "enum": [
+        "CREATED",
+        "BRAINSTORMING",
+        "WAITING_FOR_BRAINSTORM_APPROVAL",
+        "DESIGNING",
+        "WAITING_FOR_DESIGN_APPROVAL",
+        "BUILDING",
+        "CI_RUNNING",
+        "VERIFYING",
+        "PR_READY",
+        "PR_REVIEW",
+        "CLASSIFYING_COMMENT",
+        "RESOLVING",
+        "WAITING_FOR_HUMAN",
+        "MERGE_READY",
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED"
+      ]
+    },
+    "workflowEvent": {
+      "enum": [
+        "START",
+        "BRAINSTORM_COMPLETED",
+        "APPROVE_BRAINSTORM",
+        "DESIGN_COMPLETED",
+        "APPROVE_DESIGN",
+        "BUILD_COMPLETED",
+        "CI_PASSED",
+        "CI_FAILED",
+        "VERIFY_PASSED",
+        "VERIFY_PASSED_AFTER_REVIEW",
+        "VERIFY_FAILED",
+        "PR_OPENED",
+        "REVIEW_COMMENT_RECEIVED",
+        "COMMENT_IN_SCOPE",
+        "COMMENT_OUT_OF_SCOPE",
+        "RESOLUTION_COMPLETED",
+        "HUMAN_RESUME",
+        "MARK_MERGE_READY",
+        "COMPLETE",
+        "FAIL",
+        "CANCEL",
+        "RETRY_FROM_FAILED",
+        "REVALIDATE_REQUESTED",
+        "REVALIDATION_RETARGETED"
+      ]
+    },
+    "workflowEventRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "at", "type", "actor", "from", "to"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "at": { "type": "string" },
+        "type": { "$ref": "#/$defs/workflowEvent" },
+        "actor": { "type": "string", "minLength": 1 },
+        "from": { "$ref": "#/$defs/workflowState" },
+        "to": { "$ref": "#/$defs/workflowState" },
+        "details": { "type": "object" }
+      }
+    },
     "durableRuntimeFailureAttempt": {
       "type": "object",
       "additionalProperties": false,

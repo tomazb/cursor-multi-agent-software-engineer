@@ -374,7 +374,10 @@ To opt out for a trusted checkout:
 }
 ```
 
-Keep the primary workspace clean. Dirty checkouts are rejected unless `policy.allowDirtyWorkspace` is true.
+Keep the primary workspace clean. Dirty checkouts are rejected unless
+`policy.allowDirtyWorkspace` is true. The shared production run-creation boundary applies this
+check to both `start` and `supersede` before bootstrap intent, replacement creation, Git metadata
+changes, or mutation of the original run.
 
 ## 6. Run lifecycle
 
@@ -453,9 +456,17 @@ These commands record workflow status only; they do not merge a PR.
 Both commands re-read authoritative run state and apply the same exact current-head gate. The run
 must have no active revalidation, a known recorded head, the exact recorded branch in a clean
 MASWE-managed isolated worktree, matching workspace/GitHub heads when associated, and current
-passing required quality and verification evidence. `complete` additionally requires current
-passing merge-ready evidence. Rejection does not alter state, events, or evidence, and historical
-passing events do not substitute for current evidence.
+passing quality and verification evidence. These final requirements are unconditional even when
+`gates.requireCiPass` or `gates.requireVerifierPass` allowed a failed result to remain nonblocking
+before `PR_READY`. `complete` additionally requires current passing merge-ready evidence.
+Rejection does not alter state, events, or evidence, and historical passing events do not
+substitute for current evidence.
+
+Immediately before each builder, resolver, quality, verifier, merge-ready, or completion result is
+published, MASWE rechecks the branch, clean-worktree status, and exact expected head inside the
+durable per-run publication fence. A deterministic commit advances its branch only when the ref
+still has the exact expected parent. If an operator or another process moved the ref, MASWE does
+not reset, clean, force-update, rebase, or discard that work.
 
 ## 7. Recovery
 

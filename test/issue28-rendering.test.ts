@@ -126,7 +126,8 @@ test("recovery rendering redacts credential-like generated values without changi
     output,
     /Revalidation: source=local-workspace, target=\[REDACTED\], generation=1, return=PR_READY/,
   );
-  assert.equal(output.includes(secret.slice(0, 6)), false);
+  assert.equal(output.includes(secret), false);
+  assert.equal(output.includes(unsafeValue), false);
   assert.equal(JSON.stringify(run).includes(unsafeValue), true);
 });
 

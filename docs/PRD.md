@@ -161,15 +161,23 @@ The builder shall receive only approved artifacts plus repository context, may m
 
 The system shall execute configured commands sequentially outside the model and save stdout, stderr, exit codes, and durations. A failing command shall stop later commands in that quality pass and route the run back to building within policy limits.
 
+Before `PR_READY`, `gates.requireCiPass=false` may make a failed quality result nonblocking, but the
+failed result remains SHA-bound evidence and does not satisfy either final workflow gate.
+
 ### FR-10 — Independent verifier
 
 The verifier shall run read-only after quality checks, inspect the actual repository, map acceptance criteria to evidence, and end with exactly `VERDICT: PASS` or `VERDICT: FAIL`.
 
 A failed verdict shall route to the builder within the configured cycle limit.
 
+Before `PR_READY`, `gates.requireVerifierPass=false` may make a failed verdict nonblocking, but the
+failed verdict remains SHA-bound evidence and does not satisfy either final workflow gate.
+
 ### FR-11 — PR readiness
 
-A successful CI and verifier pass shall produce `PR_READY`. v0.1 requires the user or external integration to create the PR and signal `PR_OPENED`.
+Passing CI and verification produce `PR_READY`; explicitly nonblocking pre-PR policy may also
+advance there while retaining the failed evidence. v0.1 requires the user or external integration
+to create the PR and signal `PR_OPENED`.
 
 ### FR-12 — Review comment classification
 
@@ -208,6 +216,10 @@ both reject active revalidation, an unknown or mismatched head, a wrong or dirty
 an associated GitHub head mismatch, and missing, failed, or stale required evidence. Completion
 shall additionally require current passing merge-ready evidence; historical success events do not
 recreate current evidence.
+
+The quality and verification requirements at `MARK_MERGE_READY` and `COMPLETE` are unconditional:
+both bindings must be present, passing, and bound to the exact current head regardless of the
+`requireCiPass` and `requireVerifierPass` settings that govern progress before `PR_READY`.
 
 GitHub association publication shall be event-free and rollback-capable. Workflow request and
 retarget events shall publish only after association commit and shall never be rolled back.

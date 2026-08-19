@@ -95,6 +95,26 @@ class EditingBuilder implements AgentRuntime {
   }
 }
 
+class EditingBuilderAndResolver extends EditingBuilder {
+  override async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    if (request.role === "prResolver") {
+      await mkdir(path.join(request.cwd, "src"), { recursive: true });
+      await writeFile(
+        path.join(request.cwd, "src", "resolution.ts"),
+        "export const resolved = true;\n",
+        "utf8",
+      );
+      return {
+        status: "finished",
+        output: "resolved\nRESOLUTION_COMPLETE\n",
+        requestedModel: request.roleConfig.model,
+        actualModel: request.roleConfig.model,
+      };
+    }
+    return super.execute(request);
+  }
+}
+
 class TrackingRuntime extends EditingBuilder {
   verifierExecutions = 0;
 
@@ -521,6 +541,201 @@ test("merge-ready and completion events use the exact current HEAD returned by t
   assert.equal(completed.events.at(-1)?.details?.mergeReadySha, fixture.headSha);
 });
 
+for (const gate of ["merge-ready", "complete"] as const) {
+  test(`${gate} unconditionally requires current passing final evidence when pre-PR pass flags are false`, async (t) => {
+    for (const evidenceCase of ["missing", "failed", "stale", "passing"] as const) {
+      await t.test(evidenceCase, async (subtest) => {
+        const fixture = await prepareCurrentHeadGate(subtest, gate);
+        fixture.run.config.gates.requireCiPass = false;
+        fixture.run.config.gates.requireVerifierPass = false;
+        assert.ok(fixture.run.evidence);
+        if (evidenceCase === "missing") {
+          delete fixture.run.evidence.quality;
+          delete fixture.run.evidence.verification;
+        } else if (evidenceCase === "failed") {
+          fixture.run.evidence.quality = {
+            headSha: fixture.headSha,
+            passed: false,
+            at: "2026-08-19T12:03:00.000Z",
+          };
+          fixture.run.evidence.verification = {
+            headSha: fixture.headSha,
+            passed: false,
+            at: "2026-08-19T12:04:00.000Z",
+          };
+        } else if (evidenceCase === "stale") {
+          fixture.run.evidence.quality = {
+            headSha: HEAD_C,
+            passed: true,
+            at: "2026-08-19T12:03:00.000Z",
+          };
+          fixture.run.evidence.verification = {
+            headSha: HEAD_C,
+            passed: true,
+            at: "2026-08-19T12:04:00.000Z",
+          };
+        }
+        await fixture.orchestrator.store.save(fixture.run);
+        const before = await fixture.orchestrator.store.load(fixture.run.id);
+
+        if (evidenceCase === "passing") {
+          const accepted = gate === "merge-ready"
+            ? await fixture.orchestrator.markMergeReady(fixture.run.id)
+            : await fixture.orchestrator.complete(fixture.run.id);
+          assert.equal(accepted.state, gate === "merge-ready" ? "MERGE_READY" : "COMPLETED");
+          return;
+        }
+
+        await assert.rejects(
+          gate === "merge-ready"
+            ? fixture.orchestrator.markMergeReady(fixture.run.id)
+            : fixture.orchestrator.complete(fixture.run.id),
+          /quality evidence|verification evidence/i,
+        );
+        assert.deepEqual(await fixture.orchestrator.store.load(fixture.run.id), before);
+      });
+    }
+  });
+}
+
+for (const stage of ["builder", "resolver", "quality", "verifier"] as const) {
+  test(`${stage} final publication fence rejects HEAD movement after the prior last check`, async (t) => {
+    const cwd = await initRepo();
+    t.after(async () => rm(cwd, { recursive: true, force: true }));
+    const config = baseConfig((candidate) => {
+      candidate.policy.useIsolatedWorktree = false;
+      candidate.quality.commands = [];
+    });
+    const store = new FileRunStore(cwd);
+    const run = await store.create(
+      `${stage} final Git fence`,
+      "Do not publish evaluated state for a superseded HEAD.",
+      config,
+    );
+    run.state = stage === "builder"
+      ? "BUILDING"
+      : stage === "resolver"
+        ? "RESOLVING"
+        : stage === "quality"
+          ? "CI_RUNNING"
+          : "VERIFYING";
+    run.workspace = await ensureRunWorkspace(cwd, run);
+    const oldHeadSha = run.workspace.headSha;
+    assert.equal(typeof oldHeadSha, "string");
+    run.evidence = {
+      quality: {
+        headSha: oldHeadSha,
+        passed: true,
+        at: "2026-08-19T13:00:00.000Z",
+      },
+      verification: {
+        headSha: oldHeadSha,
+        passed: true,
+        at: "2026-08-19T13:01:00.000Z",
+      },
+    };
+    await store.save(run);
+    const before = await store.load(run.id);
+    let movedHeadSha: string | undefined;
+    const orchestrator = new Orchestrator(
+      cwd,
+      config,
+      stage === "resolver" ? new EditingBuilderAndResolver() : new EditingBuilder(),
+      store,
+      {
+        afterRunMutationReload: async (phase: string) => {
+          if (phase !== stage) return;
+          await execFileAsync("git", ["commit", "--allow-empty", "-qm", `${stage} operator move`], {
+            cwd,
+          });
+          movedHeadSha = (
+            await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })
+          ).stdout.trim();
+        },
+      },
+    );
+
+    await orchestrator.advance(run.id);
+    const authoritative = await store.load(run.id);
+    assert.equal(typeof movedHeadSha, "string");
+    assert.equal(
+      (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim(),
+      movedHeadSha,
+    );
+    assert.equal(authoritative.state, "FAILED");
+    assert.equal(authoritative.workspace?.headSha, movedHeadSha);
+    assert.equal(authoritative.evidence, undefined);
+    const staleSuccessTypes = new Set<string>(
+      stage === "builder"
+        ? ["BUILD_COMPLETED"]
+        : stage === "resolver"
+          ? ["RESOLUTION_COMPLETED"]
+          : stage === "quality"
+            ? ["CI_PASSED", "CI_FAILED"]
+            : ["VERIFY_PASSED", "VERIFY_PASSED_AFTER_REVIEW", "VERIFY_FAILED"],
+    );
+    const newEvents = authoritative.events.slice(before.events.length);
+    assert.equal(
+      newEvents.some((event) => staleSuccessTypes.has(event.type)),
+      false,
+    );
+    assert.equal(
+      newEvents.some((event) => event.details?.headSha === oldHeadSha),
+      false,
+    );
+  });
+}
+
+for (const gate of ["merge-ready", "complete"] as const) {
+  test(`${gate} final publication fence rejects HEAD movement before authoritative publication`, async (t) => {
+    const fixture = await prepareCurrentHeadGate(t, gate);
+    const workdir = fixture.run.workspace?.worktreePath;
+    assert.equal(typeof workdir, "string");
+    const before = await fixture.orchestrator.store.load(fixture.run.id);
+    let movedHeadSha: string | undefined;
+    const fenced = new Orchestrator(
+      fixture.cwd,
+      fixture.run.config,
+      new MockRuntime(),
+      fixture.orchestrator.store,
+      {
+        afterRunMutationReload: async (phase: string) => {
+          if (phase !== gate) return;
+          await execFileAsync("git", ["commit", "--allow-empty", "-qm", `${gate} operator move`], {
+            cwd: workdir,
+          });
+          movedHeadSha = (
+            await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workdir })
+          ).stdout.trim();
+        },
+      },
+    );
+
+    await assert.rejects(
+      gate === "merge-ready"
+        ? fenced.markMergeReady(fixture.run.id)
+        : fenced.complete(fixture.run.id),
+      /HEAD|current|registered/i,
+    );
+    const authoritative = await fixture.orchestrator.store.load(fixture.run.id);
+    assert.equal(typeof movedHeadSha, "string");
+    assert.notEqual(movedHeadSha, before.workspace?.headSha);
+    assert.deepEqual(authoritative, before);
+    assert.ok(
+      Object.values(authoritative.evidence ?? {}).every(
+        (binding) => binding.headSha !== movedHeadSha,
+      ),
+      "historical evidence must not be represented as current for the moved HEAD",
+    );
+    assert.equal(
+      authoritative.events.slice(before.events.length).some(
+        (event) => event.type === "MARK_MERGE_READY" || event.type === "COMPLETE",
+      ),
+      false,
+    );
+  });
+}
+
 test("quality command that edits a tracked file fails closed before verifier", async () => {
   const cwd = await initRepo();
   const config = baseConfig((c) => {
@@ -623,7 +838,8 @@ test("an associated target mismatch fails before work and an exact operator alig
   const headB = run.workspace?.headSha;
   const worktreePath = run.workspace?.worktreePath;
   const branch = run.workspace?.branch;
-  assert.ok(headB && worktreePath && branch);
+  assert.ok(typeof headB === "string", "old HEAD must be an explicit string fixture");
+  assert.ok(worktreePath && branch);
   t.after(async () => {
     await execFileAsync("git", ["worktree", "remove", "--force", worktreePath], { cwd }).catch(
       () => undefined,
