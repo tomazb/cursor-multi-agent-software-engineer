@@ -561,6 +561,7 @@ export class Orchestrator {
     fence: RevalidationFence | undefined,
     publish: () => Promise<T>,
     ownedLease?: RunMutationLease,
+    queuedTargetLinearizedBeforeWork = false,
   ): Promise<T> {
     const publishUnderLease = async (lease: RunMutationLease): Promise<T> => {
       const authoritative = fence
@@ -572,7 +573,9 @@ export class Orchestrator {
         );
       }
       await this.afterRunMutationReload?.(phase, authoritative);
-      await lease.assertNoQueuedTargetMutation();
+      if (!queuedTargetLinearizedBeforeWork) {
+        await lease.assertNoQueuedTargetMutation();
+      }
       return publish();
     };
     if (ownedLease) return publishUnderLease(ownedLease);
@@ -687,6 +690,9 @@ export class Orchestrator {
             return { kind: "retry", run: authoritative };
           }
         }
+        // Mutable builder work linearizes here: a later target waits for its
+        // clean commit. Evidence-only phases retain their final queued-target
+        // scan and are still superseded before publication.
         await lease.assertNoQueuedTargetMutation();
 
         switch (run.state) {
@@ -1055,7 +1061,7 @@ export class Orchestrator {
           ? { headSha: evaluatedHeadSha, outputHeadSha: evaluatedHeadSha }
           : {}),
       });
-    }, ownedLease);
+    }, ownedLease, ownedLease !== undefined);
   }
 
   private async executeResolverWithPublish(

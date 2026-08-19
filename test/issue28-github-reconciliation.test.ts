@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -21,8 +21,11 @@ import {
 import { GitHubAppAdapter } from "../src/github/adapter.ts";
 import { GitHubAssociationIndex } from "../src/github/association.ts";
 import type { GitHubHttpClient } from "../src/github/checks.ts";
+import { isGitWorkspaceClean } from "../src/git-snapshot.ts";
 import { captureWorkspace } from "../src/git-workspace.ts";
+import { scanLockJournal } from "../src/lock-journal.ts";
 import { Orchestrator } from "../src/orchestrator.ts";
+import { runMutationJournalRoot } from "../src/run-mutation.ts";
 import { MockRuntime } from "../src/runtimes/mock.ts";
 import type { RunStore } from "../src/store.ts";
 import { FileRunStore } from "../src/store.ts";
@@ -191,6 +194,57 @@ class HeadRecordingRuntime extends MockRuntime {
     })).stdout.trim();
     this.executions.push({ role: request.role, headSha });
     return super.execute(request);
+  }
+}
+
+class PausingEditingBuilder extends MockRuntime {
+  readonly executions: Array<{ role: RuntimeRequest["role"]; headSha: string }> = [];
+  private readonly signalStarted: () => void;
+  private readonly resume: Promise<void>;
+
+  constructor(signalStarted: () => void, resume: Promise<void>) {
+    super();
+    this.signalStarted = signalStarted;
+    this.resume = resume;
+  }
+
+  override async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    const headSha = (await execFileAsync("git", ["rev-parse", "HEAD"], {
+      cwd: request.cwd,
+    })).stdout.trim();
+    this.executions.push({ role: request.role, headSha });
+    if (request.role === "builder") {
+      await mkdir(path.join(request.cwd, "src"), { recursive: true });
+      await writeFile(
+        path.join(request.cwd, "src", "queued-builder.ts"),
+        "export const queuedBuilder = true;\n",
+        "utf8",
+      );
+      this.signalStarted();
+      await this.resume;
+    }
+    return super.execute(request);
+  }
+}
+
+async function waitForQueuedTargetClaim(repositoryPath: string, runId: string): Promise<void> {
+  const root = runMutationJournalRoot(repositoryPath, runId);
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    const scan = await scanLockJournal(root, "data");
+    if (
+      scan.claims.some(
+        (claim) =>
+          claim.operation === "run-target-mutation" &&
+          !scan.releases.has(claim.ticket),
+      )
+    ) {
+      return;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error("Timed out waiting for queued association target claim");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
 
@@ -409,6 +463,60 @@ async function adapterHarness(
     },
   };
 }
+
+test("builder ownership publishes cleanly before a later GitHub association commit", async (t) => {
+  const associationCommitted = deferred();
+  const harness = await associationRaceHarness(t, "BUILDING", async () => {
+    associationCommitted.resolve();
+  });
+  const builderStarted = deferred();
+  const resumeBuilder = deferred();
+  const runtime = new PausingEditingBuilder(
+    () => builderStarted.resolve(),
+    resumeBuilder.promise,
+  );
+  const before = await harness.store.load(harness.runId);
+  const localAdvance = new Orchestrator(
+    harness.cwd,
+    harness.config,
+    runtime,
+    harness.store,
+  ).advance(harness.runId);
+
+  await within(builderStarted.promise, "builder edit before association claim");
+  const webhook = deliverAssociationRace(harness, "association-queues-during-builder");
+  await waitForQueuedTargetClaim(harness.cwd, harness.runId);
+  const beforeRelease = await harness.store.load(harness.runId);
+  assert.equal(beforeRelease.github?.headSha, harness.headB);
+
+  resumeBuilder.resolve();
+  const built = await within(localAdvance, "builder-owned publication");
+  assert.equal(built.state, "CI_RUNNING");
+  await within(webhook, "post-builder association routing");
+  await within(associationCommitted.promise, "post-builder association commit");
+
+  const authoritative = await harness.store.load(harness.runId);
+  const { stdout: actualHead } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: harness.cwd,
+  });
+  assert.equal(
+    runtime.executions.some(
+      (execution) => execution.role === "builder" && execution.headSha === harness.headB,
+    ),
+    true,
+  );
+  assert.notEqual(actualHead.trim(), harness.headB);
+  assert.equal(await isGitWorkspaceClean(harness.cwd), true);
+  assert.equal(
+    authoritative.events.filter((event) => event.type === "BUILD_COMPLETED").length,
+    before.events.filter((event) => event.type === "BUILD_COMPLETED").length + 1,
+  );
+  assert.equal(authoritative.github?.headSha, harness.headC);
+  assert.equal(authoritative.revalidation?.requestedHeadSha, harness.headC);
+  assert.equal(authoritative.revalidation?.returnState, "PR_REVIEW");
+  assert.equal(authoritative.revalidation?.generation, 1);
+  assert.equal(initialRevalidationPublications(authoritative), 1);
+});
 
 for (const state of ["CI_RUNNING", "VERIFYING", "BUILDING"] as const) {
   test(`local ${state} entry reloads authority after an association commits beyond its initial snapshot`, async (t) => {
