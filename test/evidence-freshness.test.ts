@@ -9,7 +9,9 @@ import { DEFAULT_CONFIG } from "../src/config.ts";
 import type { AgentRuntime, MasweConfig, RuntimeDoctorResult, RuntimeRequest, RuntimeResult } from "../src/domain.ts";
 import { ensureRunWorkspace } from "../src/git-workspace.ts";
 import { Orchestrator } from "../src/orchestrator.ts";
+import { RevalidationService } from "../src/revalidation.ts";
 import { MockRuntime } from "../src/runtimes/mock.ts";
+import { FileRunStore } from "../src/store.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -121,4 +123,28 @@ test("HEAD change between CI and verifier fails closed", async () => {
     current.failure?.message ?? "",
     /clean worktree|stale|HEAD|quality evidence|fresh/i,
   );
+});
+
+test("initial revalidation invalidates every stale evidence binding", async () => {
+  const cwd = await initRepo();
+  const store = new FileRunStore(cwd);
+  const run = await store.create("stale evidence", "revalidate a newer head", baseConfig());
+  run.state = "PR_READY";
+  run.evidence = {
+    quality: { headSha: "a".repeat(40), passed: true, at: "2026-08-18T12:00:00.000Z" },
+    verification: { headSha: "a".repeat(40), passed: true, at: "2026-08-18T12:00:00.000Z" },
+    mergeReady: { headSha: "a".repeat(40), passed: true, at: "2026-08-18T12:00:00.000Z" },
+  };
+  await store.save(run);
+
+  const routed = await new RevalidationService(store).route(run.id, {
+    source: "local-workspace",
+    previousHeadSha: "a".repeat(40),
+    requestedHeadSha: "b".repeat(40),
+    actor: "local-runner",
+    at: "2026-08-18T12:01:00.000Z",
+  });
+
+  assert.equal(routed.evidence, undefined);
+  assert.equal((await store.load(run.id)).evidence, undefined);
 });
