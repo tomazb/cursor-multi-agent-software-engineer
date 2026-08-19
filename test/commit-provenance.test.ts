@@ -179,7 +179,7 @@ test("rejects out-of-scope working tree changes", async () => {
   assert.match(run.failure?.message ?? "", /Change-scope violation/i);
 });
 
-test("deterministic commit failures fail closed", async () => {
+test("role-controlled index mutations are cleared before deterministic commit", async () => {
   const cwd = await initRepo();
   class CommitFailRuntime extends EditingRuntime {
     constructor() {
@@ -196,9 +196,9 @@ test("deterministic commit failures fail closed", async () => {
     }
   }
   const orchestrator = new Orchestrator(cwd, config(), new CommitFailRuntime());
-  const run = await orchestrator.start("Commit fail", "Must fail closed on commit error.");
-  assert.equal(run.state, "FAILED");
-  assert.match(run.failure?.message ?? "", /commit failed|git (add|commit|status) failed/i);
+  const run = await orchestrator.start("Index isolation", "Ignore role-controlled index state.");
+  assert.equal(run.state, "PR_READY");
+  assert.equal(run.events.some((event) => event.type === "BUILD_COMPLETED"), true);
 });
 
 test("dirty tree after failed publish is not accepted as BUILD_COMPLETED", async () => {

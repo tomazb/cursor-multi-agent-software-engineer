@@ -140,6 +140,8 @@ export interface OrchestratorOptions {
   ) => Promise<void>;
   /** Failure seam after a dirty baseline receives a speculative mutable-role delta. */
   afterDirtyRoleDeltaApplied?: () => Promise<void>;
+  /** Deterministic barrier immediately before mutable-role ref publication. */
+  beforeRoleRefPublish?: () => Promise<void>;
 }
 
 interface ActiveRevalidationPreflight {
@@ -172,6 +174,11 @@ interface SpeculativeRoleWorktree {
   cleaned: boolean;
 }
 
+interface SpeculativeRoleBaseline {
+  treeSha: string;
+  ignoredInputPaths: string[];
+}
+
 function gitCommandFailure(label: string, result: { stdout: string; stderr: string }): Error {
   return new Error(`${label}: ${(result.stderr || result.stdout).trim() || "git failed"}`);
 }
@@ -188,6 +195,7 @@ export class Orchestrator {
   private readonly beforeRetryPublication: ((candidate: RunRecord) => Promise<void>) | undefined;
   private readonly afterRunMutationReload: OrchestratorOptions["afterRunMutationReload"];
   private readonly afterDirtyRoleDeltaApplied: OrchestratorOptions["afterDirtyRoleDeltaApplied"];
+  private readonly beforeRoleRefPublish: OrchestratorOptions["beforeRoleRefPublish"];
 
   constructor(
     cwd: string,
@@ -207,6 +215,7 @@ export class Orchestrator {
     this.beforeRetryPublication = options.beforeRetryPublication;
     this.afterRunMutationReload = options.afterRunMutationReload;
     this.afterDirtyRoleDeltaApplied = options.afterDirtyRoleDeltaApplied;
+    this.beforeRoleRefPublish = options.beforeRoleRefPublish;
     if (
       !Number.isSafeInteger(this.automaticTransitionLimit) ||
       this.automaticTransitionLimit <= 0
@@ -758,16 +767,6 @@ export class Orchestrator {
     speculative.cleaned = true;
   }
 
-  private async fastForwardRoleCommit(
-    workdir: string,
-    commitSha: string,
-  ): Promise<void> {
-    const merged = await gitRun(["merge", "--ff-only", commitSha], workdir);
-    if (merged.exitCode !== 0) {
-      throw gitCommandFailure("Failed to fast-forward authoritative role worktree", merged);
-    }
-  }
-
   private async applyGitPatch(
     workdir: string,
     patchContent: string,
@@ -786,12 +785,13 @@ export class Orchestrator {
     if (applied.exitCode !== 0) throw gitCommandFailure(label, applied);
   }
 
-  private async publishDirtyRoleCommit(
+  private async publishRoleCommit(
     workdir: string,
     branch: string,
     beforeSha: string,
     commitSha: string,
     roleDelta: string,
+    dirtyBaseline: boolean,
   ): Promise<void> {
     const indexLocation = await gitRun(["rev-parse", "--git-path", "index"], workdir);
     if (indexLocation.exitCode !== 0) {
@@ -826,7 +826,8 @@ export class Orchestrator {
         if (preparedIndex.exitCode !== 0) {
           throw gitCommandFailure("Failed to prepare authoritative role index", preparedIndex);
         }
-        await this.afterDirtyRoleDeltaApplied?.();
+        if (dirtyBaseline) await this.afterDirtyRoleDeltaApplied?.();
+        await this.beforeRoleRefPublish?.();
         const published = await gitRun(
           ["update-ref", `refs/heads/${branch}`, commitSha, beforeSha],
           workdir,
@@ -904,7 +905,7 @@ export class Orchestrator {
   private async seedSpeculativeRoleWorktree(
     speculative: SpeculativeRoleWorktree,
     beforeSha: string,
-  ): Promise<string> {
+  ): Promise<SpeculativeRoleBaseline> {
     const tracked = await gitRun(
       [
         "diff",
@@ -964,7 +965,8 @@ export class Orchestrator {
     if (ignored.exitCode !== 0) {
       throw gitCommandFailure("Failed to enumerate ignored local role inputs", ignored);
     }
-    for (const relativePath of ignored.stdout.split("\0").filter(Boolean)) {
+    const ignoredInputPaths = ignored.stdout.split("\0").filter(Boolean);
+    for (const relativePath of ignoredInputPaths) {
       await this.copySpeculativeWorkspacePath(
         speculative,
         relativePath,
@@ -984,7 +986,44 @@ export class Orchestrator {
     if (restoredIndex.exitCode !== 0) {
       throw gitCommandFailure("Failed to restore the speculative builder index", restoredIndex);
     }
-    return tree.stdout.trim();
+    return { treeSha: tree.stdout.trim(), ignoredInputPaths };
+  }
+
+  private async prepareSpeculativeRoleIndex(
+    speculative: SpeculativeRoleWorktree,
+    beforeSha: string,
+    ignoredInputPaths: readonly string[],
+  ): Promise<void> {
+    if (ignoredInputPaths.length > 0) {
+      const ignored = await spawnCaptured(
+        "git",
+        ["check-ignore", "--no-index", "-z", "--stdin"],
+        {
+          cwd: speculative.worktreePath,
+          input: `${ignoredInputPaths.join("\0")}\0`,
+          timeoutMs: 120_000,
+        },
+      );
+      if (ignored.timedOut) {
+        throw new Error("Ignored local input validation timed out after 120000ms");
+      }
+      if (ignored.exitCode !== 0 && ignored.exitCode !== 1) {
+        throw gitCommandFailure("Failed to validate ignored local role inputs", ignored);
+      }
+      const stillIgnored = new Set(ignored.stdout.split("\0").filter(Boolean));
+      const exposed = ignoredInputPaths.filter((relativePath) => !stillIgnored.has(relativePath));
+      if (exposed.length > 0) {
+        const sample = exposed.slice(0, 10).join(", ");
+        const omitted = exposed.length > 10 ? ` (+${exposed.length - 10} more)` : "";
+        throw new Error(
+          `Role publication refuses ignore-rule changes that expose seeded local inputs: ${sample}${omitted}`,
+        );
+      }
+    }
+    const restoredIndex = await gitRun(["read-tree", beforeSha], speculative.worktreePath);
+    if (restoredIndex.exitCode !== 0) {
+      throw gitCommandFailure("Failed to clear mutable-role index changes", restoredIndex);
+    }
   }
 
   private async assertNoMasweControlPlaneChanges(workdir: string): Promise<void> {
@@ -1465,6 +1504,7 @@ export class Orchestrator {
         : undefined);
     let speculative: SpeculativeRoleWorktree | undefined;
     let baselineTreeSha: string | undefined;
+    let ignoredInputPaths: string[] = [];
     let authoritativeSourceFingerprint: string | undefined;
     let authoritativeWasClean = true;
     let completed: RunRecord | undefined;
@@ -1488,10 +1528,12 @@ export class Orchestrator {
           beforeSha,
           spec.role,
         );
-        baselineTreeSha = await this.seedSpeculativeRoleWorktree(
+        const speculativeBaseline = await this.seedSpeculativeRoleWorktree(
           speculative,
           beforeSha,
         );
+        baselineTreeSha = speculativeBaseline.treeSha;
+        ignoredInputPaths = speculativeBaseline.ignoredInputPaths;
         const stableSourceFingerprint = await captureWorkspaceSourceFingerprint(
           authoritativeWorkdir,
         );
@@ -1525,6 +1567,11 @@ export class Orchestrator {
             `HEAD moved during ${spec.label.toLowerCase()} execution (model-created commit, reset, or rebase is not allowed)`,
           );
         }
+        await this.prepareSpeculativeRoleIndex(
+          speculative,
+          beforeSha,
+          ignoredInputPaths,
+        );
         await this.assertNoMasweControlPlaneChanges(roleWorkdir);
         await assertWorkingTreeScope(roleWorkdir, run.config.policy.allowedPathGlobs);
       }
@@ -1551,34 +1598,32 @@ export class Orchestrator {
             );
           }
           let roleDelta = "";
-          if (!authoritativeWasClean) {
-            if (!baselineTreeSha) {
-              throw new Error(
-                `Dirty ${spec.label.toLowerCase()} publication has no captured baseline tree`,
-              );
-            }
-            const delta = await gitRun(
-              [
-                "diff",
-                "--binary",
-                "--full-index",
-                "--no-ext-diff",
-                "--no-renames",
-                baselineTreeSha,
-                committed.headSha,
-                "--",
-                ...MASWE_SOURCE_PATHSPEC,
-              ],
-              roleWorkdir,
+          if (!baselineTreeSha) {
+            throw new Error(
+              `${spec.label} publication has no captured baseline tree`,
             );
-            if (delta.exitCode !== 0) {
-              throw gitCommandFailure(
-                `Failed to capture speculative ${spec.label.toLowerCase()} changes`,
-                delta,
-              );
-            }
-            roleDelta = delta.stdout;
           }
+          const delta = await gitRun(
+            [
+              "diff",
+              "--binary",
+              "--full-index",
+              "--no-ext-diff",
+              "--no-renames",
+              baselineTreeSha,
+              committed.headSha,
+              "--",
+              ...MASWE_SOURCE_PATHSPEC,
+            ],
+            roleWorkdir,
+          );
+          if (delta.exitCode !== 0) {
+            throw gitCommandFailure(
+              `Failed to capture speculative ${spec.label.toLowerCase()} changes`,
+              delta,
+            );
+          }
+          roleDelta = delta.stdout;
           await this.cleanupSpeculativeRoleWorktree(speculative);
           await this.assertExpectedGitPublicationInput(
             run,
@@ -1601,18 +1646,16 @@ export class Orchestrator {
                 `${spec.label} commit publication requires its captured clean baseline`,
               );
             }
-            if (committed.headSha !== beforeSha) {
-              await this.fastForwardRoleCommit(authoritativeWorkdir, committed.headSha);
-            }
-          } else {
-            await this.publishDirtyRoleCommit(
+          }
+          if (committed.headSha !== beforeSha) {
+            await this.publishRoleCommit(
               authoritativeWorkdir,
               run.workspace.branch,
               beforeSha,
               committed.headSha,
               roleDelta,
+              !authoritativeWasClean,
             );
-            publishedHeadSha = committed.headSha;
           }
           outputHeadSha = publishedHeadSha;
           run.workspace.headSha = publishedHeadSha;

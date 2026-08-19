@@ -104,6 +104,18 @@ class IgnoredInputBuilderRuntime extends MockRuntime {
   }
 }
 
+class UnignoringSecretBuilderRuntime extends MockRuntime {
+  override async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    if (request.role === "builder") {
+      await readFile(path.join(request.cwd, ".env"), "utf8");
+      await execFileAsync("git", ["add", "-f", ".env"], { cwd: request.cwd });
+      await writeFile(path.join(request.cwd, ".gitignore"), "", "utf8");
+      await writeFile(path.join(request.cwd, "builder-output.txt"), "safe output\n", "utf8");
+    }
+    return super.execute(request);
+  }
+}
+
 async function initGitRepo(t: test.TestContext, prefix: string): Promise<string> {
   const cwd = await mkdtemp(path.join(os.tmpdir(), prefix));
   t.after(() => rm(cwd, { recursive: true, force: true }));
@@ -306,6 +318,78 @@ test("speculative builder execution preserves ignored local inputs without publi
 
   assert.equal(publishedInput, "trusted local input\n");
   assert.equal(ignoredInCommit, "");
+});
+
+test("seeded ignored inputs cannot become publishable role output", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-ignored-builder-secret-");
+  await writeFile(path.join(cwd, ".gitignore"), ".env\n", "utf8");
+  await execFileAsync("git", ["add", ".gitignore"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "ignore local secrets"], { cwd });
+  await writeFile(path.join(cwd, ".env"), "REPOSITORY_TOKEN=do-not-publish\n", "utf8");
+  const { stdout: beforeHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  const config = testConfig((c) => {
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+
+  const run = await new Orchestrator(cwd, config, new UnignoringSecretBuilderRuntime()).start(
+    "Ignored secret",
+    "Use local inputs without publishing credentials.",
+  );
+  const { stdout: afterHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  const { stdout: status } = await execFileAsync("git", ["status", "--porcelain"], { cwd });
+  const secretLookup = await execFileAsync("git", ["cat-file", "-e", "HEAD:.env"], {
+    cwd,
+  }).then(
+    () => true,
+    () => false,
+  );
+
+  assert.equal(run.state, "FAILED");
+  assert.match(run.failure?.message ?? "", /ignore-rule|seeded local inputs/i);
+  assert.equal(afterHead.trim(), beforeHead.trim());
+  assert.equal(status, "");
+  assert.equal(secretLookup, false);
+});
+
+test("clean speculative publication rejects an intervening authoritative branch move", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-clean-role-cas-");
+  await writeFile(path.join(cwd, "baseline.txt"), "B\n", "utf8");
+  await execFileAsync("git", ["add", "baseline.txt"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "B"], { cwd });
+  const { stdout: beforeHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  const { stdout: parentHead } = await execFileAsync("git", ["rev-parse", "HEAD^"], { cwd });
+  const { stdout: branch } = await execFileAsync("git", ["branch", "--show-current"], { cwd });
+  const config = testConfig((c) => {
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+  const orchestrator = new Orchestrator(cwd, config, new EditingBuilderRuntime(), undefined, {
+    beforeRoleRefPublish: async () => {
+      await execFileAsync(
+        "git",
+        [
+          "update-ref",
+          `refs/heads/${branch.trim()}`,
+          parentHead.trim(),
+          beforeHead.trim(),
+        ],
+        { cwd },
+      );
+    },
+  });
+
+  const run = await orchestrator.start(
+    "Clean role compare-and-swap",
+    "Never overwrite an intervening branch move.",
+  );
+  const { stdout: afterHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+
+  assert.equal(run.state, "FAILED");
+  assert.match(run.failure?.message ?? "", /publish.*commit|expected.*head|ref/i);
+  assert.equal(afterHead.trim(), parentHead.trim());
 });
 
 test("failed dirty builder publication restores the exact allowed baseline", async (t) => {
