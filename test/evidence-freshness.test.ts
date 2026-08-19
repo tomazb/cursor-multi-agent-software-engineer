@@ -1016,7 +1016,7 @@ test("active preflight retries an association update injected at the routing loa
   assert.equal(authoritative.failure?.resumeState, "CI_RUNNING");
 });
 
-test("a builder-owned generation commits cleanly before a concurrent retarget", async (t) => {
+test("a concurrent retarget discards a speculative builder generation", async (t) => {
   const cwd = await initRepo();
   t.after(() => rm(cwd, { recursive: true, force: true }));
   const config = baseConfig((c) => {
@@ -1052,8 +1052,10 @@ test("a builder-owned generation commits cleanly before a concurrent retarget", 
   });
 
   const orchestrator = new Orchestrator(cwd, config, new EditingBuilder(), store);
-  const built = await orchestrator.advance(run.id);
-  assert.equal(built.state, "CI_RUNNING");
+  await assert.rejects(
+    orchestrator.advance(run.id),
+    (error: unknown) => error instanceof RunMutationSupersededError,
+  );
   await store.waitForRetarget();
   const authoritative = await store.load(run.id);
   const { stdout: actualHeadOutput } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
@@ -1061,10 +1063,10 @@ test("a builder-owned generation commits cleanly before a concurrent retarget", 
   assert.equal(authoritative.state, "CI_RUNNING");
   assert.equal(authoritative.revalidation?.requestedHeadSha, HEAD_C);
   assert.equal(authoritative.revalidation?.generation, 2);
-  assert.notEqual(actualHeadOutput.trim(), headB);
+  assert.equal(actualHeadOutput.trim(), headB);
   assert.equal(
     authoritative.events.some((event) => event.type === "BUILD_COMPLETED"),
-    true,
+    false,
   );
   assert.equal(
     authoritative.artifacts.filter(
@@ -1076,7 +1078,7 @@ test("a builder-owned generation commits cleanly before a concurrent retarget", 
   assert.equal(status, "");
 });
 
-test("a builder-owned generation commits cleanly before a queued C retarget", async (t) => {
+test("a queued C retarget supersedes a speculative builder generation", async (t) => {
   const cwd = await initRepo();
   t.after(() => rm(cwd, { recursive: true, force: true }));
   const config = baseConfig((c) => {
@@ -1145,24 +1147,17 @@ test("a builder-owned generation commits cleanly before a queued C retarget", as
   await within(cClaimPublished.promise, "C target claim publication");
   releaseBuilder.resolve();
 
-  const built = await builder;
-  assert.equal(built.state, "CI_RUNNING");
+  await assert.rejects(
+    builder,
+    (error: unknown) => error instanceof RunMutationSupersededError,
+  );
   const firstRoute = await cRoute;
-  assert.ok("error" in firstRoute);
-  assert.ok(firstRoute.error instanceof RevalidationOptimisticConflictError);
-  const afterBuilder = await store.load(run.id);
-  assert.ok(afterBuilder.revalidation);
-  const authoritative = await new RevalidationService(store).route(run.id, {
-    source: "github",
-    previousHeadSha: afterBuilder.revalidation.requestedHeadSha,
-    requestedHeadSha: HEAD_C,
-    expectedRunVersion: afterBuilder.version,
-    actor: "github-app",
-  });
+  assert.ok("value" in firstRoute);
+  const authoritative = firstRoute.value;
   const { stdout: actualHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
-  assert.notEqual(actualHead.trim(), headB);
+  assert.equal(actualHead.trim(), headB);
   assert.deepEqual(authoritative.events.slice(0, historicalEvents.length), historicalEvents);
-  assert.equal(authoritative.events.some((event) => event.type === "BUILD_COMPLETED"), true);
+  assert.equal(authoritative.events.some((event) => event.type === "BUILD_COMPLETED"), false);
   assert.equal(authoritative.revalidation?.requestedHeadSha, HEAD_C);
   assert.equal(authoritative.revalidation?.generation, 2);
   assert.equal(authoritative.evidence, undefined);

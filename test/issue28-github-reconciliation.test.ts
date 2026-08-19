@@ -201,11 +201,17 @@ class PausingEditingBuilder extends MockRuntime {
   readonly executions: Array<{ role: RuntimeRequest["role"]; headSha: string }> = [];
   private readonly signalStarted: () => void;
   private readonly resume: Promise<void>;
+  private readonly failAfterEdit: boolean;
 
-  constructor(signalStarted: () => void, resume: Promise<void>) {
+  constructor(
+    signalStarted: () => void,
+    resume: Promise<void>,
+    options: { failAfterEdit?: boolean } = {},
+  ) {
     super();
     this.signalStarted = signalStarted;
     this.resume = resume;
+    this.failAfterEdit = options.failAfterEdit ?? false;
   }
 
   override async execute(request: RuntimeRequest): Promise<RuntimeResult> {
@@ -222,6 +228,21 @@ class PausingEditingBuilder extends MockRuntime {
       );
       this.signalStarted();
       await this.resume;
+      if (this.failAfterEdit) {
+        return {
+          status: "error",
+          output: "builder failed after editing the workspace",
+          requestedModel: request.roleConfig.model,
+          actualModel: request.roleConfig.model,
+          failure: {
+            code: "runtime-error",
+            message: "builder failed after editing the workspace",
+            requestedModel: request.roleConfig.model,
+            stderrPresent: false,
+            truncated: false,
+          },
+        };
+      }
     }
     return super.execute(request);
   }
@@ -464,7 +485,7 @@ async function adapterHarness(
   };
 }
 
-test("builder ownership publishes cleanly before a later GitHub association commit", async (t) => {
+test("a queued GitHub association supersedes speculative builder publication", async (t) => {
   const associationCommitted = deferred();
   const harness = await associationRaceHarness(t, "BUILDING", async () => {
     associationCommitted.resolve();
@@ -481,7 +502,10 @@ test("builder ownership publishes cleanly before a later GitHub association comm
     harness.config,
     runtime,
     harness.store,
-  ).advance(harness.runId);
+  ).advance(harness.runId).then(
+    (value) => ({ value }),
+    (error: unknown) => ({ error }),
+  );
 
   await within(builderStarted.promise, "builder edit before association claim");
   const webhook = deliverAssociationRace(harness, "association-queues-during-builder");
@@ -490,8 +514,9 @@ test("builder ownership publishes cleanly before a later GitHub association comm
   assert.equal(beforeRelease.github?.headSha, harness.headB);
 
   resumeBuilder.resolve();
-  const built = await within(localAdvance, "builder-owned publication");
-  assert.equal(built.state, "CI_RUNNING");
+  const localResult = await within(localAdvance, "superseded builder publication");
+  assert.ok("error" in localResult);
+  assert.match(String(localResult.error), /superseded.*target|target.*superseded/i);
   await within(webhook, "post-builder association routing");
   await within(associationCommitted.promise, "post-builder association commit");
 
@@ -505,11 +530,68 @@ test("builder ownership publishes cleanly before a later GitHub association comm
     ),
     true,
   );
-  assert.notEqual(actualHead.trim(), harness.headB);
+  assert.equal(actualHead.trim(), harness.headB);
   assert.equal(await isGitWorkspaceClean(harness.cwd), true);
   assert.equal(
     authoritative.events.filter((event) => event.type === "BUILD_COMPLETED").length,
-    before.events.filter((event) => event.type === "BUILD_COMPLETED").length + 1,
+    before.events.filter((event) => event.type === "BUILD_COMPLETED").length,
+  );
+  assert.equal(authoritative.github?.headSha, harness.headC);
+  assert.equal(authoritative.revalidation?.requestedHeadSha, harness.headC);
+  assert.equal(authoritative.revalidation?.returnState, "PR_REVIEW");
+  assert.equal(authoritative.revalidation?.generation, 1);
+  assert.equal(initialRevalidationPublications(authoritative), 1);
+});
+
+test("a failed builder yields a clean workspace to a queued GitHub association", async (t) => {
+  const harness = await associationRaceHarness(t, "BUILDING", async () => undefined);
+  const builderStarted = deferred();
+  const resumeBuilder = deferred();
+  const runtime = new PausingEditingBuilder(
+    () => builderStarted.resolve(),
+    resumeBuilder.promise,
+    { failAfterEdit: true },
+  );
+  const before = await harness.store.load(harness.runId);
+  const localAdvance = new Orchestrator(
+    harness.cwd,
+    harness.config,
+    runtime,
+    harness.store,
+  ).advance(harness.runId).then(
+    (value) => ({ value }),
+    (error: unknown) => ({ error }),
+  );
+
+  await within(builderStarted.promise, "failed builder edit before association claim");
+  const webhook = deliverAssociationRace(
+    harness,
+    "association-queues-during-failed-builder",
+  ).then(
+    () => ({ ok: true as const }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
+  await waitForQueuedTargetClaim(harness.cwd, harness.runId);
+  assert.equal((await harness.store.load(harness.runId)).github?.headSha, harness.headB);
+
+  resumeBuilder.resolve();
+  await within(localAdvance, "failed builder handoff");
+  const webhookResult = await within(webhook, "post-failure association routing");
+
+  const authoritative = await harness.store.load(harness.runId);
+  const { stdout: actualHead } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: harness.cwd,
+  });
+  assert.equal(actualHead.trim(), harness.headB);
+  assert.equal(
+    await isGitWorkspaceClean(harness.cwd),
+    true,
+    "failed builder edits must not cross the target-ownership handoff",
+  );
+  assert.equal(webhookResult.ok, true, "queued association must route after builder failure");
+  assert.equal(
+    authoritative.events.filter((event) => event.type === "BUILD_COMPLETED").length,
+    before.events.filter((event) => event.type === "BUILD_COMPLETED").length,
   );
   assert.equal(authoritative.github?.headSha, harness.headC);
   assert.equal(authoritative.revalidation?.requestedHeadSha, harness.headC);
