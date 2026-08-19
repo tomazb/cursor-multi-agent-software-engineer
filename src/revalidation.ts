@@ -125,6 +125,14 @@ export class RevalidationService {
 
     if (revalidation.requestedHeadSha === input.requestedHeadSha) {
       if (
+        input.observedWorkspace !== undefined &&
+        input.observedWorkspace.headSha !== input.requestedHeadSha
+      ) {
+        throw new Error(
+          `Revalidation target ${input.requestedHeadSha} does not match observed workspace HEAD ${input.observedWorkspace.headSha}`,
+        );
+      }
+      if (
         input.observedWorkspace === undefined ||
         isDeepStrictEqual(run.workspace, input.observedWorkspace)
       ) {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -52,6 +52,36 @@ class FailingVerifierRuntime implements AgentRuntime {
   }
 }
 
+class CountingRuntime implements AgentRuntime {
+  private readonly delegate = new MockRuntime();
+  verifierExecutions = 0;
+
+  async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    if (request.role === "verifier") this.verifierExecutions += 1;
+    return this.delegate.execute(request);
+  }
+
+  doctor(): Promise<RuntimeDoctorResult> {
+    return this.delegate.doctor();
+  }
+
+  listModels(): Promise<string[]> {
+    return this.delegate.listModels();
+  }
+}
+
+async function initGitRepo(t: test.TestContext, prefix: string): Promise<string> {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), prefix));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  await execFileAsync("git", ["init", "-q"], { cwd });
+  await execFileAsync("git", ["config", "user.email", "maswe@example.com"], { cwd });
+  await execFileAsync("git", ["config", "user.name", "MASWE"], { cwd });
+  await writeFile(path.join(cwd, "README.md"), "# orchestrator\n", "utf8");
+  await execFileAsync("git", ["add", "README.md"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "init"], { cwd });
+  return cwd;
+}
+
 test("workflow reaches PR_READY after both approvals, CI, and verification", async () => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-run-"));
   const orchestrator = new Orchestrator(cwd, testConfig(), new MockRuntime());
@@ -69,6 +99,57 @@ test("workflow reaches PR_READY after both approvals, CI, and verification", asy
   assert.ok(run.artifacts.some((artifact) => artifact.name === "06-verification-report.md"));
   assert.equal(run.counters.buildVerifyCycles, 1);
 });
+
+for (const returnGate of ["PR_READY", "PR_REVIEW"] as const) {
+  test(`a local HEAD move at ${returnGate} gets fresh evidence and returns to that gate`, async (t) => {
+    const cwd = await initGitRepo(t, `maswe-local-revalidation-${returnGate.toLowerCase()}-`);
+    const config = testConfig((c) => {
+      c.gates.requireBrainstormApproval = false;
+      c.gates.requireDesignApproval = false;
+    });
+    const runtime = new CountingRuntime();
+    const orchestrator = new Orchestrator(cwd, config, runtime);
+    let run = await orchestrator.start("Local revalidation", "Verify the operator's current HEAD.");
+    if (returnGate === "PR_REVIEW") run = await orchestrator.markPrOpened(run.id);
+    assert.equal(run.state, returnGate);
+    assert.equal(runtime.verifierExecutions, 1);
+    assert.equal(run.counters.commentResolutionCycles, 0);
+    const oldHead = run.workspace?.headSha;
+
+    await writeFile(path.join(cwd, "operator-change.txt"), `${returnGate}\n`, "utf8");
+    await execFileAsync("git", ["add", "operator-change.txt"], { cwd });
+    await execFileAsync("git", ["commit", "-qm", `operator move for ${returnGate}`], { cwd });
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+    const newHead = stdout.trim();
+    assert.notEqual(newHead, oldHead);
+
+    await orchestrator.runUntilBlocked(run.id);
+    const authoritative = await orchestrator.store.load(run.id);
+
+    assert.equal(authoritative.state, returnGate);
+    assert.equal(authoritative.workspace?.headSha, newHead);
+    assert.equal(authoritative.evidence?.quality?.headSha, newHead);
+    assert.equal(authoritative.evidence?.verification?.headSha, newHead);
+    assert.equal(authoritative.revalidation, undefined);
+    assert.equal(authoritative.counters.commentResolutionCycles, 0);
+    assert.equal(runtime.verifierExecutions, 2);
+    assert.equal(
+      authoritative.artifacts.filter(
+        (artifact) => artifact.logicalName === "05-quality-report.md",
+      ).length,
+      2,
+    );
+    const finalVerify = [...authoritative.events]
+      .reverse()
+      .find((event) =>
+        event.type === "VERIFY_PASSED" || event.type === "VERIFY_PASSED_AFTER_REVIEW"
+      );
+    assert.equal(
+      finalVerify?.type,
+      returnGate === "PR_READY" ? "VERIFY_PASSED" : "VERIFY_PASSED_AFTER_REVIEW",
+    );
+  });
+}
 
 test("approval gates can be disabled for trusted automation", async () => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-auto-gates-"));

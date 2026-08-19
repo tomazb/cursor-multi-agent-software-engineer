@@ -26,6 +26,12 @@ import { renderQualityReport, runQualityChecks } from "./quality.ts";
 import { isHumanGate, isTerminal } from "./state-machine.ts";
 import { FileRunStore, type RunStore } from "./store.ts";
 import {
+  assertRevalidationFence,
+  captureRevalidationFence,
+  RevalidationService,
+  type RevalidationFence,
+} from "./revalidation.ts";
+import {
   assertBootstrapWorkspaceReady,
   captureWorkspaceBootstrapIntent,
   reconcileBootstrapWorkspace,
@@ -99,6 +105,12 @@ export interface OrchestratorOptions {
   afterWorkspaceCheckpoint?: (run: RunRecord) => Promise<void>;
   /** Test seam immediately before the single retry event publication. */
   beforeRetryPublication?: (candidate: RunRecord) => Promise<void>;
+}
+
+interface ActiveRevalidationPreflight {
+  run: RunRecord;
+  headSha: string | undefined;
+  alignmentError?: Error;
 }
 
 export class Orchestrator {
@@ -303,11 +315,28 @@ export class Orchestrator {
   async runUntilBlocked(runId: string): Promise<RunRecord> {
     let run = await this.store.load(runId);
     let iterations = 0;
-    while (!isTerminal(run.state) && !isHumanGate(run.state)) {
+    while (!isTerminal(run.state)) {
+      if (isHumanGate(run.state)) {
+        if (run.state !== "PR_READY" && run.state !== "PR_REVIEW") return run;
+        try {
+          const preflight = await this.preflightReturnGate(run);
+          run = preflight;
+          if (run.state !== "PR_READY" && run.state !== "PR_REVIEW") continue;
+          return run;
+        } catch (error) {
+          return this.failRun(
+            run,
+            runFailureMessage(error),
+            runFailureCode(error),
+            runFailureRuntime(error),
+            { preserveWorkspace: true },
+          );
+        }
+      }
       run = await this.advance(run.id);
       iterations += 1;
-      if (isTerminal(run.state) || isHumanGate(run.state)) return run;
-      if (iterations >= this.automaticTransitionLimit) {
+      if (isTerminal(run.state)) return run;
+      if (iterations >= this.automaticTransitionLimit && !isHumanGate(run.state)) {
         return this.failRun(
           run,
           `Workflow exceeded ${this.automaticTransitionLimit} automatic transitions.`,
@@ -316,6 +345,92 @@ export class Orchestrator {
       }
     }
     return run;
+  }
+
+  private hasCurrentGateEvidence(run: RunRecord, headSha: string): boolean {
+    return (
+      run.evidence?.quality?.headSha === headSha &&
+      run.evidence.verification?.headSha === headSha
+    );
+  }
+
+  private async observeRevalidationWorkspace(run: RunRecord): Promise<string | undefined> {
+    if (!run.workspace) {
+      throw new Error(`Run ${run.id} has no workspace for revalidation`);
+    }
+    const workdir = workingDirectoryFor(run);
+    if (!(await isGitWorkspaceClean(workdir))) {
+      throw new Error(`Revalidation workspace is dirty at ${run.workspace.headSha}`);
+    }
+    const headSha = (await refreshWorkspaceHead(run)) ?? run.workspace.headSha;
+    if (!(await isGitWorkspaceClean(workdir))) {
+      throw new Error(`Revalidation workspace changed while observing HEAD ${headSha}`);
+    }
+    return headSha;
+  }
+
+  private async preflightReturnGate(run: RunRecord): Promise<RunRecord> {
+    if (!run.workspace || run.workspace.baseSha === "not-a-git-repository") return run;
+    const previousHeadSha = run.workspace.headSha;
+    const observed = structuredClone(run);
+    const requestedHeadSha = await this.observeRevalidationWorkspace(observed);
+    if (!requestedHeadSha) return run;
+    if (
+      requestedHeadSha === previousHeadSha &&
+      this.hasCurrentGateEvidence(run, requestedHeadSha)
+    ) {
+      return run;
+    }
+    return new RevalidationService(this.store).route(run.id, {
+      source: "local-workspace",
+      previousHeadSha,
+      requestedHeadSha,
+      actor: "local-runner",
+      observedWorkspace: observed.workspace!,
+    });
+  }
+
+  private async preflightActiveRevalidation(
+    run: RunRecord,
+  ): Promise<ActiveRevalidationPreflight> {
+    if (!run.revalidation) {
+      return { run, headSha: (await this.syncWorkspace(run)) ?? run.workspace?.headSha };
+    }
+    const observedHeadSha = await this.observeRevalidationWorkspace(run);
+    if (!observedHeadSha || !run.workspace) {
+      throw new Error(`Run ${run.id} has no observable revalidation workspace HEAD`);
+    }
+    const source = run.github ? "github" : "local-workspace";
+    const requiredHeadSha = run.github?.headSha ?? observedHeadSha;
+    const previousRequestedHeadSha = run.revalidation.requestedHeadSha;
+    const routed = await new RevalidationService(this.store).route(run.id, {
+      source,
+      previousHeadSha: previousRequestedHeadSha,
+      requestedHeadSha: requiredHeadSha,
+      actor: source === "github" ? "github-app" : "local-runner",
+      observedWorkspace: run.workspace,
+    });
+    if (observedHeadSha !== requiredHeadSha) {
+      return {
+        run: routed,
+        headSha: observedHeadSha,
+        alignmentError: new Error(
+          `Required revalidation target ${requiredHeadSha} does not match workspace HEAD ${observedHeadSha}`,
+        ),
+      };
+    }
+    return { run: routed, headSha: observedHeadSha };
+  }
+
+  private captureOptionalRevalidationFence(run: RunRecord): RevalidationFence | undefined {
+    return run.revalidation ? captureRevalidationFence(run) : undefined;
+  }
+
+  private async assertOptionalRevalidationFence(
+    run: RunRecord,
+    fence: RevalidationFence | undefined,
+  ): Promise<void> {
+    if (fence) await assertRevalidationFence(this.store, run.id, fence);
   }
 
   private async syncWorkspace(run: RunRecord): Promise<string | undefined> {
@@ -346,10 +461,21 @@ export class Orchestrator {
   }
 
   async advance(runId: string): Promise<RunRecord> {
-    const run = await this.store.load(runId);
+    let run = await this.store.load(runId);
     try {
       this.assertWithinBudget(run);
-      const headSha = (await this.syncWorkspace(run)) ?? run.workspace?.headSha;
+      let headSha: string | undefined;
+      if (
+        run.revalidation &&
+        (run.state === "BUILDING" || run.state === "CI_RUNNING" || run.state === "VERIFYING")
+      ) {
+        const preflight = await this.preflightActiveRevalidation(run);
+        run = preflight.run;
+        headSha = preflight.headSha;
+        if (preflight.alignmentError) throw preflight.alignmentError;
+      } else {
+        headSha = (await this.syncWorkspace(run)) ?? run.workspace?.headSha;
+      }
       switch (run.state) {
         case "BRAINSTORMING": {
           const completed = await this.executeRole(
@@ -408,7 +534,9 @@ export class Orchestrator {
             }
           }
           await this.store.writeArtifact(run, "05-quality-report.md", renderQualityReport(report));
+          const fence = this.captureOptionalRevalidationFence(run);
           const accepted = report.passed || !run.config.gates.requireCiPass;
+          await this.assertOptionalRevalidationFence(run, fence);
           this.bindEvidence(run, "quality", evaluatedSha, report.passed);
           return this.store.applyEvent(
             run,
@@ -470,12 +598,22 @@ export class Orchestrator {
               extractVerifierDefects(result.output),
             );
           }
+          const fence = this.captureOptionalRevalidationFence(run);
           const accepted = passed || !run.config.gates.requireVerifierPass;
+          await this.assertOptionalRevalidationFence(run, fence);
           this.bindEvidence(run, "verification", evaluatedSha, passed);
           const successEvent =
-            run.counters.commentResolutionCycles > 0
-              ? "VERIFY_PASSED_AFTER_REVIEW"
-              : "VERIFY_PASSED";
+            run.revalidation?.returnState === "PR_READY"
+              ? "VERIFY_PASSED"
+              : run.revalidation?.returnState === "PR_REVIEW"
+                ? "VERIFY_PASSED_AFTER_REVIEW"
+                : run.counters.commentResolutionCycles > 0
+                  ? "VERIFY_PASSED_AFTER_REVIEW"
+                  : "VERIFY_PASSED";
+          if (accepted && run.revalidation) {
+            await this.assertOptionalRevalidationFence(run, fence);
+            delete run.revalidation;
+          }
           return this.store.applyEvent(
             run,
             accepted ? successEvent : "VERIFY_FAILED",
@@ -525,6 +663,7 @@ export class Orchestrator {
         runFailureMessage(error),
         runFailureCode(error),
         runFailureRuntime(error),
+        { preserveWorkspace: run.revalidation !== undefined },
       );
     }
   }
@@ -545,6 +684,7 @@ export class Orchestrator {
     const markers = parseRoleMarker("builder", result.output);
     if (!markers.ok) throw new Error(markers.message);
     await this.store.writeArtifact(run, "04-builder-report.md", result.output);
+    const fence = this.captureOptionalRevalidationFence(run);
 
     let outputHeadSha = beforeSha;
     if (run.workspace && run.workspace.baseSha !== "not-a-git-repository" && beforeSha) {
@@ -556,6 +696,7 @@ export class Orchestrator {
         );
       }
       await assertWorkingTreeScope(workdir, run.config.policy.allowedPathGlobs);
+      await this.assertOptionalRevalidationFence(run, fence);
       const committed = await createDeterministicCommit(workdir, "maswe: builder changes", {
         allowedPathGlobs: run.config.policy.allowedPathGlobs,
       });
@@ -571,6 +712,7 @@ export class Orchestrator {
     }
 
     const evaluatedHeadSha = outputHeadSha ?? beforeSha ?? run.workspace?.headSha;
+    await this.assertOptionalRevalidationFence(run, fence);
     return this.store.applyEvent(run, "BUILD_COMPLETED", "builder", {
       ...runtimeEventIdentityDetails(result),
       marker: markers.marker,
@@ -597,6 +739,7 @@ export class Orchestrator {
     const markers = parseRoleMarker("prResolver", result.output);
     if (!markers.ok) throw new Error(markers.message);
     await this.store.writeArtifact(run, "09-resolution-report.md", result.output);
+    const fence = this.captureOptionalRevalidationFence(run);
 
     let outputHeadSha = beforeSha;
     if (run.workspace && run.workspace.baseSha !== "not-a-git-repository" && beforeSha) {
@@ -608,6 +751,7 @@ export class Orchestrator {
         );
       }
       await assertWorkingTreeScope(workdir, run.config.policy.allowedPathGlobs);
+      await this.assertOptionalRevalidationFence(run, fence);
       const committed = await createDeterministicCommit(workdir, "maswe: resolve review comment", {
         allowedPathGlobs: run.config.policy.allowedPathGlobs,
       });
@@ -620,6 +764,7 @@ export class Orchestrator {
     }
 
     const evaluatedHeadSha = outputHeadSha ?? beforeSha ?? run.workspace?.headSha;
+    await this.assertOptionalRevalidationFence(run, fence);
     return this.store.applyEvent(run, "RESOLUTION_COMPLETED", "prResolver", {
       ...runtimeEventIdentityDetails(result),
       marker: markers.marker,
@@ -635,14 +780,14 @@ export class Orchestrator {
     message: string,
     code: RunFailureCode = "workflow-failure",
     runtime?: DurableRuntimeFailureSummary,
-    options: { preserveCreatedWorkspace?: boolean } = {},
+    options: { preserveCreatedWorkspace?: boolean; preserveWorkspace?: boolean } = {},
   ): Promise<RunRecord> {
     const resumeState = isTerminal(run.state) ? undefined : run.state;
     if (options.preserveCreatedWorkspace && resumeState !== "CREATED") {
       throw new Error("Workspace preservation is allowed only for a CREATED bootstrap failure");
     }
     const finishFailure = (record: RunRecord): Promise<RunRecord> =>
-      options.preserveCreatedWorkspace
+      options.preserveCreatedWorkspace || options.preserveWorkspace
         ? Promise.resolve(record)
         : this.finalizeTerminal(record);
     const safeMessage = safeFailureMessage(message);
@@ -906,8 +1051,35 @@ export class Orchestrator {
     return this.finalizeTerminal(cancelled);
   }
 
+  private async reconcileFailedRevalidationTarget(prior: RunRecord): Promise<RunRecord> {
+    if (!prior.revalidation) return prior;
+    const observed = structuredClone(prior);
+    const observedHeadSha = await this.observeRevalidationWorkspace(observed);
+    if (!observedHeadSha || !observed.workspace) {
+      throw new Error(`Run ${prior.id} has no exact retry revalidation workspace`);
+    }
+    const exactWorkspace = await reconcileRetryWorkspace(this.cwd, observed);
+    if (!exactWorkspace) {
+      throw new Error(`Run ${prior.id} has no exact retry revalidation workspace`);
+    }
+    const source = prior.github ? "github" : "local-workspace";
+    const requiredHeadSha = prior.github?.headSha ?? observedHeadSha;
+    await new RevalidationService(this.store).route(prior.id, {
+      source,
+      previousHeadSha: prior.revalidation.requestedHeadSha,
+      requestedHeadSha: requiredHeadSha,
+      actor: source === "github" ? "github-app" : "local-runner",
+      observedWorkspace: exactWorkspace,
+    });
+    return this.store.load(prior.id);
+  }
+
   async retryFromFailed(runId: string): Promise<RunRecord> {
-    const prior = await this.store.load(runId);
+    let prior = await this.store.load(runId);
+    if (prior.state !== "FAILED" || !prior.failure?.resumeState || !prior.failure) {
+      throw new Error("retry requires a FAILED run with failure.resumeState");
+    }
+    prior = await this.reconcileFailedRevalidationTarget(prior);
     const resumeState = prior.failure?.resumeState;
     if (prior.state !== "FAILED" || !resumeState || !prior.failure) {
       throw new Error("retry requires a FAILED run with failure.resumeState");

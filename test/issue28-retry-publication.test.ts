@@ -12,8 +12,13 @@ import type {
   RunRecord,
   WorkflowEventType,
 } from "../src/domain.ts";
-import { captureWorkspace, listGitWorktreeRegistrations } from "../src/git-workspace.ts";
+import {
+  captureWorkspace,
+  listGitWorktreeRegistrations,
+  refreshWorkspaceHead,
+} from "../src/git-workspace.ts";
 import { Orchestrator } from "../src/orchestrator.ts";
+import { RevalidationService } from "../src/revalidation.ts";
 import { MockRuntime } from "../src/runtimes/mock.ts";
 import {
   FileRunStore,
@@ -678,4 +683,80 @@ test("later non-Git operator-checkout retry fails closed and requires supersessi
   assert.equal(authoritative.state, "FAILED");
   assert.equal(authoritative.failure?.resumeState, "WAITING_FOR_BRAINSTORM_APPROVAL");
   assert.equal(retryEvents(authoritative).length, 0);
+});
+
+test("retry retargets a failed revalidation to the associated HEAD before publication", async (t) => {
+  const cwd = await initGitRepo();
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const value = config();
+  const store = new FileRunStore(cwd);
+  const run = await store.create("Failed revalidation", "Retry only the latest target.", value);
+  run.state = "PR_READY";
+  run.workspace = await captureWorkspace(cwd);
+  await store.save(run);
+  const headA = run.workspace.headSha;
+
+  await writeFile(path.join(cwd, "head-b.txt"), "head B\n", "utf8");
+  await execFileAsync("git", ["add", "head-b.txt"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "head B"], { cwd });
+  const observedB = structuredClone(run);
+  await refreshWorkspaceHead(observedB);
+  let failed = await new RevalidationService(store).route(run.id, {
+    source: "local-workspace",
+    previousHeadSha: headA,
+    requestedHeadSha: observedB.workspace!.headSha,
+    actor: "local-runner",
+    observedWorkspace: observedB.workspace!,
+  });
+  failed.failure = {
+    code: "workflow-failure",
+    message: "retry the current generation",
+    at: "2026-08-19T12:00:00.000Z",
+    resumeState: "CI_RUNNING",
+  };
+  failed = await store.applyEvent(failed, "FAIL", "orchestrator", {
+    reason: failed.failure.message,
+    resumeState: failed.failure.resumeState,
+  });
+  const historicalEvents = structuredClone(failed.events);
+
+  await writeFile(path.join(cwd, "head-c.txt"), "head C\n", "utf8");
+  await execFileAsync("git", ["add", "head-c.txt"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "head C"], { cwd });
+  const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  const headC = stdout.trim();
+  failed.github = {
+    installationId: 1,
+    repository: "owner/repo",
+    pullRequestNumber: 28,
+    baseSha: headA,
+    headSha: headC,
+    branch: failed.workspace!.branch,
+  };
+  await store.save(failed);
+
+  await new Orchestrator(cwd, value, new MockRuntime(), store).retryFromFailed(run.id);
+  const authoritative = await store.load(run.id);
+  const retargetIndex = authoritative.events.findIndex(
+    (event) => event.type === "REVALIDATION_RETARGETED",
+  );
+  const retryIndex = authoritative.events.findIndex(
+    (event) => event.type === "RETRY_FROM_FAILED",
+  );
+
+  assert.deepEqual(authoritative.events.slice(0, historicalEvents.length), historicalEvents);
+  assert.ok(retargetIndex >= historicalEvents.length);
+  assert.ok(retryIndex > retargetIndex);
+  assert.equal(authoritative.events[retargetIndex]?.from, "FAILED");
+  assert.equal(authoritative.events[retargetIndex]?.to, "FAILED");
+  assert.equal(
+    authoritative.events[retargetIndex]?.details?.previousResumeState,
+    "CI_RUNNING",
+  );
+  assert.equal(authoritative.events[retryIndex]?.details?.resumeState, "CI_RUNNING");
+  assert.equal(authoritative.state, "PR_READY");
+  assert.equal(authoritative.workspace?.headSha, headC);
+  assert.equal(authoritative.evidence?.quality?.headSha, headC);
+  assert.equal(authoritative.evidence?.verification?.headSha, headC);
+  assert.equal(authoritative.revalidation, undefined);
 });

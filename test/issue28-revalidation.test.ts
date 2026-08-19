@@ -259,6 +259,32 @@ test("same-target routing is event-free and saves only an exact workspace alignm
   assert.deepEqual(unchanged.revalidation, before.revalidation);
 });
 
+test("same-target routing rejects an observed workspace at a different HEAD", async (t) => {
+  const store = await tempStore(t);
+  const atB = await initialRequest(store);
+  const atC = await new RevalidationService(store).route(atB.id, {
+    source: "github",
+    previousHeadSha: HEAD_B,
+    requestedHeadSha: HEAD_C,
+    actor: "github-app",
+    at: RETARGETED_AT,
+  });
+  const before = structuredClone(atC);
+
+  await assert.rejects(
+    new RevalidationService(store).route(atC.id, {
+      source: "github",
+      previousHeadSha: HEAD_C,
+      requestedHeadSha: HEAD_C,
+      actor: "local-runner",
+      observedWorkspace: workspace(HEAD_B),
+    }),
+    /workspace.*HEAD|target.*workspace|alignment/i,
+  );
+
+  assert.deepEqual(await store.load(atC.id), before);
+});
+
 test("illegal revalidation states and contexts fail closed without publication", async (t) => {
   const store = await tempStore(t);
   const noContext = await runInState(store, "BUILDING");
