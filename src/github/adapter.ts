@@ -23,7 +23,7 @@ import {
   initializeLegacyCheckCreateJournals,
   withGitHubJournal,
 } from "./journal.ts";
-import type { GitHubInternalEvent } from "./types.ts";
+import type { AssociationRecord, GitHubInternalEvent } from "./types.ts";
 import {
   prepareWebhookRequest,
   type WebhookHandleResult,
@@ -57,6 +57,33 @@ function associationRollbackInvariant(run: RunRecord): string {
   delete record.evidence;
   return JSON.stringify(record);
 }
+
+function containsDurableAtomicWriteOutcomeUnknown(error: unknown): boolean {
+  const pending: unknown[] = [error];
+  const visited = new Set<object>();
+  while (pending.length > 0) {
+    const candidate = pending.pop();
+    if (candidate instanceof DurableAtomicWriteOutcomeUnknownError) return true;
+    if (
+      (typeof candidate !== "object" || candidate === null) &&
+      typeof candidate !== "function"
+    ) {
+      continue;
+    }
+    if (visited.has(candidate)) continue;
+    visited.add(candidate);
+    if (candidate instanceof AggregateError) pending.push(...candidate.errors);
+    if (candidate instanceof Error && candidate.cause !== undefined) {
+      pending.push(candidate.cause);
+    }
+  }
+  return false;
+}
+
+type AssociationRoutingIdentity = Pick<
+  AssociationRecord,
+  "runId" | "installationId" | "repository" | "pullRequestNumber" | "headSha"
+>;
 
 export class GitHubAppAdapter {
   private readonly cwd: string;
@@ -375,7 +402,7 @@ export class GitHubAppAdapter {
             }
             await this.saveAssociationMutation(before, run, transaction);
           }
-          transaction.bind({
+          const committedAssociation = transaction.bind({
             runId: run.id,
             installationId: run.github.installationId,
             repository: run.github.repository,
@@ -384,12 +411,11 @@ export class GitHubAppAdapter {
             headSha: liveHead,
             branch: run.github.branch,
           });
-          return { run, previousHeadSha, pendingHeadShas };
+          return { run, previousHeadSha, pendingHeadShas, committedAssociation };
         });
         const routed = await this.routeAssociationHead(
-          publication.run.id,
+          publication.committedAssociation,
           publication.previousHeadSha,
-          liveHead,
         );
         await this.publishChecks(
           routed,
@@ -467,7 +493,7 @@ export class GitHubAppAdapter {
     try {
       await this.store.save(run);
     } catch (error) {
-      if (error instanceof DurableAtomicWriteOutcomeUnknownError) throw error;
+      if (containsDurableAtomicWriteOutcomeUnknown(error)) throw error;
       try {
         await this.rollbackRunMutation(before, run);
       } catch (rollbackError) {
@@ -484,12 +510,12 @@ export class GitHubAppAdapter {
   }
 
   private async routeAssociationHead(
-    runId: string,
+    expected: AssociationRoutingIdentity,
     previousHeadSha: string | undefined,
-    requestedHeadSha: string,
   ): Promise<RunRecord> {
-    await this.afterAssociationCommitBeforeRouting?.(runId);
-    const authoritative = await this.store.load(runId);
+    await this.afterAssociationCommitBeforeRouting?.(expected.runId);
+    const authoritative = await this.loadActiveCommittedAssociation(expected);
+    const requestedHeadSha = expected.headSha;
     const priorAssociationHeadSha =
       previousHeadSha !== requestedHeadSha ? previousHeadSha : undefined;
     const priorWorkspaceHeadSha =
@@ -520,14 +546,51 @@ export class GitHubAppAdapter {
     ) {
       return authoritative;
     }
-    await new RevalidationService(this.store).route(runId, {
+    await new RevalidationService(this.store).route(expected.runId, {
       source: "github",
       previousHeadSha: routingPreviousHeadSha,
       requestedHeadSha,
       expectedRunVersion: authoritative.version,
       actor: "github-app",
     });
-    return this.store.load(runId);
+    return this.loadActiveCommittedAssociation(expected);
+  }
+
+  private async loadActiveCommittedAssociation(
+    expected: AssociationRoutingIdentity,
+  ): Promise<RunRecord> {
+    const authoritative = await this.store.load(expected.runId);
+    const github = authoritative.github;
+    if (
+      !github ||
+      github.suspended === true ||
+      github.installationId !== expected.installationId ||
+      github.repository !== expected.repository ||
+      github.pullRequestNumber !== expected.pullRequestNumber ||
+      github.headSha !== expected.headSha
+    ) {
+      throw new Error(
+        `Run ${expected.runId} GitHub association changed before routing`,
+      );
+    }
+    const indexed = await this.associations.find(
+      expected.repository,
+      expected.pullRequestNumber,
+    );
+    if (
+      !indexed ||
+      indexed.suspended ||
+      indexed.runId !== expected.runId ||
+      indexed.installationId !== expected.installationId ||
+      indexed.repository !== expected.repository ||
+      indexed.pullRequestNumber !== expected.pullRequestNumber ||
+      indexed.headSha !== expected.headSha
+    ) {
+      throw new Error(
+        `Run ${expected.runId} GitHub association index changed before routing`,
+      );
+    }
+    return authoritative;
   }
 
   private async clearPublishedCancellationHeads(
@@ -835,7 +898,7 @@ export class GitHubAppAdapter {
             : {}),
         };
         await this.saveAssociationMutation(before, run, transaction);
-        transaction.bind({
+        const committedAssociation = transaction.bind({
           runId: run.id,
           installationId,
           repository,
@@ -844,14 +907,19 @@ export class GitHubAppAdapter {
           headSha,
           branch: run.github.branch,
         });
-        return { kind: "publish", run, previousHeadSha, pendingHeadShas } as const;
+        return {
+          kind: "publish",
+          run,
+          previousHeadSha,
+          pendingHeadShas,
+          committedAssociation,
+        } as const;
       });
 
       if (publication.kind === "publish") {
         const routed = await this.routeAssociationHead(
-          publication.run.id,
+          publication.committedAssociation,
           publication.previousHeadSha,
-          headSha,
         );
         await this.publishChecks(
           routed,

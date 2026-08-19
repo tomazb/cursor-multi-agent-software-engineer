@@ -239,6 +239,47 @@ test("github association failure matrix never rewrites an already-published work
     assert.deepEqual(recovered.evidence, before.evidence);
   });
 
+  await t.test("aggregate run-save outcome unknown never invokes association compensation", async (t) => {
+    let rejectAfterPublication = true;
+    let compensationSaveAttempts = 0;
+    const harness = await adapterHarness(t, {
+      wrapStore: (store) => storeWrapper(store, {
+        async save(run) {
+          if (rejectAfterPublication && run.github?.headSha === HEAD_B) {
+            rejectAfterPublication = false;
+            await store.save(run);
+            const outcomeUnknown = new DurableAtomicWriteOutcomeUnknownError(
+              "run record",
+              new Error("simulated run directory sync failure"),
+            );
+            const nested = new Error("nested publication failure", { cause: outcomeUnknown });
+            const aggregate = new AggregateError(
+              [new Error("simulated run lock release failure"), nested],
+              "run publication and release failed",
+            );
+            Object.defineProperty(aggregate, "cause", { value: aggregate });
+            throw aggregate;
+          }
+          compensationSaveAttempts += 1;
+          await store.save(run);
+        },
+      }),
+    });
+    const before = await harness.store.load(harness.runId);
+
+    await assert.rejects(
+      deliver(harness, HEAD_B, "aggregate-run-save-outcome-unknown"),
+      /publication and release failed/,
+    );
+
+    const recovered = await harness.store.load(harness.runId);
+    assert.equal(compensationSaveAttempts, 0);
+    assert.deepEqual(eventIdentity(recovered), eventIdentity(before));
+    assert.equal(recovered.github?.headSha, HEAD_B);
+    assert.equal(recovered.evidence, undefined);
+    assert.equal((await harness.index.find("owner/repo", 28))?.headSha, HEAD_A);
+  });
+
   await t.test("known index failure restores only prior association fields", async (t) => {
     const harness = await adapterHarness(t, {
       associationWriteRecords: async () => {
@@ -409,6 +450,66 @@ test("github B then C at zero cycles retargets generation two without publishing
     bBoundQualityOrVerification.some((post) => post.conclusion === "success"),
     false,
   );
+});
+
+test("post-commit association fence blocks routing when authoritative identity changes", async (t) => {
+  for (const mutation of [
+    "index suspended before run record",
+    "run record suspended before index",
+    "active index head diverged",
+  ] as const) {
+    await t.test(mutation, async (t) => {
+      let authoritativeStore: FileRunStore;
+      let authoritativeIndex: GitHubAssociationIndex;
+      const harness = await adapterHarness(t, {
+        afterAssociationCommitBeforeRouting: async (runId) => {
+          if (mutation === "index suspended before run record") {
+            await authoritativeIndex.suspend(
+              "owner/repo",
+              28,
+              "authorization-revoked",
+            );
+            return;
+          }
+          if (mutation === "run record suspended before index") {
+            const concurrent = await authoritativeStore.load(runId);
+            concurrent.github = {
+              ...concurrent.github!,
+              suspended: true,
+              suspensionReason: "authorization-revoked",
+            };
+            await authoritativeStore.save(concurrent);
+            return;
+          }
+          const committed = await authoritativeIndex.find("owner/repo", 28);
+          assert.ok(committed);
+          await authoritativeIndex.bind({
+            runId: committed.runId,
+            installationId: committed.installationId,
+            repository: committed.repository,
+            pullRequestNumber: committed.pullRequestNumber,
+            baseSha: committed.baseSha,
+            headSha: HEAD_C,
+            branch: committed.branch,
+          });
+        },
+      });
+      authoritativeStore = harness.store;
+      authoritativeIndex = harness.index;
+      const before = await harness.store.load(harness.runId);
+
+      await assert.rejects(
+        deliver(harness, HEAD_B, `association-fence-${mutation.replaceAll(" ", "-")}`),
+        /association.*changed|association.*active|routing/i,
+      );
+
+      const recovered = await harness.store.load(harness.runId);
+      assert.deepEqual(eventIdentity(recovered), eventIdentity(before));
+      assert.equal(recovered.state, "PR_REVIEW");
+      assert.equal(recovered.revalidation, undefined);
+      assert.equal(harness.posts.length, 0);
+    });
+  }
 });
 
 test("association rollback callbacks run in reverse and aggregate every known-failure callback error", async (t) => {
