@@ -328,6 +328,14 @@ pre-upgrade backup can strand accepted work. Stop traffic and roll forward with 
 tree. Archive the whole tree only after permanent endpoint disablement and webhook-secret
 rotation/revocation.
 
+GitHub association publication is event-free and rollback-capable; workflow request and retarget
+events publish only after association commit and are never rolled back. If association processing
+fails, inspect the authoritative run and association index before redelivery: no request/retarget
+event means the association transaction did not durably reach workflow publication. Redeliver the
+authenticated webhook or retry normal publication; do not hand-edit the association, evidence, or
+event history. If the workflow event is present, treat it as immutable and recover forward from
+the recorded generation.
+
 ## 4. Configure quality commands
 
 Replace starter commands with commands that are authoritative for the target repository, for example:
@@ -350,6 +358,11 @@ Commands execute with the system shell and are trusted code. Only repository adm
 ## 5. Prefer isolated worktrees
 
 By default `policy.useIsolatedWorktree` is `true`. On `start`, MASWE creates branch `maswe/<run-id>` and a linked worktree under an **external** directory (`$TMPDIR/maswe-worktrees/...`), not inside the operator checkout. `.maswe/` is appended via `git rev-parse --git-path info/exclude` so local run storage does not dirty `git status` even when the operator is already inside a linked worktree. Builder and resolver roles execute in that worktree. With `policy.trustManagedWorktrees` (default `true`), Cursor CLI invocations pass `--trust` for every role in MASWE-created worktrees. Completed, cancelled, failed, and superseded runs remove their worktrees but **preserve** the `maswe/<run-id>` branch ref so failed-run provenance (builder `outputHeadSha`) can be restored on `retry`. Cleanup failures are surfaced to the operator.
+
+Every production-created run, including a superseding replacement, persists workspace bootstrap
+intent before branch or worktree side effects and durably checkpoints the established workspace
+before `START`. Bootstrap source-drift checks exclude the orchestrator-owned `.maswe` namespace;
+read-only role fingerprints continue to include authoritative `.maswe` state.
 
 To opt out for a trusted checkout:
 
@@ -437,6 +450,13 @@ maswe complete <run-id>
 
 These commands record workflow status only; they do not merge a PR.
 
+Both commands re-read authoritative run state and apply the same exact current-head gate. The run
+must have no active revalidation, a known recorded head, the exact recorded branch in a clean
+MASWE-managed isolated worktree, matching workspace/GitHub heads when associated, and current
+passing required quality and verification evidence. `complete` additionally requires current
+passing merge-ready evidence. Rejection does not alter state, events, or evidence, and historical
+passing events do not substitute for current evidence.
+
 ## 7. Recovery
 
 ### Unsupported Node runtime
@@ -455,6 +475,17 @@ maswe run <run-id>
 ```
 
 `maswe run` works only for actionable automatic states. Approval and review states require their specific commands.
+
+For a bootstrap failure whose `failure.resumeState` is `CREATED`, inspect `workspaceBootstrap` and
+`workspace` in `run.json` before running `maswe retry <run-id>`. Intent without a workspace means
+reconciliation had not checkpointed the side effect; intent plus a workspace means the
+branch/worktree checkpoint was durable but `START` was not. Retry reconciles the exact
+planned/current facts and publishes the single `START`. An embedding integration recovering a raw
+`CREATED` record after abrupt process termination must invoke the public
+`Orchestrator.bootstrapCreatedRun(runId)` operation before `runUntilBlocked`; the CLI has no
+separate raw-bootstrap recovery command. Do not delete or recreate the recorded branch/worktree to
+make recovery pass. A source branch/tree change outside `.maswe` is real drift and must be resolved
+explicitly; `.maswe` orchestration state is excluded only from this bootstrap drift comparison.
 
 ### Runtime failure
 
@@ -508,6 +539,17 @@ CI failure returns to `BUILDING`. The builder sees the latest quality artifact o
 ### Verifier failure loop
 
 A failed verifier returns to `BUILDING`. The next builder prompt includes the latest deterministic quality and independent verification reports so defects can be addressed directly.
+
+### Current-head revalidation
+
+A newer authenticated or local head retargets an active or recoverable failed revalidation
+generation. Evidence from a superseded generation is unusable. Inspect `revalidation.source`,
+`requestedHeadSha`, `generation`, and `returnState` in `run.json`; human status shows the same target
+as a shortened SHA. Align the recorded managed branch/worktree to the requested head, keep it
+clean, then run `maswe run <run-id>` for an active generation or `maswe retry <run-id>` for a
+recoverable failed generation. MASWE restarts at deterministic quality and fresh verification and
+returns only to the recorded gate. Never copy earlier quality, verification, or merge-ready
+evidence into the new generation, and never delete historical request/retarget/failure events.
 
 ### Read-only violation
 

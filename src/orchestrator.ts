@@ -1025,52 +1025,76 @@ export class Orchestrator {
     return this.store.applyEvent(run, "HUMAN_RESUME", "user");
   }
 
-  async markMergeReady(runId: string): Promise<RunRecord> {
-    const run = await this.store.load(runId);
-    const previousVerificationSha = run.evidence?.verification?.headSha;
-    const headSha = (await this.syncWorkspace(run)) ?? run.workspace?.headSha;
-    const workdir = workingDirectoryFor(run);
-    if (run.workspace && run.workspace.baseSha !== "not-a-git-repository") {
-      if (!(await isGitWorkspaceClean(workdir))) {
-        throw new Error("Merge-ready requires a clean worktree with fresh verification evidence.");
-      }
+  private async assertExactCurrentHeadGate(
+    run: RunRecord,
+    gate: "merge-ready" | "complete",
+  ): Promise<string> {
+    const label = gate === "merge-ready" ? "Merge-ready" : "Complete";
+    if (run.revalidation) {
+      throw new Error(`${label} requires revalidation to finish for the current HEAD.`);
     }
     if (
-      previousVerificationSha &&
-      (!run.evidence?.verification || run.evidence.verification.headSha !== headSha)
+      !run.workspace ||
+      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(run.workspace.headSha)
     ) {
+      throw new Error(`${label} requires a known exact workspace HEAD.`);
+    }
+    if (!run.config.policy.useIsolatedWorktree || !run.workspace.worktreePath) {
+      throw new Error(`${label} requires an isolated MASWE-managed worktree.`);
+    }
+
+    const workdir = workingDirectoryFor(run);
+    await assertExpectedBranch(workdir, run.workspace.branch);
+    if (!(await isGitWorkspaceClean(workdir))) {
+      throw new Error(`${label} requires a clean worktree for the current HEAD.`);
+    }
+    const headSha = await gitRevParse(workdir, "HEAD");
+    if (headSha !== run.workspace.headSha) {
       throw new Error(
-        `Verification evidence is stale for head SHA ${headSha}; re-run CI and verification before merge-ready.`,
+        `${label} rejected: current HEAD ${headSha} does not match recorded workspace HEAD ${run.workspace.headSha}.`,
       );
     }
-    if (
-      run.config.gates.requireVerifierPass &&
-      (!run.evidence?.verification?.passed ||
-        run.evidence.verification.headSha !== run.workspace?.headSha)
-    ) {
+    if (run.github && run.github.headSha !== headSha) {
       throw new Error(
-        "Merge-ready requires fresh verification evidence bound to the current head SHA.",
+        `${label} rejected: associated GitHub HEAD ${run.github.headSha} does not match workspace HEAD ${headSha}.`,
       );
     }
     if (
       run.config.gates.requireCiPass &&
-      (!run.evidence?.quality?.passed || run.evidence.quality.headSha !== run.workspace?.headSha)
+      (!run.evidence?.quality?.passed || run.evidence.quality.headSha !== headSha)
     ) {
-      throw new Error("Merge-ready requires present, passing quality evidence for the current HEAD.");
+      throw new Error(`${label} requires present, passing quality evidence for the current HEAD.`);
     }
-    const mergeReadySha = run.workspace?.headSha;
-    if (mergeReadySha && mergeReadySha !== "not-a-git-repository") {
-      run.evidence = {
-        ...(run.evidence ?? {}),
-        mergeReady: {
-          headSha: mergeReadySha,
-          passed: true,
-          at: new Date().toISOString(),
-        },
-      };
+    if (
+      run.config.gates.requireVerifierPass &&
+      (!run.evidence?.verification?.passed || run.evidence.verification.headSha !== headSha)
+    ) {
+      throw new Error(
+        `${label} requires present, passing verification evidence for the current HEAD.`,
+      );
     }
+    if (
+      gate === "complete" &&
+      (!run.evidence?.mergeReady?.passed || run.evidence.mergeReady.headSha !== headSha)
+    ) {
+      throw new Error("Complete requires current, passing merge-ready evidence for the current HEAD.");
+    }
+    return headSha;
+  }
+
+  async markMergeReady(runId: string): Promise<RunRecord> {
+    const run = await this.store.load(runId);
+    const mergeReadySha = await this.assertExactCurrentHeadGate(run, "merge-ready");
+    run.evidence = {
+      ...(run.evidence ?? {}),
+      mergeReady: {
+        headSha: mergeReadySha,
+        passed: true,
+        at: new Date().toISOString(),
+      },
+    };
     return this.store.applyEvent(run, "MARK_MERGE_READY", "user", {
-      ...(mergeReadySha ? { headSha: mergeReadySha } : {}),
+      headSha: mergeReadySha,
     });
   }
 
@@ -1079,38 +1103,10 @@ export class Orchestrator {
     if (run.state !== "MERGE_READY") {
       throw new Error(`complete requires MERGE_READY, currently ${run.state}`);
     }
-    const mergeReadySha =
-      run.evidence?.mergeReady?.headSha ??
-      [...run.events].reverse().find((event) => event.type === "MARK_MERGE_READY")?.details?.headSha;
-    const headSha = await this.syncWorkspace(run);
-    const workdir = workingDirectoryFor(run);
-    if (run.workspace && run.workspace.baseSha !== "not-a-git-repository") {
-      if (!(await isGitWorkspaceClean(workdir))) {
-        throw new Error("Complete requires a clean worktree matching merge-ready evidence.");
-      }
-      if (!headSha || !mergeReadySha || headSha !== mergeReadySha) {
-        throw new Error(
-          `Complete rejected: HEAD ${headSha ?? "(unknown)"} does not match merge-ready SHA ${String(mergeReadySha)}.`,
-        );
-      }
-      if (
-        run.config.gates.requireCiPass &&
-        (!run.evidence?.quality?.passed || run.evidence.quality.headSha !== headSha)
-      ) {
-        throw new Error("Complete requires present, passing quality evidence for the current HEAD.");
-      }
-      if (
-        run.config.gates.requireVerifierPass &&
-        (!run.evidence?.verification?.passed || run.evidence.verification.headSha !== headSha)
-      ) {
-        throw new Error(
-          "Complete requires present, passing verification evidence for the current HEAD.",
-        );
-      }
-    }
+    const headSha = await this.assertExactCurrentHeadGate(run, "complete");
     const completed = await this.store.applyEvent(run, "COMPLETE", "user", {
-      ...(headSha ? { headSha } : {}),
-      ...(mergeReadySha ? { mergeReadySha } : {}),
+      headSha,
+      mergeReadySha: headSha,
     });
     return this.finalizeTerminal(completed);
   }

@@ -127,6 +127,10 @@ The CLI shall create a project-local `.maswe/config.json` without overwriting an
 
 The user shall create a run with a title and request text or request file. The system shall snapshot effective configuration into the run record.
 
+Every production-created run, including a superseding replacement, shall persist workspace
+bootstrap intent before branch or worktree side effects and durably checkpoint the established
+workspace before `START`.
+
 ### FR-3 — State machine
 
 The system shall support explicit states for discovery, approval, design, implementation, CI, verification, PR review, comment classification, resolution, merge readiness, completion, failure, and cancellation.
@@ -187,6 +191,9 @@ Each role shall have a configurable model. When fail-closed model fallback is en
 
 The system shall fingerprint workspace state before and after read-only roles. In Git checkouts that includes git-tracked, staged, and untracked content. In both Git and non-Git working directories the system shall also fingerprint authoritative `.maswe` run state, durable artifacts, and project config under the fingerprinted working directory (independent of Git excludes). A difference shall fail the run. Ephemeral lock and `*.tmp` files under `.maswe` are excluded from that fingerprint so normal orchestration churn does not false-fail.
 
+Bootstrap source-drift checks shall exclude the orchestrator-owned `.maswe` namespace; read-only
+role fingerprints shall continue to include authoritative `.maswe` state.
+
 ### FR-17 — Run inspection
 
 The user shall list runs, inspect one run in human-readable or JSON form, and see state, timestamps, approvals, cycle counters, artifacts, and failures.
@@ -194,6 +201,16 @@ The user shall list runs, inspect one run in human-readable or JSON form, and se
 ### FR-18 — Recovery controls
 
 The user shall be able to resume an actionable run, resume human review, cancel a nonterminal run, mark merge readiness, and mark completion.
+
+A newer authenticated or local head shall retarget an active or recoverable failed revalidation
+generation. Evidence from a superseded generation is unusable. Merge-ready and completion shall
+both reject active revalidation, an unknown or mismatched head, a wrong or dirty managed worktree,
+an associated GitHub head mismatch, and missing, failed, or stale required evidence. Completion
+shall additionally require current passing merge-ready evidence; historical success events do not
+recreate current evidence.
+
+GitHub association publication shall be event-free and rollback-capable. Workflow request and
+retarget events shall publish only after association commit and shall never be rolled back.
 
 ### FR-19 — Runtime adapters
 

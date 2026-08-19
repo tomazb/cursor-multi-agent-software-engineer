@@ -87,6 +87,11 @@ stateDiagram-v2
   VERIFYING --> PR_READY: VERIFY_PASSED
   VERIFYING --> PR_REVIEW: VERIFY_PASSED_AFTER_REVIEW
   PR_READY --> PR_REVIEW: PR_OPENED
+  PR_READY --> CI_RUNNING: REVALIDATE_REQUESTED
+  PR_REVIEW --> CI_RUNNING: REVALIDATE_REQUESTED
+  BUILDING --> CI_RUNNING: REVALIDATION_RETARGETED
+  CI_RUNNING --> CI_RUNNING: REVALIDATION_RETARGETED
+  VERIFYING --> CI_RUNNING: REVALIDATION_RETARGETED
   PR_REVIEW --> CLASSIFYING_COMMENT: REVIEW_COMMENT_RECEIVED
   CLASSIFYING_COMMENT --> RESOLVING: COMMENT_IN_SCOPE
   CLASSIFYING_COMMENT --> WAITING_FOR_HUMAN: COMMENT_OUT_OF_SCOPE
@@ -98,6 +103,12 @@ stateDiagram-v2
 ```
 
 Any nonterminal state may transition to `FAILED` or `CANCELLED` through the generic events. Terminal states accept no further events.
+
+`REVALIDATE_REQUESTED` records the first current-head generation and its return gate.
+`REVALIDATION_RETARGETED` preserves all earlier events while moving an active generation back to
+`CI_RUNNING`; for a recoverable `FAILED` run it updates the retained resume state to `CI_RUNNING`
+without rewriting the historical `FAIL`. A newer authenticated or local head retargets an active
+or recoverable failed revalidation generation. Evidence from a superseded generation is unusable.
 
 ### 3.5 Orchestrator
 
@@ -113,6 +124,13 @@ Any nonterminal state may transition to `FAILED` or `CANCELLED` through the gene
 - Parses verifier and scope-classification contracts.
 - Enforces retry ceilings.
 - Stops at human and integration gates.
+
+Merge-ready and completion share one exact current-head assertion. It requires no active
+revalidation, a known head, the recorded branch in a clean MASWE-managed isolated worktree,
+workspace/GitHub head equality for an associated run, and current passing quality and verification
+evidence when configured. Completion additionally requires current passing merge-ready evidence.
+The assertion is read-only on rejection and returns the observed exact head used in event details;
+historical success events never substitute for current evidence.
 
 It does not contain Cursor SDK implementation details, shell output parsing, or persistence internals.
 
@@ -205,6 +223,11 @@ from the fingerprint digest.
 
 Read-only runtimes compare the fingerprint before and after execution. Any difference fails the run. This is a mutation detector, not an operating-system sandbox. A future sandbox can prevent writes rather than merely detecting them.
 
+Bootstrap source-drift checks exclude the orchestrator-owned `.maswe` namespace; read-only role
+fingerprints continue to include authoritative `.maswe` state. The distinction prevents MASWE's
+own intent/checkpoint writes from looking like source drift without hiding durable handoff
+mutation from a read-only role.
+
 ### 3.10 Quality runner
 
 `src/quality.ts` runs trusted project commands sequentially with the system shell. It records exit code, stdout, stderr, and duration. It stops after the first failure. Timeouts use `src/process.ts`, which terminates the shell process tree (POSIX process group / Windows `taskkill /T`) and bounds Promise settlement even if a descendant held pipes open.
@@ -217,6 +240,11 @@ SHA set and is cleared only after cancellation plus current-head publication com
 one rate-limited PR from holding the global association journal and makes partial publication
 retries deterministic.
 
+GitHub association publication is event-free and rollback-capable; workflow request and retarget
+events publish only after association commit and are never rolled back. This ordering keeps a
+failed association transaction from leaking a workflow event while treating a committed workflow
+event as immutable history.
+
 ## 4. Stage data flow
 
 ```mermaid
@@ -226,9 +254,13 @@ sequenceDiagram
   participant S as Store
   participant R as Runtime
   participant Q as Quality runner
+  participant W as Git workspace
 
   User->>O: start(title, request)
-  O->>S: create run + START
+  O->>S: create run + bootstrap intent
+  O->>W: reconcile branch/worktree
+  O->>S: checkpoint established workspace
+  O->>S: START
   O->>R: brainstorm prompt
   R-->>O: brainstorm artifact
   O->>S: save artifact + gate state
@@ -245,6 +277,11 @@ sequenceDiagram
   R-->>O: verdict and evidence
   O->>S: PR_READY or route back to BUILDING
 ```
+
+Every production-created run, including a superseding replacement, persists workspace bootstrap
+intent before branch or worktree side effects and durably checkpoints the established workspace
+before `START`. A process restart reconciles a partial `CREATED` run from those durable facts; it
+does not infer completed bootstrap from an existing branch or worktree alone.
 
 ## 5. Model routing
 

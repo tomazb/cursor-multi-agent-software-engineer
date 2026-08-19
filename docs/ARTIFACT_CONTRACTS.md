@@ -75,6 +75,57 @@ Optional `github` association binds a run to a GitHub App installation, reposito
 
 The run's configuration is a snapshot. Changing `.maswe/config.json` affects only later runs unless a future migration command explicitly updates a run.
 
+Every production-created run, including a superseding replacement, persists workspace bootstrap
+intent before branch or worktree side effects and durably checkpoints the established workspace
+before `START`. During that recoverable `CREATED` window the relevant record shape is:
+
+```json
+{
+  "state": "CREATED",
+  "workspaceBootstrap": {
+    "mode": "isolated-worktree",
+    "sourceBaseSha": "1111111111111111111111111111111111111111",
+    "sourceBranch": "main",
+    "sourceTreeFingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+    "remote": "https://github.com/example/repo.git",
+    "plannedAt": "2026-08-18T12:00:00.000Z"
+  },
+  "workspace": {
+    "remote": "https://github.com/example/repo.git",
+    "baseSha": "1111111111111111111111111111111111111111",
+    "headSha": "1111111111111111111111111111111111111111",
+    "branch": "maswe/20260722120000-1a2b3c4d",
+    "fingerprint": "...",
+    "worktreePath": "/tmp/maswe-worktrees/repository-key/20260722120000-1a2b3c4d"
+  }
+}
+```
+
+`workspaceBootstrap` remains present through the durable workspace checkpoint and is removed by
+the single `START` publication. Bootstrap source-drift checks exclude the orchestrator-owned
+`.maswe` namespace; read-only role fingerprints continue to include authoritative `.maswe` state.
+
+An active current-head generation uses this optional shape:
+
+```json
+{
+  "state": "CI_RUNNING",
+  "revalidation": {
+    "returnState": "PR_REVIEW",
+    "source": "github",
+    "originHeadSha": "3333333333333333333333333333333333333333",
+    "requestedHeadSha": "4444444444444444444444444444444444444444",
+    "generation": 2,
+    "requestedAt": "2026-08-18T12:01:00.000Z",
+    "updatedAt": "2026-08-18T12:02:00.000Z"
+  }
+}
+```
+
+A newer authenticated or local head retargets an active or recoverable failed revalidation
+generation. Evidence from a superseded generation is unusable. Retargeting invalidates the
+current evidence bindings but preserves historical workflow events verbatim.
+
 ### Failure record
 
 New failures may include `failure.code`, currently `runtime-models-exhausted` or `workflow-failure`,
@@ -301,6 +352,17 @@ durable failure model fields. Optional `agentId` and `runtimeRunId` use a separa
 identifier-display policy. Runtime invocation, catalogue selection, fallback ordering, and
 requested-versus-actual comparison use the original values and are not changed by event
 persistence.
+
+SHA-bearing event details have current-operation semantics. Build, quality, and verification
+events record the exact evaluated head. `MARK_MERGE_READY` records the exact head returned by the
+shared current-head gate. `COMPLETE` records that same exact head as both `headSha` and
+`mergeReadySha`. These details are audit history only: an earlier passing event never recreates
+missing, failed, or stale `evidence`, and completion never falls back to a historical
+`MARK_MERGE_READY` event.
+
+GitHub association publication is event-free and rollback-capable; workflow request and retarget
+events publish only after association commit and are never rolled back. Association-only saves may
+change the `github` and invalidated `evidence` fields, but do not append a workflow event.
 
 For `FAIL`, details may also include the durable failure `code`, bounded safe `reason`, and optional
 bounded `runtime` summary. For `RETRY_FROM_FAILED`, `previousFailure` is the already-safe failure

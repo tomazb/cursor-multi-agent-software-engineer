@@ -248,6 +248,269 @@ async function prepareActiveRevalidation(
   return { run: active, headA, headB };
 }
 
+type CurrentHeadGate = "merge-ready" | "complete";
+
+async function prepareCurrentHeadGate(
+  t: test.TestContext,
+  gate: CurrentHeadGate,
+): Promise<{
+  cwd: string;
+  orchestrator: Orchestrator;
+  run: RunRecord;
+  headSha: string;
+}> {
+  const cwd = await initRepo();
+  const config = baseConfig((candidate) => {
+    candidate.quality.commands = [];
+  });
+  const store = new FileRunStore(cwd);
+  let run = await store.create("current-head gate", "accept only current evidence", config);
+  run.state = "PR_READY";
+  run.workspace = await ensureRunWorkspace(cwd, run);
+  const headSha = run.workspace.headSha;
+  run.evidence = {
+    quality: { headSha, passed: true, at: "2026-08-19T12:00:00.000Z" },
+    verification: { headSha, passed: true, at: "2026-08-19T12:01:00.000Z" },
+    mergeReady: { headSha, passed: true, at: "2026-08-19T12:02:00.000Z" },
+  };
+  await store.save(run);
+  if (gate === "complete") {
+    run = await store.applyEvent(run, "MARK_MERGE_READY", "user", { headSha });
+  }
+  const worktreePath = run.workspace?.worktreePath;
+  t.after(async () => {
+    if (worktreePath) {
+      await execFileAsync("git", ["worktree", "remove", "--force", worktreePath], { cwd }).catch(
+        () => undefined,
+      );
+    }
+    await rm(cwd, { recursive: true, force: true });
+  });
+  return {
+    cwd,
+    orchestrator: new Orchestrator(cwd, config, new MockRuntime(), store),
+    run,
+    headSha,
+  };
+}
+
+function currentHeadGateSnapshot(run: RunRecord): {
+  state: RunRecord["state"];
+  events: RunRecord["events"];
+  evidence: RunRecord["evidence"];
+} {
+  return structuredClone({
+    state: run.state,
+    events: run.events,
+    evidence: run.evidence,
+  });
+}
+
+async function rejectCurrentHeadGateWithoutMutation(
+  orchestrator: Orchestrator,
+  run: RunRecord,
+  gate: CurrentHeadGate,
+  expected: RegExp,
+): Promise<void> {
+  const before = currentHeadGateSnapshot(await orchestrator.store.load(run.id));
+  const operation = gate === "merge-ready"
+    ? orchestrator.markMergeReady(run.id)
+    : orchestrator.complete(run.id);
+  await assert.rejects(operation, expected);
+  const authoritative = await orchestrator.store.load(run.id);
+  assert.deepEqual(currentHeadGateSnapshot(authoritative), before);
+}
+
+const currentHeadGateCases: Array<{
+  name: string;
+  expected: RegExp;
+  arrange: (fixture: {
+    cwd: string;
+    orchestrator: Orchestrator;
+    run: RunRecord;
+    headSha: string;
+  }) => Promise<void> | void;
+}> = [
+  {
+    name: "active revalidation",
+    expected: /revalidation/i,
+    arrange: ({ run, headSha }) => {
+      run.revalidation = {
+        returnState: "PR_REVIEW",
+        source: "github",
+        originHeadSha: headSha,
+        requestedHeadSha: headSha,
+        generation: 2,
+        requestedAt: "2026-08-19T12:03:00.000Z",
+        updatedAt: "2026-08-19T12:04:00.000Z",
+      };
+    },
+  },
+  {
+    name: "unknown recorded HEAD",
+    expected: /known.*HEAD|exact.*HEAD|workspace.*HEAD/i,
+    arrange: ({ run }) => {
+      assert.ok(run.workspace);
+      run.workspace.headSha = "not-a-git-repository";
+    },
+  },
+  {
+    name: "missing isolated worktree",
+    expected: /isolated.*worktree|worktree.*required/i,
+    arrange: ({ run }) => {
+      assert.ok(run.workspace);
+      delete run.workspace.worktreePath;
+    },
+  },
+  {
+    name: "recorded workspace HEAD mismatch",
+    expected: /workspace.*HEAD|current.*HEAD|HEAD.*mismatch/i,
+    arrange: ({ run }) => {
+      assert.ok(run.workspace);
+      run.workspace.headSha = HEAD_C;
+      run.evidence = {
+        quality: { headSha: HEAD_C, passed: true, at: "2026-08-19T12:00:00.000Z" },
+        verification: { headSha: HEAD_C, passed: true, at: "2026-08-19T12:01:00.000Z" },
+        mergeReady: { headSha: HEAD_C, passed: true, at: "2026-08-19T12:02:00.000Z" },
+      };
+    },
+  },
+  {
+    name: "associated GitHub HEAD mismatch",
+    expected: /GitHub.*HEAD|associated.*HEAD|HEAD.*GitHub/i,
+    arrange: ({ run }) => {
+      assert.ok(run.workspace);
+      run.github = {
+        installationId: 28,
+        repository: "owner/repo",
+        pullRequestNumber: 28,
+        baseSha: run.workspace.baseSha,
+        headSha: HEAD_C,
+        branch: run.workspace.branch,
+      };
+    },
+  },
+  {
+    name: "dirty worktree",
+    expected: /clean.*worktree|worktree.*dirty/i,
+    arrange: async ({ run }) => {
+      assert.ok(run.workspace?.worktreePath);
+      await writeFile(path.join(run.workspace.worktreePath, "dirty.txt"), "dirty\n", "utf8");
+    },
+  },
+  {
+    name: "wrong branch",
+    expected: /branch/i,
+    arrange: async ({ run }) => {
+      assert.ok(run.workspace?.worktreePath);
+      await execFileAsync("git", ["checkout", "-qb", "maswe/wrong-current-head-gate"], {
+        cwd: run.workspace.worktreePath,
+      });
+    },
+  },
+  {
+    name: "missing quality evidence",
+    expected: /quality evidence/i,
+    arrange: ({ run }) => {
+      assert.ok(run.evidence);
+      delete run.evidence.quality;
+    },
+  },
+  {
+    name: "failed quality evidence",
+    expected: /passing quality evidence|quality evidence/i,
+    arrange: ({ run }) => {
+      assert.ok(run.evidence?.quality);
+      run.evidence.quality.passed = false;
+    },
+  },
+  {
+    name: "stale quality evidence",
+    expected: /current.*HEAD|quality evidence/i,
+    arrange: ({ run }) => {
+      assert.ok(run.evidence?.quality);
+      run.evidence.quality.headSha = HEAD_C;
+    },
+  },
+  {
+    name: "missing verification evidence",
+    expected: /verification evidence/i,
+    arrange: ({ run }) => {
+      assert.ok(run.evidence);
+      delete run.evidence.verification;
+    },
+  },
+  {
+    name: "failed verification evidence",
+    expected: /passing verification evidence|verification evidence/i,
+    arrange: ({ run }) => {
+      assert.ok(run.evidence?.verification);
+      run.evidence.verification.passed = false;
+    },
+  },
+  {
+    name: "stale verification evidence",
+    expected: /current.*HEAD|verification evidence/i,
+    arrange: ({ run }) => {
+      assert.ok(run.evidence?.verification);
+      run.evidence.verification.headSha = HEAD_C;
+    },
+  },
+];
+
+for (const gate of ["merge-ready", "complete"] as const) {
+  test(`${gate} rejects every non-current gate input without state, event, or evidence mutation`, async (t) => {
+    for (const rejection of currentHeadGateCases) {
+      await t.test(rejection.name, async (subtest) => {
+        const fixture = await prepareCurrentHeadGate(subtest, gate);
+        await rejection.arrange(fixture);
+        await fixture.orchestrator.store.save(fixture.run);
+        const authoritative = await fixture.orchestrator.store.load(fixture.run.id);
+        await rejectCurrentHeadGateWithoutMutation(
+          fixture.orchestrator,
+          authoritative,
+          gate,
+          rejection.expected,
+        );
+      });
+    }
+  });
+}
+
+for (const mergeReadyCase of ["missing", "failed", "stale", "historical-only"] as const) {
+  test(`complete rejects ${mergeReadyCase} merge-ready evidence without mutation`, async (t) => {
+    const fixture = await prepareCurrentHeadGate(t, "complete");
+    assert.ok(fixture.run.evidence?.mergeReady);
+    if (mergeReadyCase === "missing" || mergeReadyCase === "historical-only") {
+      delete fixture.run.evidence.mergeReady;
+    } else if (mergeReadyCase === "failed") {
+      fixture.run.evidence.mergeReady.passed = false;
+    } else {
+      fixture.run.evidence.mergeReady.headSha = HEAD_C;
+    }
+    if (mergeReadyCase !== "historical-only") {
+      fixture.run.events = fixture.run.events.filter((event) => event.type !== "MARK_MERGE_READY");
+    }
+    await fixture.orchestrator.store.save(fixture.run);
+    const authoritative = await fixture.orchestrator.store.load(fixture.run.id);
+    await rejectCurrentHeadGateWithoutMutation(
+      fixture.orchestrator,
+      authoritative,
+      "complete",
+      /current.*merge-ready|merge-ready evidence/i,
+    );
+  });
+}
+
+test("merge-ready and completion events use the exact current HEAD returned by the gate", async (t) => {
+  const fixture = await prepareCurrentHeadGate(t, "merge-ready");
+  const mergeReady = await fixture.orchestrator.markMergeReady(fixture.run.id);
+  assert.equal(mergeReady.events.at(-1)?.details?.headSha, fixture.headSha);
+  const completed = await fixture.orchestrator.complete(mergeReady.id);
+  assert.equal(completed.events.at(-1)?.details?.headSha, fixture.headSha);
+  assert.equal(completed.events.at(-1)?.details?.mergeReadySha, fixture.headSha);
+});
+
 test("quality command that edits a tracked file fails closed before verifier", async () => {
   const cwd = await initRepo();
   const config = baseConfig((c) => {

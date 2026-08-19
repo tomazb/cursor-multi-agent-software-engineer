@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -174,6 +175,54 @@ for (const state of ["BUILDING", "CI_RUNNING", "VERIFYING"] as const) {
     );
   });
 }
+
+test("a newer generation preserves history but makes superseded success evidence unusable", async (t) => {
+  const store = await tempStore(t);
+  const atB = await initialRequest(store);
+  atB.evidence = {
+    quality: { headSha: HEAD_B, passed: true, at: REQUESTED_AT },
+    verification: { headSha: HEAD_B, passed: true, at: REQUESTED_AT },
+    mergeReady: { headSha: HEAD_B, passed: true, at: REQUESTED_AT },
+  };
+  atB.events.push(
+    {
+      id: randomUUID(),
+      at: REQUESTED_AT,
+      type: "CI_PASSED",
+      actor: "quality-runner",
+      from: "CI_RUNNING",
+      to: "VERIFYING",
+      details: { headSha: HEAD_B, passed: true, required: true },
+    },
+    {
+      id: randomUUID(),
+      at: REQUESTED_AT,
+      type: "VERIFY_PASSED_AFTER_REVIEW",
+      actor: "verifier",
+      from: "VERIFYING",
+      to: "PR_REVIEW",
+      details: { headSha: HEAD_B },
+    },
+  );
+  await store.save(atB);
+  const historicalEvents = structuredClone(atB.events);
+
+  const atC = await new RevalidationService(store).route(atB.id, {
+    source: "github",
+    previousHeadSha: HEAD_B,
+    requestedHeadSha: HEAD_C,
+    expectedRunVersion: atB.version,
+    actor: "github-app",
+    observedWorkspace: workspace(HEAD_C),
+    at: RETARGETED_AT,
+  });
+
+  assert.deepEqual(atC.events.slice(0, historicalEvents.length), historicalEvents);
+  assert.equal(atC.revalidation?.generation, 2);
+  assert.equal(atC.revalidation?.requestedHeadSha, HEAD_C);
+  assert.equal(atC.evidence, undefined);
+  assert.equal((await store.load(atC.id)).evidence, undefined);
+});
 
 for (const resumeState of ["BUILDING", "CI_RUNNING", "VERIFYING"] as const) {
   test(`failed ${resumeState} revalidation retarget preserves failure history`, async (t) => {

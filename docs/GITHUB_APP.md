@@ -201,9 +201,42 @@ The run record retains a bounded set of pending old-head cancellations until eve
 the current-head publication succeeds. A retry therefore cannot forget uncancelled checks after a
 partial Checks API failure or a later head change.
 
+A newer authenticated or local head retargets an active or recoverable failed revalidation
+generation. Evidence from a superseded generation is unusable. The associated GitHub head is the
+required target: quality and verification cannot publish for a worktree head that has not been
+aligned to it, and merge-ready/completion require exact workspace/GitHub head equality.
+
 Association state is exact-schema validated and permits one active PR per run ID. PR closure uses
 a distinct suspension reason, so a valid `reopened` event can reactivate it. Installation deletion
 or repository removal uses authorization suspension, which no PR event may clear.
+
+### Association and workflow publication order
+
+GitHub association publication is event-free and rollback-capable; workflow request and retarget
+events publish only after association commit and are never rolled back.
+
+```mermaid
+sequenceDiagram
+  participant GH as GitHub
+  participant A as Association transaction
+  participant S as Run store
+  participant O as Orchestrator
+
+  GH->>A: authenticated current PR identity/head
+  A->>S: save association/evidence mutation (no event)
+  alt association commit fails
+    A->>S: rollback association/evidence mutation
+  else association commit succeeds
+    A-->>O: committed exact association identity
+    O->>S: publish REVALIDATE_REQUESTED or REVALIDATION_RETARGETED
+    Note over O,S: published workflow history is immutable
+  end
+```
+
+If association commit or rollback reports an outcome-unknown failure, publication stops before a
+workflow event. After an association has committed, a request/retarget publication failure is
+retried against authoritative state; the committed association is not rolled back across an
+already-published event.
 
 ## Approval model
 

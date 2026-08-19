@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
@@ -263,19 +264,22 @@ test("run-record schema and migration accept exact recovery metadata", async (t)
   t.after(async () => rm(cwd, { recursive: true, force: true }));
   const store = new FileRunStore(cwd);
   const run = await store.create("schema", "recovery contracts", DEFAULT_CONFIG);
+  const sourceSha = randomBytes(20).toString("hex");
+  const originSha = randomBytes(20).toString("hex");
+  const requestedSha = randomBytes(20).toString("hex");
   run.workspaceBootstrap = {
     mode: "isolated-worktree",
-    sourceBaseSha: "a".repeat(40),
+    sourceBaseSha: sourceSha,
     sourceBranch: "main",
-    sourceTreeFingerprint: "b".repeat(64),
+    sourceTreeFingerprint: randomBytes(32).toString("hex"),
     remote: "https://github.com/owner/repo.git",
     plannedAt: "2026-08-18T12:00:00.000Z",
   };
   run.revalidation = {
     returnState: "PR_REVIEW",
     source: "github",
-    originHeadSha: "c".repeat(40),
-    requestedHeadSha: "d".repeat(40),
+    originHeadSha: originSha,
+    requestedHeadSha: requestedSha,
     generation: 2,
     requestedAt: "2026-08-18T12:01:00.000Z",
     updatedAt: "2026-08-18T12:02:00.000Z",
@@ -291,6 +295,9 @@ test("run-record schema and migration accept exact recovery metadata", async (t)
 
   assert.doesNotThrow(() => assertMatches(schema, schema, persisted, "run"));
   assert.doesNotThrow(() => migrateRunRecord(persisted));
+  assert.equal(persisted.workspaceBootstrap?.sourceBaseSha, sourceSha);
+  assert.equal(persisted.revalidation?.originHeadSha, originSha);
+  assert.equal(persisted.revalidation?.requestedHeadSha, requestedSha);
 
   const recovery = persisted as unknown as Record<string, unknown>;
   const revalidation = recovery.revalidation as Record<string, unknown>;
