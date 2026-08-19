@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -86,6 +86,19 @@ class EditingResolverRuntime extends MockRuntime {
       !request.prompt.includes("Role: PR comment scope classifier")
     ) {
       await writeFile(path.join(request.cwd, "resolver-change.txt"), "resolver delta\n", "utf8");
+    }
+    return super.execute(request);
+  }
+}
+
+class IgnoredInputBuilderRuntime extends MockRuntime {
+  override async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    if (request.role === "builder") {
+      const localInput = await readFile(
+        path.join(request.cwd, "node_modules", "local-tool", "input.txt"),
+        "utf8",
+      );
+      await writeFile(path.join(request.cwd, "builder-input.txt"), localInput, "utf8");
     }
     return super.execute(request);
   }
@@ -260,6 +273,39 @@ test("allowed dirty workspace changes are included in speculative builder public
   assert.equal(builderDelta, "builder delta\n");
   assert.equal(stagedBaseline, "# operator baseline\n");
   assert.equal(status, "");
+});
+
+test("speculative builder execution preserves ignored local inputs without publishing them", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-ignored-builder-input-");
+  await writeFile(path.join(cwd, ".gitignore"), "node_modules/\n", "utf8");
+  await execFileAsync("git", ["add", ".gitignore"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "ignore local builder inputs"], { cwd });
+  await mkdir(path.join(cwd, "node_modules", "local-tool"), { recursive: true });
+  await writeFile(
+    path.join(cwd, "node_modules", "local-tool", "input.txt"),
+    "trusted local input\n",
+    "utf8",
+  );
+  const config = testConfig((c) => {
+    c.gates.requireBrainstormApproval = false;
+    c.gates.requireDesignApproval = false;
+    c.quality.commands = [];
+  });
+
+  const run = await new Orchestrator(cwd, config, new IgnoredInputBuilderRuntime()).start(
+    "Ignored builder input",
+    "Use the trusted local input without publishing it.",
+  );
+  assert.equal(run.state, "PR_READY");
+  const publishedInput = await readFile(path.join(cwd, "builder-input.txt"), "utf8");
+  const { stdout: ignoredInCommit } = await execFileAsync(
+    "git",
+    ["ls-tree", "-r", "--name-only", "HEAD", "--", "node_modules"],
+    { cwd },
+  );
+
+  assert.equal(publishedInput, "trusted local input\n");
+  assert.equal(ignoredInCommit, "");
 });
 
 test("failed dirty builder publication restores the exact allowed baseline", async (t) => {

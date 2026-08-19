@@ -67,6 +67,7 @@ import {
 } from "./failure-diagnostics.ts";
 import path from "node:path";
 import os from "node:os";
+import { constants as fsConstants } from "node:fs";
 import {
   chmod,
   copyFile,
@@ -875,6 +876,31 @@ export class Orchestrator {
     return candidate;
   }
 
+  private async copySpeculativeWorkspacePath(
+    speculative: SpeculativeRoleWorktree,
+    relativePath: string,
+    kind: "untracked baseline" | "ignored local input",
+  ): Promise<void> {
+    const sourcePath = this.resolveSpeculativePath(
+      speculative.repositoryWorkdir,
+      relativePath,
+    );
+    const destinationPath = this.resolveSpeculativePath(
+      speculative.worktreePath,
+      relativePath,
+    );
+    const sourceStat = await lstat(sourcePath);
+    await mkdir(path.dirname(destinationPath), { recursive: true });
+    if (sourceStat.isSymbolicLink()) {
+      await symlink(await readlink(sourcePath), destinationPath);
+    } else if (sourceStat.isFile()) {
+      await copyFile(sourcePath, destinationPath, fsConstants.COPYFILE_FICLONE);
+      await chmod(destinationPath, sourceStat.mode & 0o777);
+    } else {
+      throw new Error(`Unsupported ${kind} path: ${relativePath}`);
+    }
+  }
+
   private async seedSpeculativeRoleWorktree(
     speculative: SpeculativeRoleWorktree,
     beforeSha: string,
@@ -916,24 +942,34 @@ export class Orchestrator {
       throw gitCommandFailure("Failed to enumerate untracked role baseline paths", untracked);
     }
     for (const relativePath of untracked.stdout.split("\0").filter(Boolean)) {
-      const sourcePath = this.resolveSpeculativePath(
-        speculative.repositoryWorkdir,
+      await this.copySpeculativeWorkspacePath(
+        speculative,
         relativePath,
+        "untracked baseline",
       );
-      const destinationPath = this.resolveSpeculativePath(
-        speculative.worktreePath,
+    }
+
+    const ignored = await gitRun(
+      [
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "-z",
+        "--",
+        ...MASWE_SOURCE_PATHSPEC,
+      ],
+      speculative.repositoryWorkdir,
+    );
+    if (ignored.exitCode !== 0) {
+      throw gitCommandFailure("Failed to enumerate ignored local role inputs", ignored);
+    }
+    for (const relativePath of ignored.stdout.split("\0").filter(Boolean)) {
+      await this.copySpeculativeWorkspacePath(
+        speculative,
         relativePath,
+        "ignored local input",
       );
-      const sourceStat = await lstat(sourcePath);
-      await mkdir(path.dirname(destinationPath), { recursive: true });
-      if (sourceStat.isSymbolicLink()) {
-        await symlink(await readlink(sourcePath), destinationPath);
-      } else if (sourceStat.isFile()) {
-        await copyFile(sourcePath, destinationPath);
-        await chmod(destinationPath, sourceStat.mode & 0o777);
-      } else {
-        throw new Error(`Unsupported untracked role baseline path: ${relativePath}`);
-      }
     }
 
     const staged = await gitRun(["add", "-A"], speculative.worktreePath);
