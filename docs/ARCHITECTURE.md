@@ -56,11 +56,35 @@ NVM is optional contributor tooling, not a product dependency. Adding another su
 
 The CLI contains no transition logic beyond selecting a public orchestrator operation.
 
+Its grammar is strict: it accepts only declared long options, rejects short or abbreviated
+options, duplicate options, the option terminator, empty string values, invalid command options,
+and extra operands. The global `--config` and `--cwd` options may appear before or after the
+command; command-specific options may likewise be interleaved with that command's operands. Both
+split (`--title "Title"`) and equals (`--title=Title`) forms are valid. A string value beginning
+with `-` must use equals form (for example, `--request=--literal`); split form would treat that
+value as another option.
+
 ### 3.2 Configuration loader
 
 `src/config.ts` supplies safe defaults, loads project JSON, applies environment overrides, validates essential values, and returns an immutable configuration snapshot for each run.
 
 The configuration snapshot prevents later project edits from silently changing an in-progress run.
+
+Role permissions are deterministic authority, not a prompt preference. Project configuration and
+persisted run snapshots must use this exact matrix:
+
+| Role | Required permission | Allowed per-execution narrowing |
+|---|---|---|
+| `brainstormer` | `read-only` | None |
+| `designer` | `read-only` | None |
+| `builder` | `workspace-write` | None |
+| `verifier` | `read-only` | None |
+| `prResolver` | `workspace-write` | `read-only` only for comment classification |
+
+Any other configured permission or execution override is rejected before runtime invocation.
+`quality.commands` is a list of trusted shell strings: `[]` is a valid empty list, while every
+present entry must be a non-empty, non-whitespace string. The list is never derived from model or
+review input.
 
 ### 3.3 Domain model
 
@@ -176,6 +200,14 @@ checks; a mismatch requires operator reconciliation.
 
 It does not contain Cursor SDK implementation details, shell output parsing, or persistence internals.
 
+The policy boundary is also owned here. The orchestrator applies the read-only workspace fence
+outside runtime adapters: it captures the workspace fingerprint and, in Git repositories, exact
+`HEAD` before every read-only invocation. It checks both again in a `finally` path after either a
+runtime return or a runtime throw. A changed exact `HEAD` is distinct from a changed fingerprint.
+Runtime-reported actual-model identity is compared with the requested model by the orchestrator;
+a mismatch is a policy failure, not an ordinary model attempt failure. Policy failures are
+re-thrown directly and never enter runtime fallback or all-attempt aggregation.
+
 ### 3.6 Run and artifact store
 
 `src/store.ts` persists each run below:
@@ -209,13 +241,23 @@ scan after its reload: an already-published queued target claim wins; a target c
 after that scan observes the completed publication. The journal is separate from the store journal
 so protected callbacks can take ordinary run data locks without recursive acquisition.
 
-Artifacts are SHA-256 hashed when written. A future store can place content in object storage and keep the same reference contract.
+Artifacts are SHA-256 hashed when written. A reference names exactly one direct child of
+`.maswe/runs/<run-id>/artifacts/`: no absolute paths, traversal, nested paths, or non-portable
+filenames are valid. Reads verify every namespace ancestor is an ordinary directory, open only an
+ordinary final file with no-follow support, bound the read to 1 MiB, recheck the namespace, and
+compare the content digest with the recorded SHA-256. This prevents accidental pathname escape and
+fails closed when no-follow support is unavailable. A future store can place content in object
+storage and keep the same reference contract.
 
 ### 3.7 Prompt builder
 
 `src/prompt-builder.ts` loads versioned templates from `prompts/`, injects the request and previously approved artifacts, and creates a self-contained stage prompt.
 
 Prompts are implementation assets, not the workflow source of truth. A prompt cannot authorize a transition or bypass policy.
+
+Template rendering is a single pass over declared uppercase placeholders. Values are inserted
+literally and are never rescanned, so placeholder-shaped request or artifact text remains data.
+An unknown placeholder fails deterministically before runtime invocation.
 
 ### 3.8 Runtime adapter interface
 
@@ -247,6 +289,15 @@ displays where supplied, exit/timeout/duration/transport fields where supplied, 
 and `truncated`. Model displays are single-line, delimiter-neutral, and capped at 256 code points;
 the actual configured model passed to the runtime is not rewritten.
 
+The following policy failures have durable codes and do not become fallback attempts:
+
+| Code | Meaning |
+|---|---|
+| `policy-role-permission-mismatch` | A persisted/configured role permission or execution override violates the fixed matrix. |
+| `policy-read-only-workspace-mutation` | A read-only invocation changed the protected workspace fingerprint. |
+| `policy-read-only-head-moved` | A read-only invocation changed or made unreadable the exact Git `HEAD`. |
+| `policy-runtime-identity-mismatch` | The runtime reported an actual model different from the requested model. |
+
 Successful runtime-backed transition events cross the same untrusted runtime-to-persistence
 boundary. `runtimeEventIdentityDetails()` creates display-only copies of `requestedModel` and
 `actualModel` with the model-display policy, and optional `agentId` and `runtimeRunId` with a
@@ -273,7 +324,11 @@ roles cannot mutate handoffs undetected. Workspace identity fields (`baseSha` / 
 `branch`) may still record `not-a-git-repository` for non-Git trees; that sentinel is separate
 from the fingerprint digest.
 
-Read-only runtimes compare the fingerprint before and after execution. Any difference fails the run. This is a mutation detector, not an operating-system sandbox. A future sandbox can prevent writes rather than merely detecting them.
+The orchestrator, rather than an adapter, compares the fingerprint before and after every
+read-only runtime call and performs the Git `HEAD` check when applicable. Its `finally` fence runs
+after both a normal runtime return and a thrown runtime error. Any fingerprint change or head move
+fails the run; neither is eligible for fallback aggregation. This is a mutation detector, not an
+operating-system sandbox. A future sandbox can prevent writes rather than merely detecting them.
 
 Bootstrap source-drift checks exclude the orchestrator-owned `.maswe` namespace; read-only role
 fingerprints continue to include authoritative `.maswe` state. The distinction prevents MASWE's
@@ -285,6 +340,11 @@ mutation from a read-only role.
 `src/quality.ts` runs trusted project commands sequentially with the system shell. It records exit code, stdout, stderr, and duration. It stops after the first failure. Timeouts use `src/process.ts`, which terminates the shell process tree (POSIX process group / Windows `taskkill /T`) and bounds Promise settlement even if a descendant held pipes open.
 
 Quality commands never come from model output, issue text, or PR comments.
+
+`policy.allowedPathGlobs` is portable and deterministic. MASWE normalizes both candidate paths
+and glob strings from `\\` to `/`; `*` and `?` match only within one path segment, `**` matches
+across segments, and `**/` matches zero or more complete segments. The special globs `**` and
+`**/*` allow every path. A changed path is allowed when at least one configured glob matches.
 
 GitHub check publication uses a hash-addressed per-PR journal, separate from the short global
 association transaction. Old-head cancellation intent is also persisted on the run as a bounded

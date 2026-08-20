@@ -38,9 +38,14 @@ Superpowers supplies the engineering practices inside each stage. MASWE supplies
 | Designer | Claude Fable 5; Opus 4.8 fallback | Read-only | PRD-quality specification, architecture, test and implementation plan |
 | Builder | Grok 4.5 | Workspace write | TDD-oriented implementation of the approved plan |
 | Verifier | GPT-5.6 Sol High | Read-only | Independent evidence-based verification |
-| PR resolver | GPT-5.6 Sol High | Scoped workspace write | Minimal resolution of in-scope review comments |
+| PR resolver | GPT-5.6 Sol High | Workspace write; read-only only while classifying | Minimal resolution of in-scope review comments |
 
-These defaults currently resolve through Cursor. Model identifiers in Cursor can change and may differ by plan. The starter config contains the intended defaults as initial slugs. Run `agent models` and `maswe doctor`, then adjust the exact values available to your account.
+These are enforced permissions, not model instructions: brainstormer, designer, and verifier must
+be read-only; builder and PR resolver must be workspace-write. The resolver alone may run
+read-only for comment classification. These defaults currently resolve through Cursor. Model
+identifiers in Cursor can change and may differ by plan. The starter config contains the intended
+defaults as initial slugs. Run `agent models` and `maswe doctor`, then adjust the exact values
+available to your account.
 
 ## Architecture at a glance
 
@@ -136,6 +141,17 @@ maswe start \
   --request-file docs/requests/organization-audit-trail.md
 ```
 
+The request input is exclusive: use exactly one of `--request-file <path>` or `--request <text>`.
+Equals form is also valid, including a dash-prefixed literal value:
+
+```bash
+maswe --cwd=/path/to/your-project start --title="Inspect option grammar" --request=--literal
+```
+
+Do not use split form for that last value (`--request --literal`), because the CLI reads it as an
+option. Global `--config` and `--cwd` may appear before or after the command; other options are
+strictly command-specific.
+
 The brainstormer runs and the workflow stops at the first approval gate. Inspect the generated artifact under `.maswe/runs/<run-id>/artifacts/`.
 
 ```bash
@@ -148,6 +164,8 @@ The second approval executes the builder, configured quality commands, and a fre
 ```bash
 maswe pr-opened <run-id>
 maswe review-comment <run-id> --text "Please add the missing expired-token case."
+# Or, exclusively:
+maswe review-comment <run-id> --file /path/to/comment.md
 # In-scope changes return to PR_REVIEW after CI and fresh verification.
 maswe merge-ready <run-id>
 maswe complete <run-id>
@@ -185,6 +203,12 @@ Do not configure Claude Code, Codex CLI, GitHub Copilot CLI, or OpenCode runtime
 
 Fallback models are attempted only when `policy.rejectModelFallback` is `false`. With the default fail-closed policy, a role runs only with its primary configured model and rejects a reported model mismatch.
 
+Fallback applies only to ordinary runtime attempt failures. A role-permission violation, read-only
+workspace/HEAD change, or reported model-identity mismatch is a policy failure and stops the run.
+`quality.commands: []` is valid for a deliberately empty quality pass; blank command entries are
+invalid. `policy.allowedPathGlobs` uses portable `/`-normalized matching (`*`/`?` stay in one
+segment, `**` crosses segments, and `**/` accepts zero or more segments).
+
 ## Safety and correctness guarantees
 
 The current implementation provides:
@@ -194,7 +218,10 @@ The current implementation provides:
 - Structured, hashed artifacts stored per run.
 - Deterministic project quality commands outside the model.
 - Independent verifier context and an exact `VERDICT: PASS|FAIL` contract.
-- Read-only workspace fingerprinting around brainstorm, design, classification, and verification stages.
+- Orchestrator-owned read-only workspace fingerprinting and exact-HEAD checks around brainstorm,
+  design, classification, and verification stages, including runtime throws.
+- Artifact reads confined to one direct child of the run artifact namespace, with ordinary/no-follow
+  bounded reads and SHA-256 revalidation.
 - Immutable per-run ticket journals with exact-target release and explicitly serialized recovery;
   no automatic age reclaim or recursive lock deletion.
 - Configurable retry ceilings for build/verify and review-resolution loops.

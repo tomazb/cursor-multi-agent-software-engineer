@@ -8,6 +8,15 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
 - The store records logical name, attempt number, repository-relative path, creation timestamp, and SHA-256 digest.
 - Retries write attempt-scoped immutable files (`*.attempt-<n>.md`) and keep a latest logical pointer by name.
 - Digests are recomputed and compared on every read; mismatches fail closed.
+- A stored reference names exactly one portable direct child of
+  `.maswe/runs/<run-id>/artifacts/`. Absolute paths, `.`/`..`, nested paths, separator tricks, and
+  non-portable physical filenames are rejected; historical `\\` separators are normalized to `/`
+  before validation.
+- Artifact reads require every namespace ancestor to be an ordinary directory, require an ordinary
+  final file opened with no-follow support, read at most 1 MiB, recheck the namespace after the
+  bounded read, then recompute and compare the recorded SHA-256 digest. Lack of no-follow support
+  fails closed. The trusted-local-user boundary does not claim to prevent every concurrent
+  same-user ancestor-replacement race between filesystem operations.
 - Agents must not rely on prior chat messages that are absent from the supplied prompt.
 - Model output cannot authorize a transition unless the orchestrator recognizes the required terminal marker after structured response decoding: exactly one bare marker token on the final logical line of the authoritative assistant text (no backticks, quotes, earlier mentions, duplicates, or conflicting markers).
 - For Cursor CLI `json` / `stream-json` modes, marker validation runs only on the decoded authoritative `result` string. Transport JSON quoting is not treated as embedded model content. Malformed envelopes, unsupported shapes, and missing `result` fields fail closed before marker validation.

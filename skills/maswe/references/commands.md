@@ -42,8 +42,16 @@ modes do not validate raw JSON envelope text as assistant content.
 
 ```bash
 maswe start --title "Title" --request-file path/to/request.md
+# Or, exclusively:
 maswe start --title "Title" --request "Request text"
+maswe --cwd=/path/to/project start --title="Literal request" --request=--literal
 ```
+
+`start` requires `--title` and exactly one request source: `--request-file` **or** `--request`.
+The final example uses equals form because a dash-prefixed string value must be attached to its
+option; `--request --literal` is invalid. Global `--config` and `--cwd` may be placed before or
+after the command. All options are long, declared, non-duplicated, and command-specific; short
+and abbreviated options, `--`, empty string values, and extra operands are rejected.
 
 ## Inspect
 
@@ -77,9 +85,12 @@ This is valid only for automatic states such as building, CI, verification, clas
 ```bash
 maswe pr-opened <run-id>
 maswe review-comment <run-id> --text "..."
+# Or, exclusively:
 maswe review-comment <run-id> --file /path/to/comment.md
 maswe resume-review <run-id>
 ```
+
+`review-comment` requires exactly one comment source: `--text` **or** `--file`.
 
 ## Finish, recover, or stop
 
