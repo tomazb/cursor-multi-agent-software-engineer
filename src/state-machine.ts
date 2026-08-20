@@ -1,4 +1,8 @@
-import type { WorkflowEventType, WorkflowState } from "./domain.ts";
+import type {
+  RevalidationReturnState,
+  WorkflowEventType,
+  WorkflowState,
+} from "./domain.ts";
 
 const TRANSITIONS: Partial<Record<WorkflowState, Partial<Record<WorkflowEventType, WorkflowState>>>> = {
   CREATED: { START: "BRAINSTORMING" },
@@ -6,30 +10,53 @@ const TRANSITIONS: Partial<Record<WorkflowState, Partial<Record<WorkflowEventTyp
   WAITING_FOR_BRAINSTORM_APPROVAL: { APPROVE_BRAINSTORM: "DESIGNING" },
   DESIGNING: { DESIGN_COMPLETED: "WAITING_FOR_DESIGN_APPROVAL" },
   WAITING_FOR_DESIGN_APPROVAL: { APPROVE_DESIGN: "BUILDING" },
-  BUILDING: { BUILD_COMPLETED: "CI_RUNNING" },
-  CI_RUNNING: { CI_PASSED: "VERIFYING", CI_FAILED: "BUILDING" },
+  BUILDING: {
+    BUILD_COMPLETED: "CI_RUNNING",
+    REVALIDATE_REQUESTED: "CI_RUNNING",
+    REVALIDATION_RETARGETED: "CI_RUNNING",
+  },
+  CI_RUNNING: {
+    CI_PASSED: "VERIFYING",
+    CI_FAILED: "BUILDING",
+    REVALIDATE_REQUESTED: "CI_RUNNING",
+    REVALIDATION_RETARGETED: "CI_RUNNING",
+  },
   VERIFYING: {
     VERIFY_PASSED: "PR_READY",
     VERIFY_PASSED_AFTER_REVIEW: "PR_REVIEW",
     VERIFY_FAILED: "BUILDING",
+    REVALIDATE_REQUESTED: "CI_RUNNING",
+    REVALIDATION_RETARGETED: "CI_RUNNING",
   },
-  PR_READY: { PR_OPENED: "PR_REVIEW", MARK_MERGE_READY: "MERGE_READY" },
+  PR_READY: {
+    PR_OPENED: "PR_REVIEW",
+    MARK_MERGE_READY: "MERGE_READY",
+    REVALIDATE_REQUESTED: "CI_RUNNING",
+  },
   PR_REVIEW: {
     REVIEW_COMMENT_RECEIVED: "CLASSIFYING_COMMENT",
     MARK_MERGE_READY: "MERGE_READY",
+    REVALIDATE_REQUESTED: "CI_RUNNING",
   },
   CLASSIFYING_COMMENT: {
     COMMENT_IN_SCOPE: "RESOLVING",
     COMMENT_OUT_OF_SCOPE: "WAITING_FOR_HUMAN",
   },
-  RESOLVING: { RESOLUTION_COMPLETED: "CI_RUNNING" },
+  RESOLVING: {
+    RESOLUTION_COMPLETED: "CI_RUNNING",
+    REVALIDATE_REQUESTED: "CI_RUNNING",
+  },
   WAITING_FOR_HUMAN: { HUMAN_RESUME: "PR_REVIEW" },
-  MERGE_READY: { COMPLETE: "COMPLETED" },
+  MERGE_READY: {
+    COMPLETE: "COMPLETED",
+    REVALIDATE_REQUESTED: "CI_RUNNING",
+  },
 };
 
 const TERMINAL_STATES: WorkflowState[] = ["COMPLETED", "FAILED", "CANCELLED"];
 
 const RESUMABLE_STATES: WorkflowState[] = [
+  "CREATED",
   "BRAINSTORMING",
   "WAITING_FOR_BRAINSTORM_APPROVAL",
   "DESIGNING",
@@ -45,29 +72,93 @@ const RESUMABLE_STATES: WorkflowState[] = [
   "MERGE_READY",
 ];
 
+export interface TransitionContext {
+  retryResumeState?: WorkflowState;
+  failureResumeState?: WorkflowState;
+  hasRevalidation?: boolean;
+  associatedHeadRecovery?: boolean;
+  revalidationReturnState?: RevalidationReturnState;
+}
+
+function hasAssociatedHeadRecoveryContext(context: TransitionContext): boolean {
+  return (
+    context.hasRevalidation === true &&
+    context.associatedHeadRecovery === true &&
+    (context.revalidationReturnState === "PR_READY" ||
+      context.revalidationReturnState === "PR_REVIEW")
+  );
+}
+
 export function transition(
   state: WorkflowState,
   event: WorkflowEventType,
-  resumeState?: WorkflowState,
+  context: TransitionContext = {},
 ): WorkflowState {
   if (event === "CANCEL" && !TERMINAL_STATES.includes(state)) return "CANCELLED";
   if (event === "FAIL" && !TERMINAL_STATES.includes(state)) return "FAILED";
   if (event === "RETRY_FROM_FAILED") {
     if (state !== "FAILED") throw new Error(`Event RETRY_FROM_FAILED is not allowed from state ${state}`);
-    if (!resumeState || !RESUMABLE_STATES.includes(resumeState)) {
+    if (
+      !context.retryResumeState ||
+      !RESUMABLE_STATES.includes(context.retryResumeState)
+    ) {
       throw new Error("RETRY_FROM_FAILED requires a resumable resumeState");
     }
-    return resumeState;
+    return context.retryResumeState;
+  }
+  if (event === "REVALIDATION_RETARGETED" && !context.hasRevalidation) {
+    throw new Error("REVALIDATION_RETARGETED requires active revalidation");
+  }
+  if (event === "REVALIDATION_RETARGETED" && state === "FAILED") {
+    if (
+      !context.hasRevalidation ||
+      !context.failureResumeState ||
+      !["BUILDING", "CI_RUNNING", "VERIFYING"].includes(context.failureResumeState)
+    ) {
+      throw new Error(
+        "REVALIDATION_RETARGETED requires active revalidation and a legal failure resume state",
+      );
+    }
+    return "FAILED";
+  }
+  if (
+    event === "REVALIDATE_REQUESTED" &&
+    state !== "PR_READY" &&
+    state !== "PR_REVIEW" &&
+    !hasAssociatedHeadRecoveryContext(context)
+  ) {
+    throw new Error(
+      "REVALIDATE_REQUESTED outside a PR gate requires associated GitHub head recovery context",
+    );
   }
   const next = TRANSITIONS[state]?.[event];
   if (!next) throw new Error(`Event ${event} is not allowed from state ${state}`);
   return next;
 }
 
-export function allowedEvents(state: WorkflowState): WorkflowEventType[] {
-  if (state === "FAILED") return ["RETRY_FROM_FAILED"];
+export function allowedEvents(
+  state: WorkflowState,
+  context: TransitionContext = {},
+): WorkflowEventType[] {
+  if (state === "FAILED") {
+    const failedEvents: WorkflowEventType[] = ["RETRY_FROM_FAILED"];
+    if (
+      context.hasRevalidation &&
+      ["BUILDING", "CI_RUNNING", "VERIFYING"].includes(context.failureResumeState ?? "")
+    ) {
+      failedEvents.push("REVALIDATION_RETARGETED");
+    }
+    return failedEvents;
+  }
   if (TERMINAL_STATES.includes(state)) return [];
-  const events = Object.keys(TRANSITIONS[state] ?? {}) as WorkflowEventType[];
+  const events = (Object.keys(TRANSITIONS[state] ?? {}) as WorkflowEventType[]).filter(
+    (event) =>
+      (event !== "REVALIDATION_RETARGETED" || context.hasRevalidation === true) &&
+      (event !== "REVALIDATE_REQUESTED" ||
+        state === "PR_READY" ||
+        state === "PR_REVIEW" ||
+        hasAssociatedHeadRecoveryContext(context)),
+  );
   return [...events, "FAIL", "CANCEL"];
 }
 

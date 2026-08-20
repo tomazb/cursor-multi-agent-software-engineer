@@ -13,6 +13,7 @@ import type {
   ArtifactReference,
   MasweConfig,
   RunRecord,
+  WorkspaceBootstrapIntent,
   WorkflowEventType,
   WorkflowState,
 } from "./domain.ts";
@@ -84,7 +85,12 @@ async function readLockMeta(lockPath: string): Promise<LockMeta | undefined> {
 }
 
 export interface RunStore {
-  create(title: string, request: string, config: MasweConfig): Promise<RunRecord>;
+  create(
+    title: string,
+    request: string,
+    config: MasweConfig,
+    options?: CreateRunOptions,
+  ): Promise<RunRecord>;
   save(run: RunRecord): Promise<void>;
   load(runId: string): Promise<RunRecord>;
   list(): Promise<RunRecord[]>;
@@ -96,6 +102,11 @@ export interface RunStore {
   ): Promise<RunRecord>;
   writeArtifact(run: RunRecord, name: string, content: string): Promise<ArtifactReference>;
   readArtifact(run: RunRecord, name: string): Promise<string | undefined>;
+}
+
+export interface CreateRunOptions {
+  workspaceBootstrap?: WorkspaceBootstrapIntent;
+  supersedes?: string;
 }
 
 function sanitizePersistedFailureMessage(message: string): string {
@@ -198,6 +209,8 @@ const RUN_RECORD_FIELDS = new Set([
   "artifacts",
   "events",
   "workspace",
+  "workspaceBootstrap",
+  "revalidation",
   "evidence",
   "github",
   "supersedes",
@@ -735,7 +748,12 @@ export class FileRunStore implements RunStore {
     return result as T;
   }
 
-  async create(title: string, request: string, config: MasweConfig): Promise<RunRecord> {
+  async create(
+    title: string,
+    request: string,
+    config: MasweConfig,
+    options: CreateRunOptions = {},
+  ): Promise<RunRecord> {
     const createdAt = now();
     const run: RunRecord = {
       schemaVersion: 1,
@@ -752,6 +770,10 @@ export class FileRunStore implements RunStore {
       config: structuredClone(config),
       artifacts: [],
       events: [],
+      ...(options.workspaceBootstrap !== undefined
+        ? { workspaceBootstrap: structuredClone(options.workspaceBootstrap) }
+        : {}),
+      ...(options.supersedes !== undefined ? { supersedes: options.supersedes } : {}),
     };
     await this.withLock(run.id, async () => {
       const prepared = this.prepareRunRecord(run);
@@ -805,11 +827,33 @@ export class FileRunStore implements RunStore {
   ): Promise<RunRecord> {
     const from = run.state;
     const safeDetails = sanitizeEventDetails(type, details);
-    const to = transition(
-      from,
-      type,
-      safeDetails?.resumeState as WorkflowState | undefined,
-    );
+    const requestedHeadSha = run.revalidation?.requestedHeadSha;
+    const evidenceBindings = Object.values(run.evidence ?? {});
+    const sameTargetEvidenceRecovery =
+      run.revalidation?.originHeadSha === requestedHeadSha &&
+      (from === "PR_READY" || from === "PR_REVIEW" || from === "MERGE_READY") &&
+      (run.evidence?.quality?.headSha !== requestedHeadSha ||
+        run.evidence?.verification?.headSha !== requestedHeadSha);
+    const associatedHeadRecovery =
+      run.github !== undefined &&
+      run.revalidation?.source === "github" &&
+      run.github.headSha === requestedHeadSha &&
+      (sameTargetEvidenceRecovery ||
+        (run.revalidation.originHeadSha !== requestedHeadSha &&
+          evidenceBindings.every((binding) => binding?.headSha === requestedHeadSha)));
+    const to = transition(from, type, {
+      ...(safeDetails?.resumeState !== undefined
+        ? { retryResumeState: safeDetails.resumeState as WorkflowState }
+        : {}),
+      ...(run.failure?.resumeState !== undefined
+        ? { failureResumeState: run.failure.resumeState }
+        : {}),
+      hasRevalidation: run.revalidation !== undefined,
+      associatedHeadRecovery,
+      ...(run.revalidation?.returnState !== undefined
+        ? { revalidationReturnState: run.revalidation.returnState }
+        : {}),
+    });
     run.state = to;
     run.events.push({
       id: randomUUID(),

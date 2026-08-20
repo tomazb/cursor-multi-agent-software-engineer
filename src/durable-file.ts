@@ -29,6 +29,29 @@ export class DurableAtomicWriteOutcomeUnknownError extends Error {
   }
 }
 
+/** Find an indeterminate durable publication through nested/cyclic error wrappers. */
+export function containsDurableAtomicWriteOutcomeUnknown(error: unknown): boolean {
+  const pending: unknown[] = [error];
+  const visited = new Set<object>();
+  while (pending.length > 0) {
+    const candidate = pending.pop();
+    if (candidate instanceof DurableAtomicWriteOutcomeUnknownError) return true;
+    if (
+      (typeof candidate !== "object" || candidate === null) &&
+      typeof candidate !== "function"
+    ) {
+      continue;
+    }
+    if (visited.has(candidate)) continue;
+    visited.add(candidate);
+    if (candidate instanceof AggregateError) pending.push(...candidate.errors);
+    if (candidate instanceof Error && candidate.cause !== undefined) {
+      pending.push(candidate.cause);
+    }
+  }
+  return false;
+}
+
 export interface DurableFileOptions {
   syncFile?: (handle: FileHandle, filePath: string) => Promise<void>;
   syncDirectory?: (directoryPath: string) => Promise<void>;

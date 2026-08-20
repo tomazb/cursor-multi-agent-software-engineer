@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
+import { appendFile, lstat, mkdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { RunRecord, RunWorkspace } from "./domain.ts";
@@ -55,6 +55,150 @@ export function externalWorktreePath(repositoryPath: string, runId: string): str
   assertSafeRunId(runId);
   const repoKey = createHash("sha256").update(path.resolve(repositoryPath)).digest("hex").slice(0, 16);
   return path.join(os.tmpdir(), "maswe-worktrees", repoKey, runId);
+}
+
+export interface GitWorktreeRegistration {
+  worktreePath: string;
+  headSha: string;
+  branch?: string;
+  prunable: boolean;
+}
+
+/** Parse Git's NUL-delimited porcelain format without consulting diagnostic prose. */
+export function parseGitWorktreeRegistrationsPorcelain(
+  output: string,
+): GitWorktreeRegistration[] {
+  if (!output.endsWith("\0\0")) {
+    throw new Error("Malformed Git worktree registration output: missing record terminator");
+  }
+
+  const registrations: GitWorktreeRegistration[] = [];
+  const paths = new Set<string>();
+  const branches = new Set<string>();
+  let bareSeen = false;
+  for (const rawRecord of output.slice(0, -2).split("\0\0")) {
+    const fields = rawRecord.split("\0");
+    const worktreeField = fields.shift();
+    const headField = fields.shift();
+    if (!worktreeField?.startsWith("worktree ")) {
+      throw new Error("Malformed Git worktree registration: worktree must come first");
+    }
+    const rawPath = worktreeField.slice("worktree ".length);
+    if (!path.isAbsolute(rawPath)) {
+      throw new Error("Malformed Git worktree registration path");
+    }
+    const worktreePath = path.resolve(rawPath);
+    if (paths.has(worktreePath)) {
+      throw new Error(`Conflicting Git worktree registrations for path ${worktreePath}`);
+    }
+    paths.add(worktreePath);
+    if (headField === "bare") {
+      if (bareSeen || fields.length !== 0) {
+        throw new Error("Malformed bare Git worktree registration");
+      }
+      bareSeen = true;
+      continue;
+    }
+    if (!headField?.startsWith("HEAD ")) {
+      throw new Error("Malformed Git worktree registration: HEAD must follow worktree");
+    }
+    const headSha = headField.slice("HEAD ".length).toLowerCase();
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(headSha)) {
+      throw new Error("Malformed Git worktree registration HEAD");
+    }
+
+    let branch: string | undefined;
+    let detached = false;
+    let locked = false;
+    let prunable = false;
+    for (const field of fields) {
+      if (field === "detached") {
+        if (detached) {
+          throw new Error("Malformed Git worktree registration: duplicate detached field");
+        }
+        detached = true;
+        continue;
+      }
+      if (field === "locked" || field.startsWith("locked ")) {
+        if (locked) {
+          throw new Error("Malformed Git worktree registration: duplicate locked field");
+        }
+        locked = true;
+        continue;
+      }
+      if (field === "prunable" || field.startsWith("prunable ")) {
+        if (prunable) throw new Error("Malformed Git worktree registration: duplicate prunable field");
+        prunable = true;
+        continue;
+      }
+      if (field.startsWith("branch ")) {
+        if (branch !== undefined) {
+          throw new Error("Malformed Git worktree registration: duplicate branch field");
+        }
+        const fullRef = field.slice("branch ".length);
+        if (!fullRef.startsWith("refs/heads/") || fullRef.length === "refs/heads/".length) {
+          throw new Error("Malformed Git worktree registration branch ref");
+        }
+        branch = fullRef.slice("refs/heads/".length);
+        continue;
+      }
+      throw new Error(`Malformed Git worktree registration field: ${field}`);
+    }
+
+    if ((branch !== undefined) === detached) {
+      throw new Error(
+        "Malformed Git worktree registration: exactly one branch or detached marker is required",
+      );
+    }
+
+    if (branch && branches.has(branch)) {
+      throw new Error(`Conflicting Git worktree registrations for branch ${branch}`);
+    }
+    if (branch) branches.add(branch);
+    registrations.push({ worktreePath, headSha, ...(branch ? { branch } : {}), prunable });
+  }
+  return registrations;
+}
+
+export async function listGitWorktreeRegistrations(
+  repositoryPath: string,
+): Promise<GitWorktreeRegistration[]> {
+  const result = await gitExec(
+    "git",
+    ["worktree", "list", "--porcelain", "-z"],
+    repositoryPath,
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(`Failed to inspect Git worktree registrations: ${result.stderr || result.stdout}`);
+  }
+  return parseGitWorktreeRegistrationsPorcelain(result.stdout);
+}
+
+export async function gitLocalBranchHead(
+  repositoryPath: string,
+  branch: string,
+): Promise<string | undefined> {
+  const result = await gitExec(
+    "git",
+    ["rev-parse", "--verify", `refs/heads/${branch}`],
+    repositoryPath,
+  );
+  if (result.exitCode !== 0) return undefined;
+  const headSha = result.stdout.trim().toLowerCase();
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(headSha)) {
+    throw new Error(`Git returned a malformed HEAD for branch ${branch}`);
+  }
+  return headSha;
+}
+
+export async function pathExists(candidatePath: string): Promise<boolean> {
+  try {
+    await lstat(candidatePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 export async function ensureMasweGitExclude(repositoryPath: string): Promise<void> {
@@ -234,14 +378,31 @@ export async function ensureRunWorkspace(
 export async function createDeterministicCommit(
   cwd: string,
   message: string,
-  options: { allowedPathGlobs: string[] },
+  options: { allowedPathGlobs: string[]; expectedParentSha: string },
 ): Promise<{ headSha: string; files: string[] }> {
+  const branch = await gitCurrentBranch(cwd);
+  if (branch === "HEAD") {
+    throw new Error("Deterministic commit requires an attached branch; workspace HEAD is detached");
+  }
+  const initialHeadSha = await gitRevParse(cwd, "HEAD");
+  if (initialHeadSha !== options.expectedParentSha) {
+    throw new Error(
+      `Deterministic commit expected parent ${options.expectedParentSha}, but HEAD moved to ${initialHeadSha}`,
+    );
+  }
   await assertWorkingTreeScope(cwd, options.allowedPathGlobs);
 
   const status = await gitExec("git", ["status", "--porcelain=v1", "--untracked-files=all"], cwd);
   if (status.exitCode !== 0) throw new Error(`git status failed: ${status.stderr}`);
   if (!status.stdout.trim()) {
-    return { headSha: await gitRevParse(cwd, "HEAD"), files: [] };
+    const currentBranch = await gitCurrentBranch(cwd);
+    const currentHeadSha = await gitRevParse(cwd, "HEAD");
+    if (currentBranch !== branch || currentHeadSha !== options.expectedParentSha) {
+      throw new Error(
+        `Deterministic commit input moved: expected ${branch}@${options.expectedParentSha}, found ${currentBranch}@${currentHeadSha}`,
+      );
+    }
+    return { headSha: options.expectedParentSha, files: [] };
   }
 
   const add = await gitExec("git", ["add", "-A"], cwd);
@@ -254,20 +415,59 @@ export async function createDeterministicCommit(
     .filter(Boolean);
   const disallowed = files.filter((file) => !pathAllowed(file, options.allowedPathGlobs));
   if (disallowed.length > 0) {
-    await gitExec("git", ["reset", "HEAD"], cwd);
     throw new Error(`Change-scope violation: ${disallowed.join(", ")}`);
   }
 
-  const commit = await gitExec("git", ["-c", "core.hooksPath=/dev/null", "commit", "-m", message], cwd);
+  const tree = await gitExec("git", ["write-tree"], cwd);
+  if (tree.exitCode !== 0) {
+    throw new Error(`git write-tree failed: ${tree.stderr || tree.stdout}`);
+  }
+  const currentBranch = await gitCurrentBranch(cwd);
+  const currentHeadSha = await gitRevParse(cwd, "HEAD");
+  if (currentBranch !== branch || currentHeadSha !== options.expectedParentSha) {
+    throw new Error(
+      `Deterministic commit input moved: expected ${branch}@${options.expectedParentSha}, found ${currentBranch}@${currentHeadSha}`,
+    );
+  }
+
+  const commit = await gitExec(
+    "git",
+    ["commit-tree", tree.stdout.trim(), "-p", options.expectedParentSha, "-m", message],
+    cwd,
+  );
   if (commit.exitCode !== 0) {
-    throw new Error(`git commit failed: ${commit.stderr || commit.stdout}`);
+    throw new Error(`git commit-tree failed: ${commit.stderr || commit.stdout}`);
+  }
+  const commitSha = commit.stdout.trim().toLowerCase();
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commitSha)) {
+    throw new Error("git commit-tree returned a malformed commit object name");
+  }
+  const publishedParentSha = await gitRevParse(cwd, `${commitSha}^`);
+  if (publishedParentSha !== options.expectedParentSha) {
+    throw new Error(
+      `Deterministic commit parent ${publishedParentSha} does not match expected input ${options.expectedParentSha}`,
+    );
+  }
+
+  const update = await gitExec(
+    "git",
+    ["update-ref", `refs/heads/${branch}`, commitSha, options.expectedParentSha],
+    cwd,
+  );
+  if (update.exitCode !== 0) {
+    throw new Error(
+      `Deterministic commit publication lost its expected-old-SHA fence: ${update.stderr || update.stdout}`,
+    );
+  }
+  if ((await gitCurrentBranch(cwd)) !== branch || (await gitRevParse(cwd, "HEAD")) !== commitSha) {
+    throw new Error("Deterministic commit publication did not retain the expected branch and HEAD");
   }
 
   if (!(await isGitWorkspaceClean(cwd))) {
     throw new Error("worktree remained dirty after deterministic commit");
   }
 
-  return { headSha: await gitRevParse(cwd, "HEAD"), files };
+  return { headSha: commitSha, files };
 }
 
 export async function assertChangeScope(
@@ -393,5 +593,11 @@ export async function restoreRunWorkspace(
 }
 
 export function workingDirectoryFor(run: RunRecord): string {
-  return run.workspace?.worktreePath ?? run.repositoryPath;
+  if (run.config.policy.useIsolatedWorktree) {
+    if (!run.workspace?.worktreePath) {
+      throw new Error(`Run ${run.id} requires an established MASWE-managed worktree`);
+    }
+    return run.workspace.worktreePath;
+  }
+  return run.repositoryPath;
 }

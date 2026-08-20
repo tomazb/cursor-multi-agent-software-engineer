@@ -1,6 +1,6 @@
 import path from "node:path";
 import {
-  DurableAtomicWriteOutcomeUnknownError,
+  containsDurableAtomicWriteOutcomeUnknown,
   MAX_AUTHORITATIVE_FILE_BYTES,
   readBoundedOrdinaryFile,
   requireOrdinaryDirectory,
@@ -115,6 +115,7 @@ export interface GitHubAssociationTransaction {
     pullRequestNumber: number,
     reason: "pull-request-closed" | "authorization-revoked",
   ): AssociationRecord | undefined;
+  /** Compensate only a known transaction failure; callbacks run in reverse registration order. */
   onRollback(callback: () => Promise<void>): void;
 }
 
@@ -240,15 +241,15 @@ export class GitHubAssociationIndex {
         if (dirty) await this.writeAll(records);
         return result;
       } catch (error) {
-        if (error instanceof DurableAtomicWriteOutcomeUnknownError) {
+        if (containsDurableAtomicWriteOutcomeUnknown(error)) {
           // Rename already published the exact intended index. Retrying is required because the
           // parent sync failed, but rolling back the run would create known cross-file divergence.
           throw error;
         }
         const rollbackErrors: unknown[] = [];
-        for (const rollback of rollbacks.reverse()) {
+        for (let index = rollbacks.length - 1; index >= 0; index -= 1) {
           try {
-            await rollback();
+            await rollbacks[index]!();
           } catch (rollbackError) {
             rollbackErrors.push(rollbackError);
           }
@@ -293,6 +294,26 @@ export class GitHubAssociationIndex {
       .sort(
         (left, right) =>
           left.pullRequestNumber - right.pullRequestNumber || left.runId.localeCompare(right.runId),
+      );
+  }
+
+  async findAllByInstallation(
+    installationId: number,
+    repository?: string,
+  ): Promise<AssociationRecord[]> {
+    const records = await this.readAll();
+    return Object.values(records)
+      .filter(
+        (record) =>
+          record.installationId === installationId &&
+          (repository === undefined || record.repository === repository),
+      )
+      .map((record) => ({ ...record }))
+      .sort(
+        (left, right) =>
+          left.repository.localeCompare(right.repository) ||
+          left.pullRequestNumber - right.pullRequestNumber ||
+          left.runId.localeCompare(right.runId),
       );
   }
 

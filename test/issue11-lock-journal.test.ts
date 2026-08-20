@@ -1015,6 +1015,33 @@ test("ambiguous EEXIST after exact claim link reconciles as published", async ()
   );
 });
 
+test("claim-publication compensation uses the injected link mechanism for release", async () => {
+  const runDirectory = await freshRunDirectory("maswe-journal-compensating-link-");
+  const linkedTargets: string[] = [];
+
+  await assert.rejects(
+    publishLockClaim(runDirectory, "data", "store-write", {
+      linkFile: async (existingPath, newPath) => {
+        linkedTargets.push(newPath.toString());
+        await hardLink(existingPath, newPath);
+      },
+      transition: async (event) => {
+        if (event === "CLAIM_VALIDATED") {
+          throw new Error("simulated failure after exact claim publication");
+        }
+      },
+    }),
+    /failure after exact claim publication/,
+  );
+
+  assert.equal(linkedTargets.length, 2);
+  assert.match(linkedTargets[0]!, /\/claims\//);
+  assert.match(linkedTargets[1]!, /\/releases\//);
+  const scan = await scanLockJournal(runDirectory, "data");
+  assert.equal(scan.claims.length, 1);
+  assert.equal(scan.releases.has(scan.claims[0]!.ticket), true);
+});
+
 test("two claimants may propose one ticket but publish contiguous unique claims", async () => {
   const runDirectory = await freshRunDirectory("maswe-journal-allocate-");
   const proposed = barrier(2);

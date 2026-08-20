@@ -29,8 +29,104 @@ test("post-review verification returns to the existing PR review state", () => {
 });
 
 test("retry-from-failed resumes into the provided resumeState", () => {
-  assert.equal(transition("FAILED", "RETRY_FROM_FAILED", "BUILDING"), "BUILDING");
-  assert.throws(() => transition("PR_READY", "RETRY_FROM_FAILED", "BUILDING"), /not allowed/);
+  assert.equal(
+    transition("FAILED", "RETRY_FROM_FAILED", { retryResumeState: "BUILDING" }),
+    "BUILDING",
+  );
+  assert.throws(
+    () => transition("PR_READY", "RETRY_FROM_FAILED", { retryResumeState: "BUILDING" }),
+    /not allowed/,
+  );
   assert.throws(() => transition("FAILED", "RETRY_FROM_FAILED"), /resumeState/);
   assert.deepEqual(allowedEvents("FAILED"), ["RETRY_FROM_FAILED"]);
+});
+
+test("revalidation transitions are centralized", () => {
+  assert.equal(transition("PR_READY", "REVALIDATE_REQUESTED", {}), "CI_RUNNING");
+  assert.equal(transition("PR_REVIEW", "REVALIDATE_REQUESTED", {}), "CI_RUNNING");
+  for (const state of ["CI_RUNNING", "BUILDING", "VERIFYING"] as const) {
+    assert.equal(
+      transition(state, "REVALIDATION_RETARGETED", { hasRevalidation: true }),
+      "CI_RUNNING",
+    );
+  }
+});
+
+test("associated-head recovery requests are context-fenced outside PR gates", () => {
+  for (const state of ["BUILDING", "CI_RUNNING", "VERIFYING", "RESOLVING"] as const) {
+    for (const returnState of ["PR_READY", "PR_REVIEW"] as const) {
+      assert.equal(
+        transition(state, "REVALIDATE_REQUESTED", {
+          hasRevalidation: true,
+          associatedHeadRecovery: true,
+          revalidationReturnState: returnState,
+        }),
+        "CI_RUNNING",
+      );
+    }
+    assert.throws(
+      () => transition(state, "REVALIDATE_REQUESTED", {}),
+      /associated.*head.*recovery|revalidation.*context/i,
+    );
+    assert.equal(allowedEvents(state).includes("REVALIDATE_REQUESTED"), false);
+  }
+
+  for (const returnState of ["PR_READY", "PR_REVIEW"] as const) {
+    assert.equal(
+      transition("MERGE_READY", "REVALIDATE_REQUESTED", {
+        hasRevalidation: true,
+        associatedHeadRecovery: true,
+        revalidationReturnState: returnState,
+      }),
+      "CI_RUNNING",
+    );
+  }
+  assert.throws(
+    () => transition("MERGE_READY", "REVALIDATE_REQUESTED", {}),
+    /associated.*head.*recovery|revalidation.*context/i,
+  );
+  assert.equal(allowedEvents("MERGE_READY").includes("REVALIDATE_REQUESTED"), false);
+});
+
+test("retarget requires active revalidation in every active state", () => {
+  for (const state of ["BUILDING", "CI_RUNNING", "VERIFYING"] as const) {
+    assert.throws(
+      () => transition(state, "REVALIDATION_RETARGETED", {}),
+      /active revalidation/i,
+    );
+    assert.equal(allowedEvents(state).includes("REVALIDATION_RETARGETED"), false);
+    assert.equal(
+      allowedEvents(state, { hasRevalidation: true }).includes("REVALIDATION_RETARGETED"),
+      true,
+    );
+  }
+});
+
+test("failed retarget requires active revalidation and a legal resume state", () => {
+  assert.equal(
+    transition("FAILED", "REVALIDATION_RETARGETED", {
+      hasRevalidation: true,
+      failureResumeState: "VERIFYING",
+    }),
+    "FAILED",
+  );
+  assert.throws(
+    () => transition("FAILED", "REVALIDATION_RETARGETED", {}),
+    /active revalidation|resume state/i,
+  );
+  assert.equal(allowedEvents("FAILED").includes("REVALIDATION_RETARGETED"), false);
+  assert.deepEqual(
+    allowedEvents("FAILED", {
+      hasRevalidation: true,
+      failureResumeState: "VERIFYING",
+    }),
+    ["RETRY_FROM_FAILED", "REVALIDATION_RETARGETED"],
+  );
+});
+
+test("CREATED is retry-resumable", () => {
+  assert.equal(
+    transition("FAILED", "RETRY_FROM_FAILED", { retryResumeState: "CREATED" }),
+    "CREATED",
+  );
 });

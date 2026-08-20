@@ -328,6 +328,14 @@ pre-upgrade backup can strand accepted work. Stop traffic and roll forward with 
 tree. Archive the whole tree only after permanent endpoint disablement and webhook-secret
 rotation/revocation.
 
+GitHub association publication is event-free and rollback-capable; workflow request and retarget
+events publish only after association commit and are never rolled back. If association processing
+fails, inspect the authoritative run and association index before redelivery: no request/retarget
+event means the association transaction did not durably reach workflow publication. Redeliver the
+authenticated webhook or retry normal publication; do not hand-edit the association, evidence, or
+event history. If the workflow event is present, treat it as immutable and recover forward from
+the recorded generation.
+
 ## 4. Configure quality commands
 
 Replace starter commands with commands that are authoritative for the target repository, for example:
@@ -351,6 +359,11 @@ Commands execute with the system shell and are trusted code. Only repository adm
 
 By default `policy.useIsolatedWorktree` is `true`. On `start`, MASWE creates branch `maswe/<run-id>` and a linked worktree under an **external** directory (`$TMPDIR/maswe-worktrees/...`), not inside the operator checkout. `.maswe/` is appended via `git rev-parse --git-path info/exclude` so local run storage does not dirty `git status` even when the operator is already inside a linked worktree. Builder and resolver roles execute in that worktree. With `policy.trustManagedWorktrees` (default `true`), Cursor CLI invocations pass `--trust` for every role in MASWE-created worktrees. Completed, cancelled, failed, and superseded runs remove their worktrees but **preserve** the `maswe/<run-id>` branch ref so failed-run provenance (builder `outputHeadSha`) can be restored on `retry`. Cleanup failures are surfaced to the operator.
 
+Every production-created run, including a superseding replacement, persists workspace bootstrap
+intent before branch or worktree side effects and durably checkpoints the established workspace
+before `START`. Bootstrap source-drift checks exclude the orchestrator-owned `.maswe` namespace;
+read-only role fingerprints continue to include authoritative `.maswe` state.
+
 To opt out for a trusted checkout:
 
 ```json
@@ -361,7 +374,10 @@ To opt out for a trusted checkout:
 }
 ```
 
-Keep the primary workspace clean. Dirty checkouts are rejected unless `policy.allowDirtyWorkspace` is true.
+Keep the primary workspace clean. Dirty checkouts are rejected unless
+`policy.allowDirtyWorkspace` is true. The shared production run-creation boundary applies this
+check to both `start` and `supersede` before bootstrap intent, replacement creation, Git metadata
+changes, or mutation of the original run.
 
 ## 6. Run lifecycle
 
@@ -437,6 +453,21 @@ maswe complete <run-id>
 
 These commands record workflow status only; they do not merge a PR.
 
+Both commands re-read authoritative run state and apply the same exact current-head gate. The run
+must have no active revalidation, a known recorded head, the exact recorded branch in a clean
+MASWE-managed isolated worktree, matching workspace/GitHub heads when associated, and current
+passing quality and verification evidence. These final requirements are unconditional even when
+`gates.requireCiPass` or `gates.requireVerifierPass` allowed a failed result to remain nonblocking
+before `PR_READY`. `complete` additionally requires current passing merge-ready evidence.
+Rejection does not alter state, events, or evidence, and historical passing events do not
+substitute for current evidence.
+
+Immediately before each builder, resolver, quality, verifier, merge-ready, or completion result is
+published, MASWE rechecks the branch, clean-worktree status, and exact expected head inside the
+durable per-run publication fence. A deterministic commit advances its branch only when the ref
+still has the exact expected parent. If an operator or another process moved the ref, MASWE does
+not reset, clean, force-update, rebase, or discard that work.
+
 ## 7. Recovery
 
 ### Unsupported Node runtime
@@ -455,6 +486,17 @@ maswe run <run-id>
 ```
 
 `maswe run` works only for actionable automatic states. Approval and review states require their specific commands.
+
+For a bootstrap failure whose `failure.resumeState` is `CREATED`, inspect `workspaceBootstrap` and
+`workspace` in `run.json` before running `maswe retry <run-id>`. Intent without a workspace means
+reconciliation had not checkpointed the side effect; intent plus a workspace means the
+branch/worktree checkpoint was durable but `START` was not. Retry reconciles the exact
+planned/current facts and publishes the single `START`. An embedding integration recovering a raw
+`CREATED` record after abrupt process termination must invoke the public
+`Orchestrator.bootstrapCreatedRun(runId)` operation before `runUntilBlocked`; the CLI has no
+separate raw-bootstrap recovery command. Do not delete or recreate the recorded branch/worktree to
+make recovery pass. A source branch/tree change outside `.maswe` is real drift and must be resolved
+explicitly; `.maswe` orchestration state is excluded only from this bootstrap drift comparison.
 
 ### Runtime failure
 
@@ -509,9 +551,33 @@ CI failure returns to `BUILDING`. The builder sees the latest quality artifact o
 
 A failed verifier returns to `BUILDING`. The next builder prompt includes the latest deterministic quality and independent verification reports so defects can be addressed directly.
 
+### Current-head revalidation
+
+A newer authenticated or local head retargets an active or recoverable failed revalidation
+generation. Evidence from a superseded generation is unusable. Inspect `revalidation.source`,
+`requestedHeadSha`, `generation`, and `returnState` in `run.json`; human status shows the same target
+as a shortened SHA. Align the recorded managed branch/worktree to the requested head, keep it
+clean, then run `maswe run <run-id>` for an active generation or `maswe retry <run-id>` for a
+recoverable failed generation. MASWE restarts at deterministic quality and fresh verification and
+returns only to the recorded gate. Never copy earlier quality, verification, or merge-ready
+evidence into the new generation, and never delete historical request/retarget/failure events.
+If an associated head moves after review while the run is in `BUILDING`, `CI_RUNNING`,
+`VERIFYING`, or `MERGE_READY` with no active generation, a delivery retry or manual check rerun
+creates the missing generation. Durable event history selects `PR_REVIEW` after review entry and
+`PR_READY` otherwise. The recovery pass never restores `MERGE_READY`; mark it again only after
+current-head quality and verification succeed.
+
+Retarget and final stage publication ownership is retained in
+`.maswe/runs/<run-id>/.mutation-journal-v1/.lock-journal-v3/`. Its acquisition order is GitHub
+per-PR publication, per-PR association identity, per-run mutation, global association, then run
+store. A crashed owner is recovered automatically only when same-host PID probing proves `ESRCH`;
+a live owner remains blocking until the bounded acquisition timeout. Claims and releases are
+immutable and retained. Do not delete, compact, rename, or hand-repair this journal; corrupt or
+uncertain ownership fails closed.
+
 ### Read-only violation
 
-The run fails if a read-only role changes fingerprinted workspace state. In Git checkouts that includes git status/diffs/untracked content. In both Git and non-Git working directories it also includes authoritative `.maswe` run records, durable artifacts, and project config under the fingerprinted working directory (Git excludes do not hide that state from the fingerprint). Inspect `git status` (when applicable) and `.maswe/runs/<id>/`, and revert only changes attributable to that role. Preserve unrelated user work. Ephemeral `.lock` / `.admin.lock` / `.admin.lock.recovering` / `*.tmp` churn under `.maswe` is excluded from the fingerprint by design. The fingerprint is a before/after mutation detector, not an OS sandbox.
+The run fails if a read-only role changes fingerprinted workspace state. In Git checkouts that includes git status/diffs/untracked content. In both Git and non-Git working directories it also includes authoritative `.maswe` run records, durable artifacts, and project config under the fingerprinted working directory (Git excludes do not hide that state from the fingerprint). Inspect `git status` (when applicable) and `.maswe/runs/<id>/`, and revert only changes attributable to that role. Preserve unrelated user work. Ephemeral `.lock` / `.admin.lock` / `.admin.lock.recovering` / `*.tmp` churn and validated immutable run/mutation journal records under their exact paths are excluded from the fingerprint by design. The fingerprint is a before/after mutation detector, not an OS sandbox.
 
 ## 8. File-store backup and privacy
 

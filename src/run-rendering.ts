@@ -41,6 +41,11 @@ function renderRuntimeFailure(run: RunRecord): string[] {
   return lines;
 }
 
+function renderRecoverySha(value: string): string {
+  const safe = sanitizeDiagnostic(value, 256).text;
+  return safe.includes("[REDACTED]") ? "[REDACTED]" : safe.slice(0, 12);
+}
+
 export function renderRun(run: RunRecord): string {
   const artifacts = run.artifacts.length
     ? run.artifacts.map((artifact) => `  - ${artifact.name}: ${artifact.path}`).join("\n")
@@ -48,12 +53,20 @@ export function renderRun(run: RunRecord): string {
   const workspace = run.workspace
     ? `Workspace: branch=${run.workspace.branch}, head=${run.workspace.headSha.slice(0, 12)}, worktree=${run.workspace.worktreePath ?? "(repo)"}`
     : "Workspace: (unset)";
+  const bootstrap = run.workspaceBootstrap
+    ? `Bootstrap: mode=${run.workspaceBootstrap.mode}, source=${renderRecoverySha(run.workspaceBootstrap.sourceBaseSha)}, workspace=${run.workspace ? "checkpointed" : "pending"}`
+    : undefined;
+  const revalidation = run.revalidation
+    ? `Revalidation: source=${run.revalidation.source}, target=${renderRecoverySha(run.revalidation.requestedHeadSha)}, generation=${run.revalidation.generation}, return=${run.revalidation.returnState}`
+    : undefined;
   return [
     `Run: ${run.id}`,
     `Title: ${run.title}`,
     `State: ${run.state}`,
     `Updated: ${run.updatedAt}`,
     workspace,
+    ...(bootstrap ? [bootstrap] : []),
+    ...(revalidation ? [revalidation] : []),
     `Approvals: brainstorm=${run.approvals.brainstorm}, design=${run.approvals.design}`,
     `Cycles: build/verify=${run.counters.buildVerifyCycles}, comments=${run.counters.commentResolutionCycles}`,
     "Artifacts:",
@@ -64,6 +77,7 @@ export function renderRun(run: RunRecord): string {
             run.failure.message,
             FAILURE_AGGREGATE_MAX_CODE_POINTS,
           ).text}`,
+          ...(run.failure.code ? [`Failure code: ${run.failure.code}`] : []),
           ...renderRuntimeFailure(run),
         ]
       : []),

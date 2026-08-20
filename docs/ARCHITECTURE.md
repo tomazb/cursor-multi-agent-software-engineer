@@ -87,17 +87,53 @@ stateDiagram-v2
   VERIFYING --> PR_READY: VERIFY_PASSED
   VERIFYING --> PR_REVIEW: VERIFY_PASSED_AFTER_REVIEW
   PR_READY --> PR_REVIEW: PR_OPENED
+  PR_READY --> CI_RUNNING: REVALIDATE_REQUESTED
+  PR_REVIEW --> CI_RUNNING: REVALIDATE_REQUESTED
+  BUILDING --> CI_RUNNING: REVALIDATE_REQUESTED (associated head recovery)
+  CI_RUNNING --> CI_RUNNING: REVALIDATE_REQUESTED (associated head recovery)
+  VERIFYING --> CI_RUNNING: REVALIDATE_REQUESTED (associated head recovery)
+  BUILDING --> CI_RUNNING: REVALIDATION_RETARGETED
+  CI_RUNNING --> CI_RUNNING: REVALIDATION_RETARGETED
+  VERIFYING --> CI_RUNNING: REVALIDATION_RETARGETED
   PR_REVIEW --> CLASSIFYING_COMMENT: REVIEW_COMMENT_RECEIVED
   CLASSIFYING_COMMENT --> RESOLVING: COMMENT_IN_SCOPE
   CLASSIFYING_COMMENT --> WAITING_FOR_HUMAN: COMMENT_OUT_OF_SCOPE
   WAITING_FOR_HUMAN --> PR_REVIEW: HUMAN_RESUME
   RESOLVING --> CI_RUNNING: RESOLUTION_COMPLETED
+  RESOLVING --> CI_RUNNING: REVALIDATE_REQUESTED (associated head recovery)
   PR_READY --> MERGE_READY: MARK_MERGE_READY
   PR_REVIEW --> MERGE_READY: MARK_MERGE_READY
+  MERGE_READY --> CI_RUNNING: REVALIDATE_REQUESTED (associated head recovery)
   MERGE_READY --> COMPLETED: COMPLETE
 ```
 
 Any nonterminal state may transition to `FAILED` or `CANCELLED` through the generic events. Terminal states accept no further events.
+
+`REVALIDATE_REQUESTED` records the first current-head generation and its return gate. Outside
+`PR_READY` and `PR_REVIEW`, it is legal only when explicit transition context proves that a
+committed GitHub association moved to a different head and stale evidence was invalidated, or that
+association movement erased current gate evidence before returning to the workspace target. The
+return gate comes from append-only workflow history: a run that entered `PR_REVIEW` returns there;
+otherwise recovery returns to `PR_READY`. Recovery never returns directly to `MERGE_READY`.
+At either return gate, the orchestrator routes a mismatched committed GitHub association before
+checking local workspace freshness, then reloads authoritative state before returning an equality
+snapshot. A GitHub-routed checkpoint is returned without starting automatic work until the local
+workspace reaches that requested head; local-head routing may continue immediately because its
+observed workspace is already aligned. Optimistic races are retried through the bounded target
+reconciliation loop, and an unstable target fails closed.
+Association routing treats an active `revalidation.requestedHeadSha` as the authoritative target,
+then `workspace.headSha` when no generation is active. Prior association and pending-cancellation
+heads remain publication and cancellation metadata; they never determine or override the workflow
+target. A missing target fails closed, and the revalidation service rejects a predecessor or
+observed workspace that conflicts with the authoritative target loaded after target ownership is
+acquired. Equal-target delivery is ordinarily event-free; at `PR_READY`, `PR_REVIEW`, or
+`MERGE_READY`, missing quality or verification evidence permits exactly one same-target generation
+so an interrupted association reversal cannot strand the gate. Its active generation makes later
+delivery idempotent.
+`REVALIDATION_RETARGETED` preserves all earlier events while moving an active generation back to
+`CI_RUNNING`; for a recoverable `FAILED` run it updates the retained resume state to `CI_RUNNING`
+without rewriting the historical `FAIL`. A newer authenticated or local head retargets an active
+or recoverable failed revalidation generation. Evidence from a superseded generation is unusable.
 
 ### 3.5 Orchestrator
 
@@ -114,6 +150,30 @@ Any nonterminal state may transition to `FAILED` or `CANCELLED` through the gene
 - Enforces retry ceilings.
 - Stops at human and integration gates.
 
+Merge-ready and completion share one exact current-head assertion. It requires no active
+revalidation, a known head, the recorded branch in a clean MASWE-managed isolated worktree,
+workspace/GitHub head equality for an associated run, and current passing quality and verification
+evidence unconditionally. Completion additionally requires current passing merge-ready evidence.
+`requireCiPass` and `requireVerifierPass` can make results nonblocking only on the path to
+`PR_READY`; they never relax `MARK_MERGE_READY` or `COMPLETE`. The assertion is read-only on
+rejection and returns the observed exact head used in event details; historical success events
+never substitute for current evidence.
+
+Builder, resolver, quality, verification, merge-ready, and completion publication each perform a
+final branch, cleanliness, and exact-HEAD assertion inside the durable per-run publication fence.
+Deterministic commits name their exact expected parent and advance the branch only through an
+expected-old-SHA compare-and-swap; unexpected Git movement is preserved and fails closed.
+
+Mutable builder and resolver work is prepared in a disposable speculative worktree. Publication
+applies only the role delta to the authoritative worktree before the ref compare-and-swap and
+prepares the authoritative index only after that ref update succeeds. A definite ref rejection
+reverses the role delta before the final safety observation and performs no authoritative mutation
+afterward; a timeout, changed ref, failed rollback, or post-ref index failure is outcome-unknown.
+Once a MASWE-managed authoritative baseline has been captured, any failure in the mutable-role flow
+preserves that managed worktree for retry reconciliation instead of force-removing it. Retry must
+re-establish the recorded branch, head, cleanliness, and fingerprint through the normal recovery
+checks; a mismatch requires operator reconciliation.
+
 It does not contain Cursor SDK implementation details, shell output parsing, or persistence internals.
 
 ### 3.6 Run and artifact store
@@ -123,6 +183,7 @@ It does not contain Cursor SDK implementation details, shell output parsing, or 
 ```text
 .maswe/runs/<run-id>/
 ├── run.json
+├── .mutation-journal-v1/.lock-journal-v3/
 └── artifacts/
     ├── 02-brainstorm.md
     ├── 03-specification-and-design.md
@@ -139,6 +200,14 @@ for audit and recovery in a single-host local deployment. Mutating operations us
 per-run `.lock-journal-v3/` ticket journal described below. `writeArtifact` still rejects stale
 caller versions and only mutates authoritative on-disk state, so the lock change does not weaken
 optimistic versions or atomic run/artifact publication.
+
+Target retargeting and final stage publication use a second durable per-run journal beneath
+`.mutation-journal-v1/`. Target claims serialize every revalidation route and GitHub association
+head mutation with the final authoritative reload, builder/resolver commit, evidence/event
+publication, and successful verifier context clear. A publication performs one final successor
+scan after its reload: an already-published queued target claim wins; a target claim published
+after that scan observes the completed publication. The journal is separate from the store journal
+so protected callbacks can take ordinary run data locks without recursive acquisition.
 
 Artifacts are SHA-256 hashed when written. A future store can place content in object storage and keep the same reference contract.
 
@@ -194,7 +263,8 @@ the original values before those copies are constructed.
 
 Intentionally excluded from the MASWE portion (expected orchestration churn): `.lock`,
 `.admin.lock`, `.admin.lock.recovering`, canonical protocol entries beneath exact
-`runs/<run-id>/.lock-journal-v3/` paths, and ordinary `*.tmp` staging files. Unexpected or
+`runs/<run-id>/.lock-journal-v3/` and
+`runs/<run-id>/.mutation-journal-v1/.lock-journal-v3/` paths, and ordinary `*.tmp` staging files. Unexpected or
 malformed journal entries remain fingerprint-visible and also fail journal validation. The
 journal exclusion is deliberately path-specific; a `.lock-journal-v3` name elsewhere under
 `.maswe` remains fingerprinted. Isolated worktrees fingerprint their own `cwd` (typically without
@@ -204,6 +274,11 @@ roles cannot mutate handoffs undetected. Workspace identity fields (`baseSha` / 
 from the fingerprint digest.
 
 Read-only runtimes compare the fingerprint before and after execution. Any difference fails the run. This is a mutation detector, not an operating-system sandbox. A future sandbox can prevent writes rather than merely detecting them.
+
+Bootstrap source-drift checks exclude the orchestrator-owned `.maswe` namespace; read-only role
+fingerprints continue to include authoritative `.maswe` state. The distinction prevents MASWE's
+own intent/checkpoint writes from looking like source drift without hiding durable handoff
+mutation from a read-only role.
 
 ### 3.10 Quality runner
 
@@ -217,6 +292,11 @@ SHA set and is cleared only after cancellation plus current-head publication com
 one rate-limited PR from holding the global association journal and makes partial publication
 retries deterministic.
 
+GitHub association publication is event-free and rollback-capable; workflow request and retarget
+events publish only after association commit and are never rolled back. This ordering keeps a
+failed association transaction from leaking a workflow event while treating a committed workflow
+event as immutable history.
+
 ## 4. Stage data flow
 
 ```mermaid
@@ -226,9 +306,13 @@ sequenceDiagram
   participant S as Store
   participant R as Runtime
   participant Q as Quality runner
+  participant W as Git workspace
 
   User->>O: start(title, request)
-  O->>S: create run + START
+  O->>S: create run + bootstrap intent
+  O->>W: reconcile branch/worktree
+  O->>S: checkpoint established workspace
+  O->>S: START
   O->>R: brainstorm prompt
   R-->>O: brainstorm artifact
   O->>S: save artifact + gate state
@@ -245,6 +329,11 @@ sequenceDiagram
   R-->>O: verdict and evidence
   O->>S: PR_READY or route back to BUILDING
 ```
+
+Every production-created run, including a superseding replacement, persists workspace bootstrap
+intent before branch or worktree side effects and durably checkpoints the established workspace
+before `START`. A process restart reconciles a partial `CREATED` run from those durable facts; it
+does not infer completed bootstrap from an existing branch or worktree alone.
 
 ## 5. Model routing
 
@@ -317,7 +406,7 @@ Phase A (read-only checks) lives in `src/github/` and calls public orchestrator/
   sanitized local diagnostics. Manual publication never reclaims the listener's inbox leases.
 
 GitHub journals live beneath
-`.maswe/github/journals/{association,check-create,delivery,publication}/<logical-key-sha256>/.lock-journal-v3/`
+`.maswe/github/journals/{association,association-identity,check-create,delivery,publication}/<logical-key-sha256>/.lock-journal-v3/`
 and use the same claims/releases/tmp layout as local journals. The Phase A concurrency boundary is
 one listener plus simultaneous manual publishers on one host and one coherent local filesystem
 with atomic no-clobber hard links. Legacy association/check-create/delivery migration requires all
@@ -329,6 +418,12 @@ Phase B adds push/PR writes, comment replies, and digest-bound GitHub approvals.
 
 v0.2 uses optimistic `version` checks and atomic writes per run. Concurrent writers against the
 same run still fail closed rather than merge updates.
+
+The cross-system acquisition order is fixed: GitHub per-PR publication journal, GitHub per-PR
+association-identity journal, per-run mutation journal, global GitHub association journal, then
+per-run store data journal. Paths that need only a suffix of this order start at that suffix.
+No callback reacquires a journal it already owns. This ordering lets manual and webhook Phase A
+mutations share the same target boundary as local retargets without deadlocking store writes.
 
 ### 9.1 Immutable local lock journals
 

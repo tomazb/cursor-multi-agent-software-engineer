@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import test from "node:test";
 import { renderRun } from "../src/run-rendering.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
@@ -32,6 +34,16 @@ const MODELS = [
   "cursor-claude-opus-4.8-high",
 ];
 const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+const execFileAsync = promisify(execFile);
+
+async function initializeCleanGitRepository(cwd: string): Promise<void> {
+  await execFileAsync("git", ["init", "-q"], { cwd });
+  await execFileAsync("git", ["config", "user.email", "maswe@example.com"], { cwd });
+  await execFileAsync("git", ["config", "user.name", "MASWE"], { cwd });
+  await writeFile(path.join(cwd, "README.md"), "# Issue 19 persistence\n", "utf8");
+  await execFileAsync("git", ["add", "README.md"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "init"], { cwd });
+}
 
 interface ExpectedDurableRuntimeAttempt {
   model: string;
@@ -262,6 +274,7 @@ test("unsafe runtime failure is absent from returned state, disk, events, artifa
 test("synthetic fine-grained GitHub PAT is absent from every durable and rendered sink", async (t) => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-issue19-fine-pat-"));
   t.after(() => rm(cwd, { recursive: true, force: true }));
+  await initializeCleanGitRepository(cwd);
   const config = issue19Config(true);
   const runtime = new FineGrainedPatFailureRuntime();
   const store = new FileRunStore(cwd);
@@ -417,6 +430,7 @@ test("fallback failures retain structured metadata for every stored attempt and 
 
 test("retry history re-sanitizes previousFailure before persistence", async (t) => {
   const { cwd, store, orchestrator } = await makeProject(t, true);
+  await initializeCleanGitRepository(cwd);
   const failed = await orchestrator.start("Issue 19 retry", "synthetic request");
   failed.failure!.message = `manually unsafe token=${PERSISTED_CANARY}_RETRY`;
   await store.save(failed);
