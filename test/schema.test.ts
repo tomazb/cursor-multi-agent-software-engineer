@@ -292,6 +292,57 @@ test("persisted run records satisfy run-record schema required shape", async (t)
   assertMatches(schema, schema, run, "run");
 });
 
+test("run-record schema and runtime migration enforce the same run id grammar", async (t) => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-run-id-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const run = await new FileRunStore(cwd).create("schema", "run id grammar", DEFAULT_CONFIG);
+  const validIds = [
+    "a",
+    "run-123",
+    "A_b.c-9",
+    `a${"b".repeat(127)}`,
+  ];
+  const invalidIds = [
+    "../foreign",
+    "/absolute",
+    ".leading-dot",
+    "-leading-dash",
+    "contains/slash",
+    "contains\\backslash",
+    "white space",
+    "",
+    `a${"b".repeat(128)}`,
+  ];
+
+  for (const id of validIds) {
+    const candidate = structuredClone(run);
+    candidate.id = id;
+    assert.doesNotThrow(
+      () => assertMatches(schema, schema, candidate, `valid run id ${id.length}`),
+      id,
+    );
+    assert.doesNotThrow(() => migrateRunRecord(candidate), id);
+  }
+
+  for (const id of invalidIds) {
+    const candidate = structuredClone(run);
+    candidate.id = id;
+    assert.throws(
+      () => assertMatches(schema, schema, candidate, `invalid run id ${JSON.stringify(id)}`),
+      /run id|\.id|pattern|maxLength|minLength/i,
+      id,
+    );
+    assert.throws(
+      () => migrateRunRecord(candidate),
+      /invalid run id|Run record id must be a non-empty string/i,
+      id,
+    );
+  }
+});
+
 test("run-record schema and migration accept exact legal recovery metadata", async (t) => {
   const schema = JSON.parse(
     await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
