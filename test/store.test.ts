@@ -22,12 +22,20 @@ test("writeArtifact keeps attempt history and logical latest pointer", async () 
   assert.equal(latest.attempt, 2);
   assert.equal(latest.logicalName, "06-verification-report.md");
   assert.match(latest.path, /attempt-2/);
+  assert.equal(
+    latest.path,
+    `.maswe/runs/${run.id}/artifacts/06-verification-report.attempt-2.md`,
+  );
 
   const history = run.artifacts.filter((a) => a.logicalName === "06-verification-report.md");
   assert.equal(history.length, 2);
 
   const content = await store.readArtifact(run, "06-verification-report.md");
   assert.match(content ?? "", /attempt two/);
+
+  const firstAttempt = history.find((artifact) => artifact.attempt === 1);
+  assert.ok(firstAttempt);
+  assert.match(await store.readArtifact(run, firstAttempt.name) ?? "", /attempt one/);
 });
 
 test("writeArtifact preserves pending caller mutations for the following run save", async () => {

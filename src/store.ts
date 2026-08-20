@@ -41,6 +41,10 @@ import {
   requiredRunRecordString,
 } from "./run-record-validation.ts";
 import { transition } from "./state-machine.ts";
+import {
+  canonicalArtifactReferencePath,
+  validateArtifactReferencePath,
+} from "./artifact-path.ts";
 
 function now(): string {
   return new Date().toISOString();
@@ -236,6 +240,9 @@ export function migrateRunRecord(raw: unknown): RunRecord {
     throw new Error("Run record config is required");
   }
 
+  const runId = requiredRunRecordString(candidate.id, "Run record id", false);
+  assertSafeRunId(runId);
+
   if (candidate.artifacts !== undefined && !Array.isArray(candidate.artifacts)) {
     throw new Error("Run record artifacts must be an array");
   }
@@ -286,11 +293,16 @@ export function migrateRunRecord(raw: unknown): RunRecord {
     if (!/^[a-f0-9]{64}$/.test(digest)) {
       throw new Error(`Run artifact[${index}].sha256 is invalid`);
     }
+    const persistedPath = requiredRunRecordString(
+      artifact.path,
+      `Run artifact[${index}].path`,
+    );
+    const { canonicalPath } = validateArtifactReferencePath(runId, persistedPath);
     return {
       name,
       logicalName,
       attempt,
-      path: requiredRunRecordString(artifact.path, `Run artifact[${index}].path`),
+      path: canonicalPath,
       sha256: digest,
       createdAt: artifact.createdAt === undefined
         ? now()
@@ -882,8 +894,8 @@ export class FileRunStore implements RunStore {
       const priorAttempts = next.artifacts.filter((artifact) => artifact.logicalName === logicalName);
       const attempt = priorAttempts.reduce((max, artifact) => Math.max(max, artifact.attempt), 0) + 1;
       const fileName = `${logicalName.replace(/\.md$/i, "")}.attempt-${attempt}.md`;
-      const relativePath = path.join(".maswe", "runs", run.id, "artifacts", fileName);
-      const absolutePath = path.join(this.cwd, relativePath);
+      const relativePath = canonicalArtifactReferencePath(run.id, fileName);
+      const absolutePath = path.join(this.root, run.id, "artifacts", fileName);
       const redacted = redactSecrets(content);
 
       const reference: ArtifactReference = {
@@ -936,7 +948,14 @@ export class FileRunStore implements RunStore {
       run.artifacts.find((artifact) => artifact.name === name) ??
       run.artifacts.find((artifact) => artifact.logicalName === name && artifact.name === name);
     if (!reference) return undefined;
-    const content = await readFile(path.join(this.cwd, reference.path), "utf8");
+    const { fileName } = validateArtifactReferencePath(run.id, reference.path);
+    const artifactDirectory = path.join(this.root, run.id, "artifacts");
+    await requireOrdinaryDirectory(artifactDirectory, "run artifact namespace");
+    const content = await readBoundedOrdinaryFile(
+      path.join(artifactDirectory, fileName),
+      "run artifact",
+      MAX_AUTHORITATIVE_FILE_BYTES,
+    );
     const digest = sha256(content);
     if (digest !== reference.sha256) {
       throw new Error(

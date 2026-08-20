@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -83,4 +83,18 @@ test("cancellation concurrent with matching-version artifact write keeps cancel 
     final.artifacts.some((a) => a.logicalName === "02-brainstorm.md"),
     false,
   );
+});
+
+test("readArtifact rejects a tampered in-memory reference outside the run artifact namespace", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-cas-art-path-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("confine", "artifact", DEFAULT_CONFIG);
+  await store.writeArtifact(run, "note.md", "trusted artifact\n");
+  const reference = run.artifacts.find((artifact) => artifact.name === "note.md");
+  assert.ok(reference);
+  await writeFile(path.join(cwd, "outside.md"), "trusted artifact\n", "utf8");
+  reference.path = "outside.md";
+
+  await assert.rejects(store.readArtifact(run, "note.md"), /artifact.*path|artifact reference/i);
 });

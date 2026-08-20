@@ -53,12 +53,16 @@
       "type": "array",
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["name", "logicalName", "attempt", "path", "sha256", "createdAt"],
         "properties": {
           "name": { "type": "string" },
           "logicalName": { "type": "string" },
           "attempt": { "type": "integer", "minimum": 1 },
-          "path": { "type": "string" },
+          "path": {
+            "type": "string",
+            "pattern": "^\\.maswe[\\\\/]runs[\\\\/][A-Za-z0-9][A-Za-z0-9._-]{0,127}[\\\\/]artifacts[\\\\/](?!\\.{1,2}$)[^\\\\/]+$"
+          },
           "sha256": {
             "type": "string",
             "pattern": "^[a-f0-9]{64}$"
