@@ -197,6 +197,33 @@ test("DEFAULT_CONFIG satisfies config JSON schema required shape", async () => {
   assertMatches(schema, schema, DEFAULT_CONFIG, "config");
 });
 
+test("config schema encodes exact role permissions and nonblank quality commands", async () => {
+  const schema = await loadConfigSchema();
+  const roles = schema.properties?.roles?.properties;
+  const expected = {
+    brainstormer: "read-only",
+    designer: "read-only",
+    builder: "workspace-write",
+    verifier: "read-only",
+    prResolver: "workspace-write",
+  } as const;
+  for (const [role, permission] of Object.entries(expected)) {
+    const roleSchema = resolveRef(schema, roles?.[role] ?? {});
+    assert.ok(roleSchema, `${role} schema`);
+    const permissionSchema = roleSchema.allOf?.[1]?.properties?.permissions;
+    assert.equal(permissionSchema?.const, permission, `${role} permissions.const`);
+  }
+
+  const commands = schema.properties?.quality?.properties?.commands;
+  assert.doesNotThrow(() => assertMatches(schema, commands!, [], "quality.commands.empty"));
+  for (const command of ["", " \t\n "]) {
+    assert.throws(
+      () => assertMatches(schema, commands!, [command], "quality.commands.blank"),
+      /pattern/,
+    );
+  }
+});
+
 test("config schema rejects enabled GitHub App write mode", async () => {
   const schema = await loadConfigSchema();
   const config = configWithGitHubApp({ readOnlyChecks: false });
@@ -408,6 +435,22 @@ test("run-record schema workflow enums and exact event records stay synchronized
       invalid.label,
     );
   }
+});
+
+test("run-record schema contains every stable policy failure code", async () => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const failureCodes = schema.properties?.failure?.properties?.code?.enum;
+  assert.deepEqual(
+    failureCodes?.filter((code) => typeof code === "string" && code.startsWith("policy-")),
+    [
+      "policy-read-only-workspace-mutation",
+      "policy-runtime-identity-mismatch",
+      "policy-role-permission-mismatch",
+      "policy-read-only-head-moved",
+    ],
+  );
 });
 
 test("persisted run config uses the exact config schema and rejects nested secrets", async (t) => {

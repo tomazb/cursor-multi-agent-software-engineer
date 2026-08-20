@@ -344,7 +344,11 @@ function validateFailure(value: unknown): NonNullable<RunRecord["failure"]> {
     failure.code !== undefined &&
     failure.code !== "runtime-models-exhausted" &&
     failure.code !== "workflow-failure" &&
-    failure.code !== "automatic-transition-limit-exceeded"
+    failure.code !== "automatic-transition-limit-exceeded" &&
+    failure.code !== "policy-read-only-workspace-mutation" &&
+    failure.code !== "policy-runtime-identity-mismatch" &&
+    failure.code !== "policy-role-permission-mismatch" &&
+    failure.code !== "policy-read-only-head-moved"
   ) {
     throw new Error("Run record failure.code is invalid");
   }

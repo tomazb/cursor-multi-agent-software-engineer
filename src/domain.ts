@@ -196,7 +196,14 @@ export interface RunEvidence {
 export type RunFailureCode =
   | "runtime-models-exhausted"
   | "workflow-failure"
-  | "automatic-transition-limit-exceeded";
+  | "automatic-transition-limit-exceeded"
+  | PolicyViolationCode;
+
+export type PolicyViolationCode =
+  | "policy-read-only-workspace-mutation"
+  | "policy-runtime-identity-mismatch"
+  | "policy-role-permission-mismatch"
+  | "policy-read-only-head-moved";
 
 export interface DurableRuntimeFailureAttempt {
   model: string;

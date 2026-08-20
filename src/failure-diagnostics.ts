@@ -8,6 +8,7 @@ import type {
   RuntimeFailureDiagnostic,
   RuntimeResult,
 } from "./domain.ts";
+import { findPolicyViolationError, PolicyViolationError } from "./policy.ts";
 import {
   FAILURE_AGGREGATE_MAX_CODE_POINTS,
   FAILURE_DIAGNOSTIC_MAX_CODE_POINTS,
@@ -337,6 +338,8 @@ export function reportOmittedFailureAttempts(
 }
 
 export function runFailureCode(error: unknown): RunFailureCode {
+  const policyFailure = findPolicyViolationError(error);
+  if (policyFailure) return policyFailure.code;
   const runtimeFailure = findRuntimeModelsExhaustedError(error);
   if (runtimeFailure) return runtimeFailure.code;
   return "workflow-failure";
@@ -352,6 +355,7 @@ export function runFailureMessage(error: unknown): string {
 export function runFailureRuntime(
   error: unknown,
 ): DurableRuntimeFailureSummary | undefined {
+  if (findPolicyViolationError(error)) return undefined;
   const runtimeFailure = findRuntimeModelsExhaustedError(error);
   return runtimeFailure
     ? sanitizeDurableRuntimeFailureSummary(runtimeFailure.runtime)
@@ -409,7 +413,8 @@ export function assertRuntimeIdentity(
   role: RoleId,
 ): void {
   if (result.actualModel && result.actualModel !== result.requestedModel) {
-    throw new Error(
+    throw new PolicyViolationError(
+      "policy-runtime-identity-mismatch",
       `${role} requested ${normalizeModelDisplay(result.requestedModel)}, but runtime reported ${normalizeModelDisplay(result.actualModel)}.`,
     );
   }

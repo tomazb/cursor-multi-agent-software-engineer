@@ -123,6 +123,21 @@ test("doctorProbeTimeoutMs accepts explicit bounds and rejects invalid values", 
   }
 });
 
+test("quality commands accept an explicit empty list but reject blank entries", () => {
+  assert.deepEqual(mergeConfigForTest({ quality: { commands: [] } }).quality.commands, []);
+  for (const command of ["", " \t\n "]) {
+    assert.throws(
+      () => mergeConfigForTest({ quality: { commands: [command] } }),
+      /quality\.commands/i,
+    );
+  }
+  const trustedText = "  npm test  ";
+  assert.deepEqual(
+    mergeConfigForTest({ quality: { commands: [trustedText] } }).quality.commands,
+    [trustedText],
+  );
+});
+
 test("githubApp is optional and omitted by default", () => {
   const config = mergeConfigForTest({});
   assert.equal(config.githubApp, undefined);

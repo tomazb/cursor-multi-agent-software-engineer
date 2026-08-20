@@ -210,7 +210,11 @@
           "enum": [
             "runtime-models-exhausted",
             "workflow-failure",
-            "automatic-transition-limit-exceeded"
+            "automatic-transition-limit-exceeded",
+            "policy-read-only-workspace-mutation",
+            "policy-runtime-identity-mismatch",
+            "policy-role-permission-mismatch",
+            "policy-read-only-head-moved"
           ]
         },
         "message": { "type": "string" },

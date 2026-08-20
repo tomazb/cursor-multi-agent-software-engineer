@@ -22,11 +22,11 @@
       "additionalProperties": false,
       "required": ["brainstormer", "designer", "builder", "verifier", "prResolver"],
       "properties": {
-        "brainstormer": { "$ref": "#/$defs/role" },
-        "designer": { "$ref": "#/$defs/role" },
-        "builder": { "$ref": "#/$defs/role" },
-        "verifier": { "$ref": "#/$defs/role" },
-        "prResolver": { "$ref": "#/$defs/role" }
+        "brainstormer": { "$ref": "#/$defs/brainstormerRole" },
+        "designer": { "$ref": "#/$defs/designerRole" },
+        "builder": { "$ref": "#/$defs/builderRole" },
+        "verifier": { "$ref": "#/$defs/verifierRole" },
+        "prResolver": { "$ref": "#/$defs/prResolverRole" }
       }
     },
     "gates": {
@@ -52,7 +52,7 @@
       "properties": {
         "commands": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": { "type": "string", "pattern": "\\S" }
         }
       }
     },
@@ -152,6 +152,36 @@
         "reasoning": { "enum": ["low", "medium", "high"] },
         "permissions": { "enum": ["read-only", "workspace-write"] }
       }
+    },
+    "brainstormerRole": {
+      "allOf": [
+        { "$ref": "#/$defs/role" },
+        { "type": "object", "properties": { "permissions": { "const": "read-only" } } }
+      ]
+    },
+    "designerRole": {
+      "allOf": [
+        { "$ref": "#/$defs/role" },
+        { "type": "object", "properties": { "permissions": { "const": "read-only" } } }
+      ]
+    },
+    "builderRole": {
+      "allOf": [
+        { "$ref": "#/$defs/role" },
+        { "type": "object", "properties": { "permissions": { "const": "workspace-write" } } }
+      ]
+    },
+    "verifierRole": {
+      "allOf": [
+        { "$ref": "#/$defs/role" },
+        { "type": "object", "properties": { "permissions": { "const": "read-only" } } }
+      ]
+    },
+    "prResolverRole": {
+      "allOf": [
+        { "$ref": "#/$defs/role" },
+        { "type": "object", "properties": { "permissions": { "const": "workspace-write" } } }
+      ]
     }
   }
 }

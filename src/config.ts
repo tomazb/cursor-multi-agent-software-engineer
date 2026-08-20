@@ -1,6 +1,7 @@
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { MasweConfig, RoleConfig, RoleId, RuntimeKind } from "./domain.ts";
+import { assertConfiguredRolePermission } from "./policy.ts";
 
 export const DEFAULT_CONFIG: MasweConfig = {
   version: 1,
@@ -304,6 +305,7 @@ export function assertConfig(config: MasweConfig): void {
     if (!["read-only", "workspace-write"].includes(roleConfig.permissions)) {
       throw new Error(`roles.${role}.permissions must be read-only or workspace-write`);
     }
+    assertConfiguredRolePermission(role as RoleId, roleConfig.permissions);
     if (!["low", "medium", "high"].includes(roleConfig.reasoning)) {
       throw new Error(`roles.${role}.reasoning must be low, medium, or high`);
     }
@@ -323,8 +325,12 @@ export function assertConfig(config: MasweConfig): void {
   if (!Array.isArray(config.quality.commands)) {
     throw new Error("quality.commands must be an array");
   }
-  if (!config.quality.commands.every((command) => typeof command === "string")) {
-    throw new Error("quality.commands must contain only strings");
+  if (
+    !config.quality.commands.every(
+      (command) => typeof command === "string" && command.trim().length > 0,
+    )
+  ) {
+    throw new Error("quality.commands must contain only non-empty strings");
   }
   if (
     typeof config.policy.maxBuildVerifyCycles !== "number" ||
