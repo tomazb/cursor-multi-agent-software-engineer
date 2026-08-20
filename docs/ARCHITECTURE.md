@@ -200,13 +200,17 @@ checks; a mismatch requires operator reconciliation.
 
 It does not contain Cursor SDK implementation details, shell output parsing, or persistence internals.
 
-The policy boundary is also owned here. The orchestrator applies the read-only workspace fence
-outside runtime adapters: it captures the workspace fingerprint and, in Git repositories, exact
-`HEAD` before every read-only invocation. It checks both again in a `finally` path after either a
-runtime return or a runtime throw. A changed exact `HEAD` is distinct from a changed fingerprint.
-Runtime-reported actual-model identity is compared with the requested model by the orchestrator;
-a mismatch is a policy failure, not an ordinary model attempt failure. Policy failures are
-re-thrown directly and never enter runtime fallback or all-attempt aggregation.
+The policy boundary is also owned here. The orchestrator applies the authoritative read-only
+workspace fence around runtime adapters: it captures the workspace fingerprint and, in Git
+repositories, exact `HEAD` before every read-only invocation. It checks both again in a `finally`
+path after either a runtime return or a runtime throw. The final classification is HEAD-first: a
+changed or unreadable post-run `HEAD` is `policy-read-only-head-moved` even if the fingerprint also
+changed; only a stable/readable `HEAD` followed by a changed fingerprint is
+`policy-read-only-workspace-mutation`. Cursor adapters retain local fingerprint checks as defense
+in depth, but the orchestrator's fence is the authoritative classification. Runtime-reported
+actual-model identity is compared with the requested model by the orchestrator; a mismatch is a
+policy failure, not an ordinary model attempt failure. Policy failures are re-thrown directly and
+never enter runtime fallback or all-attempt aggregation.
 
 ### 3.6 Run and artifact store
 
@@ -243,11 +247,14 @@ so protected callbacks can take ordinary run data locks without recursive acquis
 
 Artifacts are SHA-256 hashed when written. A reference names exactly one direct child of
 `.maswe/runs/<run-id>/artifacts/`: no absolute paths, traversal, nested paths, or non-portable
-filenames are valid. Reads verify every namespace ancestor is an ordinary directory, open only an
-ordinary final file with no-follow support, bound the read to 1 MiB, recheck the namespace, and
-compare the content digest with the recorded SHA-256. This prevents accidental pathname escape and
-fails closed when no-follow support is unavailable. A future store can place content in object
-storage and keep the same reference contract.
+filenames are valid. Its physical leaf is ASCII `[A-Za-z0-9._-]+`, is neither `.` nor `..`, does
+not end in `.`, and cannot have a Windows reserved device stem (including an extension or the
+`¹`/`²`/`³` device-number variants). When a generated writer leaf would be reserved, the writer
+prefixes it with `_` deterministically. Reads verify every namespace ancestor is an ordinary
+directory, open only an ordinary final file with no-follow support, bound the read to 1 MiB,
+recheck the namespace, and compare the content digest with the recorded SHA-256. This prevents
+accidental pathname escape and fails closed when no-follow support is unavailable. A future store
+can place content in object storage and keep the same reference contract.
 
 ### 3.7 Prompt builder
 
@@ -324,10 +331,14 @@ roles cannot mutate handoffs undetected. Workspace identity fields (`baseSha` / 
 `branch`) may still record `not-a-git-repository` for non-Git trees; that sentinel is separate
 from the fingerprint digest.
 
-The orchestrator, rather than an adapter, compares the fingerprint before and after every
-read-only runtime call and performs the Git `HEAD` check when applicable. Its `finally` fence runs
-after both a normal runtime return and a thrown runtime error. Any fingerprint change or head move
-fails the run; neither is eligible for fallback aggregation. This is a mutation detector, not an
+The orchestrator performs the authoritative final comparison before and after every read-only
+runtime call and performs the Git `HEAD` check when applicable. Its `finally` fence runs after
+both a normal runtime return and a thrown runtime error. It checks post-run `HEAD` first: a changed
+or unreadable head is `policy-read-only-head-moved`, even if a later fingerprint check would also
+detect a change. With a stable/readable head, a changed fingerprint is
+`policy-read-only-workspace-mutation`. Cursor CLI and SDK adapters also retain local fingerprint
+checks as defense in depth, but do not replace the orchestrator's final classification. Neither
+policy failure is eligible for fallback aggregation. This is a mutation detector, not an
 operating-system sandbox. A future sandbox can prevent writes rather than merely detecting them.
 
 Bootstrap source-drift checks exclude the orchestrator-owned `.maswe` namespace; read-only role
@@ -342,9 +353,12 @@ mutation from a read-only role.
 Quality commands never come from model output, issue text, or PR comments.
 
 `policy.allowedPathGlobs` is portable and deterministic. MASWE normalizes both candidate paths
-and glob strings from `\\` to `/`; `*` and `?` match only within one path segment, `**` matches
-across segments, and `**/` matches zero or more complete segments. The special globs `**` and
-`**/*` allow every path. A changed path is allowed when at least one configured glob matches.
+and glob strings from `\\` to `/` and anchors each match to the whole path. `*` matches zero or
+more non-separator characters; `?` exactly one non-separator; `**` zero or more characters,
+including separators; and `**/` zero or more complete path segments, including zero segments.
+`**` permits every candidate and `**/*` permits every non-empty candidate. Dotfiles are ordinary
+path characters, and regex metacharacters in a glob are literal rather than a second pattern
+language. A changed path is allowed when at least one configured glob matches.
 
 GitHub check publication uses a hash-addressed per-PR journal, separate from the short global
 association transaction. Old-head cancellation intent is also persisted on the run as a bounded

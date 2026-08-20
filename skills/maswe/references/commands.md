@@ -50,8 +50,9 @@ maswe --cwd=/path/to/project start --title="Literal request" --request=--literal
 `start` requires `--title` and exactly one request source: `--request-file` **or** `--request`.
 The final example uses equals form because a dash-prefixed string value must be attached to its
 option; `--request --literal` is invalid. Global `--config` and `--cwd` may be placed before or
-after the command. All options are long, declared, non-duplicated, and command-specific; short
-and abbreviated options, `--`, empty string values, and extra operands are rejected.
+after the command. Apart from those two globals, options are long, declared, non-duplicated, and
+command-specific; short and abbreviated options, `--`, empty string values, and extra operands are
+rejected.
 
 ## Inspect
 

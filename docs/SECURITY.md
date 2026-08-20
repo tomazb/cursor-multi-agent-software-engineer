@@ -58,8 +58,10 @@ permission, and identity contracts are governed by MH-00/#32 and are not impleme
   or a thrown runtime error.
 - In Git checkouts the fingerprint covers git status, unstaged/staged diffs, and untracked content, with `.maswe/` excluded from those Git-plane probes via explicit pathspecs (independent of `.git/info/exclude`).
 - In both Git and non-Git working directories the fingerprint also covers authoritative `.maswe` state under `cwd` (project config, `runs/*/run.json`, durable artifacts) via the MASWE-plane hashing contract.
-- A fingerprint mismatch fails with `policy-read-only-workspace-mutation`; a moved or unreadable
-  Git `HEAD` fails with `policy-read-only-head-moved`.
+- The orchestrator classifies its post-run state HEAD-first: a moved or unreadable Git `HEAD`
+  fails with `policy-read-only-head-moved`, even when the fingerprint also changed; only a stable
+  readable `HEAD` plus a fingerprint mismatch fails with
+  `policy-read-only-workspace-mutation`. Adapter-local fingerprint checks remain defense in depth.
 
 **Gap:** Detection occurs after the process runs; it is a mutation detector, not a preventive
 OS-level sandbox. External side effects outside the fingerprinted working directory are not

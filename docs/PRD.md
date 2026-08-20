@@ -206,12 +206,14 @@ attempt aggregation.
 
 The orchestrator shall fingerprint workspace state before and after every read-only role, outside
 runtime adapters, and shall make the after check even when the runtime throws. In Git checkouts it
-shall also compare the exact `HEAD` before and after the invocation. The fingerprint includes
-git-tracked, staged, and untracked content; in both Git and non-Git working directories it also
-includes authoritative `.maswe` run state, durable artifacts, and project config under the
-fingerprinted working directory (independent of Git excludes). A difference or moved `HEAD` shall
-fail the run. Ephemeral lock and `*.tmp` files under `.maswe` are excluded from that fingerprint
-so normal orchestration churn does not false-fail.
+shall also compare the exact `HEAD` before and after the invocation. It shall classify post-run
+state HEAD-first: a changed or unreadable `HEAD` fails before a fingerprint comparison; only a
+stable/readable `HEAD` with a changed fingerprint is a workspace-mutation failure. Adapters may
+retain local fingerprint checks as defense in depth. The fingerprint includes git-tracked, staged,
+and untracked content; in both Git and non-Git working directories it also includes authoritative
+`.maswe` run state, durable artifacts, and project config under the fingerprinted working directory
+(independent of Git excludes). Ephemeral lock and `*.tmp` files under `.maswe` are excluded from
+that fingerprint so normal orchestration churn does not false-fail.
 
 Bootstrap source-drift checks shall exclude the orchestrator-owned `.maswe` namespace; read-only
 role fingerprints shall continue to include authoritative `.maswe` state.
@@ -221,9 +223,11 @@ are `read-only`; builder and prResolver are `workspace-write`. Only prResolver m
 `read-only` for the comment-classification invocation. Every other mismatch shall fail before
 runtime invocation.
 
-`policy.allowedPathGlobs` shall use portable matching: paths and globs normalize `\\` to `/`; `*`
-and `?` stay within one segment; `**` crosses segments; and `**/` matches zero or more complete
-segments. `**` and `**/*` allow every path.
+`policy.allowedPathGlobs` shall use portable fully anchored matching: paths and globs normalize
+`\\` to `/`; `*` is zero or more non-separators; `?` is exactly one non-separator; `**` is zero or
+more characters including separators; and `**/` is zero or more complete segments including zero.
+`**` allows every candidate and `**/*` every non-empty candidate. Dotfiles are ordinary and regex
+metacharacters are literal.
 
 ### FR-17 — Run inspection
 
@@ -267,10 +271,13 @@ form so it cannot be parsed as another option.
 
 Prompt templates shall render declared placeholders once, insert values literally without
 rescanning them, and reject unknown placeholders deterministically. An artifact path shall name
-exactly one portable direct child of the run's artifact namespace. Reads shall require ordinary
-namespace directories and an ordinary no-follow final file, remain bounded, and verify the
-recorded SHA-256 digest. The trusted-local-user boundary does not claim to eliminate all concurrent
-same-user ancestor replacement races.
+exactly one portable direct child of the run's artifact namespace. The physical leaf shall be ASCII
+`[A-Za-z0-9._-]+`, neither `.` nor `..`, without a trailing `.`, and without a Windows reserved
+device stem (including extension and superscript-number variants); a reserved generated leaf shall
+receive a deterministic `_` prefix. Reads shall require ordinary namespace directories and an
+ordinary no-follow final file, remain bounded, and verify the recorded SHA-256 digest. The
+trusted-local-user boundary does not claim to eliminate all concurrent same-user ancestor
+replacement races.
 
 ## Non-functional requirements
 
