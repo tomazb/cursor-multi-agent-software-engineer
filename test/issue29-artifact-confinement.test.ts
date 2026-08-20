@@ -19,6 +19,24 @@ import { FileRunStore, migrateRunRecord } from "../src/store.ts";
 
 const execFileAsync = promisify(execFile);
 const TRUSTED_ARTIFACT = "trusted artifact\n";
+const INVALID_PORTABLE_FILE_NAMES = [
+  "file:stream",
+  "file::$DATA",
+  "NUL",
+  "nul.attempt-1.md",
+  "CON.txt",
+  "com1.md",
+  "LPT9.attempt-1.md",
+  "COM¹.md",
+  "lpt².txt",
+  "COM³",
+  "trailing.",
+  "trailing ",
+  "control\u0001.md",
+  "nul\u0000byte.md",
+  "question?.md",
+  "pipe|name.md",
+] as const;
 
 async function runFixture(t: test.TestContext, prefix: string) {
   const cwd = await mkdtemp(path.join(os.tmpdir(), prefix));
@@ -71,6 +89,21 @@ test("run migration validates the enclosing run ID before artifact references", 
   assert.throws(() => migrateRunRecord(persisted), /invalid run id/i);
 });
 
+test("run migration rejects non-portable physical artifact filenames", async (t) => {
+  const { run, persisted } = await runFixture(t, "maswe-artifact-leaf-migration-");
+
+  for (const fileName of INVALID_PORTABLE_FILE_NAMES) {
+    const candidate = structuredClone(persisted);
+    const artifacts = candidate.artifacts as Array<Record<string, unknown>>;
+    artifacts[0]!.path = `.maswe/runs/${run.id}/artifacts/${fileName}`;
+    assert.throws(
+      () => migrateRunRecord(candidate),
+      /artifact.*path|physical.*filename/i,
+      JSON.stringify(fileName),
+    );
+  }
+});
+
 test("run migration accepts historical Windows separators and returns a canonical path", async (t) => {
   const { run, persisted } = await runFixture(t, "maswe-artifact-windows-");
   const artifacts = persisted.artifacts as Array<Record<string, unknown>>;
@@ -92,6 +125,20 @@ test("load rejects an invalid artifact reference without rewriting run.json", as
   await writeFile(runPath, invalidSnapshot, "utf8");
 
   await assert.rejects(store.load(run.id), /artifact.*path|artifact reference/i);
+  assert.equal(await readFile(runPath, "utf8"), invalidSnapshot);
+});
+
+test("load rejects a non-portable artifact filename without rewriting run.json", async (t) => {
+  const { store, run, runPath, persisted } = await runFixture(
+    t,
+    "maswe-artifact-leaf-load-",
+  );
+  const artifacts = persisted.artifacts as Array<Record<string, unknown>>;
+  artifacts[0]!.path = `.maswe/runs/${run.id}/artifacts/CON.txt`;
+  const invalidSnapshot = `${JSON.stringify(persisted, null, 2)}\n`;
+  await writeFile(runPath, invalidSnapshot, "utf8");
+
+  await assert.rejects(store.load(run.id), /artifact.*path|physical.*filename/i);
   assert.equal(await readFile(runPath, "utf8"), invalidSnapshot);
 });
 
@@ -122,8 +169,38 @@ test("run-record schema closes artifact references and constrains their portable
     ".maswe//runs/run-1/artifacts/x.md",
     ".maswe/runs/run-1/artifacts/../run.json",
     ".maswe/runs/run-1/artifacts/nested/x.md",
+    ...INVALID_PORTABLE_FILE_NAMES.map(
+      (fileName) => `.maswe/runs/run-1/artifacts/${fileName}`,
+    ),
   ]) {
     assert.doesNotMatch(invalid, artifactPath, invalid);
+  }
+});
+
+test("readArtifact rejects tampered in-memory references with non-portable filenames", async (t) => {
+  const { store, run, artifactDirectory } = await runFixture(
+    t,
+    "maswe-artifact-leaf-read-",
+  );
+  const reference = run.artifacts.find((artifact) => artifact.name === "note.md");
+  assert.ok(reference);
+  const readableInvalidNames = [
+    "file:stream",
+    "CON.txt",
+    "trailing.",
+    "trailing ",
+    "control\u0001.md",
+    "question?.md",
+  ] as const;
+
+  for (const fileName of readableInvalidNames) {
+    await writeFile(path.join(artifactDirectory, fileName), TRUSTED_ARTIFACT, "utf8");
+    reference.path = `.maswe/runs/${run.id}/artifacts/${fileName}`;
+    await assert.rejects(
+      store.readArtifact(run, "note.md"),
+      /artifact.*path|physical.*filename/i,
+      JSON.stringify(fileName),
+    );
   }
 });
 
@@ -143,6 +220,31 @@ test("readArtifact rejects a symlinked artifact directory", async (t) => {
   await symlink(retained, artifactDirectory, process.platform === "win32" ? "junction" : "dir");
 
   await assert.rejects(store.readArtifact(run, "note.md"), /ordinary.*directory|symbolic/i);
+});
+
+test("readArtifact rejects persistent symlinks in every artifact namespace ancestor", async (t) => {
+  const cases = ["MASWE state", "run store", "run record"] as const;
+  for (const label of cases) {
+    await t.test(label, async (t) => {
+      const { cwd, store, run } = await runFixture(
+        t,
+        `maswe-artifact-ancestor-${label.replaceAll(" ", "-")}-`,
+      );
+      const target = label === "MASWE state"
+        ? path.dirname(store.root)
+        : label === "run store"
+          ? store.root
+          : path.join(store.root, run.id);
+      const retained = path.join(cwd, `retained-${label.replaceAll(" ", "-")}`);
+      await rename(target, retained);
+      await symlink(retained, target, process.platform === "win32" ? "junction" : "dir");
+
+      await assert.rejects(
+        store.readArtifact(run, "note.md"),
+        /ordinary.*directory|symbolic/i,
+      );
+    });
+  }
 });
 
 test("readArtifact rejects a symlinked artifact file", async (t) => {

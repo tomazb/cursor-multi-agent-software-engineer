@@ -50,6 +50,21 @@ test("writeArtifact preserves pending caller mutations for the following run sav
   assert.equal((await store.load(run.id)).counters.buildVerifyCycles, 1);
 });
 
+test("writeArtifact preserves a reserved logical name with a portable physical filename", async () => {
+  const store = await tempStore();
+  const run = await store.create("t", "r", DEFAULT_CONFIG);
+
+  const reference = await store.writeArtifact(run, "NUL.md", "portable");
+
+  assert.equal(reference.name, "NUL.md");
+  assert.equal(reference.logicalName, "NUL.md");
+  assert.equal(
+    reference.path,
+    `.maswe/runs/${run.id}/artifacts/_NUL.attempt-1.md`,
+  );
+  assert.equal(await store.readArtifact(run, "NUL.md"), "portable");
+});
+
 test("readArtifact fails closed when digest does not match file bytes", async () => {
   const store = await tempStore();
   const run = await store.create("t", "r", DEFAULT_CONFIG);

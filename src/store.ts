@@ -43,6 +43,7 @@ import {
 import { transition } from "./state-machine.ts";
 import {
   canonicalArtifactReferencePath,
+  isPortableArtifactFileName,
   validateArtifactReferencePath,
 } from "./artifact-path.ts";
 
@@ -434,11 +435,22 @@ export class FileRunStore implements RunStore {
     return path.join(this.runDirectory(runId), ".admin.lock");
   }
 
+  private async requireOrdinaryRunNamespace(runId: string): Promise<void> {
+    await requireOrdinaryDirectory(path.dirname(this.root), "MASWE state namespace");
+    await requireOrdinaryDirectory(this.root, "run store namespace");
+    await requireOrdinaryDirectory(this.runDirectory(runId), "run record namespace");
+  }
+
+  private async requireOrdinaryArtifactNamespace(runId: string): Promise<string> {
+    await this.requireOrdinaryRunNamespace(runId);
+    const artifactDirectory = path.join(this.runDirectory(runId), "artifacts");
+    await requireOrdinaryDirectory(artifactDirectory, "run artifact namespace");
+    return artifactDirectory;
+  }
+
   private async readRunFile(runId: string): Promise<RunRecord> {
     try {
-      await requireOrdinaryDirectory(path.dirname(this.root), "MASWE state namespace");
-      await requireOrdinaryDirectory(this.root, "run store namespace");
-      await requireOrdinaryDirectory(this.runDirectory(runId), "run record namespace");
+      await this.requireOrdinaryRunNamespace(runId);
       const raw = await readBoundedOrdinaryFile(
         this.runFile(runId),
         "run record",
@@ -893,7 +905,10 @@ export class FileRunStore implements RunStore {
       const logicalName = name.replace(/[^a-zA-Z0-9._-]/g, "-");
       const priorAttempts = next.artifacts.filter((artifact) => artifact.logicalName === logicalName);
       const attempt = priorAttempts.reduce((max, artifact) => Math.max(max, artifact.attempt), 0) + 1;
-      const fileName = `${logicalName.replace(/\.md$/i, "")}.attempt-${attempt}.md`;
+      const candidateFileName = `${logicalName.replace(/\.md$/i, "")}.attempt-${attempt}.md`;
+      const fileName = isPortableArtifactFileName(candidateFileName)
+        ? candidateFileName
+        : `_${candidateFileName}`;
       const relativePath = canonicalArtifactReferencePath(run.id, fileName);
       const absolutePath = path.join(this.root, run.id, "artifacts", fileName);
       const redacted = redactSecrets(content);
@@ -949,13 +964,13 @@ export class FileRunStore implements RunStore {
       run.artifacts.find((artifact) => artifact.logicalName === name && artifact.name === name);
     if (!reference) return undefined;
     const { fileName } = validateArtifactReferencePath(run.id, reference.path);
-    const artifactDirectory = path.join(this.root, run.id, "artifacts");
-    await requireOrdinaryDirectory(artifactDirectory, "run artifact namespace");
+    const artifactDirectory = await this.requireOrdinaryArtifactNamespace(run.id);
     const content = await readBoundedOrdinaryFile(
       path.join(artifactDirectory, fileName),
       "run artifact",
       MAX_AUTHORITATIVE_FILE_BYTES,
     );
+    await this.requireOrdinaryArtifactNamespace(run.id);
     const digest = sha256(content);
     if (digest !== reference.sha256) {
       throw new Error(

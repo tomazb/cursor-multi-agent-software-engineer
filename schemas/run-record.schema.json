@@ -61,7 +61,7 @@
           "attempt": { "type": "integer", "minimum": 1 },
           "path": {
             "type": "string",
-            "pattern": "^\\.maswe[\\\\/]runs[\\\\/][A-Za-z0-9][A-Za-z0-9._-]{0,127}[\\\\/]artifacts[\\\\/](?!\\.{1,2}$)[^\\\\/]+$"
+            "pattern": "^\\.maswe[\\\\/]runs[\\\\/][A-Za-z0-9][A-Za-z0-9._-]{0,127}[\\\\/]artifacts[\\\\/](?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.|$))[A-Za-z0-9._-]*[A-Za-z0-9_-]$"
           },
           "sha256": {
             "type": "string",
