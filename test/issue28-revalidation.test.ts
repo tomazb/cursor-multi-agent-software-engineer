@@ -148,6 +148,41 @@ test("initial revalidation rejects an unchanged target before publication", asyn
   assert.deepEqual(await store.load(run.id), before);
 });
 
+test("initial revalidation permits same-target recovery only for missing associated gate evidence", async (t) => {
+  const store = await tempStore(t);
+  const run = await runInState(store, "PR_REVIEW");
+  run.workspace = workspace(HEAD_A);
+  run.github = {
+    installationId: 28,
+    repository: "owner/repo",
+    pullRequestNumber: 28,
+    baseSha: HEAD_A,
+    headSha: HEAD_A,
+    branch: "maswe/issue-28",
+    suspended: false,
+  };
+  await store.save(run);
+
+  const recovered = await new RevalidationService(store).route(run.id, {
+    source: "github",
+    previousHeadSha: HEAD_A,
+    requestedHeadSha: HEAD_A,
+    expectedRunVersion: run.version,
+    actor: "github-app",
+    at: REQUESTED_AT,
+  });
+
+  assert.equal(recovered.state, "CI_RUNNING");
+  assert.equal(recovered.revalidation?.originHeadSha, HEAD_A);
+  assert.equal(recovered.revalidation?.requestedHeadSha, HEAD_A);
+  assert.equal(recovered.revalidation?.returnState, "PR_REVIEW");
+  assert.equal(recovered.revalidation?.generation, 1);
+  assert.equal(
+    recovered.events.filter((event) => event.type === "REVALIDATE_REQUESTED").length,
+    1,
+  );
+});
+
 test("initial revalidation rejects a stale predecessor after fenced reload", async (t) => {
   const store = await tempStore(t);
   const run = await runInState(store, "PR_REVIEW");

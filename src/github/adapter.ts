@@ -1,7 +1,10 @@
 import type { GitHubAppConfig, MasweConfig, RunRecord } from "../domain.ts";
 import { containsDurableAtomicWriteOutcomeUnknown } from "../durable-file.ts";
 import { invalidateStaleEvidence } from "../git-workspace.ts";
-import { RevalidationService } from "../revalidation.ts";
+import {
+  requiresSameTargetEvidenceRecovery,
+  RevalidationService,
+} from "../revalidation.ts";
 import { withRunMutationFence } from "../run-mutation.ts";
 import type { RunStore } from "../store.ts";
 import {
@@ -564,7 +567,8 @@ export class GitHubAppAdapter {
     }
     if (
       authoritative.revalidation === undefined &&
-      routingPreviousHeadSha === requestedHeadSha
+      routingPreviousHeadSha === requestedHeadSha &&
+      !requiresSameTargetEvidenceRecovery(authoritative, requestedHeadSha)
     ) {
       return authoritative;
     }

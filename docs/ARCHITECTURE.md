@@ -111,7 +111,8 @@ Any nonterminal state may transition to `FAILED` or `CANCELLED` through the gene
 
 `REVALIDATE_REQUESTED` records the first current-head generation and its return gate. Outside
 `PR_READY` and `PR_REVIEW`, it is legal only when explicit transition context proves that a
-committed GitHub association moved to a different head and stale evidence was invalidated. The
+committed GitHub association moved to a different head and stale evidence was invalidated, or that
+association movement erased current gate evidence before returning to the workspace target. The
 return gate comes from append-only workflow history: a run that entered `PR_REVIEW` returns there;
 otherwise recovery returns to `PR_READY`. Recovery never returns directly to `MERGE_READY`.
 At either return gate, the orchestrator routes a mismatched committed GitHub association before
@@ -125,7 +126,10 @@ then `workspace.headSha` when no generation is active. Prior association and pen
 heads remain publication and cancellation metadata; they never determine or override the workflow
 target. A missing target fails closed, and the revalidation service rejects a predecessor or
 observed workspace that conflicts with the authoritative target loaded after target ownership is
-acquired.
+acquired. Equal-target delivery is ordinarily event-free; at `PR_READY`, `PR_REVIEW`, or
+`MERGE_READY`, missing quality or verification evidence permits exactly one same-target generation
+so an interrupted association reversal cannot strand the gate. Its active generation makes later
+delivery idempotent.
 `REVALIDATION_RETARGETED` preserves all earlier events while moving an active generation back to
 `CI_RUNNING`; for a recoverable `FAILED` run it updates the retained resume state to `CI_RUNNING`
 without rewriting the historical `FAIL`. A newer authenticated or local head retargets an active

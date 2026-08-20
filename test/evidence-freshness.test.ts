@@ -586,6 +586,47 @@ for (const gate of ["merge-ready", "complete"] as const) {
   });
 }
 
+test("complete starts same-target recovery when association movement erased current evidence", async (t) => {
+  const fixture = await prepareCurrentHeadGate(t, "complete");
+  assert.ok(fixture.run.workspace);
+  fixture.run.github = {
+    installationId: 28,
+    repository: "owner/repo",
+    pullRequestNumber: 28,
+    baseSha: fixture.run.workspace.baseSha,
+    headSha: fixture.headSha,
+    branch: fixture.run.workspace.branch,
+    suspended: false,
+    pendingCancellationHeadShas: [HEAD_C],
+  };
+  delete fixture.run.evidence;
+  await fixture.orchestrator.store.save(fixture.run);
+  const before = await fixture.orchestrator.store.load(fixture.run.id);
+
+  await assert.rejects(
+    fixture.orchestrator.complete(fixture.run.id),
+    /revalidation|complete requires MERGE_READY/i,
+  );
+
+  const authoritative = await fixture.orchestrator.store.load(fixture.run.id);
+  assert.equal(authoritative.state, "CI_RUNNING");
+  assert.equal(authoritative.github?.headSha, fixture.headSha);
+  assert.equal(authoritative.workspace?.headSha, fixture.headSha);
+  assert.equal(authoritative.revalidation?.originHeadSha, fixture.headSha);
+  assert.equal(authoritative.revalidation?.requestedHeadSha, fixture.headSha);
+  assert.equal(authoritative.revalidation?.returnState, "PR_READY");
+  assert.equal(authoritative.revalidation?.generation, 1);
+  assert.equal(
+    authoritative.events.filter((event) => event.type === "REVALIDATE_REQUESTED").length,
+    1,
+  );
+  assert.equal(
+    authoritative.events.filter((event) => event.type === "MARK_MERGE_READY").length,
+    before.events.filter((event) => event.type === "MARK_MERGE_READY").length,
+  );
+  assert.equal(authoritative.events.some((event) => event.type === "COMPLETE"), false);
+});
+
 for (const mergeReadyCase of ["missing", "failed", "stale", "historical-only"] as const) {
   test(`complete rejects ${mergeReadyCase} merge-ready evidence without mutation`, async (t) => {
     const fixture = await prepareCurrentHeadGate(t, "complete");

@@ -829,12 +829,18 @@ export class FileRunStore implements RunStore {
     const safeDetails = sanitizeEventDetails(type, details);
     const requestedHeadSha = run.revalidation?.requestedHeadSha;
     const evidenceBindings = Object.values(run.evidence ?? {});
+    const sameTargetEvidenceRecovery =
+      run.revalidation?.originHeadSha === requestedHeadSha &&
+      (from === "PR_READY" || from === "PR_REVIEW" || from === "MERGE_READY") &&
+      (run.evidence?.quality?.headSha !== requestedHeadSha ||
+        run.evidence?.verification?.headSha !== requestedHeadSha);
     const associatedHeadRecovery =
       run.github !== undefined &&
       run.revalidation?.source === "github" &&
-      run.revalidation.originHeadSha !== requestedHeadSha &&
       run.github.headSha === requestedHeadSha &&
-      evidenceBindings.every((binding) => binding?.headSha === requestedHeadSha);
+      (sameTargetEvidenceRecovery ||
+        (run.revalidation.originHeadSha !== requestedHeadSha &&
+          evidenceBindings.every((binding) => binding?.headSha === requestedHeadSha)));
     const to = transition(from, type, {
       ...(safeDetails?.resumeState !== undefined
         ? { retryResumeState: safeDetails.resumeState as WorkflowState }

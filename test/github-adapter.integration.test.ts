@@ -392,7 +392,7 @@ test("integration: new head SHA invalidates prior success conclusions", async ()
   assert.equal(loaded.github?.headSha, "sha2");
 });
 
-test("integration: the post-association seam observes an event-free snapshot and an equal workspace target avoids routing", async () => {
+test("integration: the post-association seam is event-free before equal-target evidence recovery", async () => {
   process.env[SECRET_ENV] = SECRET;
   const priorHead = "a".repeat(40);
   const routedHead = "b".repeat(40);
@@ -452,9 +452,11 @@ test("integration: the post-association seam observes an event-free snapshot and
   assert.equal(snapshotAtSeam?.revalidation, undefined);
   assert.deepEqual(snapshotAtSeam?.events, priorEvents);
   const routed = await store.load(run.id);
-  assert.equal(routed.state, "PR_REVIEW");
-  assert.equal(routed.revalidation, undefined);
-  assert.deepEqual(routed.events, priorEvents);
+  assert.equal(routed.state, "CI_RUNNING");
+  assert.equal(routed.revalidation?.originHeadSha, routedHead);
+  assert.equal(routed.revalidation?.requestedHeadSha, routedHead);
+  assert.equal(routed.revalidation?.returnState, "PR_REVIEW");
+  assert.equal(routed.events.at(-1)?.type, "REVALIDATE_REQUESTED");
 });
 
 test("integration: pending cancellation heads cannot replace a missing authoritative workflow target", async () => {

@@ -1532,6 +1532,59 @@ test("github B then C at zero cycles retargets generation two without publishing
   );
 });
 
+test("github A to B crash then B to A starts one same-target evidence recovery", async (t) => {
+  let associationCommits = 0;
+  const harness = await adapterHarness(t, {
+    afterAssociationCommitBeforeRouting: async () => {
+      associationCommits += 1;
+      if (associationCommits === 1) {
+        throw new Error("stop after A to B association commit");
+      }
+    },
+  });
+
+  await assert.rejects(
+    deliver(harness, HEAD_B, "head-b-crash-before-routing"),
+    /stop after A to B association commit/,
+  );
+  const atB = await harness.store.load(harness.runId);
+  assert.equal(atB.github?.headSha, HEAD_B);
+  assert.equal(atB.workspace?.headSha, HEAD_A);
+  assert.equal(atB.evidence, undefined);
+  assert.equal(atB.revalidation, undefined);
+  assert.equal(initialRevalidationPublications(atB), 0);
+
+  await deliver(harness, HEAD_A, "head-a-return-after-crash");
+
+  const recovered = await harness.store.load(harness.runId);
+  assert.equal(recovered.state, "CI_RUNNING");
+  assert.equal(recovered.github?.headSha, HEAD_A);
+  assert.equal(recovered.workspace?.headSha, HEAD_A);
+  assert.equal(recovered.revalidation?.originHeadSha, HEAD_A);
+  assert.equal(recovered.revalidation?.requestedHeadSha, HEAD_A);
+  assert.equal(recovered.revalidation?.returnState, "PR_REVIEW");
+  assert.equal(recovered.revalidation?.generation, 1);
+  assert.equal(initialRevalidationPublications(recovered), 1);
+
+  await deliver(harness, HEAD_A, "head-a-same-target-redelivery");
+  const redelivered = await harness.store.load(harness.runId);
+  assert.equal(redelivered.revalidation?.generation, 1);
+  assert.equal(initialRevalidationPublications(redelivered), 1);
+  assert.deepEqual(eventIdentity(redelivered), eventIdentity(recovered));
+});
+
+test("github equal-target delivery with current gate evidence remains event-free", async (t) => {
+  const harness = await adapterHarness(t);
+  const before = await harness.store.load(harness.runId);
+
+  await deliver(harness, HEAD_A, "head-a-current-evidence");
+
+  const after = await harness.store.load(harness.runId);
+  assert.equal(after.state, "PR_REVIEW");
+  assert.equal(after.revalidation, undefined);
+  assert.deepEqual(eventIdentity(after), eventIdentity(before));
+});
+
 test("github head movement starts post-review recovery without an active revalidation", async (t) => {
   for (const state of ["CI_RUNNING", "VERIFYING", "RESOLVING", "MERGE_READY"] as const) {
     await t.test(state, async (t) => {

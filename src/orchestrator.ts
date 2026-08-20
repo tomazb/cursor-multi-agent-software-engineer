@@ -37,6 +37,7 @@ import {
   assertRevalidationFence,
   captureRevalidationFence,
   hasEnteredPullRequestReview,
+  requiresSameTargetEvidenceRecovery,
   RevalidationOptimisticConflictError,
   RevalidationService,
   type RevalidationFence,
@@ -562,7 +563,12 @@ export class Orchestrator {
           `Run ${run.id} has no authoritative workflow target for committed GitHub HEAD ${github.headSha}`,
         );
       }
-      if (github.headSha === currentTarget) return snapshot;
+      if (
+        github.headSha === currentTarget &&
+        !requiresSameTargetEvidenceRecovery(snapshot, currentTarget)
+      ) {
+        return snapshot;
+      }
 
       const committedHeadSha = github.headSha;
       try {
@@ -579,7 +585,8 @@ export class Orchestrator {
         if (
           authoritative.github?.suspended !== true &&
           authoritative.github?.headSha === committedHeadSha &&
-          this.currentWorkflowTarget(authoritative) === committedHeadSha
+          this.currentWorkflowTarget(authoritative) === committedHeadSha &&
+          !requiresSameTargetEvidenceRecovery(authoritative, committedHeadSha)
         ) {
           return authoritative;
         }
@@ -591,7 +598,8 @@ export class Orchestrator {
       if (
         authoritative.github?.suspended !== true &&
         authoritative.github?.headSha === committedHeadSha &&
-        this.currentWorkflowTarget(authoritative) === committedHeadSha
+        this.currentWorkflowTarget(authoritative) === committedHeadSha &&
+        !requiresSameTargetEvidenceRecovery(authoritative, committedHeadSha)
       ) {
         return authoritative;
       }

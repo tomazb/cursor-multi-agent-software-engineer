@@ -41,6 +41,27 @@ const ASSOCIATED_HEAD_RECOVERY_STATES: WorkflowState[] = [
   "MERGE_READY",
 ];
 
+const SAME_TARGET_EVIDENCE_RECOVERY_STATES: WorkflowState[] = [
+  "PR_READY",
+  "PR_REVIEW",
+  "MERGE_READY",
+];
+
+export function requiresSameTargetEvidenceRecovery(
+  run: RunRecord,
+  headSha: string,
+): boolean {
+  return (
+    run.revalidation === undefined &&
+    SAME_TARGET_EVIDENCE_RECOVERY_STATES.includes(run.state) &&
+    run.github?.suspended !== true &&
+    run.github?.headSha === headSha &&
+    run.workspace?.headSha === headSha &&
+    (run.evidence?.quality?.headSha !== headSha ||
+      run.evidence?.verification?.headSha !== headSha)
+  );
+}
+
 export function hasEnteredPullRequestReview(run: RunRecord): boolean {
   return (
     run.state === "PR_REVIEW" ||
@@ -169,7 +190,11 @@ export class RevalidationService {
     run: RunRecord,
     input: RevalidationTargetInput,
   ): Promise<RunRecord> {
-    if (input.previousHeadSha === input.requestedHeadSha) {
+    if (
+      input.previousHeadSha === input.requestedHeadSha &&
+      (input.source !== "github" ||
+        !requiresSameTargetEvidenceRecovery(run, input.requestedHeadSha))
+    ) {
       throw new Error("Initial revalidation target is unchanged");
     }
     const returnState = initialReturnState(run, input);
