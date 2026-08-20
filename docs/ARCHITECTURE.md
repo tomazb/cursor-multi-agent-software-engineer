@@ -120,6 +120,12 @@ snapshot. A GitHub-routed checkpoint is returned without starting automatic work
 workspace reaches that requested head; local-head routing may continue immediately because its
 observed workspace is already aligned. Optimistic races are retried through the bounded target
 reconciliation loop, and an unstable target fails closed.
+Association routing treats an active `revalidation.requestedHeadSha` as the authoritative target,
+then `workspace.headSha` when no generation is active. Prior association and pending-cancellation
+heads remain publication and cancellation metadata; they never determine or override the workflow
+target. A missing target fails closed, and the revalidation service rejects a predecessor or
+observed workspace that conflicts with the authoritative target loaded after target ownership is
+acquired.
 `REVALIDATION_RETARGETED` preserves all earlier events while moving an active generation back to
 `CI_RUNNING`; for a recoverable `FAILED` run it updates the retained resume state to `CI_RUNNING`
 without rewriting the historical `FAIL`. A newer authenticated or local head retargets an active

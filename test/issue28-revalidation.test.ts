@@ -56,6 +56,8 @@ async function initialRequest(
   gate: RevalidationReturnState = "PR_REVIEW",
 ): Promise<RunRecord> {
   const run = await runInState(store, gate);
+  run.workspace = workspace(HEAD_A);
+  await store.save(run);
   return new RevalidationService(store).route(run.id, {
     source: "local-workspace",
     previousHeadSha: HEAD_A,
@@ -71,6 +73,7 @@ for (const gate of ["PR_READY", "PR_REVIEW"] as const) {
   test(`initial revalidation from ${gate} retains that return gate and publishes once`, async (t) => {
     const store = await tempStore(t);
     const run = await runInState(store, gate);
+    run.workspace = workspace(HEAD_A);
     run.evidence = {
       quality: { headSha: HEAD_A, passed: true, at: REQUESTED_AT },
       verification: { headSha: HEAD_A, passed: true, at: REQUESTED_AT },
@@ -126,6 +129,8 @@ for (const gate of ["PR_READY", "PR_REVIEW"] as const) {
 test("initial revalidation rejects an unchanged target before publication", async (t) => {
   const store = await tempStore(t);
   const run = await runInState(store, "PR_REVIEW");
+  run.workspace = workspace(HEAD_A);
+  await store.save(run);
   const before = structuredClone(run);
 
   await assert.rejects(
@@ -138,6 +143,51 @@ test("initial revalidation rejects an unchanged target before publication", asyn
       at: REQUESTED_AT,
     }),
     /unchanged|different.*head|same.*head/i,
+  );
+
+  assert.deepEqual(await store.load(run.id), before);
+});
+
+test("initial revalidation rejects a stale predecessor after fenced reload", async (t) => {
+  const store = await tempStore(t);
+  const run = await runInState(store, "PR_REVIEW");
+  run.workspace = workspace(HEAD_B);
+  await store.save(run);
+  const before = structuredClone(run);
+
+  await assert.rejects(
+    new RevalidationService(store).route(run.id, {
+      source: "github",
+      previousHeadSha: HEAD_A,
+      requestedHeadSha: HEAD_C,
+      expectedRunVersion: run.version,
+      actor: "github-app",
+      at: REQUESTED_AT,
+    }),
+    /optimistic.*predecessor|authoritative target/i,
+  );
+
+  assert.deepEqual(await store.load(run.id), before);
+});
+
+test("initial revalidation rejects an observed workspace at a different HEAD", async (t) => {
+  const store = await tempStore(t);
+  const run = await runInState(store, "PR_REVIEW");
+  run.workspace = workspace(HEAD_A);
+  await store.save(run);
+  const before = structuredClone(run);
+
+  await assert.rejects(
+    new RevalidationService(store).route(run.id, {
+      source: "github",
+      previousHeadSha: HEAD_A,
+      requestedHeadSha: HEAD_B,
+      expectedRunVersion: run.version,
+      actor: "github-app",
+      observedWorkspace: workspace(HEAD_C),
+      at: REQUESTED_AT,
+    }),
+    /workspace.*HEAD|target.*workspace|alignment/i,
   );
 
   assert.deepEqual(await store.load(run.id), before);
@@ -464,6 +514,8 @@ test("active routing never reverses a newer target when the predecessor is stale
 test("illegal revalidation requests and persisted contexts fail closed without publication", async (t) => {
   const store = await tempStore(t);
   const noContext = await runInState(store, "BUILDING");
+  noContext.workspace = workspace(HEAD_A);
+  await store.save(noContext);
   const noContextVersion = noContext.version;
   await assert.rejects(
     new RevalidationService(store).route(noContext.id, {

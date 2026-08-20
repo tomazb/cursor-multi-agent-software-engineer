@@ -426,7 +426,6 @@ export class GitHubAppAdapter {
         );
         return this.publishCommittedAssociation(
           publication.committedAssociation,
-          publication.previousHeadSha,
           publication.pendingHeadShas,
         );
       },
@@ -541,27 +540,9 @@ export class GitHubAppAdapter {
 
   private async routeAssociationHead(
     expected: AssociationRoutingIdentity,
-    previousHeadSha: string | undefined,
   ): Promise<RunRecord> {
     const authoritative = await this.loadActiveCommittedAssociation(expected);
     const requestedHeadSha = expected.headSha;
-    const priorAssociationHeadSha =
-      previousHeadSha !== requestedHeadSha ? previousHeadSha : undefined;
-    const priorWorkspaceHeadSha =
-      authoritative.workspace?.headSha !== requestedHeadSha
-        ? authoritative.workspace?.headSha
-        : undefined;
-    const pendingPredecessor = authoritative.github?.pendingCancellationHeadShas?.find(
-      (headSha) => headSha !== requestedHeadSha,
-    );
-    const routingPreviousHeadSha =
-      authoritative.revalidation?.requestedHeadSha ??
-      priorAssociationHeadSha ??
-      priorWorkspaceHeadSha ??
-      pendingPredecessor ??
-      previousHeadSha ??
-      authoritative.workspace?.headSha;
-    if (!routingPreviousHeadSha) return authoritative;
     if (
       authoritative.revalidation === undefined &&
       authoritative.state !== "PR_READY" &&
@@ -573,6 +554,13 @@ export class GitHubAppAdapter {
       authoritative.state !== "MERGE_READY"
     ) {
       return authoritative;
+    }
+    const routingPreviousHeadSha =
+      authoritative.revalidation?.requestedHeadSha ?? authoritative.workspace?.headSha;
+    if (!routingPreviousHeadSha) {
+      throw new Error(
+        `Associated run ${expected.runId} has no authoritative workflow target for GitHub head ${requestedHeadSha}`,
+      );
     }
     if (
       authoritative.revalidation === undefined &&
@@ -592,7 +580,6 @@ export class GitHubAppAdapter {
 
   private async publishCommittedAssociation(
     expected: AssociationRoutingIdentity,
-    previousHeadSha: string | undefined,
     pendingHeadShas: readonly string[],
   ): Promise<RunRecord> {
     await this.afterAssociationCommitBeforeRouting?.(expected.runId);
@@ -602,7 +589,7 @@ export class GitHubAppAdapter {
       expected.repository,
       expected.pullRequestNumber,
       async () => {
-        const routed = await this.routeAssociationHead(expected, previousHeadSha);
+        const routed = await this.routeAssociationHead(expected);
         await this.afterAssociationRoutedBeforeChecks?.(expected.runId);
         await this.publishChecks(
           routed,
@@ -1077,7 +1064,6 @@ export class GitHubAppAdapter {
       if (publication.kind === "publish") {
         await this.publishCommittedAssociation(
           publication.committedAssociation,
-          publication.previousHeadSha,
           publication.pendingHeadShas,
         );
         return;

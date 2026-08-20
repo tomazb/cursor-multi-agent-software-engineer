@@ -884,16 +884,18 @@ test("initial revalidation invalidates every stale evidence binding", async () =
   const store = new FileRunStore(cwd);
   const run = await store.create("stale evidence", "revalidate a newer head", baseConfig());
   run.state = "PR_READY";
+  run.workspace = await ensureRunWorkspace(cwd, run);
+  const previousHeadSha = run.workspace.headSha;
   run.evidence = {
-    quality: { headSha: "a".repeat(40), passed: true, at: "2026-08-18T12:00:00.000Z" },
-    verification: { headSha: "a".repeat(40), passed: true, at: "2026-08-18T12:00:00.000Z" },
-    mergeReady: { headSha: "a".repeat(40), passed: true, at: "2026-08-18T12:00:00.000Z" },
+    quality: { headSha: previousHeadSha, passed: true, at: "2026-08-18T12:00:00.000Z" },
+    verification: { headSha: previousHeadSha, passed: true, at: "2026-08-18T12:00:00.000Z" },
+    mergeReady: { headSha: previousHeadSha, passed: true, at: "2026-08-18T12:00:00.000Z" },
   };
   await store.save(run);
 
   const routed = await new RevalidationService(store).route(run.id, {
     source: "local-workspace",
-    previousHeadSha: "a".repeat(40),
+    previousHeadSha,
     requestedHeadSha: "b".repeat(40),
     expectedRunVersion: run.version,
     actor: "local-runner",

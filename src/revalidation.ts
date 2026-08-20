@@ -138,6 +138,20 @@ export class RevalidationService {
 
         const revalidation = run.revalidation;
         if (revalidation === undefined) {
+          const authoritativeTarget = run.workspace?.headSha;
+          if (authoritativeTarget !== input.previousHeadSha) {
+            throw new RevalidationOptimisticConflictError(
+              `Revalidation optimistic predecessor conflict for run ${runId}: expected ${input.previousHeadSha}, authoritative target ${authoritativeTarget ?? "missing"}`,
+            );
+          }
+          if (
+            input.observedWorkspace !== undefined &&
+            input.observedWorkspace.headSha !== input.requestedHeadSha
+          ) {
+            throw new Error(
+              `Revalidation target ${input.requestedHeadSha} does not match observed workspace HEAD ${input.observedWorkspace.headSha}`,
+            );
+          }
           return this.requestInitial(run, input);
         }
         if (revalidation.requestedHeadSha !== input.previousHeadSha) {

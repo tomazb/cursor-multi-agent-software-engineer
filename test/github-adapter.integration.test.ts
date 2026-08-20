@@ -392,7 +392,7 @@ test("integration: new head SHA invalidates prior success conclusions", async ()
   assert.equal(loaded.github?.headSha, "sha2");
 });
 
-test("integration: the post-association seam observes an event-free snapshot before head routing", async () => {
+test("integration: the post-association seam observes an event-free snapshot and an equal workspace target avoids routing", async () => {
   process.env[SECRET_ENV] = SECRET;
   const priorHead = "a".repeat(40);
   const routedHead = "b".repeat(40);
@@ -452,8 +452,53 @@ test("integration: the post-association seam observes an event-free snapshot bef
   assert.equal(snapshotAtSeam?.revalidation, undefined);
   assert.deepEqual(snapshotAtSeam?.events, priorEvents);
   const routed = await store.load(run.id);
-  assert.equal(routed.state, "CI_RUNNING");
-  assert.equal(routed.events.at(-1)?.type, "REVALIDATE_REQUESTED");
+  assert.equal(routed.state, "PR_REVIEW");
+  assert.equal(routed.revalidation, undefined);
+  assert.deepEqual(routed.events, priorEvents);
+});
+
+test("integration: pending cancellation heads cannot replace a missing authoritative workflow target", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const routedHead = "b".repeat(40);
+  const { adapter, store, cwd } = await setup({ liveHead: routedHead });
+  const run = await store.create("missing-routing-target", "req", testConfig());
+  run.state = "PR_REVIEW";
+  run.github = {
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: routedHead,
+    branch: "maswe/run-1",
+    suspended: false,
+    pendingCancellationHeadShas: ["a".repeat(40), "c".repeat(40)],
+  };
+  await store.save(run);
+  await new GitHubAssociationIndex(path.join(cwd, ".maswe", "github")).bind({
+    runId: run.id,
+    installationId: 44,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: routedHead,
+    branch: "maswe/run-1",
+  });
+  const priorEvents = structuredClone(run.events);
+  const body = JSON.stringify(prPayload(routedHead));
+
+  await assert.rejects(
+    adapter.handleWebhook({
+      deliveryId: "del-missing-routing-target",
+      eventName: "pull_request",
+      signatureHeader: sign(body),
+      rawBody: body,
+    }),
+    /has no authoritative workflow target/i,
+  );
+
+  const after = await store.load(run.id);
+  assert.equal(after.revalidation, undefined);
+  assert.deepEqual(after.events, priorEvents);
 });
 
 test("integration: retry remembers every old head until cancellation publication succeeds", async () => {
