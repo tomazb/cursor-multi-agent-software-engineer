@@ -71,6 +71,22 @@ test("persisted migration rejects explicit null permissions without rewriting sn
   }
 });
 
+test("persisted migration rejects explicit top-level null config", () => {
+  const persisted = historicalRun();
+  persisted.config = null;
+
+  assert.throws(() => migrateRunRecord(persisted), /config.*object/i);
+  assert.equal(persisted.config, null);
+});
+
+test("persisted migration rejects omitted config", () => {
+  const persisted = historicalRun();
+  delete persisted.config;
+
+  assert.throws(() => migrateRunRecord(persisted), /config.*required/i);
+  assert.equal(Object.hasOwn(persisted, "config"), false);
+});
+
 test("omitted permissions in partial role config retain role defaults", () => {
   for (const [role, required] of roles) {
     const config = mergeConfigForTest({

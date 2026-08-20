@@ -153,7 +153,7 @@ function normalizeGitHubAppConfig(raw: unknown): NonNullable<MasweConfig["github
 /** Pure default migration without applying process environment overrides. */
 export function migrateConfig(raw: unknown): MasweConfig {
   const base = cloneDefaults();
-  if (raw === undefined || raw === null) return base;
+  if (raw === undefined) return base;
   const value = exactObject(raw, "config", [
     "version",
     "runtime",
