@@ -50,6 +50,16 @@ test("unknown prompt placeholders fail deterministically", () => {
   );
 });
 
+test("brainstorm prompts preserve placeholder-shaped requests literally", async () => {
+  const prompt = await buildRolePrompt(
+    "brainstormer",
+    makeRun("request {{DESIGN}}"),
+    artifactStore({}),
+  );
+
+  assert.match(prompt, /request \{\{DESIGN\}\}/);
+});
+
 test("role prompts preserve placeholder-shaped requests and artifact handoffs literally", async () => {
   const run = makeRun("request {{DESIGN}}");
   const store = artifactStore({
