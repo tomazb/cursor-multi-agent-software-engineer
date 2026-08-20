@@ -2007,13 +2007,16 @@ export class Orchestrator {
     const workdir = workdirOverride ?? workingDirectoryFor(run);
 
     for (const model of candidates) {
+      const before = permissions === "read-only"
+        ? await captureReadOnlyExecutionState(workdir)
+        : undefined;
+      let runtimeOutcome:
+        | { ok: true; result: Awaited<ReturnType<AgentRuntime["execute"]>> }
+        | { ok: false; error: unknown };
       try {
-        const before = permissions === "read-only"
-          ? await captureReadOnlyExecutionState(workdir)
-          : undefined;
-        let result: Awaited<ReturnType<AgentRuntime["execute"]>>;
-        try {
-          result = await this.runtime.execute({
+        runtimeOutcome = {
+          ok: true,
+          result: await this.runtime.execute({
             runId: run.id,
             role,
             prompt,
@@ -2023,36 +2026,68 @@ export class Orchestrator {
             managedWorktree: managedWorktreeOverride ?? Boolean(
               run.workspace?.worktreePath && path.resolve(workdir) === path.resolve(run.workspace.worktreePath),
             ),
-          });
-        } finally {
-          if (before) await assertReadOnlyExecutionState(workdir, role, before);
-        }
-        assertRuntimeIdentity(result, role);
-        ensureRuntimeSuccess(result, role);
-        return result;
+          }),
+        };
       } catch (error) {
-        const policyViolation = findPolicyViolationError(error);
-        if (policyViolation) throw policyViolation;
-        totalFailureAttempts += 1;
-        const failure = runtimeAttemptFailure(model, error);
-        if (
-          durableAttempts.length <
-          DURABLE_RUNTIME_FAILURE_ATTEMPT_LIMIT
-        ) {
-          durableAttempts.push(failure.durable);
+        runtimeOutcome = { ok: false, error };
+      }
+
+      let fenceError: unknown;
+      let fenceFailed = false;
+      if (before) {
+        try {
+          await assertReadOnlyExecutionState(workdir, role, before);
+        } catch (error) {
+          fenceError = error;
+          fenceFailed = true;
         }
-        if (aggregateFull) {
-          aggregateOmittedAttempts += 1;
-        } else {
-          const appended = appendFailureAggregate(
-            aggregate,
-            failure.rendered,
-            aggregateHasEntries,
-          );
-          aggregate = appended.text;
-          aggregateFull = appended.full;
-          aggregateHasEntries = true;
+      }
+
+      const fencePolicyViolation = fenceFailed
+        ? findPolicyViolationError(fenceError)
+        : undefined;
+      const runtimePolicyViolation = runtimeOutcome.ok
+        ? undefined
+        : findPolicyViolationError(runtimeOutcome.error);
+      const policyViolation = fencePolicyViolation ?? runtimePolicyViolation;
+      if (policyViolation) throw policyViolation;
+      if (fenceFailed) throw fenceError;
+
+      let attemptError: unknown;
+      if (runtimeOutcome.ok) {
+        const { result } = runtimeOutcome;
+        try {
+          assertRuntimeIdentity(result, role, model);
+          ensureRuntimeSuccess(result, role);
+          return result;
+        } catch (error) {
+          const resultPolicyViolation = findPolicyViolationError(error);
+          if (resultPolicyViolation) throw resultPolicyViolation;
+          attemptError = error;
         }
+      } else {
+        attemptError = runtimeOutcome.error;
+      }
+
+      totalFailureAttempts += 1;
+      const failure = runtimeAttemptFailure(model, attemptError);
+      if (
+        durableAttempts.length <
+        DURABLE_RUNTIME_FAILURE_ATTEMPT_LIMIT
+      ) {
+        durableAttempts.push(failure.durable);
+      }
+      if (aggregateFull) {
+        aggregateOmittedAttempts += 1;
+      } else {
+        const appended = appendFailureAggregate(
+          aggregate,
+          failure.rendered,
+          aggregateHasEntries,
+        );
+        aggregate = appended.text;
+        aggregateFull = appended.full;
+        aggregateHasEntries = true;
       }
     }
     const message = reportOmittedFailureAttempts(

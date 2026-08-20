@@ -212,6 +212,14 @@ test("config schema encodes exact role permissions and nonblank quality commands
     assert.ok(roleSchema, `${role} schema`);
     const permissionSchema = roleSchema.allOf?.[1]?.properties?.permissions;
     assert.equal(permissionSchema?.const, permission, `${role} permissions.const`);
+    const invalidConfig = structuredClone(DEFAULT_CONFIG) as unknown as {
+      roles: Record<string, { permissions: unknown }>;
+    };
+    invalidConfig.roles[role]!.permissions = null;
+    assert.throws(
+      () => assertMatches(schema, schema, invalidConfig, `config.roles.${role}.permissions.null`),
+      /enum|const/,
+    );
   }
 
   const commands = schema.properties?.quality?.properties?.commands;

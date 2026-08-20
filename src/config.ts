@@ -108,10 +108,13 @@ function mergeRole(base: RoleConfig, incoming: unknown, label: string): RoleConf
     "permissions",
   ]) as Partial<RoleConfig>;
   const fallbackModels = value.fallbackModels ?? base.fallbackModels;
+  const permissions = Object.hasOwn(value, "permissions")
+    ? value.permissions
+    : base.permissions;
   return {
     model: value.model ?? base.model,
     reasoning: value.reasoning ?? base.reasoning,
-    permissions: value.permissions ?? base.permissions,
+    permissions: permissions as RoleConfig["permissions"],
     ...(fallbackModels ? { fallbackModels } : {}),
   };
 }

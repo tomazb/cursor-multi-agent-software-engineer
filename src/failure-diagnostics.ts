@@ -411,11 +411,19 @@ export function safeFailureMessage(message: string): string {
 export function assertRuntimeIdentity(
   result: RuntimeResult,
   role: RoleId,
+  trustedRequestedModel: string,
 ): void {
-  if (result.actualModel && result.actualModel !== result.requestedModel) {
+  const requestedModelMismatch = result.requestedModel !== trustedRequestedModel;
+  const actualModelMismatch =
+    result.actualModel !== undefined &&
+    result.actualModel !== trustedRequestedModel;
+  if (requestedModelMismatch || actualModelMismatch) {
+    const reportedActual = result.actualModel === undefined
+      ? "not reported"
+      : normalizeModelDisplay(result.actualModel);
     throw new PolicyViolationError(
       "policy-runtime-identity-mismatch",
-      `${role} requested ${normalizeModelDisplay(result.requestedModel)}, but runtime reported ${normalizeModelDisplay(result.actualModel)}.`,
+      `${role} requested ${normalizeModelDisplay(trustedRequestedModel)}, but runtime reported requested model ${normalizeModelDisplay(result.requestedModel)} and actual model ${reportedActual}.`,
     );
   }
 }

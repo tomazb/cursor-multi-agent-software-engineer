@@ -43,6 +43,43 @@ test("role permissions are an exact persisted/project policy matrix", () => {
   }
 });
 
+test("project config rejects explicit null permissions for every role", () => {
+  for (const [role] of roles) {
+    assert.throws(
+      () =>
+        mergeConfigForTest({
+          roles: { [role]: { permissions: null } },
+        }),
+      new RegExp(`roles\\.${role}\\.permissions`, "i"),
+    );
+  }
+});
+
+test("persisted migration rejects explicit null permissions without rewriting snapshots", () => {
+  for (const [role] of roles) {
+    const persisted = historicalRun();
+    const persistedConfig = persisted.config as unknown as {
+      roles: Record<string, { permissions: unknown }>;
+    };
+    persistedConfig.roles[role]!.permissions = null;
+
+    assert.throws(
+      () => migrateRunRecord(persisted),
+      new RegExp(`roles\\.${role}\\.permissions`, "i"),
+    );
+    assert.equal(persistedConfig.roles[role]!.permissions, null);
+  }
+});
+
+test("omitted permissions in partial role config retain role defaults", () => {
+  for (const [role, required] of roles) {
+    const config = mergeConfigForTest({
+      roles: { [role]: { model: `partial-${role}` } },
+    });
+    assert.equal(config.roles[role].permissions, required);
+  }
+});
+
 test("only prResolver may narrow one execution to read-only", () => {
   assert.equal(
     resolveExecutionPermission("prResolver", "workspace-write", "read-only"),

@@ -234,6 +234,153 @@ for (const wrapper of ["cause", "aggregate"] as const) {
   });
 }
 
+for (const wrapper of ["direct", "cause", "aggregate"] as const) {
+  test(`${wrapper} runtime policy survives an unreadable post-run fingerprint`, async (t) => {
+    const cwd = await initGitRepo(t, `maswe-issue29-fence-policy-${wrapper}-`);
+    const config = policyConfig("brainstormer");
+    const runtime = new RecordingRuntime(async (request) => {
+      if (request.role !== "brainstormer") return undefined;
+      await writeFile(path.join(request.cwd, ".git", "index"), "corrupt index\n", "utf8");
+      const policyError = new PolicyViolationError(
+        "policy-runtime-identity-mismatch",
+        "runtime reported the wrong model",
+      );
+      if (wrapper === "direct") throw policyError;
+      if (wrapper === "cause") {
+        throw new Error("runtime wrapper", { cause: policyError });
+      }
+      throw new AggregateError(
+        [new Error("transport wrapper"), policyError],
+        "aggregate runtime wrapper",
+      );
+    });
+    const run = await advanceToTarget(new Orchestrator(cwd, config, runtime), "brainstormer");
+
+    assertPolicyFailure(run, "policy-runtime-identity-mismatch");
+    const brainstormRequests = runtime.requests.filter((request) => request.role === "brainstormer");
+    assert.equal(brainstormRequests.length, 1);
+    assert.equal(
+      brainstormRequests.some((request) => request.roleConfig.model === FALLBACK_MODEL),
+      false,
+    );
+  });
+}
+
+test("ordinary runtime error with an unreadable post-run fingerprint fails closed", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-issue29-fence-runtime-error-");
+  const config = policyConfig("brainstormer");
+  const runtime = new RecordingRuntime(async (request) => {
+    if (request.role !== "brainstormer") return undefined;
+    await writeFile(path.join(request.cwd, ".git", "index"), "corrupt index\n", "utf8");
+    throw new Error("temporary provider failure");
+  });
+  const run = await advanceToTarget(new Orchestrator(cwd, config, runtime), "brainstormer");
+
+  assert.equal(run.state, "FAILED");
+  assert.equal(run.failure?.code, "workflow-failure");
+  assert.equal(run.failure?.runtime, undefined);
+  assert.doesNotMatch(run.failure?.message ?? "", /all configured models|runtime-models-exhausted/i);
+  const failEvent = run.events.findLast((event) => event.type === "FAIL");
+  assert.equal(failEvent?.details?.code, "workflow-failure");
+  assert.equal(failEvent?.details?.runtime, undefined);
+  const brainstormRequests = runtime.requests.filter((request) => request.role === "brainstormer");
+  assert.equal(brainstormRequests.length, 1);
+  assert.equal(
+    brainstormRequests.some((request) => request.roleConfig.model === FALLBACK_MODEL),
+    false,
+  );
+});
+
+const runtimeIdentityBoundaryCases = [
+  {
+    name: "successful result cannot echo a self-consistent model other than the trusted candidate",
+    status: "finished",
+    identity: "other",
+    rejectModelFallback: false,
+  },
+  {
+    name: "runtime error result cannot echo a self-consistent model other than the trusted candidate",
+    status: "error",
+    identity: "other",
+    rejectModelFallback: true,
+  },
+  {
+    name: "successful result rejects a present empty actual model",
+    status: "finished",
+    identity: "empty-actual",
+    rejectModelFallback: true,
+  },
+  {
+    name: "runtime error result rejects a present empty actual model",
+    status: "error",
+    identity: "empty-actual",
+    rejectModelFallback: false,
+  },
+] as const;
+
+for (const spec of runtimeIdentityBoundaryCases) {
+  test(spec.name, async (t) => {
+    const cwd = await initGitRepo(t, `maswe-issue29-identity-boundary-${spec.status}-`);
+    const config = policyConfig("brainstormer", (value) => {
+      value.policy.rejectModelFallback = spec.rejectModelFallback;
+    });
+    const runtime = new RecordingRuntime(async (request) => {
+      if (request.role !== "brainstormer") return undefined;
+      const requestedModel = spec.identity === "other"
+        ? "runtime-selected-other-model"
+        : request.roleConfig.model;
+      const actualModel = spec.identity === "other"
+        ? "runtime-selected-other-model"
+        : "";
+      if (spec.status === "finished") {
+        const result = await new MockRuntime().execute(request);
+        return { ...result, requestedModel, actualModel };
+      }
+      return {
+        status: "error",
+        output: "provider rejected request",
+        requestedModel,
+        actualModel,
+        failure: {
+          code: "runtime-error",
+          message: "provider rejected request",
+          requestedModel,
+          stderrPresent: false,
+          truncated: false,
+        },
+      };
+    });
+    const run = await advanceToTarget(new Orchestrator(cwd, config, runtime), "brainstormer");
+
+    assertPolicyFailure(run, "policy-runtime-identity-mismatch");
+    const brainstormRequests = runtime.requests.filter((request) => request.role === "brainstormer");
+    assert.equal(brainstormRequests.length, 1);
+    assert.equal(brainstormRequests[0]?.roleConfig.model, config.roles.brainstormer.model);
+    assert.equal(
+      brainstormRequests.some((request) => request.roleConfig.model === FALLBACK_MODEL),
+      false,
+    );
+  });
+}
+
+test("a genuinely undefined actual model remains valid", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-issue29-identity-undefined-");
+  const config = policyConfig("brainstormer");
+  const runtime = new RecordingRuntime(async (request) => {
+    if (request.role !== "brainstormer") return undefined;
+    const result = await new MockRuntime().execute(request);
+    delete result.actualModel;
+    return result;
+  });
+  const run = await advanceToTarget(new Orchestrator(cwd, config, runtime), "brainstormer");
+
+  assert.equal(run.state, "WAITING_FOR_BRAINSTORM_APPROVAL");
+  assert.equal(run.failure, undefined);
+  const brainstormRequests = runtime.requests.filter((request) => request.role === "brainstormer");
+  assert.equal(brainstormRequests.length, 1);
+  assert.equal(brainstormRequests[0]?.roleConfig.model, config.roles.brainstormer.model);
+});
+
 test("runtime model identity mismatch is policy failure and skips fallback", async (t) => {
   const cwd = await initGitRepo(t, "maswe-issue29-identity-");
   const config = policyConfig("brainstormer");
@@ -288,7 +435,6 @@ test("ordinary runtime failure still uses configured fallback", async (t) => {
       status: "error",
       output: "temporary provider failure",
       requestedModel: request.roleConfig.model,
-      actualModel: request.roleConfig.model,
       failure: {
         code: "runtime-error",
         message: "temporary provider failure",
