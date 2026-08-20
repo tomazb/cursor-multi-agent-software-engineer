@@ -15,6 +15,7 @@ import type {
   RuntimeRequest,
   RuntimeResult,
 } from "../src/domain.ts";
+import { assertRuntimeIdentity } from "../src/failure-diagnostics.ts";
 import { Orchestrator } from "../src/orchestrator.ts";
 import { PolicyViolationError } from "../src/policy.ts";
 import { CursorCliRuntime } from "../src/runtimes/cursor-cli.ts";
@@ -317,6 +318,124 @@ const runtimeIdentityBoundaryCases = [
     rejectModelFallback: false,
   },
 ] as const;
+
+const malformedActualIdentities: Array<{ label: string; value: unknown }> = [
+  { label: "null", value: null },
+  { label: "number", value: 123 },
+  { label: "boolean", value: true },
+  { label: "object", value: {} },
+  { label: "array", value: [] },
+  { label: "empty string", value: "" },
+];
+
+test("malformed present runtime identities are typed policy violations before formatting", () => {
+  for (const { label, value } of malformedActualIdentities) {
+    const result = {
+      status: "finished",
+      output: "result",
+      requestedModel: "trusted-model",
+      actualModel: value,
+    } as unknown as RuntimeResult;
+
+    assert.throws(
+      () => assertRuntimeIdentity(result, "brainstormer", "trusted-model"),
+      (error: unknown) => {
+        assert.ok(error instanceof PolicyViolationError, label);
+        assert.equal(error.code, "policy-runtime-identity-mismatch", label);
+        assert.doesNotMatch(error.message, /TypeError|Cannot read properties/i, label);
+        return true;
+      },
+    );
+  }
+});
+
+test("missing or malformed required requested identities fail as policy", () => {
+  for (const trustedRequestedModel of [undefined, null, "", "   "]) {
+    assert.throws(
+      () =>
+        assertRuntimeIdentity(
+          {
+            status: "finished",
+            output: "result",
+            requestedModel: "trusted-model",
+          },
+          "brainstormer",
+          trustedRequestedModel as unknown as string,
+        ),
+      (error: unknown) =>
+        error instanceof PolicyViolationError &&
+        error.code === "policy-runtime-identity-mismatch",
+    );
+  }
+
+  for (const reportedRequestedModel of [undefined, null, 123, true, {}, [], "", "   "]) {
+    assert.throws(
+      () =>
+        assertRuntimeIdentity(
+          {
+            status: "finished",
+            output: "result",
+            requestedModel: reportedRequestedModel,
+          } as unknown as RuntimeResult,
+          "brainstormer",
+          "trusted-model",
+        ),
+      (error: unknown) =>
+        error instanceof PolicyViolationError &&
+        error.code === "policy-runtime-identity-mismatch",
+    );
+  }
+});
+
+const malformedIdentityIntegrationCases = [
+  { label: "null", value: null, status: "finished", rejectModelFallback: false },
+  { label: "number", value: 123, status: "error", rejectModelFallback: true },
+  { label: "boolean", value: true, status: "finished", rejectModelFallback: true },
+  { label: "object", value: {}, status: "error", rejectModelFallback: false },
+  { label: "array", value: [], status: "finished", rejectModelFallback: false },
+  { label: "empty string", value: "", status: "error", rejectModelFallback: true },
+] as const;
+
+for (const spec of malformedIdentityIntegrationCases) {
+  test(`${spec.status} result with ${spec.label} actual identity skips fallback`, async (t) => {
+    const cwd = await initGitRepo(t, `maswe-issue29-malformed-identity-${spec.label}-`);
+    const config = policyConfig("brainstormer", (value) => {
+      value.policy.rejectModelFallback = spec.rejectModelFallback;
+    });
+    const runtime = new RecordingRuntime(async (request) => {
+      if (request.role !== "brainstormer") return undefined;
+      if (spec.status === "finished") {
+        const result = await new MockRuntime().execute(request);
+        return { ...result, actualModel: spec.value } as unknown as RuntimeResult;
+      }
+      return {
+        status: "error",
+        output: "provider rejected request",
+        requestedModel: request.roleConfig.model,
+        actualModel: spec.value,
+        failure: {
+          code: "runtime-error",
+          message: "provider rejected request",
+          requestedModel: request.roleConfig.model,
+          stderrPresent: false,
+          truncated: false,
+        },
+      } as unknown as RuntimeResult;
+    });
+
+    const run = await advanceToTarget(new Orchestrator(cwd, config, runtime), "brainstormer");
+
+    assertPolicyFailure(run, "policy-runtime-identity-mismatch");
+    const brainstormRequests = runtime.requests.filter((request) =>
+      request.role === "brainstormer"
+    );
+    assert.equal(brainstormRequests.length, 1);
+    assert.equal(
+      brainstormRequests.some((request) => request.roleConfig.model === FALLBACK_MODEL),
+      false,
+    );
+  });
+}
 
 for (const spec of runtimeIdentityBoundaryCases) {
   test(spec.name, async (t) => {

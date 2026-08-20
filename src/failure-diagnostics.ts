@@ -413,17 +413,45 @@ export function assertRuntimeIdentity(
   role: RoleId,
   trustedRequestedModel: string,
 ): void {
-  const requestedModelMismatch = result.requestedModel !== trustedRequestedModel;
-  const actualModelMismatch =
-    result.actualModel !== undefined &&
-    result.actualModel !== trustedRequestedModel;
-  if (requestedModelMismatch || actualModelMismatch) {
-    const reportedActual = result.actualModel === undefined
-      ? "not reported"
-      : normalizeModelDisplay(result.actualModel);
+  const untrustedResult = result as unknown as {
+    requestedModel?: unknown;
+    actualModel?: unknown;
+  };
+  const reportedRequestedModel = untrustedResult.requestedModel;
+  const reportedActualModel = untrustedResult.actualModel;
+  const validModelIdentity = (value: unknown): value is string =>
+    typeof value === "string" && value.trim().length > 0;
+
+  if (!validModelIdentity(trustedRequestedModel)) {
     throw new PolicyViolationError(
       "policy-runtime-identity-mismatch",
-      `${role} requested ${normalizeModelDisplay(trustedRequestedModel)}, but runtime reported requested model ${normalizeModelDisplay(result.requestedModel)} and actual model ${reportedActual}.`,
+      `${role} trusted requested model identity is missing or invalid.`,
+    );
+  }
+  if (!validModelIdentity(reportedRequestedModel)) {
+    throw new PolicyViolationError(
+      "policy-runtime-identity-mismatch",
+      `${role} runtime reported a missing or invalid requested model identity.`,
+    );
+  }
+  if (reportedActualModel !== undefined && !validModelIdentity(reportedActualModel)) {
+    throw new PolicyViolationError(
+      "policy-runtime-identity-mismatch",
+      `${role} runtime reported an invalid actual model identity.`,
+    );
+  }
+
+  const requestedModelMismatch = reportedRequestedModel !== trustedRequestedModel;
+  const actualModelMismatch =
+    reportedActualModel !== undefined &&
+    reportedActualModel !== trustedRequestedModel;
+  if (requestedModelMismatch || actualModelMismatch) {
+    const reportedActual = reportedActualModel === undefined
+      ? "not reported"
+      : normalizeModelDisplay(reportedActualModel);
+    throw new PolicyViolationError(
+      "policy-runtime-identity-mismatch",
+      `${role} requested ${normalizeModelDisplay(trustedRequestedModel)}, but runtime reported requested model ${normalizeModelDisplay(reportedRequestedModel)} and actual model ${reportedActual}.`,
     );
   }
 }
