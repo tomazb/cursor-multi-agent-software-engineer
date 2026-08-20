@@ -268,7 +268,6 @@ function cursorFailureResult(options: {
     status: "error",
     output: sanitized.text,
     requestedModel: options.requestedModel,
-    actualModel: options.requestedModel,
     failure: {
       code: options.code,
       message: sanitized.text,
@@ -441,7 +440,8 @@ export class CursorCliRuntime implements AgentRuntime {
       // Never treat stderr as successful assistant content.
       output: extracted,
       requestedModel: resolvedModel,
-      actualModel: resolvedModel,
+      // Cursor CLI does not expose an exact executable model ID in these modes.
+      // stream-json's init model is a display label without an authoritative ID mapping.
       metadata: {
         exitCode: result.exitCode,
         durationMs: result.durationMs,
