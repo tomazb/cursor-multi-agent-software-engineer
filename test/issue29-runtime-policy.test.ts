@@ -191,6 +191,49 @@ test("read-only HEAD movement is distinct and skips fallback", async (t) => {
   assert.notEqual(verifierRequests[0]?.roleConfig.model, FALLBACK_MODEL);
 });
 
+test("an unreadable captured HEAD is a policy failure and skips fallback", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-issue29-unreadable-head-");
+  const config = policyConfig("brainstormer");
+  const runtime = new RecordingRuntime(async (request) => {
+    if (request.role !== "brainstormer") return undefined;
+    await rm(path.join(request.cwd, ".git", "HEAD"), { force: true });
+    return new MockRuntime().execute(request);
+  });
+  const run = await advanceToTarget(new Orchestrator(cwd, config, runtime), "brainstormer");
+
+  assertPolicyFailure(run, "policy-read-only-head-moved");
+  const brainstormRequests = runtime.requests.filter((request) => request.role === "brainstormer");
+  assert.equal(brainstormRequests.length, 1);
+  assert.notEqual(brainstormRequests[0]?.roleConfig.model, FALLBACK_MODEL);
+});
+
+for (const wrapper of ["cause", "aggregate"] as const) {
+  test(`${wrapper}-wrapped policy violation skips fallback`, async (t) => {
+    const cwd = await initGitRepo(t, `maswe-issue29-wrapped-${wrapper}-`);
+    const config = policyConfig("brainstormer");
+    const runtime = new RecordingRuntime(async (request) => {
+      if (request.role !== "brainstormer") return undefined;
+      const policyError = new PolicyViolationError(
+        "policy-read-only-workspace-mutation",
+        "wrapped read-only mutation",
+      );
+      if (wrapper === "cause") {
+        throw new Error("runtime wrapper", { cause: policyError });
+      }
+      throw new AggregateError(
+        [new Error("transport wrapper"), policyError],
+        "aggregate runtime wrapper",
+      );
+    });
+    const run = await advanceToTarget(new Orchestrator(cwd, config, runtime), "brainstormer");
+
+    assertPolicyFailure(run, "policy-read-only-workspace-mutation");
+    const brainstormRequests = runtime.requests.filter((request) => request.role === "brainstormer");
+    assert.equal(brainstormRequests.length, 1);
+    assert.notEqual(brainstormRequests[0]?.roleConfig.model, FALLBACK_MODEL);
+  });
+}
+
 test("runtime model identity mismatch is policy failure and skips fallback", async (t) => {
   const cwd = await initGitRepo(t, "maswe-issue29-identity-");
   const config = policyConfig("brainstormer");
@@ -198,6 +241,33 @@ test("runtime model identity mismatch is policy failure and skips fallback", asy
     if (request.role !== "brainstormer") return undefined;
     const result = await new MockRuntime().execute(request);
     return { ...result, actualModel: "cursor-claude-fable-5-high" };
+  });
+  const run = await advanceToTarget(new Orchestrator(cwd, config, runtime), "brainstormer");
+
+  assertPolicyFailure(run, "policy-runtime-identity-mismatch");
+  const brainstormRequests = runtime.requests.filter((request) => request.role === "brainstormer");
+  assert.equal(brainstormRequests.length, 1);
+  assert.notEqual(brainstormRequests[0]?.roleConfig.model, FALLBACK_MODEL);
+});
+
+test("failed runtime result identity mismatch is policy failure and skips fallback", async (t) => {
+  const cwd = await initGitRepo(t, "maswe-issue29-failed-identity-");
+  const config = policyConfig("brainstormer");
+  const runtime = new RecordingRuntime(async (request) => {
+    if (request.role !== "brainstormer") return undefined;
+    return {
+      status: "error",
+      output: "provider rejected request",
+      requestedModel: request.roleConfig.model,
+      actualModel: "cursor-claude-fable-5-high",
+      failure: {
+        code: "runtime-error",
+        message: "provider rejected request",
+        requestedModel: request.roleConfig.model,
+        stderrPresent: false,
+        truncated: false,
+      },
+    };
   });
   const run = await advanceToTarget(new Orchestrator(cwd, config, runtime), "brainstormer");
 

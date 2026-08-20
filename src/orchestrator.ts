@@ -89,7 +89,7 @@ import {
   type RunMutationLease,
 } from "./run-mutation.ts";
 import {
-  isPolicyViolationError,
+  findPolicyViolationError,
   PolicyViolationError,
   resolveExecutionPermission,
 } from "./policy.ts";
@@ -113,9 +113,18 @@ async function assertReadOnlyExecutionState(
   role: RoleId,
   before: ReadOnlyExecutionState,
 ): Promise<void> {
-  const afterHead = before.head === undefined
-    ? undefined
-    : await gitRevParse(workdir, "HEAD");
+  let afterHead: string | undefined;
+  if (before.head !== undefined) {
+    try {
+      afterHead = await gitRevParse(workdir, "HEAD");
+    } catch (error) {
+      throw new PolicyViolationError(
+        "policy-read-only-head-moved",
+        `${role} changed HEAD during read-only execution.`,
+        { cause: error },
+      );
+    }
+  }
   if (before.head !== undefined && afterHead !== before.head) {
     throw new PolicyViolationError(
       "policy-read-only-head-moved",
@@ -2018,11 +2027,12 @@ export class Orchestrator {
         } finally {
           if (before) await assertReadOnlyExecutionState(workdir, role, before);
         }
-        ensureRuntimeSuccess(result, role);
         assertRuntimeIdentity(result, role);
+        ensureRuntimeSuccess(result, role);
         return result;
       } catch (error) {
-        if (isPolicyViolationError(error)) throw error;
+        const policyViolation = findPolicyViolationError(error);
+        if (policyViolation) throw policyViolation;
         totalFailureAttempts += 1;
         const failure = runtimeAttemptFailure(model, error);
         if (

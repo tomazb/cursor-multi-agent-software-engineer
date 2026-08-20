@@ -409,7 +409,7 @@ export function safeFailureMessage(message: string): string {
 }
 
 export function assertRuntimeIdentity(
-  result: RuntimeFinishedResult,
+  result: RuntimeResult,
   role: RoleId,
 ): void {
   if (result.actualModel && result.actualModel !== result.requestedModel) {
