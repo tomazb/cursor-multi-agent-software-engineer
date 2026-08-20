@@ -356,9 +356,10 @@ Quality commands never come from model output, issue text, or PR comments.
 and glob strings from `\\` to `/` and anchors each match to the whole path. `*` matches zero or
 more non-separator characters; `?` exactly one non-separator; `**` zero or more characters,
 including separators; and `**/` zero or more complete path segments, including zero segments.
-`**` permits every candidate and `**/*` permits every non-empty candidate. Dotfiles are ordinary
-path characters, and regex metacharacters in a glob are literal rather than a second pattern
-language. A changed path is allowed when at least one configured glob matches.
+`**` and `**/*` each permit every candidate path. Production working-tree candidates are
+non-empty file paths, but the matcher special-cases both forms without a non-empty restriction.
+Dotfiles are ordinary path characters, and regex metacharacters in a glob are literal rather than
+a second pattern language. A changed path is allowed when at least one configured glob matches.
 
 GitHub check publication uses a hash-addressed per-PR journal, separate from the short global
 association transaction. Old-head cancellation intent is also persisted on the run as a bounded

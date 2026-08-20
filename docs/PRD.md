@@ -226,8 +226,9 @@ runtime invocation.
 `policy.allowedPathGlobs` shall use portable fully anchored matching: paths and globs normalize
 `\\` to `/`; `*` is zero or more non-separators; `?` is exactly one non-separator; `**` is zero or
 more characters including separators; and `**/` is zero or more complete segments including zero.
-`**` allows every candidate and `**/*` every non-empty candidate. Dotfiles are ordinary and regex
-metacharacters are literal.
+`**` and `**/*` each allow every candidate path. Production working-tree candidates are non-empty
+file paths, but the matcher special-cases both forms without a non-empty restriction. Dotfiles are
+ordinary and regex metacharacters are literal.
 
 ### FR-17 — Run inspection
 
