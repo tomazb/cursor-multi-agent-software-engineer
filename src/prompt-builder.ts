@@ -14,11 +14,18 @@ async function readTemplate(fileName: string): Promise<string> {
   return readFile(new URL(`../prompts/${fileName}`, import.meta.url), "utf8");
 }
 
-function replaceAll(template: string, values: Record<string, string>): string {
-  return Object.entries(values).reduce(
-    (result, [key, value]) => result.replaceAll(`{{${key}}}`, value),
-    template,
-  );
+const PROMPT_PLACEHOLDER = /\{\{([A-Z][A-Z0-9_]*)\}\}/g;
+
+export function renderPromptTemplate(
+  template: string,
+  values: Record<string, string>,
+): string {
+  return template.replace(PROMPT_PLACEHOLDER, (token, key: string) => {
+    if (!Object.prototype.hasOwnProperty.call(values, key)) {
+      throw new Error(`Unknown prompt placeholder ${token}`);
+    }
+    return values[key]!;
+  });
 }
 
 export async function buildRolePrompt(
@@ -40,7 +47,7 @@ export async function buildRolePrompt(
   const classification =
     (await store.readArtifact(run, "08-comment-classification.md")) ?? "Not available.";
 
-  return replaceAll(template, {
+  return renderPromptTemplate(template, {
     RUN_ID: run.id,
     TITLE: run.title,
     REQUEST: run.request,
@@ -63,7 +70,7 @@ export async function buildCommentClassifierPrompt(
 ): Promise<string> {
   const template = await readTemplate("pr-comment-classify.md");
   const design = (await store.readArtifact(run, "03-specification-and-design.md")) ?? "Not available.";
-  return replaceAll(template, {
+  return renderPromptTemplate(template, {
     RUN_ID: run.id,
     TITLE: run.title,
     REQUEST: run.request,
