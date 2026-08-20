@@ -94,6 +94,8 @@ Options:
   --cwd <path>     Run against a different repository directory.
   --json           Print machine-readable output.
   --force          init: replace config; unlock*: assert quiescence and release exactly.
+
+String option values beginning with "-" require --name=value.
 `;
 }
 

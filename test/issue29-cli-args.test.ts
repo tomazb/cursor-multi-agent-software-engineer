@@ -10,6 +10,10 @@ const validGrammarCases: Array<{
   { name: "start split", argv: ["start", "--title", "T", "--request", "R"] },
   { name: "start equals", argv: ["start", "--title=T", "--request=R"] },
   {
+    name: "equals-form dash-prefixed string value",
+    argv: ["start", "--title=T", "--request=--literal"],
+  },
+  {
     name: "global before",
     argv: ["--cwd", "/tmp/x", "status", "run-1"],
     positionals: ["status", "run-1"],
@@ -37,6 +41,12 @@ for (const grammarCase of validGrammarCases) {
     assert.deepEqual(parsed.positionals, grammarCase.positionals ?? [grammarCase.argv[0]!]);
   });
 }
+
+test("CLI grammar preserves an equals-form dash-prefixed string value", () => {
+  const parsed = parseMasweArgs(["start", "--title=T", "--request=--literal"]);
+  assert.equal(parsed.options.request, "--literal");
+  assert.deepEqual(parsed.positionals, ["start"]);
+});
 
 const documentedCommands: Array<[name: string, argv: string[]]> = [
   ["help", ["help"]],
@@ -72,6 +82,10 @@ for (const [name, argv] of documentedCommands) {
 const invalidGrammarCases: Array<[name: string, argv: string[]]> = [
   ["unknown", ["status", "--wat"]],
   ["unknown before a positional", ["status", "--wat", "run-1"]],
+  [
+    "split dash-prefixed string value without consuming the option-like token",
+    ["start", "--title=T", "--request", "--literal"],
+  ],
   ["duplicate split/equals", ["status", "--cwd", "a", "--cwd=b"]],
   ["missing string", ["start", "--title"]],
   ["wrong option for command", ["run", "r1", "--force"]],

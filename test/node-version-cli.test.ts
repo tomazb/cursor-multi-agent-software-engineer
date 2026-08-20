@@ -75,6 +75,10 @@ test("supported Node preserves help behavior without creating state", async () =
     console.log = (...values: unknown[]) => output.push(values.map(String).join(" "));
     await runCli({ argv: ["help", "--cwd", cwd], observedNodeVersion: CANONICAL_NODE_VERSION });
     assert.match(output.join("\n"), /Multi-Agent Software Engineer/);
+    assert.match(
+      output.join("\n"),
+      /String option values beginning with "-" require --name=value\./,
+    );
     await assertPathAbsent(path.join(cwd, ".maswe"));
     assert.deepEqual(await readdir(cwd), []);
   } finally {
