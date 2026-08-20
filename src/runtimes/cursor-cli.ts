@@ -24,6 +24,7 @@ import { parseModelCatalogue, parseModelCatalogueIds } from "./cursor-model-cata
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { RunRecord } from "../domain.ts";
+import { PolicyViolationError } from "../policy.ts";
 
 export { parseModelCatalogueIds };
 
@@ -357,7 +358,8 @@ export class CursorCliRuntime implements AgentRuntime {
     } catch (error) {
       const after = await gitWorkspaceFingerprint(request.cwd);
       if (request.roleConfig.permissions === "read-only" && before !== after) {
-        throw new Error(
+        throw new PolicyViolationError(
+          "policy-read-only-workspace-mutation",
           `${request.role} changed the workspace despite read-only policy. Review and revert the changes before continuing.`,
         );
       }
@@ -376,7 +378,8 @@ export class CursorCliRuntime implements AgentRuntime {
     }
     const after = await gitWorkspaceFingerprint(request.cwd);
     if (request.roleConfig.permissions === "read-only" && before !== after) {
-      throw new Error(
+      throw new PolicyViolationError(
+        "policy-read-only-workspace-mutation",
         `${request.role} changed the workspace despite read-only policy. Review and revert the changes before continuing.`,
       );
     }

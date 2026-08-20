@@ -2,6 +2,7 @@ import type {
   AgentRuntime,
   DurableRuntimeFailureAttempt,
   DurableRuntimeFailureSummary,
+  PermissionMode,
   RoleId,
   RunFailureCode,
   RunRecord,
@@ -14,6 +15,7 @@ import {
   gitRevParse,
   gitRun,
   gitWorkspaceFingerprint,
+  isGitRepository,
   isGitWorkspaceClean,
 } from "./git-snapshot.ts";
 import {
@@ -86,6 +88,48 @@ import {
   withRunMutationFence,
   type RunMutationLease,
 } from "./run-mutation.ts";
+import {
+  isPolicyViolationError,
+  PolicyViolationError,
+  resolveExecutionPermission,
+} from "./policy.ts";
+
+interface ReadOnlyExecutionState {
+  fingerprint: string;
+  head?: string;
+}
+
+async function captureReadOnlyExecutionState(
+  workdir: string,
+): Promise<ReadOnlyExecutionState> {
+  const fingerprint = await gitWorkspaceFingerprint(workdir);
+  const git = await isGitRepository(workdir);
+  const head = git ? await gitRevParse(workdir, "HEAD") : undefined;
+  return { fingerprint, ...(head !== undefined ? { head } : {}) };
+}
+
+async function assertReadOnlyExecutionState(
+  workdir: string,
+  role: RoleId,
+  before: ReadOnlyExecutionState,
+): Promise<void> {
+  const afterHead = before.head === undefined
+    ? undefined
+    : await gitRevParse(workdir, "HEAD");
+  if (before.head !== undefined && afterHead !== before.head) {
+    throw new PolicyViolationError(
+      "policy-read-only-head-moved",
+      `${role} changed HEAD during read-only execution.`,
+    );
+  }
+  const afterFingerprint = await gitWorkspaceFingerprint(workdir);
+  if (afterFingerprint !== before.fingerprint) {
+    throw new PolicyViolationError(
+      "policy-read-only-workspace-mutation",
+      `${role} modified the workspace during read-only execution.`,
+    );
+  }
+}
 
 class RolePublicationOutcomeUnknownError extends AggregateError {
   constructor(errors: Iterable<unknown>, message: string) {
@@ -1547,8 +1591,7 @@ export class Orchestrator {
           const comment = (await this.store.readArtifact(run, "07-review-comment.md")) ?? "";
           const prompt = await buildCommentClassifierPrompt(run, this.store, comment);
           const result = await this.executeAgent(run, "prResolver", prompt, {
-            ...run.config.roles.prResolver,
-            permissions: "read-only",
+            permissionOverride: "read-only",
           });
           const markers = parseRoleMarker("prResolver", result.output, { mode: "classify" });
           if (!markers.ok) throw new Error(markers.message);
@@ -1932,14 +1975,20 @@ export class Orchestrator {
     run: RunRecord,
     role: RoleId,
     prompt: string,
-    roleOverride?: RunRecord["config"]["roles"][RoleId],
+    executionOptions?: { permissionOverride?: PermissionMode },
     workdirOverride?: string,
     managedWorktreeOverride?: boolean,
   ): Promise<RuntimeFinishedResult> {
-    const configured = roleOverride ?? run.config.roles[role];
+    const configured = run.config.roles[role];
+    const permissions = resolveExecutionPermission(
+      role,
+      configured.permissions,
+      executionOptions?.permissionOverride,
+    );
+    const effective = { ...configured, permissions };
     const candidates = run.config.policy.rejectModelFallback
-      ? [configured.model]
-      : [configured.model, ...(configured.fallbackModels ?? [])];
+      ? [effective.model]
+      : [effective.model, ...(effective.fallbackModels ?? [])];
     let aggregate = `${role} failed for all configured models: `;
     let aggregateHasEntries = false;
     let aggregateFull = false;
@@ -1950,27 +1999,30 @@ export class Orchestrator {
 
     for (const model of candidates) {
       try {
-        const result = await this.runtime.execute({
-          runId: run.id,
-          role,
-          prompt,
-          cwd: workdir,
-          roleConfig: { ...configured, model },
-          timeoutMs: run.config.policy.roleTimeoutMs,
-          managedWorktree: managedWorktreeOverride ?? Boolean(
-            run.workspace?.worktreePath && path.resolve(workdir) === path.resolve(run.workspace.worktreePath),
-          ),
-        });
-        ensureRuntimeSuccess(result, role);
-        if (
-          run.config.policy.rejectModelFallback &&
-          result.actualModel &&
-          result.actualModel !== result.requestedModel
-        ) {
-          assertRuntimeIdentity(result, role);
+        const before = permissions === "read-only"
+          ? await captureReadOnlyExecutionState(workdir)
+          : undefined;
+        let result: Awaited<ReturnType<AgentRuntime["execute"]>>;
+        try {
+          result = await this.runtime.execute({
+            runId: run.id,
+            role,
+            prompt,
+            cwd: workdir,
+            roleConfig: { ...effective, model },
+            timeoutMs: run.config.policy.roleTimeoutMs,
+            managedWorktree: managedWorktreeOverride ?? Boolean(
+              run.workspace?.worktreePath && path.resolve(workdir) === path.resolve(run.workspace.worktreePath),
+            ),
+          });
+        } finally {
+          if (before) await assertReadOnlyExecutionState(workdir, role, before);
         }
+        ensureRuntimeSuccess(result, role);
+        assertRuntimeIdentity(result, role);
         return result;
       } catch (error) {
+        if (isPolicyViolationError(error)) throw error;
         totalFailureAttempts += 1;
         const failure = runtimeAttemptFailure(model, error);
         if (
