@@ -47,10 +47,10 @@ function matchGlob(filePath: string, glob: string): boolean {
     if (token === "*") {
       if (normalizedGlob[index + 1] === "*") {
         if (normalizedGlob[index + 2] === "/") {
-          source += "(?:.*/)?";
+          source += "(?:[\\s\\S]*/)?";
           index += 2;
         } else {
-          source += ".*";
+          source += "[\\s\\S]*";
           index += 1;
         }
       } else {

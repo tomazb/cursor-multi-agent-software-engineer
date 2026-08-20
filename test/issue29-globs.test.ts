@@ -19,6 +19,10 @@ const cases: Array<[pattern: string, candidate: string, expected: boolean]> = [
   ["**/*", ".env.example", true],
   ["**/*", "config/.env", true],
   ["src\\**\\*.ts", "src\\nested\\x.ts", true],
+  ["src\\**\\*.ts", "src/nested/x.ts", true],
+  ["src/**/*.ts", "src\\nested\\x.ts", true],
+  ["src/**.ts", "src/nested\nname/file.ts", true],
+  ["**/README.md", "docs/new\nline/README.md", true],
   ["src/a+b[1].ts", "src/a+b[1].ts", true],
   ["src/*.ts", "src/a.ts.bak", false],
 ];
