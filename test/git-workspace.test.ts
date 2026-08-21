@@ -77,6 +77,39 @@ test("createDeterministicCommit rejects out-of-scope paths", async () => {
   );
 });
 
+test(
+  "createDeterministicCommit does not reinterpret a POSIX literal-backslash filename",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const cwd = await initRepo();
+    t.after(async () => rm(cwd, { recursive: true, force: true }));
+    const expectedParentSha = (
+      await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })
+    ).stdout.trim();
+    const literalBackslashPath = path.join(cwd, "src\\unapproved.ts");
+    await writeFile(literalBackslashPath, "export const escaped = true;\n", "utf8");
+
+    await assert.rejects(
+      createDeterministicCommit(cwd, "must remain out of scope", {
+        allowedPathGlobs: ["src/**"],
+        expectedParentSha,
+      }),
+      /Change-scope violation.*src\\unapproved\.ts/,
+    );
+
+    assert.equal(
+      (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim(),
+      expectedParentSha,
+    );
+    assert.match(
+      (
+        await execFileAsync("git", ["status", "--porcelain=v1", "-z"], { cwd })
+      ).stdout,
+      /src\\unapproved\.ts/,
+    );
+  },
+);
+
 test("createDeterministicCommit and assertChangeScope accept in-scope edits", async () => {
   const cwd = await initRepo();
   const base = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim();

@@ -37,7 +37,6 @@ export function assertSafeRunId(runId: string): void {
 }
 
 function matchGlob(filePath: string, glob: string): boolean {
-  const normalizedPath = filePath.replace(/\\/g, "/");
   const normalizedGlob = glob.replace(/\\/g, "/");
   if (normalizedGlob === "**" || normalizedGlob === "**/*") return true;
 
@@ -64,7 +63,7 @@ function matchGlob(filePath: string, glob: string): boolean {
       source += token;
     }
   }
-  return new RegExp(`^${source}$`).test(normalizedPath);
+  return new RegExp(`^${source}$`).test(filePath);
 }
 
 export function pathAllowed(filePath: string, globs: string[]): boolean {
