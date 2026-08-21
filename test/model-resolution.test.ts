@@ -144,6 +144,17 @@ test("validatePersistedExactModel refuses substitution when high disappears and 
   );
 });
 
+test("validatePersistedExactModel returns the trusted catalogue spelling for a mixed-case selector", () => {
+  assert.equal(
+    validatePersistedExactModel("Cursor-Grok-4.5-High", ["cursor-grok-4.5-high"]),
+    "cursor-grok-4.5-high",
+  );
+  assert.throws(
+    () => validatePersistedExactModel("Cursor-Grok-4.5-Unknown", CATALOGUE),
+    /no longer available|Refusing substitution/i,
+  );
+});
+
 test("doctor probe and start share effort-aware project resolution", () => {
   const catalogue = [
     "cursor-grok-4.5-high",

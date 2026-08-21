@@ -236,18 +236,24 @@ export function validatePersistedExactModel(
   if (!needle) {
     throw new Error("Persisted model id must not be empty");
   }
-  const ids = [...new Set([...catalogue].map((id) => id.trim().toLowerCase()).filter(Boolean))];
+  const ids = [...new Set([...catalogue].map((id) => id.trim()).filter(Boolean))];
   if (ids.length === 0) {
     throw new Error(
       `Persisted exact model '${persistedExactId}' cannot be validated: model catalogue is empty or unparseable.`,
     );
   }
-  if (!ids.includes(needle)) {
+  const matches = ids.filter((id) => id.toLowerCase() === needle);
+  if (matches.length === 0) {
     throw new Error(
       `Persisted exact model '${persistedExactId}' is no longer available in the Cursor catalogue. Refusing substitution; update the run only via a new start after correcting catalogue/auth.`,
     );
   }
-  return needle;
+  if (matches.length > 1) {
+    throw new Error(
+      `Persisted exact model '${persistedExactId}' has multiple case-conflicting Cursor catalogue entries. Refusing ambiguous identity resolution.`,
+    );
+  }
+  return matches[0]!;
 }
 
 /** Ordered allowlist of logical families acceptable for deterministic smoke selection. */

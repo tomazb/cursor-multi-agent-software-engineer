@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -13,6 +13,7 @@ import type { SpawnResult } from "../src/process.ts";
 
 const execFileAsync = promisify(execFile);
 const REQUESTED_MODEL = "cursor-grok-4.5-high";
+const MIXED_CASE_REQUESTED_MODEL = "Cursor-Grok-4.5-High";
 const FALLBACK_MODEL = "cursor-claude-fable-5-high";
 const CATALOGUE = [
   REQUESTED_MODEL,
@@ -210,4 +211,107 @@ test("Cursor CLI identity absence preserves ordinary transport fallback", async 
   assert.equal(run.state, "WAITING_FOR_BRAINSTORM_APPROVAL");
   assert.deepEqual(invokedModels, [REQUESTED_MODEL, FALLBACK_MODEL]);
   assert.equal(run.failure, undefined);
+});
+
+async function runPersistedMixedCaseDesigner(
+  t: test.TestContext,
+  options: { rejectModelFallback: boolean; primaryFails: boolean },
+): Promise<{ run: Awaited<ReturnType<Orchestrator["approve"]>>; designerModels: string[] }> {
+  const cwd = await initGitRepo(t);
+  const config: MasweConfig = structuredClone(DEFAULT_CONFIG);
+  config.runtime.kind = "cursor-cli";
+  config.runtime.command = "agent";
+  config.runtime.outputFormat = "text";
+  config.policy.useIsolatedWorktree = false;
+  config.policy.rejectModelFallback = options.rejectModelFallback;
+  config.quality.commands = [];
+  config.roles.designer.model = REQUESTED_MODEL;
+  config.roles.designer.fallbackModels = [FALLBACK_MODEL];
+  const invokedModels: string[] = [];
+  let executionCount = 0;
+  const runtime = new CursorCliRuntime(config, {
+    cwd,
+    spawnFn: async (_command, args) => {
+      if (args[0] === "models") {
+        return { exitCode: 0, stdout: CATALOGUE, stderr: "", durationMs: 1 };
+      }
+      const modelIndex = args.indexOf("--model");
+      const model = args[modelIndex + 1]!;
+      executionCount += 1;
+      if (executionCount === 1) {
+        return {
+          exitCode: 0,
+          stdout: "READY_FOR_BRAINSTORM_APPROVAL\n",
+          stderr: "",
+          durationMs: 1,
+        };
+      }
+      invokedModels.push(model);
+      if (options.primaryFails && model === REQUESTED_MODEL) {
+        return {
+          exitCode: 7,
+          stdout: "",
+          stderr: "temporary provider failure",
+          durationMs: 1,
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: "READY_FOR_DESIGN_APPROVAL\n",
+        stderr: "",
+        durationMs: 1,
+      };
+    },
+  });
+  const orchestrator = new Orchestrator(cwd, config, runtime);
+  const started = await orchestrator.start(
+    "Persisted mixed-case Cursor identity",
+    "Exercise canonical candidate selection.",
+  );
+  const runPath = path.join(cwd, ".maswe", "runs", started.id, "run.json");
+  const persisted = JSON.parse(await readFile(runPath, "utf8")) as {
+    config: MasweConfig;
+  };
+  persisted.config.roles.designer.model = MIXED_CASE_REQUESTED_MODEL;
+  await writeFile(runPath, `${JSON.stringify(persisted, null, 2)}\n`, "utf8");
+
+  return {
+    run: await orchestrator.approve(started.id, "brainstorm"),
+    designerModels: invokedModels,
+  };
+}
+
+test("mixed-case persisted Cursor candidate executes as the trusted catalogue identity", async (t) => {
+  const { run, designerModels } = await runPersistedMixedCaseDesigner(t, {
+    rejectModelFallback: true,
+    primaryFails: false,
+  });
+
+  assert.equal(run.state, "WAITING_FOR_DESIGN_APPROVAL");
+  assert.equal(run.failure, undefined);
+  assert.deepEqual(designerModels, [REQUESTED_MODEL]);
+});
+
+test("mixed-case persisted Cursor candidate keeps an ordinary runtime error retryable", async (t) => {
+  const { run, designerModels } = await runPersistedMixedCaseDesigner(t, {
+    rejectModelFallback: false,
+    primaryFails: true,
+  });
+
+  assert.equal(run.state, "WAITING_FOR_DESIGN_APPROVAL");
+  assert.equal(run.failure, undefined);
+  assert.deepEqual(designerModels, [REQUESTED_MODEL, FALLBACK_MODEL]);
+});
+
+test("mixed-case persisted Cursor candidate fails ordinarily when fallback is disabled", async (t) => {
+  const { run, designerModels } = await runPersistedMixedCaseDesigner(t, {
+    rejectModelFallback: true,
+    primaryFails: true,
+  });
+
+  assert.equal(run.state, "FAILED");
+  assert.equal(run.failure?.code, "runtime-models-exhausted");
+  assert.notEqual(run.failure?.code, "policy-runtime-identity-mismatch");
+  assert.equal(run.failure?.runtime?.attempts[0]?.model, REQUESTED_MODEL);
+  assert.deepEqual(designerModels, [REQUESTED_MODEL]);
 });

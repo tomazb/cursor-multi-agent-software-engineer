@@ -31,7 +31,10 @@ import {
   workingDirectoryFor,
 } from "./git-workspace.ts";
 import { parseRoleMarker } from "./markers.ts";
-import { resolveProjectModels } from "./model-resolution.ts";
+import {
+  resolveProjectModels,
+  validatePersistedExactModel,
+} from "./model-resolution.ts";
 import { renderQualityReport, runQualityChecks } from "./quality.ts";
 import { isHumanGate, isTerminal } from "./state-machine.ts";
 import { FileRunStore, type RunStore } from "./store.ts";
@@ -2007,6 +2010,7 @@ export class Orchestrator {
     const workdir = workdirOverride ?? workingDirectoryFor(run);
 
     for (const model of candidates) {
+      let trustedModel = model;
       const before = permissions === "read-only"
         ? await captureReadOnlyExecutionState(workdir)
         : undefined;
@@ -2014,6 +2018,10 @@ export class Orchestrator {
         | { ok: true; result: Awaited<ReturnType<AgentRuntime["execute"]>> }
         | { ok: false; error: unknown };
       try {
+        const catalogue = await this.runtime.listModels();
+        if (catalogue.length > 0) {
+          trustedModel = validatePersistedExactModel(model, catalogue);
+        }
         runtimeOutcome = {
           ok: true,
           result: await this.runtime.execute({
@@ -2021,7 +2029,7 @@ export class Orchestrator {
             role,
             prompt,
             cwd: workdir,
-            roleConfig: { ...effective, model },
+            roleConfig: { ...effective, model: trustedModel },
             timeoutMs: run.config.policy.roleTimeoutMs,
             managedWorktree: managedWorktreeOverride ?? Boolean(
               run.workspace?.worktreePath && path.resolve(workdir) === path.resolve(run.workspace.worktreePath),
@@ -2057,7 +2065,7 @@ export class Orchestrator {
       if (runtimeOutcome.ok) {
         const { result } = runtimeOutcome;
         try {
-          assertRuntimeIdentity(result, role, model);
+          assertRuntimeIdentity(result, role, trustedModel);
           ensureRuntimeSuccess(result, role);
           return result;
         } catch (error) {
@@ -2070,7 +2078,7 @@ export class Orchestrator {
       }
 
       totalFailureAttempts += 1;
-      const failure = runtimeAttemptFailure(model, attemptError);
+      const failure = runtimeAttemptFailure(trustedModel, attemptError);
       if (
         durableAttempts.length <
         DURABLE_RUNTIME_FAILURE_ATTEMPT_LIMIT
