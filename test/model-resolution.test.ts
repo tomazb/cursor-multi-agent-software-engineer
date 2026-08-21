@@ -155,6 +155,13 @@ test("validatePersistedExactModel returns the trusted catalogue spelling for a m
   );
 });
 
+test("validatePersistedExactModel rejects case-conflicting catalogue identities", () => {
+  assert.throws(
+    () => validatePersistedExactModel("Model-A", ["Model-A", "model-a"]),
+    /multiple case-conflicting|ambiguous identity/i,
+  );
+});
+
 test("doctor probe and start share effort-aware project resolution", () => {
   const catalogue = [
     "cursor-grok-4.5-high",
