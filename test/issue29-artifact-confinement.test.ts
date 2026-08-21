@@ -222,6 +222,22 @@ test("readArtifact rejects a symlinked artifact directory", async (t) => {
   await assert.rejects(store.readArtifact(run, "note.md"), /ordinary.*directory|symbolic/i);
 });
 
+test("writeArtifact rejects a symlinked artifact directory", async (t) => {
+  const { cwd, store, run, artifactDirectory } = await runFixture(
+    t,
+    "maswe-artifact-write-directory-link-",
+  );
+  const retained = path.join(cwd, "retained-write-artifacts");
+  await rename(artifactDirectory, retained);
+  await symlink(retained, artifactDirectory, process.platform === "win32" ? "junction" : "dir");
+
+  await assert.rejects(
+    store.writeArtifact(run, "other.md", "must not follow the directory link"),
+    /ordinary.*directory|symbolic/i,
+  );
+  await assert.rejects(readFile(path.join(retained, "other.attempt-1.md"), "utf8"), /ENOENT/);
+});
+
 test("readArtifact rejects persistent symlinks in every artifact namespace ancestor", async (t) => {
   const cases = ["MASWE state", "run store", "run record"] as const;
   for (const label of cases) {

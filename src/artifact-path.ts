@@ -8,6 +8,7 @@ export interface ValidatedArtifactReferencePath {
 
 const PORTABLE_ARTIFACT_FILE_NAME = /^[A-Za-z0-9._-]+$/;
 const WINDOWS_DEVICE_STEM = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
+const GENERATED_ARTIFACT_ESCAPE_PREFIX = "_maswe-escaped-";
 
 export function isPortableArtifactFileName(fileName: unknown): fileName is string {
   return (
@@ -17,6 +18,24 @@ export function isPortableArtifactFileName(fileName: unknown): fileName is strin
     !fileName.endsWith(" ") &&
     !WINDOWS_DEVICE_STEM.test(fileName)
   );
+}
+
+/**
+ * Preserve existing lowercase portable leaves while escaping every other generated leaf into an
+ * injective, case-insensitive-filesystem-safe namespace. Inputs already resembling the escape
+ * namespace are escaped too, so an encoded output can never collide with a passthrough input.
+ */
+export function generatedArtifactFileName(candidateFileName: string): string {
+  if (
+    isPortableArtifactFileName(candidateFileName) &&
+    candidateFileName === candidateFileName.toLowerCase() &&
+    !candidateFileName.startsWith(GENERATED_ARTIFACT_ESCAPE_PREFIX)
+  ) {
+    return candidateFileName;
+  }
+
+  const encoded = Buffer.from(candidateFileName, "utf8").toString("hex");
+  return `${GENERATED_ARTIFACT_ESCAPE_PREFIX}${encoded}.md`;
 }
 
 function invalidArtifactPath(persistedPath: string): never {

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import {
   DurableAtomicWriteOutcomeUnknownError,
@@ -43,7 +43,7 @@ import {
 import { transition } from "./state-machine.ts";
 import {
   canonicalArtifactReferencePath,
-  isPortableArtifactFileName,
+  generatedArtifactFileName,
   validateArtifactReferencePath,
 } from "./artifact-path.ts";
 
@@ -906,12 +906,25 @@ export class FileRunStore implements RunStore {
       const priorAttempts = next.artifacts.filter((artifact) => artifact.logicalName === logicalName);
       const attempt = priorAttempts.reduce((max, artifact) => Math.max(max, artifact.attempt), 0) + 1;
       const candidateFileName = `${logicalName.replace(/\.md$/i, "")}.attempt-${attempt}.md`;
-      const fileName = isPortableArtifactFileName(candidateFileName)
-        ? candidateFileName
-        : `_${candidateFileName}`;
+      const fileName = generatedArtifactFileName(candidateFileName);
       const relativePath = canonicalArtifactReferencePath(run.id, fileName);
       const absolutePath = path.join(this.root, run.id, "artifacts", fileName);
       const redacted = redactSecrets(content);
+
+      const conflictingOwner = next.artifacts.find(
+        (artifact) => artifact.path === relativePath && artifact.logicalName !== logicalName,
+      );
+      if (conflictingOwner) {
+        throw new Error(
+          `Artifact physical path ${relativePath} is already owned by logical artifact ${conflictingOwner.logicalName}`,
+        );
+      }
+      try {
+        await lstat(absolutePath);
+        throw new Error(`Artifact physical path ${relativePath} already exists`);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
 
       const reference: ArtifactReference = {
         name: logicalName,
