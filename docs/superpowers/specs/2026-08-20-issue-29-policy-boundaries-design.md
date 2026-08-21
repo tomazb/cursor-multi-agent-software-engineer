@@ -137,6 +137,13 @@ Cursor CLI and SDK adapter mutation detections also throw the same typed policy 
 
 `assertRuntimeIdentity()` throws `policy-runtime-identity-mismatch`. `executeAgent()` applies identity validation whenever an `actualModel` is reported and differs from `requestedModel`; it is not conditional on whether fallback selection was enabled.
 
+Before each existing-run attempt, the orchestrator resolves the persisted selector against the
+runtime's trusted catalogue. Case-insensitive exact-ID acceptance returns the catalogue entry's
+canonical spelling; it does not lowercase arbitrary runtime metadata or permit family, provider,
+or effort substitution. That canonical value drives the runtime request, the orchestrator's
+trusted requested identity, attempt diagnostics, and any reported-identity comparison. Runtime
+`requestedModel` and `actualModel` fields remain untrusted evidence and cannot replace it.
+
 Fallback chooses the requested model for a new attempt. It does not authorize a runtime/provider to return a different model from the model requested for that attempt.
 
 ### 4.5 Prompt replacement is single-pass
@@ -180,7 +187,11 @@ No abbreviated option names, implicit values, or combined short flags are introd
 
 ### 4.7 Portable path-glob semantics are explicit
 
-Candidate paths and configured glob separators are normalized to `/` for policy matching. Backslash therefore acts as a portable path separator in this policy language, not a regex escape.
+Configured glob separators are normalized to `/` for portable policy matching. Git-reported
+candidate paths are not rewritten: they are the authoritative scope subjects. In particular, a
+literal `\` in a POSIX Git filename remains part of that root filename and is never reclassified
+as a directory separator. This corrects the original Issue #29 design wording, which normalized
+both sides and could widen `src/**` to a root file such as `src\unapproved.ts`.
 
 Token semantics:
 
@@ -190,7 +201,7 @@ Token semantics:
 - `**/` — zero or more complete path segments, including zero segments;
 - all other characters are literals and regex metacharacters are escaped.
 
-Patterns are anchored to the complete normalized path. Dotfiles are not special: `*` and `?` may match `.`. Consequently `**/*.ts` matches both `root.ts` and `src/root.ts`.
+Patterns are anchored to the complete candidate path. Dotfiles are not special: `*` and `?` may match `.`. Consequently `**/*.ts` matches both `root.ts` and `src/root.ts`.
 
 Keep the existing special meaning of `**` / `**/*` as all paths, although the compiler also yields equivalent behavior for non-empty candidate file paths.
 
@@ -215,6 +226,13 @@ Persist new artifact paths canonically with `/` separators:
 ```
 
 The current writer creates only direct artifact files, so migration accepts only a direct child of that exact prefix. This is backward-compatible with records created by MASWE because the artifact file-name sanitizer does not generate path separators. Historical Windows separators are accepted only by first normalizing `\` to `/` for validation.
+
+Generated physical names preserve the existing lowercase portable form. Every non-lowercase,
+reserved, or escape-prefix-shaped generated leaf is encoded into a dedicated hexadecimal escape
+namespace. Escaping inputs that already resemble that namespace makes the transformation
+injective, including on case-insensitive filesystems. Before publication, the store also rejects a
+physical path already owned by another logical artifact and refuses to replace an unexpected
+existing target. Historical schema-version-1 physical names remain valid references.
 
 Reject during run-record migration:
 

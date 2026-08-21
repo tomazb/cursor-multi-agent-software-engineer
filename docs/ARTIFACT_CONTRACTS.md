@@ -11,10 +11,14 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
 - A stored reference names exactly one portable direct child of
   `.maswe/runs/<run-id>/artifacts/`. Its physical leaf is ASCII `[A-Za-z0-9._-]+`, neither `.` nor
   `..`, does not end in `.`, and has no Windows reserved device stem, including a stem before an
-  extension or an `¹`/`²`/`³` device-number variant. The writer deterministically prefixes a
-  generated reserved leaf with `_`. Absolute paths, nested paths, separator tricks, and other
-  non-portable physical filenames are rejected; historical `\\` separators are normalized to `/`
-  before validation.
+  extension or an `¹`/`²`/`³` device-number variant. The writer preserves lowercase portable
+  generated leaves and uses an injective hexadecimal escape namespace for all other generated
+  leaves, including names already shaped like that namespace. This keeps distinct logical names
+  distinct on case-insensitive filesystems. Publication rejects any physical path owned by another
+  logical artifact and any unexpected existing target instead of overwriting it. Existing
+  schema-version-1 physical names remain valid. Absolute paths, nested paths, separator tricks,
+  and other non-portable physical filenames are rejected; historical `\\` separators are
+  normalized to `/` before validation.
 - Artifact reads require every namespace ancestor to be an ordinary directory, require an ordinary
   final file opened with no-follow support, read at most 1 MiB, recheck the namespace after the
   bounded read, then recompute and compare the recorded SHA-256 digest. Lack of no-follow support
@@ -28,7 +32,12 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
   redaction contract; its URI-authority scanner advances once forwards without rescanning prior
   content. Failure diagnostics additionally follow the bounded failure contract below.
 - JSON schemas live under `schemas/` for configuration and run records.
-- Persisted `run.config.roles.*.model` values are exact executable catalogue IDs after `start`. Loading a run migrates defaults then runs the same config assertions as project load (without applying process environment overrides).
+- Persisted `run.config.roles.*.model` values are exact executable catalogue selectors after
+  `start`. Before execution, a catalogue-capable runtime resolves a case-insensitive exact selector
+  to the trusted catalogue entry's canonical spelling, without family/provider/effort
+  substitution. That canonical value drives the request and identity comparison; runtime metadata
+  cannot replace it. Loading a run migrates defaults then runs the same config assertions as
+  project load (without applying process environment overrides).
 - `RuntimeDoctorResult` (including `maswe doctor --json` output) is not a persisted artifact and is not governed by run-record schemas. It is an in-process report surface with typed doctor `code` values and optional skipped-check `prerequisite` constrained by `DoctorCheckPrerequisite` to `cursor-cli`, `model-catalogue`, or `model-brainstormer`.
 
 ## Run record

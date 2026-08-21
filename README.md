@@ -206,8 +206,10 @@ Fallback models are attempted only when `policy.rejectModelFallback` is `false`.
 Fallback applies only to ordinary runtime attempt failures. A role-permission violation, read-only
 workspace/HEAD change, or reported model-identity mismatch is a policy failure and stops the run.
 `quality.commands: []` is valid for a deliberately empty quality pass; blank command entries are
-invalid. `policy.allowedPathGlobs` uses portable `/`-normalized matching (`*`/`?` stay in one
-segment, `**` crosses segments, and `**/` accepts zero or more segments).
+invalid. `policy.allowedPathGlobs` uses portable `/`-normalized configured glob syntax (`*`/`?`
+stay in one segment, `**` crosses segments, and `**/` accepts zero or more segments). Git-reported
+candidate path identity is preserved, so a literal POSIX `\\` filename character is not treated
+as a directory separator.
 
 ## Safety and correctness guarantees
 

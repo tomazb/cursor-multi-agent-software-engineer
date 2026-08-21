@@ -83,6 +83,9 @@ the digest fingerprint.
 - PR comments require a read-only scope classification before resolution.
 - Out-of-scope comments stop for a human.
 - Deterministic quality and fresh independent verification follow edits.
+- Writer-scope matching preserves Git-reported candidate path identity. Only configured glob
+  separator syntax is normalized; a literal POSIX `\\` in a Git filename cannot be reinterpreted
+  as `/` to enter an allowed subtree.
 
 **Gap:** v0.2 isolates builders in a dedicated worktree and rejects commits outside `policy.allowedPathGlobs`. Fine-grained path policy derived from design artifacts remains future work.
 
@@ -103,12 +106,17 @@ the digest fingerprint.
 
 **Controls:**
 
-- Requested model is stored in configuration and event details.
+- The persisted model spelling is resolved to the trusted catalogue entry's canonical identity
+  before execution. That value drives the request and comparison; runtime metadata cannot replace
+  it.
 - Default policy does not attempt configured fallbacks.
 - Reported actual-model mismatch fails with `policy-runtime-identity-mismatch`.
 - Policy failures bypass fallback selection and all-attempt aggregation; only ordinary runtime
   attempt failures may proceed to a configured fallback.
-- Doctor checks available model catalogue with fail-closed structured row parsing. Empty or unparseable catalogues are failures. Logical names resolve only for new runs; existing runs validate persisted exact IDs without substitution.
+- Doctor checks available model catalogue with fail-closed structured row parsing. Empty or
+  unparseable catalogues are failures. Logical names resolve only for new runs; existing runs
+  resolve only a case-insensitive exact selector to the canonical catalogue entry, without
+  family/provider/effort substitution.
 
 **Gap:** Not every runtime reports actual model identity. Provider-side substitution may remain opaque.
 
@@ -226,6 +234,9 @@ authentication field.
 **Controls:**
 
 - Artifacts have SHA-256 digests in the run record.
+- Generated physical names use an injective escape namespace, and publication rejects a target
+  already owned by another logical artifact or unexpectedly present on disk; distinct handoffs
+  cannot silently overwrite one another.
 - An artifact reference must name one portable direct child of its run's `artifacts/` directory.
   Reads reject symlink/non-directory ancestors and non-regular final objects, require no-follow
   support, bound content to 1 MiB, recheck the namespace, and verify the recorded digest.

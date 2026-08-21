@@ -255,8 +255,12 @@ Artifacts are SHA-256 hashed when written. A reference names exactly one direct 
 filenames are valid. Its physical leaf is ASCII `[A-Za-z0-9._-]+`, is neither `.` nor `..`, does
 not end in `.`, and cannot have a Windows reserved device stem (including an extension or the
 `¹`/`²`/`³` device-number variants). When a generated writer leaf would be reserved, the writer
-prefixes it with `_` deterministically. Reads verify every namespace ancestor is an ordinary
-directory, open only an ordinary final file with no-follow support, bound the read to 1 MiB,
+uses an injective hexadecimal escape namespace; uppercase and escape-prefix-shaped generated
+leaves use the same encoding so distinct logical names remain distinct on case-insensitive
+filesystems. Lowercase portable leaves keep their historical form, and existing schema-version-1
+references remain readable. Publication rejects a physical path owned by another logical artifact
+or an unexpected existing target instead of overwriting it. Reads verify every namespace ancestor
+is an ordinary directory, open only an ordinary final file with no-follow support, bound the read to 1 MiB,
 recheck the namespace, and compare the content digest with the recorded SHA-256. This prevents
 accidental pathname escape and fails closed when no-follow support is unavailable. A future store
 can place content in object storage and keep the same reference contract.
@@ -283,7 +287,7 @@ doctor(): Promise<RuntimeDoctorResult>
 Implemented adapters:
 
 - `MockRuntime`: deterministic outputs for tests and workflow development.
-- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode. **New runs** resolve logical model names via `resolveProjectModels` against a fail-closed structured catalogue parse; **existing-run stages** call `validatePersistedExactModel` and never substitute. Unwraps JSON/`stream-json` stdout by decoding the transport envelope once and reading only the authoritative string `result` field (text mode keeps raw stdout); never treats stderr as successful assistant content; structured modes never fall back to raw envelope text. Terminal markers are validated only on that decoded logical text. `requestedModel` records the exact candidate MASWE selected. Cursor CLI output does not provide an authoritative mapping from its optional stream initialization model label to that exact candidate, so this adapter omits `actualModel` in every output mode instead of synthesizing identity evidence; the orchestrator treats absence as identity unavailable, while any malformed present identity or exact mismatch is a policy failure. Non-zero process stderr stays inside the adapter: the returned error contains a structured failure code, safe execution metadata, and a redacted bounded diagnostic; metadata stores `stderrPresent`, never raw stderr. Adds `--mode ask` for read-only roles and `--force` only for write roles; adds `--trust` when `policy.trustManagedWorktrees` is set for MASWE-managed worktrees. Doctor emits typed check codes, isolates catalogue discovery from per-role resolution, and, for normal Cursor CLI commands, skips downstream checks with explicit prerequisites when catalogue or model checks fail. The documented Node transport-only stand-in is an explicit test seam: its `node -e` stdin probe needs no model, so catalogue/model failures do not block it. Every eligible stdin probe uses `policy.doctorProbeTimeoutMs` and cleans its probe branch/worktree by recorded probe identity in `finally`.
+- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode. **New runs** resolve logical model names via `resolveProjectModels` against a fail-closed structured catalogue parse; **existing-run stages** resolve a case-insensitive exact selector to the trusted catalogue entry's canonical spelling before execution and never substitute family, provider, or effort variants. That canonical entry drives the runtime request and the orchestrator's trusted identity comparison. Unwraps JSON/`stream-json` stdout by decoding the transport envelope once and reading only the authoritative string `result` field (text mode keeps raw stdout); never treats stderr as successful assistant content; structured modes never fall back to raw envelope text. Terminal markers are validated only on that decoded logical text. `requestedModel` records the exact candidate MASWE selected. Cursor CLI output does not provide an authoritative mapping from its optional stream initialization model label to that exact candidate, so this adapter omits `actualModel` in every output mode instead of synthesizing identity evidence; the orchestrator treats absence as identity unavailable, while any malformed present identity or exact mismatch is a policy failure. Non-zero process stderr stays inside the adapter: the returned error contains a structured failure code, safe execution metadata, and a redacted bounded diagnostic; metadata stores `stderrPresent`, never raw stderr. Adds `--mode ask` for read-only roles and `--force` only for write roles; adds `--trust` when `policy.trustManagedWorktrees` is set for MASWE-managed worktrees. Doctor emits typed check codes, isolates catalogue discovery from per-role resolution, and, for normal Cursor CLI commands, skips downstream checks with explicit prerequisites when catalogue or model checks fail. The documented Node transport-only stand-in is an explicit test seam: its `node -e` stdin probe needs no model, so catalogue/model failures do not block it. Every eligible stdin probe uses `policy.doctorProbeTimeoutMs` and cleans its probe branch/worktree by recorded probe identity in `finally`.
 - `CursorSdkRuntime`: dynamically imports `@cursor/sdk` and runs a local one-shot `Agent.prompt` call (no catalogue capability; empty-catalogue pass-through stays SDK-only). Both `execute()` and `doctor()` use an injectable import seam defaulting to dynamic import.
 
 The optional SDK import means the CLI can build and run without installing the beta SDK.
@@ -357,9 +361,11 @@ mutation from a read-only role.
 
 Quality commands never come from model output, issue text, or PR comments.
 
-`policy.allowedPathGlobs` is portable and deterministic. MASWE normalizes both candidate paths
-and glob strings from `\\` to `/` and anchors each match to the whole path. `*` matches zero or
-more non-separator characters; `?` exactly one non-separator; `**` zero or more characters,
+`policy.allowedPathGlobs` is portable and deterministic. MASWE normalizes configured glob strings
+from `\\` to `/`, but preserves each Git-reported candidate path as the authoritative scope
+subject, and anchors each match to the whole path. A literal POSIX `\\` therefore remains a
+filename character rather than becoming a directory separator. `*` matches zero or more
+non-separator characters; `?` exactly one non-separator; `**` zero or more characters,
 including separators; and `**/` zero or more complete path segments, including zero segments.
 `**` and `**/*` each permit every candidate path. Production working-tree candidates are
 non-empty file paths, but the matcher special-cases both forms without a non-empty restriction.
@@ -432,7 +438,11 @@ Model aliases are project configuration for **new runs only**. For runtimes that
 
 - **`start`:** discovers the catalogue, resolves logical role models to exact executable IDs (effort-aware: an explicit `-high`/`-medium`/`-low` suffix requires the same effort; otherwise fail closed), and **persists** those exact IDs in the new `run.config` snapshot.
 - **`doctor`:** for normal Cursor CLI commands, discovers the catalogue and resolves an exact ID for its stdin probe only. The Node transport-only test stand-in instead uses `node -e`, requires no model, and remains eligible when Node's unsupported catalogue command fails. Doctor does **not** create a run and does **not** persist a `run.config` snapshot. Probe timeout comes from `policy.doctorProbeTimeoutMs` (default `60_000`, hard bounds `1_000..300_000`, no clamping).
-- **Existing-run stages:** validate the persisted exact ID against the live catalogue and never substitute same-core, same-family, provider, or effort variants when the catalogue drifts.
+- **Existing-run stages:** treat the persisted spelling as a selector, resolve a case-insensitive exact
+  match to the live catalogue entry's canonical spelling before execution, and never substitute
+  same-core, same-family, provider, or effort variants when the catalogue drifts. The canonical
+  entry drives both the runtime request and the orchestrator's trusted comparison identity;
+  runtime-reported metadata cannot replace it.
 
 `CursorSdkRuntime` has no catalogue capability; doctor/start do not call `agent models`, and empty-catalogue pass-through keeps configured IDs as-is for SDK-only paths.
 

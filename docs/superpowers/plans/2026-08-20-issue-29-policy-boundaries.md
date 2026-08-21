@@ -502,8 +502,9 @@ Assert:
 ["**/README.md", "docs/README.md", true],
 // dotfiles are ordinary characters.
 ["**/*", ".env.example", true],
-// candidate/pattern Windows separators normalize.
-["src\\**\\*.ts", "src\\nested\\x.ts", true],
+// configured Windows-style separators normalize, but Git candidate identity is preserved.
+["src\\**\\*.ts", "src/nested/x.ts", true],
+["src/**", "src\\unapproved.ts", false],
 // regex metacharacters are literals.
 ["src/a+b[1].ts", "src/a+b[1].ts", true],
 ```
@@ -516,7 +517,8 @@ npm run _test -- test/issue29-globs.test.ts
 
 - [ ] **Step 3: Replace placeholder regex translation with a token compiler**
 
-Implement a character scanner that normalizes `\` to `/` and emits:
+Implement a character scanner that normalizes configured glob `\` to `/`, preserves the
+Git-reported candidate path exactly, and emits:
 
 ```ts
 "*"   -> "[^/]*"

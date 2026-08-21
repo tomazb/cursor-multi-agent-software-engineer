@@ -157,7 +157,7 @@ test("quality commands accept an explicit empty list but reject blank entries", 
   for (const command of ["", " \t\n "]) {
     assert.throws(
       () => mergeConfigForTest({ quality: { commands: [command] } }),
-      /quality\.commands/i,
+      /quality\.commands must contain only non-blank strings/,
     );
   }
   const trustedText = "  npm test  ";

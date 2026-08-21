@@ -200,7 +200,9 @@ Each role shall have a configurable model. When fail-closed model fallback is en
 
 A runtime-reported actual model different from the requested model is a policy failure. Policy
 failures, including identity and permission violations, shall bypass fallback selection and
-attempt aggregation.
+attempt aggregation. Existing-run model selectors shall resolve to the trusted catalogue entry's
+canonical spelling before execution; that value, not runtime-reported metadata, shall drive the
+request and identity comparison.
 
 ### FR-16 — Read-only enforcement
 
@@ -223,9 +225,11 @@ are `read-only`; builder and prResolver are `workspace-write`. Only prResolver m
 `read-only` for the comment-classification invocation. Every other mismatch shall fail before
 runtime invocation.
 
-`policy.allowedPathGlobs` shall use portable fully anchored matching: paths and globs normalize
-`\\` to `/`; `*` is zero or more non-separators; `?` is exactly one non-separator; `**` is zero or
-more characters including separators; and `**/` is zero or more complete segments including zero.
+`policy.allowedPathGlobs` shall use portable fully anchored matching: configured glob separators
+normalize `\\` to `/`, while Git-reported candidate paths preserve their exact identity. A literal
+POSIX `\\` in a candidate filename is not a directory separator. `*` is zero or more
+non-separators; `?` is exactly one non-separator; `**` is zero or more characters including
+separators; and `**/` is zero or more complete segments including zero.
 `**` and `**/*` each allow every candidate path. Production working-tree candidates are non-empty
 file paths, but the matcher special-cases both forms without a non-empty restriction. Dotfiles are
 ordinary and regex metacharacters are literal.
@@ -274,8 +278,10 @@ Prompt templates shall render declared placeholders once, insert values literall
 rescanning them, and reject unknown placeholders deterministically. An artifact path shall name
 exactly one portable direct child of the run's artifact namespace. The physical leaf shall be ASCII
 `[A-Za-z0-9._-]+`, neither `.` nor `..`, without a trailing `.`, and without a Windows reserved
-device stem (including extension and superscript-number variants); a reserved generated leaf shall
-receive a deterministic `_` prefix. Reads shall require ordinary namespace directories and an
+device stem (including extension and superscript-number variants). Generated names shall be
+injective for distinct logical artifact ownership, including on case-insensitive filesystems, and
+publication shall reject an already-owned or unexpected existing physical target rather than
+overwrite it. Reads shall require ordinary namespace directories and an
 ordinary no-follow final file, remain bounded, and verify the recorded SHA-256 digest. The
 trusted-local-user boundary does not claim to eliminate all concurrent same-user ancestor
 replacement races.

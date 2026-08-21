@@ -132,7 +132,10 @@ const duplicateOptionCases: Array<[name: string, argv: string[]]> = [
 
 for (const [name, argv] of duplicateOptionCases) {
   test(`CLI grammar rejects mixed or repeated ${name} options`, () => {
-    assert.throws(() => parseMasweArgs(argv), Error);
+    assert.throws(
+      () => parseMasweArgs(argv),
+      new RegExp(`Option --${name} may not appear more than once`),
+    );
   });
 }
 
@@ -164,7 +167,7 @@ const wrongCommandOptionCases: Array<[name: string, argv: string[]]> = [
 
 for (const [name, argv] of wrongCommandOptionCases) {
   test(`CLI grammar enforces the command allowlist for --${name}`, () => {
-    assert.throws(() => parseMasweArgs(argv), Error);
+    assert.throws(() => parseMasweArgs(argv), new RegExp(`Option --${name} is not valid for`));
   });
 }
 
@@ -188,3 +191,37 @@ for (const [name, argv] of invalidPositionalCases) {
     assert.throws(() => parseMasweArgs(argv), Error);
   });
 }
+
+test("CLI grammar reports split dash-prefixed request text as a native ambiguous value", () => {
+  assert.throws(
+    () => parseMasweArgs(["start", "--title=T", "--request", "--literal"]),
+    (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.equal(
+        (error as TypeError & { code?: string }).code,
+        "ERR_PARSE_ARGS_INVALID_OPTION_VALUE",
+      );
+      assert.match(error.message, /--request.*ambiguous|ambiguous.*--request/i);
+      return true;
+    },
+  );
+});
+
+test("CLI grammar reports the intended mutual-exclusion and cardinality failures", () => {
+  assert.throws(
+    () =>
+      parseMasweArgs([
+        "start",
+        "--title=T",
+        "--request=R",
+        "--request-file=r.md",
+      ]),
+    /start requires --title and exactly one request source/,
+  );
+  assert.throws(
+    () => parseMasweArgs(["review-comment", "r1", "--text=x", "--file=x.md"]),
+    /review-comment requires exactly one comment source/,
+  );
+  assert.throws(() => parseMasweArgs(["run", "r1", "r2"]), /run accepts exactly 1 operand/);
+  assert.throws(() => parseMasweArgs(["status", "--wat"]), /Unknown option '--wat'/);
+});

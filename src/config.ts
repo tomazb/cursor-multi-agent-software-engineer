@@ -333,7 +333,7 @@ export function assertConfig(config: MasweConfig): void {
       (command) => typeof command === "string" && command.trim().length > 0,
     )
   ) {
-    throw new Error("quality.commands must contain only non-empty strings");
+    throw new Error("quality.commands must contain only non-blank strings");
   }
   if (
     typeof config.policy.maxBuildVerifyCycles !== "number" ||
