@@ -492,6 +492,178 @@ test("writeArtifact still rejects an unexpected pre-existing physical target", a
   assert.equal((await store.load(run.id)).artifacts.length, 0);
 });
 
+test("writeArtifact still rejects a pre-existing target whose contents already match", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-artifact-matching-target-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("artifact matching target", "test", DEFAULT_CONFIG);
+  const artifactDirectory = path.join(store.root, run.id, "artifacts");
+  const artifactPath = path.join(artifactDirectory, "note.attempt-1.md");
+  await mkdir(artifactDirectory);
+  await writeFile(artifactPath, TRUSTED_ARTIFACT, "utf8");
+
+  await assert.rejects(
+    store.writeArtifact(run, "note.md", TRUSTED_ARTIFACT),
+    /artifact physical path.*already exists/i,
+  );
+
+  assert.equal(await readFile(artifactPath, "utf8"), TRUSTED_ARTIFACT);
+  assert.equal(run.artifacts.length, 0);
+  assert.equal((await store.load(run.id)).artifacts.length, 0);
+});
+
+test("writeArtifact reconciles a same-invocation artifact outcome-unknown publication", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-artifact-unknown-reconcile-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const initialStore = new FileRunStore(cwd);
+  const run = await initialStore.create("artifact unknown reconcile", "test", DEFAULT_CONFIG);
+  const initialVersion = run.version;
+  const artifactPath = path.join(
+    initialStore.root,
+    run.id,
+    "artifacts",
+    "note.attempt-1.md",
+  );
+  const artifactDirectory = path.dirname(artifactPath);
+  let failFirstArtifactDirectorySync = true;
+  const store = new FileRunStore(cwd, {
+    syncDirectory: async (directoryPath) => {
+      if (directoryPath !== artifactDirectory) return;
+      if (failFirstArtifactDirectorySync) {
+        failFirstArtifactDirectorySync = false;
+        throw new Error("injected artifact directory-sync outcome unknown");
+      }
+    },
+  });
+
+  const reference = await store.writeArtifact(run, "note.md", TRUSTED_ARTIFACT);
+  const authoritative = await store.load(run.id);
+  const noteReferences = authoritative.artifacts.filter(
+    (artifact) => artifact.logicalName === "note.md",
+  );
+
+  assert.equal(reference.attempt, 1);
+  assert.equal(run.version, initialVersion + 1);
+  assert.equal(authoritative.version, initialVersion + 1);
+  assert.equal(noteReferences.length, 1);
+  assert.equal(noteReferences[0]?.attempt, 1);
+  assert.equal(await store.readArtifact(authoritative, "note.md"), TRUSTED_ARTIFACT);
+  assert.equal(
+    noteReferences[0]?.sha256,
+    "c2c9a171a07671741f43b25f9a93db9558c07e3d21fc0e7bbce31e89ca38c597",
+  );
+  assert.equal(await readFile(artifactPath, "utf8"), TRUSTED_ARTIFACT);
+});
+
+test("writeArtifact returns to A when artifact outcome-unknown cannot reconfirm durability", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-artifact-unknown-cleanup-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const initialStore = new FileRunStore(cwd);
+  const run = await initialStore.create("artifact unknown cleanup", "test", DEFAULT_CONFIG);
+  const initialVersion = run.version;
+  const initialArtifacts = structuredClone(run.artifacts);
+  const runPath = path.join(initialStore.root, run.id, "run.json");
+  const artifactPath = path.join(
+    initialStore.root,
+    run.id,
+    "artifacts",
+    "note.attempt-1.md",
+  );
+  const artifactDirectory = path.dirname(artifactPath);
+  let artifactDirectorySyncs = 0;
+  let observedCleanupDirectorySync = false;
+  const store = new FileRunStore(cwd, {
+    syncDirectory: async (directoryPath) => {
+      if (directoryPath !== artifactDirectory) return;
+      artifactDirectorySyncs += 1;
+      if (artifactDirectorySyncs <= 2) {
+        throw new Error(`injected artifact directory-sync failure ${artifactDirectorySyncs}`);
+      }
+      try {
+        await readFile(artifactPath, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        observedCleanupDirectorySync = true;
+      }
+    },
+  });
+
+  await assert.rejects(
+    store.writeArtifact(run, "note.md", TRUSTED_ARTIFACT),
+    (error: unknown) => {
+      assert.ok(
+        error instanceof DurableAtomicWriteOutcomeUnknownError ||
+          (error instanceof AggregateError &&
+            error.errors.some((candidate) => candidate instanceof DurableAtomicWriteOutcomeUnknownError)),
+      );
+      return true;
+    },
+  );
+
+  const authoritative = JSON.parse(await readFile(runPath, "utf8")) as {
+    version: number;
+    artifacts: Array<{ logicalName: string }>;
+  };
+  assert.equal(authoritative.version, initialVersion);
+  assert.equal(
+    authoritative.artifacts.some((artifact) => artifact.logicalName === "note.md"),
+    false,
+  );
+  await assert.rejects(readFile(artifactPath, "utf8"), { code: "ENOENT" });
+  assert.equal(observedCleanupDirectorySync, true);
+  assert.equal(run.version, initialVersion);
+  assert.deepEqual(run.artifacts, initialArtifacts);
+
+  const reference = await store.writeArtifact(run, "note.md", TRUSTED_ARTIFACT);
+  const recovered = await store.load(run.id);
+  const noteReferences = recovered.artifacts.filter(
+    (artifact) => artifact.logicalName === "note.md",
+  );
+  assert.equal(reference.attempt, 1);
+  assert.equal(noteReferences.length, 1);
+  assert.equal(noteReferences[0]?.attempt, 1);
+  assert.equal(await store.readArtifact(recovered, "note.md"), TRUSTED_ARTIFACT);
+});
+
+test("writeArtifact does not adopt a tampered artifact after outcome-unknown", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-artifact-unknown-tamper-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const initialStore = new FileRunStore(cwd);
+  const run = await initialStore.create("artifact unknown tamper", "test", DEFAULT_CONFIG);
+  const initialVersion = run.version;
+  const initialArtifacts = structuredClone(run.artifacts);
+  const artifactPath = path.join(
+    initialStore.root,
+    run.id,
+    "artifacts",
+    "note.attempt-1.md",
+  );
+  const artifactDirectory = path.dirname(artifactPath);
+  const tampered = "tampered after rename\n";
+  let failFirstArtifactDirectorySync = true;
+  const store = new FileRunStore(cwd, {
+    syncDirectory: async (directoryPath) => {
+      if (directoryPath !== artifactDirectory) return;
+      if (failFirstArtifactDirectorySync) {
+        failFirstArtifactDirectorySync = false;
+        assert.equal(await readFile(artifactPath, "utf8"), TRUSTED_ARTIFACT);
+        await writeFile(artifactPath, tampered, "utf8");
+        throw new Error("injected artifact directory-sync outcome unknown after tamper");
+      }
+    },
+  });
+
+  await assert.rejects(
+    store.writeArtifact(run, "note.md", TRUSTED_ARTIFACT),
+    /mismatch|digest|unexpected|tamper|content/i,
+  );
+
+  assert.equal(await readFile(artifactPath, "utf8"), tampered);
+  assert.equal(run.version, initialVersion);
+  assert.deepEqual(run.artifacts, initialArtifacts);
+  assert.equal((await store.load(run.id)).artifacts.length, 0);
+});
+
 test("readArtifact rejects a symlinked artifact directory", async (t) => {
   const { cwd, store, run, artifactDirectory } = await runFixture(
     t,

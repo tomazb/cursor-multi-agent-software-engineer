@@ -132,7 +132,15 @@ export async function ensureOrdinaryDirectory(
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
   await requireOrdinaryDirectory(directoryPath, label);
-  await (options.syncDirectory ?? defaultSyncDirectory)(parent);
+  await syncDurableDirectory(parent, options);
+}
+
+/** Durably order a directory update through the shared sync seam. */
+export async function syncDurableDirectory(
+  directoryPath: string,
+  options: DurableFileOptions = {},
+): Promise<void> {
+  await (options.syncDirectory ?? defaultSyncDirectory)(directoryPath);
 }
 
 /** Remove one ordinary file and durably order the containing-directory update. */
@@ -148,7 +156,7 @@ export async function removeDurableFile(
     throw new Error(`${label} must be an ordinary local file`);
   }
   await unlink(filePath);
-  await (options.syncDirectory ?? defaultSyncDirectory)(directory);
+  await syncDurableDirectory(directory, options);
 }
 
 /** Read one regular file without following its final path and without unbounded allocation. */
@@ -249,7 +257,7 @@ export async function writeDurableAtomic(
     handle = undefined;
     await rename(tempPath, filePath);
     published = true;
-    await (options.syncDirectory ?? defaultSyncDirectory)(directory);
+    await syncDurableDirectory(directory, options);
   } catch (error) {
     primary = error;
   }

@@ -29,11 +29,19 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
   protects against tampering, historical malformed data, filesystem replacement, and bypassed
   writers. Lack of no-follow support fails closed. The trusted-local-user boundary does not claim
   to prevent every concurrent same-user ancestor-replacement race between filesystem operations.
-- Artifact-file publication precedes its run-record reference. If the run-record write fails with a
-  determinate non-publication result, the store removes the just-published ordinary artifact and
-  syncs the artifact directory before returning the original error. A run-record outcome-unknown
-  error instead retains the artifact and reconciles an exact matching canonical record; it never
-  triggers determinate cleanup.
+- Artifact-file publication precedes its run-record reference. Modeled outcomes:
+  - Determinate artifact write failure leaves no published artifact; ordinary retry may start again.
+  - Artifact outcome-unknown (rename observed, directory durability unconfirmed) is reconciled only
+    within the same invocation: bounded no-follow verification of the exact expected bytes and
+    digest, then a second directory sync. Successful reconfirmation continues to run-record
+    publication. Failed reconfirmation after verified same-invocation ownership durably removes the
+    artifact when possible so retry can start cleanly. Mismatched or unverifiable targets are not
+    adopted, overwritten, or blindly deleted. Cross-process recovery of an orphaned matching file
+    without durable publication intent is outside this contract.
+  - Determinate run-record write failure removes the just-published ordinary artifact and syncs the
+    artifact directory before returning the original error.
+  - Run-record outcome-unknown retains the artifact and reconciles an exact matching canonical
+    record; it never triggers determinate cleanup.
 - Agents must not rely on prior chat messages that are absent from the supplied prompt.
 - Model output cannot authorize a transition unless the orchestrator recognizes the required terminal marker after structured response decoding: exactly one bare marker token on the final logical line of the authoritative assistant text (no backticks, quotes, earlier mentions, duplicates, or conflicting markers).
 - For Cursor CLI `json` / `stream-json` modes, marker validation runs only on the decoded authoritative `result` string. Transport JSON quoting is not treated as embedded model content. Malformed envelopes, unsupported shapes, and missing `result` fields fail closed before marker validation.

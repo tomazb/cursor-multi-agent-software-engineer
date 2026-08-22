@@ -7,6 +7,7 @@ import {
   readBoundedOrdinaryFile,
   removeDurableFile,
   requireOrdinaryDirectory,
+  syncDurableDirectory,
   writeDurableAtomic,
   type DurableFileOptions,
 } from "./durable-file.ts";
@@ -516,6 +517,73 @@ export class FileRunStore implements RunStore {
     }
   }
 
+  /**
+   * Same-invocation recovery for artifact DurableAtomicWriteOutcomeUnknownError.
+   * Provenance is limited to this write: exact path, redacted bytes, and digest.
+   * Foreign/mismatched targets are never adopted, overwritten, or blindly deleted.
+   */
+  private async confirmUncertainArtifactPublication(
+    runId: string,
+    absolutePath: string,
+    expectedContent: string,
+    expectedDigest: string,
+    publicationError: DurableAtomicWriteOutcomeUnknownError,
+  ): Promise<void> {
+    let recovered: string;
+    try {
+      await this.requireOrdinaryArtifactNamespace(runId);
+      recovered = await readBoundedOrdinaryFile(
+        absolutePath,
+        "run artifact",
+        MAX_AUTHORITATIVE_FILE_BYTES,
+      );
+      await this.requireOrdinaryArtifactNamespace(runId);
+    } catch (verifyError) {
+      throw new AggregateError(
+        [publicationError, verifyError],
+        `Run ${runId} artifact publication outcome is unknown and the published target could not be verified`,
+        { cause: publicationError },
+      );
+    }
+
+    const recoveredDigest = sha256(recovered);
+    if (recovered !== expectedContent || recoveredDigest !== expectedDigest) {
+      throw new AggregateError(
+        [
+          publicationError,
+          new Error(
+            `Run ${runId} artifact publication outcome is unknown and the published target content/digest mismatch`,
+          ),
+        ],
+        `Run ${runId} artifact publication outcome is unknown and the published target content/digest mismatch`,
+        { cause: publicationError },
+      );
+    }
+
+    try {
+      await syncDurableDirectory(path.dirname(absolutePath), this.durableOptions);
+    } catch (resyncError) {
+      try {
+        await removeDurableFile(
+          absolutePath,
+          "orphaned run artifact",
+          this.durableOptions,
+        );
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [publicationError, resyncError, cleanupError],
+          `Run ${runId} artifact publication outcome unknown, durability reconfirmation failed, and durable cleanup also failed`,
+          { cause: publicationError },
+        );
+      }
+      throw new AggregateError(
+        [publicationError, resyncError],
+        `Run ${runId} artifact publication outcome unknown and durability could not be reconfirmed`,
+        { cause: publicationError },
+      );
+    }
+  }
+
   private async writeAndReconcile(
     target: RunRecord,
     prepared: { record: RunRecord; content: string },
@@ -959,12 +1027,23 @@ export class FileRunStore implements RunStore {
       // The authoritative record capacity is known before artifact publication, so a
       // deterministic record overflow cannot leave an orphaned artifact behind.
       const prepared = this.prepareRunRecord(next);
-      await writeDurableAtomic(
-        absolutePath,
-        redacted,
-        "run artifact",
-        this.durableOptions,
-      );
+      try {
+        await writeDurableAtomic(
+          absolutePath,
+          redacted,
+          "run artifact",
+          this.durableOptions,
+        );
+      } catch (error) {
+        if (!(error instanceof DurableAtomicWriteOutcomeUnknownError)) throw error;
+        await this.confirmUncertainArtifactPublication(
+          run.id,
+          absolutePath,
+          redacted,
+          reference.sha256,
+          error,
+        );
+      }
       try {
         await this.writePreparedRunRecord(prepared);
         this.adoptArtifactPublication(run, prepared.record);
