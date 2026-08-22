@@ -29,6 +29,11 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
   protects against tampering, historical malformed data, filesystem replacement, and bypassed
   writers. Lack of no-follow support fails closed. The trusted-local-user boundary does not claim
   to prevent every concurrent same-user ancestor-replacement race between filesystem operations.
+- Artifact-file publication precedes its run-record reference. If the run-record write fails with a
+  determinate non-publication result, the store removes the just-published ordinary artifact and
+  syncs the artifact directory before returning the original error. A run-record outcome-unknown
+  error instead retains the artifact and reconciles an exact matching canonical record; it never
+  triggers determinate cleanup.
 - Agents must not rely on prior chat messages that are absent from the supplied prompt.
 - Model output cannot authorize a transition unless the orchestrator recognizes the required terminal marker after structured response decoding: exactly one bare marker token on the final logical line of the authoritative assistant text (no backticks, quotes, earlier mentions, duplicates, or conflicting markers).
 - For Cursor CLI `json` / `stream-json` modes, marker validation runs only on the decoded authoritative `result` string. Transport JSON quoting is not treated as embedded model content. Malformed envelopes, unsupported shapes, and missing `result` fields fail closed before marker validation.

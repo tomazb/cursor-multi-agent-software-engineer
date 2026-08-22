@@ -5,6 +5,7 @@ import {
   DurableAtomicWriteOutcomeUnknownError,
   MAX_AUTHORITATIVE_FILE_BYTES,
   readBoundedOrdinaryFile,
+  removeDurableFile,
   requireOrdinaryDirectory,
   writeDurableAtomic,
   type DurableFileOptions,
@@ -971,6 +972,20 @@ export class FileRunStore implements RunStore {
         if (error instanceof DurableAtomicWriteOutcomeUnknownError) {
           const observed = await this.matchingCanonicalRecord(prepared);
           if (observed) this.adoptArtifactPublication(run, observed);
+        } else {
+          try {
+            await removeDurableFile(
+              absolutePath,
+              "orphaned run artifact",
+              this.durableOptions,
+            );
+          } catch (cleanupError) {
+            throw new AggregateError(
+              [error, cleanupError],
+              `Run ${run.id} artifact record publication and durable cleanup both failed`,
+              { cause: error },
+            );
+          }
         }
         throw error;
       }

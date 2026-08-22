@@ -16,7 +16,10 @@ import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
-import { MAX_AUTHORITATIVE_FILE_BYTES } from "../src/durable-file.ts";
+import {
+  DurableAtomicWriteOutcomeUnknownError,
+  MAX_AUTHORITATIVE_FILE_BYTES,
+} from "../src/durable-file.ts";
 import { FileRunStore, migrateRunRecord } from "../src/store.ts";
 
 const execFileAsync = promisify(execFile);
@@ -355,6 +358,138 @@ test("oversized artifact rejection leaves the complete run namespace unchanged",
   const reference = await store.writeArtifact(run, "note.md", "valid note");
   assert.equal(reference.attempt, 1);
   assert.equal(await store.readArtifact(run, "note.md"), "valid note");
+});
+
+test("writeArtifact retry recovers a determinate orphaned artifact publication", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-artifact-orphan-retry-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const initialStore = new FileRunStore(cwd);
+  const run = await initialStore.create("artifact orphan retry", "test", DEFAULT_CONFIG);
+  const initialVersion = run.version;
+  const initialArtifacts = structuredClone(run.artifacts);
+  const runPath = path.join(initialStore.root, run.id, "run.json");
+  const artifactPath = path.join(
+    initialStore.root,
+    run.id,
+    "artifacts",
+    "note.attempt-1.md",
+  );
+  const artifactDirectory = path.dirname(artifactPath);
+  let failRunRecordSync = true;
+  let observedCleanupDirectorySync = false;
+  const store = new FileRunStore(cwd, {
+    syncFile: async (handle, filePath) => {
+      const isRunRecordTemp =
+        path.dirname(filePath) === path.join(store.root, run.id) &&
+        path.basename(filePath).startsWith(".run.json.") &&
+        path.basename(filePath).endsWith(".tmp");
+      if (isRunRecordTemp && failRunRecordSync) {
+        failRunRecordSync = false;
+        throw new Error("injected determinate run-record persistence failure");
+      }
+      await handle.sync();
+    },
+    syncDirectory: async (directoryPath) => {
+      if (directoryPath !== artifactDirectory) return;
+      try {
+        await readFile(artifactPath, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        observedCleanupDirectorySync = true;
+      }
+    },
+  });
+
+  await assert.rejects(
+    store.writeArtifact(run, "note.md", TRUSTED_ARTIFACT),
+    /injected determinate run-record persistence failure/,
+  );
+
+  const orphanedRecord = JSON.parse(await readFile(runPath, "utf8")) as {
+    version: number;
+    artifacts: Array<{ logicalName: string }>;
+  };
+  assert.equal(orphanedRecord.version, initialVersion);
+  assert.equal(
+    orphanedRecord.artifacts.some((artifact) => artifact.logicalName === "note.md"),
+    false,
+  );
+  await assert.rejects(readFile(artifactPath, "utf8"), { code: "ENOENT" });
+  assert.equal(observedCleanupDirectorySync, true);
+  assert.equal(run.version, initialVersion);
+  assert.deepEqual(run.artifacts, initialArtifacts);
+
+  const reference = await store.writeArtifact(run, "note.md", TRUSTED_ARTIFACT);
+  const authoritative = await store.load(run.id);
+  const noteReferences = authoritative.artifacts.filter(
+    (artifact) => artifact.logicalName === "note.md",
+  );
+
+  assert.equal(reference.attempt, 1);
+  assert.equal(run.version, initialVersion + 1);
+  assert.equal(authoritative.version, initialVersion + 1);
+  assert.equal(noteReferences.length, 1);
+  assert.equal(noteReferences[0]?.attempt, 1);
+  assert.equal(await store.readArtifact(authoritative, "note.md"), TRUSTED_ARTIFACT);
+  assert.equal(
+    noteReferences[0]?.sha256,
+    "c2c9a171a07671741f43b25f9a93db9558c07e3d21fc0e7bbce31e89ca38c597",
+  );
+});
+
+test("writeArtifact preserves a published artifact when run-record outcome is unknown", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-artifact-record-unknown-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const initialStore = new FileRunStore(cwd);
+  const run = await initialStore.create("artifact record unknown", "test", DEFAULT_CONFIG);
+  const initialVersion = run.version;
+  let runDirectorySyncs = 0;
+  const store = new FileRunStore(cwd, {
+    syncDirectory: async (directoryPath) => {
+      if (directoryPath === path.join(store.root, run.id)) {
+        runDirectorySyncs += 1;
+      }
+      if (runDirectorySyncs === 2) {
+        runDirectorySyncs += 1;
+        throw new Error("injected unknown run-record directory-sync outcome");
+      }
+    },
+  });
+
+  await assert.rejects(
+    store.writeArtifact(run, "note.md", TRUSTED_ARTIFACT),
+    DurableAtomicWriteOutcomeUnknownError,
+  );
+
+  const authoritative = await initialStore.load(run.id);
+  const noteReferences = authoritative.artifacts.filter(
+    (artifact) => artifact.logicalName === "note.md",
+  );
+  assert.equal(authoritative.version, initialVersion + 1);
+  assert.equal(run.version, authoritative.version);
+  assert.equal(noteReferences.length, 1);
+  assert.equal(noteReferences[0]?.attempt, 1);
+  assert.equal(await initialStore.readArtifact(authoritative, "note.md"), TRUSTED_ARTIFACT);
+});
+
+test("writeArtifact still rejects an unexpected pre-existing physical target", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-artifact-unexpected-target-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("artifact unexpected target", "test", DEFAULT_CONFIG);
+  const artifactDirectory = path.join(store.root, run.id, "artifacts");
+  const artifactPath = path.join(artifactDirectory, "note.attempt-1.md");
+  await mkdir(artifactDirectory);
+  await writeFile(artifactPath, "manually planted bytes", "utf8");
+
+  await assert.rejects(
+    store.writeArtifact(run, "note.md", TRUSTED_ARTIFACT),
+    /artifact physical path.*already exists/i,
+  );
+
+  assert.equal(await readFile(artifactPath, "utf8"), "manually planted bytes");
+  assert.equal(run.artifacts.length, 0);
+  assert.equal((await store.load(run.id)).artifacts.length, 0);
 });
 
 test("readArtifact rejects a symlinked artifact directory", async (t) => {

@@ -135,6 +135,22 @@ export async function ensureOrdinaryDirectory(
   await (options.syncDirectory ?? defaultSyncDirectory)(parent);
 }
 
+/** Remove one ordinary file and durably order the containing-directory update. */
+export async function removeDurableFile(
+  filePath: string,
+  label: string,
+  options: DurableFileOptions = {},
+): Promise<void> {
+  const directory = path.dirname(filePath);
+  await requireOrdinaryDirectory(directory, `${label} namespace`);
+  const target = await lstat(filePath);
+  if (target.isSymbolicLink() || !target.isFile()) {
+    throw new Error(`${label} must be an ordinary local file`);
+  }
+  await unlink(filePath);
+  await (options.syncDirectory ?? defaultSyncDirectory)(directory);
+}
+
 /** Read one regular file without following its final path and without unbounded allocation. */
 export async function readBoundedOrdinaryFile(
   filePath: string,
