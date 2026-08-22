@@ -40,9 +40,29 @@ const INVALID_PORTABLE_FILE_NAMES = [
   "pipe|name.md",
 ] as const;
 
-async function directoryContentsOrMissing(directory: string): Promise<string[] | undefined> {
+async function namespaceSnapshotOrMissing(
+  directory: string,
+): Promise<Array<[relativePath: string, contents: string]> | undefined> {
   try {
-    return (await readdir(directory)).sort();
+    const snapshot: Array<[relativePath: string, contents: string]> = [];
+    const visit = async (current: string, relativeDirectory: string): Promise<void> => {
+      const entries = (await readdir(current, { withFileTypes: true }))
+        .sort((left, right) => left.name.localeCompare(right.name));
+      for (const entry of entries) {
+        const relativePath = path.posix.join(relativeDirectory, entry.name);
+        const absolutePath = path.join(current, entry.name);
+        if (entry.isDirectory()) {
+          snapshot.push([`${relativePath}/`, "directory"]);
+          await visit(absolutePath, relativePath);
+        } else if (entry.isFile()) {
+          snapshot.push([relativePath, await readFile(absolutePath, "base64")]);
+        } else {
+          snapshot.push([relativePath, "non-ordinary"]);
+        }
+      }
+    };
+    await visit(directory, "");
+    return snapshot;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
@@ -287,35 +307,54 @@ test("writeArtifact applies the authoritative-file bound after redaction", async
   );
 });
 
-test("oversized artifact rejection is publication-atomic and preserves the next attempt", async (t) => {
+test("oversized artifact rejection leaves the complete run namespace unchanged", async (t) => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-artifact-write-atomic-"));
   t.after(() => rm(cwd, { recursive: true, force: true }));
   const store = new FileRunStore(cwd);
   const run = await store.create("artifact size", "test", DEFAULT_CONFIG);
+  const runDirectory = path.join(store.root, run.id);
   const runPath = path.join(store.root, run.id, "run.json");
   const artifactDirectory = path.join(store.root, run.id, "artifacts");
-  const runSnapshot = structuredClone(run);
+  const lockJournalDirectory = path.join(store.root, run.id, ".lock-journal-v3");
+  const runNamespaceSnapshot = await namespaceSnapshotOrMissing(runDirectory);
+  const lockJournalSnapshot = await namespaceSnapshotOrMissing(lockJournalDirectory);
+  const artifactDirectorySnapshot = await namespaceSnapshotOrMissing(artifactDirectory);
   const persistedSnapshot = await readFile(runPath, "utf8");
-  const directorySnapshot = await directoryContentsOrMissing(artifactDirectory);
-  const oversized = `DO-NOT-ECHO-ARTIFACT-CONTENT\n${"x".repeat(MAX_AUTHORITATIVE_FILE_BYTES)}`;
+  const versionSnapshot = run.version;
+  const artifactsSnapshot = structuredClone(run.artifacts);
+  const oversized = "x".repeat(MAX_AUTHORITATIVE_FILE_BYTES + 1);
 
+  for (let rejection = 0; rejection < 2; rejection += 1) {
+    await assert.rejects(
+      store.writeArtifact(run, "note.md", oversized),
+      /artifact.*exceeds.*authoritative.*byte limit/i,
+    );
+  }
+
+  const lockJournalAfter = await namespaceSnapshotOrMissing(lockJournalDirectory);
+  assert.equal(
+    lockJournalAfter?.length,
+    lockJournalSnapshot?.length,
+    "oversized rejection added lock-journal records",
+  );
+  assert.deepEqual(lockJournalAfter, lockJournalSnapshot);
+  assert.deepEqual(await namespaceSnapshotOrMissing(runDirectory), runNamespaceSnapshot);
+  assert.deepEqual(
+    await namespaceSnapshotOrMissing(artifactDirectory),
+    artifactDirectorySnapshot,
+  );
+  assert.equal(await readFile(runPath, "utf8"), persistedSnapshot);
+  assert.equal(run.version, versionSnapshot);
+  assert.deepEqual(run.artifacts, artifactsSnapshot);
+  assert.deepEqual((await store.load(run.id)).artifacts, artifactsSnapshot);
   await assert.rejects(
-    store.writeArtifact(run, "handoff.md", oversized),
-    (error: Error) => {
-      assert.match(error.message, /artifact.*exceeds.*authoritative.*byte limit/i);
-      assert.doesNotMatch(error.message, /DO-NOT-ECHO-ARTIFACT-CONTENT/);
-      return true;
-    },
+    readFile(path.join(artifactDirectory, "note.attempt-1.md"), "utf8"),
+    /ENOENT/,
   );
 
-  assert.deepEqual(run, runSnapshot);
-  assert.deepEqual(await store.load(run.id), runSnapshot);
-  assert.equal(await readFile(runPath, "utf8"), persistedSnapshot);
-  assert.deepEqual(await directoryContentsOrMissing(artifactDirectory), directorySnapshot);
-
-  const reference = await store.writeArtifact(run, "handoff.md", "valid handoff");
+  const reference = await store.writeArtifact(run, "note.md", "valid note");
   assert.equal(reference.attempt, 1);
-  assert.equal(await store.readArtifact(run, "handoff.md"), "valid handoff");
+  assert.equal(await store.readArtifact(run, "note.md"), "valid note");
 });
 
 test("readArtifact rejects a symlinked artifact directory", async (t) => {

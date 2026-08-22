@@ -893,6 +893,15 @@ export class FileRunStore implements RunStore {
   }
 
   async writeArtifact(run: RunRecord, name: string, content: string): Promise<ArtifactReference> {
+    assertSafeRunId(run.id);
+    const redacted = redactSecrets(content);
+    const persistedBytes = Buffer.byteLength(redacted, "utf8");
+    if (persistedBytes > MAX_AUTHORITATIVE_FILE_BYTES) {
+      throw new Error(
+        `Run artifact exceeds the authoritative file byte limit of ${MAX_AUTHORITATIVE_FILE_BYTES} bytes`,
+      );
+    }
+
     return this.withLock(run.id, async () => {
       const onDisk = await this.readRunFile(run.id);
       if (onDisk.version !== run.version) {
@@ -909,13 +918,6 @@ export class FileRunStore implements RunStore {
       const fileName = generatedArtifactFileName(candidateFileName);
       const relativePath = canonicalArtifactReferencePath(run.id, fileName);
       const absolutePath = path.join(this.root, run.id, "artifacts", fileName);
-      const redacted = redactSecrets(content);
-      const persistedBytes = Buffer.byteLength(redacted, "utf8");
-      if (persistedBytes > MAX_AUTHORITATIVE_FILE_BYTES) {
-        throw new Error(
-          `Run artifact exceeds the authoritative file byte limit of ${MAX_AUTHORITATIVE_FILE_BYTES} bytes`,
-        );
-      }
 
       const conflictingOwner = next.artifacts.find(
         (artifact) => artifact.path === relativePath && artifact.logicalName !== logicalName,
