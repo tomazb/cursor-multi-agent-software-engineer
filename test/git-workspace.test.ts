@@ -9,6 +9,7 @@ import { DEFAULT_CONFIG } from "../src/config.ts";
 import type { RunRecord } from "../src/domain.ts";
 import {
   assertChangeScope,
+  assertWorkingTreeScope,
   createDeterministicCommit,
   ensureRunWorkspace,
   pathAllowed,
@@ -31,6 +32,16 @@ test("pathAllowed honors ** and simple globs", () => {
   assert.equal(pathAllowed("src/a.ts", ["**"]), true);
   assert.equal(pathAllowed("src/a.ts", ["src/**"]), true);
   assert.equal(pathAllowed("docs/a.md", ["src/**"]), false);
+});
+
+test("assertWorkingTreeScope accepts root and nested files matched by **/*.ts", async (t) => {
+  const cwd = await initRepo();
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  await mkdir(path.join(cwd, "src"), { recursive: true });
+  await writeFile(path.join(cwd, "index.ts"), "export {}\n", "utf8");
+  await writeFile(path.join(cwd, "src", "index.ts"), "export {}\n", "utf8");
+
+  assert.deepEqual(await assertWorkingTreeScope(cwd, ["**/*.ts"]), ["index.ts", "src/index.ts"]);
 });
 
 test("ensureRunWorkspace creates an isolated branch worktree", async () => {
@@ -65,6 +76,39 @@ test("createDeterministicCommit rejects out-of-scope paths", async () => {
     /Change-scope violation/,
   );
 });
+
+test(
+  "createDeterministicCommit does not reinterpret a POSIX literal-backslash filename",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const cwd = await initRepo();
+    t.after(async () => rm(cwd, { recursive: true, force: true }));
+    const expectedParentSha = (
+      await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })
+    ).stdout.trim();
+    const literalBackslashPath = path.join(cwd, "src\\unapproved.ts");
+    await writeFile(literalBackslashPath, "export const escaped = true;\n", "utf8");
+
+    await assert.rejects(
+      createDeterministicCommit(cwd, "must remain out of scope", {
+        allowedPathGlobs: ["src/**"],
+        expectedParentSha,
+      }),
+      /Change-scope violation.*src\\unapproved\.ts/,
+    );
+
+    assert.equal(
+      (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim(),
+      expectedParentSha,
+    );
+    assert.match(
+      (
+        await execFileAsync("git", ["status", "--porcelain=v1", "-z"], { cwd })
+      ).stdout,
+      /src\\unapproved\.ts/,
+    );
+  },
+);
 
 test("createDeterministicCommit and assertChangeScope accept in-scope edits", async () => {
   const cwd = await initRepo();

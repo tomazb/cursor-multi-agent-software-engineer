@@ -24,6 +24,7 @@ import { parseModelCatalogue, parseModelCatalogueIds } from "./cursor-model-cata
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { RunRecord } from "../domain.ts";
+import { PolicyViolationError } from "../policy.ts";
 
 export { parseModelCatalogueIds };
 
@@ -267,7 +268,6 @@ function cursorFailureResult(options: {
     status: "error",
     output: sanitized.text,
     requestedModel: options.requestedModel,
-    actualModel: options.requestedModel,
     failure: {
       code: options.code,
       message: sanitized.text,
@@ -357,7 +357,8 @@ export class CursorCliRuntime implements AgentRuntime {
     } catch (error) {
       const after = await gitWorkspaceFingerprint(request.cwd);
       if (request.roleConfig.permissions === "read-only" && before !== after) {
-        throw new Error(
+        throw new PolicyViolationError(
+          "policy-read-only-workspace-mutation",
           `${request.role} changed the workspace despite read-only policy. Review and revert the changes before continuing.`,
         );
       }
@@ -376,7 +377,8 @@ export class CursorCliRuntime implements AgentRuntime {
     }
     const after = await gitWorkspaceFingerprint(request.cwd);
     if (request.roleConfig.permissions === "read-only" && before !== after) {
-      throw new Error(
+      throw new PolicyViolationError(
+        "policy-read-only-workspace-mutation",
         `${request.role} changed the workspace despite read-only policy. Review and revert the changes before continuing.`,
       );
     }
@@ -438,7 +440,8 @@ export class CursorCliRuntime implements AgentRuntime {
       // Never treat stderr as successful assistant content.
       output: extracted,
       requestedModel: resolvedModel,
-      actualModel: resolvedModel,
+      // Cursor CLI does not expose an exact executable model ID in these modes.
+      // stream-json's init model is a display label without an authoritative ID mapping.
       metadata: {
         exitCode: result.exitCode,
         durationMs: result.durationMs,

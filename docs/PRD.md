@@ -161,6 +161,9 @@ The builder shall receive only approved artifacts plus repository context, may m
 
 The system shall execute configured commands sequentially outside the model and save stdout, stderr, exit codes, and durations. A failing command shall stop later commands in that quality pass and route the run back to building within policy limits.
 
+`quality.commands: []` is valid and produces a passing empty quality report. If an entry is
+present, it shall be a non-empty, non-whitespace string; blank entries are invalid configuration.
+
 Before `PR_READY`, `gates.requireCiPass=false` may make a failed quality result nonblocking, but the
 failed result remains SHA-bound evidence and does not satisfy either final workflow gate.
 
@@ -195,12 +198,41 @@ Out-of-scope or ambiguous comments shall enter `WAITING_FOR_HUMAN`. The system s
 
 Each role shall have a configurable model. When fail-closed model fallback is enabled, the system shall use only the primary model and reject a reported mismatch. When disabled, configured fallback models may be attempted in order.
 
+A runtime-reported actual model different from the requested model is a policy failure. Policy
+failures, including identity and permission violations, shall bypass fallback selection and
+attempt aggregation. Existing-run model selectors shall resolve to the trusted catalogue entry's
+canonical spelling before execution; that value, not runtime-reported metadata, shall drive the
+request and identity comparison.
+
 ### FR-16 — Read-only enforcement
 
-The system shall fingerprint workspace state before and after read-only roles. In Git checkouts that includes git-tracked, staged, and untracked content. In both Git and non-Git working directories the system shall also fingerprint authoritative `.maswe` run state, durable artifacts, and project config under the fingerprinted working directory (independent of Git excludes). A difference shall fail the run. Ephemeral lock and `*.tmp` files under `.maswe` are excluded from that fingerprint so normal orchestration churn does not false-fail.
+The orchestrator shall fingerprint workspace state before and after every read-only role, outside
+runtime adapters, and shall make the after check even when the runtime throws. In Git checkouts it
+shall also compare the exact `HEAD` before and after the invocation. It shall classify post-run
+state HEAD-first: a changed or unreadable `HEAD` fails before a fingerprint comparison; only a
+stable/readable `HEAD` with a changed fingerprint is a workspace-mutation failure. Adapters may
+retain local fingerprint checks as defense in depth. The fingerprint includes git-tracked, staged,
+and untracked content; in both Git and non-Git working directories it also includes authoritative
+`.maswe` run state, durable artifacts, and project config under the fingerprinted working directory
+(independent of Git excludes). Ephemeral lock and `*.tmp` files under `.maswe` are excluded from
+that fingerprint so normal orchestration churn does not false-fail.
 
 Bootstrap source-drift checks shall exclude the orchestrator-owned `.maswe` namespace; read-only
 role fingerprints shall continue to include authoritative `.maswe` state.
+
+The persisted/project role-permission matrix shall be exact: brainstormer, designer, and verifier
+are `read-only`; builder and prResolver are `workspace-write`. Only prResolver may be narrowed to
+`read-only` for the comment-classification invocation. Every other mismatch shall fail before
+runtime invocation.
+
+`policy.allowedPathGlobs` shall use portable fully anchored matching: configured glob separators
+normalize `\\` to `/`, while Git-reported candidate paths preserve their exact identity. A literal
+POSIX `\\` in a candidate filename is not a directory separator. `*` is zero or more
+non-separators; `?` is exactly one non-separator; `**` is zero or more characters including
+separators; and `**/` is zero or more complete segments including zero.
+`**` and `**/*` each allow every candidate path. Production working-tree candidates are non-empty
+file paths, but the matcher special-cases both forms without a non-empty restriction. Dotfiles are
+ordinary and regex metacharacters are literal.
 
 ### FR-17 — Run inspection
 
@@ -231,6 +263,28 @@ The core shall support a mock runtime, Cursor CLI runtime, and optional Cursor S
 ### FR-20 — Environment diagnostics
 
 The system shall provide a doctor command that checks runtime availability, credentials where applicable, and configured model slugs. For runtimes that implement catalogue discovery (currently Cursor CLI), doctor shall perform fail-closed catalogue discovery and project-style logical→exact resolution before the probe, and shall not report transport success when model resolution failed. Doctor does not create a run or persist a `run.config` snapshot. Runtimes without catalogue capability (currently Cursor SDK) are diagnosed without `agent models` resolution.
+
+### FR-21 — CLI grammar
+
+The CLI shall accept only its declared commands and long options, reject option abbreviations,
+short options, duplicates, empty string values, option terminators, wrong-command options, and
+wrong operand counts. Global `--config` and `--cwd` may appear before or after the command. Split
+and equals forms are accepted for string options, but a dash-prefixed string value shall use equals
+form so it cannot be parsed as another option.
+
+### FR-22 — Prompt and artifact confinement
+
+Prompt templates shall render declared placeholders once, insert values literally without
+rescanning them, and reject unknown placeholders deterministically. An artifact path shall name
+exactly one portable direct child of the run's artifact namespace. The physical leaf shall be ASCII
+`[A-Za-z0-9._-]+`, neither `.` nor `..`, without a trailing `.`, and without a Windows reserved
+device stem (including extension and superscript-number variants). Generated names shall be
+injective for distinct logical artifact ownership, including on case-insensitive filesystems, and
+publication shall reject an already-owned or unexpected existing physical target rather than
+overwrite it. Reads shall require ordinary namespace directories and an
+ordinary no-follow final file, remain bounded, and verify the recorded SHA-256 digest. The
+trusted-local-user boundary does not claim to eliminate all concurrent same-user ancestor
+replacement races.
 
 ## Non-functional requirements
 

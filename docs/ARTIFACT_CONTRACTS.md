@@ -8,6 +8,40 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
 - The store records logical name, attempt number, repository-relative path, creation timestamp, and SHA-256 digest.
 - Retries write attempt-scoped immutable files (`*.attempt-<n>.md`) and keep a latest logical pointer by name.
 - Digests are recomputed and compared on every read; mismatches fail closed.
+- A stored reference names exactly one portable direct child of
+  `.maswe/runs/<run-id>/artifacts/`. Its physical leaf is ASCII `[A-Za-z0-9._-]+`, neither `.` nor
+  `..`, does not end in `.`, and has no Windows reserved device stem, including a stem before an
+  extension or an `¹`/`²`/`³` device-number variant. The writer preserves lowercase portable
+  generated leaves and uses an injective hexadecimal escape namespace for all other generated
+  leaves, including names already shaped like that namespace. This keeps distinct logical names
+  distinct on case-insensitive filesystems. Publication rejects any physical path owned by another
+  logical artifact and any unexpected existing target instead of overwriting it. Existing
+  schema-version-1 physical names remain valid. Absolute paths, nested paths, separator tricks,
+  and other non-portable physical filenames are rejected; historical `\\` separators are
+  normalized to `/` before validation.
+- Artifact publication redacts content first, then measures the exact UTF-8 bytes that would be
+  stored. Post-redaction content above the shared 1 MiB authoritative-file bound is rejected before
+  artifact-file or run-record publication; content at exactly 1 MiB is allowed. Artifact reads use
+  the same 1 MiB bound, so an artifact accepted by the writer cannot later be rejected solely for
+  exceeding it. Reads still require every namespace ancestor to be an ordinary directory, require
+  an ordinary final file opened with no-follow support, recheck the namespace after the bounded
+  read, then recompute and compare the recorded SHA-256 digest. This independent read-side check
+  protects against tampering, historical malformed data, filesystem replacement, and bypassed
+  writers. Lack of no-follow support fails closed. The trusted-local-user boundary does not claim
+  to prevent every concurrent same-user ancestor-replacement race between filesystem operations.
+- Artifact-file publication precedes its run-record reference. Modeled outcomes:
+  - Determinate artifact write failure leaves no published artifact; ordinary retry may start again.
+  - Artifact outcome-unknown (rename observed, directory durability unconfirmed) is reconciled only
+    within the same invocation: bounded no-follow verification of the exact expected bytes and
+    digest, then a second directory sync. Successful reconfirmation continues to run-record
+    publication. Failed reconfirmation after verified same-invocation ownership durably removes the
+    artifact when possible so retry can start cleanly. Mismatched or unverifiable targets are not
+    adopted, overwritten, or blindly deleted. Cross-process recovery of an orphaned matching file
+    without durable publication intent is outside this contract.
+  - Determinate run-record write failure removes the just-published ordinary artifact and syncs the
+    artifact directory before returning the original error.
+  - Run-record outcome-unknown retains the artifact and reconciles an exact matching canonical
+    record; it never triggers determinate cleanup.
 - Agents must not rely on prior chat messages that are absent from the supplied prompt.
 - Model output cannot authorize a transition unless the orchestrator recognizes the required terminal marker after structured response decoding: exactly one bare marker token on the final logical line of the authoritative assistant text (no backticks, quotes, earlier mentions, duplicates, or conflicting markers).
 - For Cursor CLI `json` / `stream-json` modes, marker validation runs only on the decoded authoritative `result` string. Transport JSON quoting is not treated as embedded model content. Malformed envelopes, unsupported shapes, and missing `result` fields fail closed before marker validation.
@@ -16,7 +50,12 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
   redaction contract; its URI-authority scanner advances once forwards without rescanning prior
   content. Failure diagnostics additionally follow the bounded failure contract below.
 - JSON schemas live under `schemas/` for configuration and run records.
-- Persisted `run.config.roles.*.model` values are exact executable catalogue IDs after `start`. Loading a run migrates defaults then runs the same config assertions as project load (without applying process environment overrides).
+- Persisted `run.config.roles.*.model` values are exact executable catalogue selectors after
+  `start`. Before execution, a catalogue-capable runtime resolves a case-insensitive exact selector
+  to the trusted catalogue entry's canonical spelling, without family/provider/effort
+  substitution. That canonical value drives the request and identity comparison; runtime metadata
+  cannot replace it. Loading a run migrates defaults then runs the same config assertions as
+  project load (without applying process environment overrides).
 - `RuntimeDoctorResult` (including `maswe doctor --json` output) is not a persisted artifact and is not governed by run-record schemas. It is an in-process report surface with typed doctor `code` values and optional skipped-check `prerequisite` constrained by `DoctorCheckPrerequisite` to `cursor-cli`, `model-catalogue`, or `model-brainstormer`.
 
 ## Run record
@@ -133,9 +172,12 @@ current evidence bindings but preserves historical workflow events verbatim.
 
 ### Failure record
 
-New failures may include `failure.code`, currently `runtime-models-exhausted` or `workflow-failure`,
-alongside the existing message, timestamp, and optional resume state. The code is optional for
-backward compatibility with existing schema-version-1 records. They may also include the optional
+New failures may include `failure.code`, currently one of `runtime-models-exhausted`,
+`workflow-failure`, `automatic-transition-limit-exceeded`,
+`policy-read-only-workspace-mutation`, `policy-runtime-identity-mismatch`,
+`policy-role-permission-mismatch`, or `policy-read-only-head-moved`, alongside the existing
+message, timestamp, and optional resume state. The code is optional for backward compatibility
+with existing schema-version-1 records. They may also include the optional
 schema-version-1-compatible object:
 
 ```json
@@ -173,6 +215,11 @@ optional per attempt. Arbitrary runtime metadata is not part of this contract. T
 are rejected.
 Store and migration safeguards inspect only the first eight raw attempt slots and discard invalid
 entries, keeping sanitization work bounded even for malformed historical input.
+
+Policy failures are discovered through nested `Error.cause` and `AggregateError.errors` wrappers,
+with cycle protection, so their durable code survives wrapped execution errors. They intentionally
+persist without `failure.runtime` or a runtime-attempt summary: policy failures bypass fallback
+selection and are not model attempts.
 
 Failure messages and `FAIL.details.reason` are normalized, redacted, and bounded to 8,192 Unicode
 code points including `… [truncated]`. `RETRY_FROM_FAILED.details.previousFailure.message` receives

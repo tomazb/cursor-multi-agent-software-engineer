@@ -8,6 +8,7 @@ import type {
   RuntimeFailureDiagnostic,
   RuntimeResult,
 } from "./domain.ts";
+import { findPolicyViolationError, PolicyViolationError } from "./policy.ts";
 import {
   FAILURE_AGGREGATE_MAX_CODE_POINTS,
   FAILURE_DIAGNOSTIC_MAX_CODE_POINTS,
@@ -337,6 +338,8 @@ export function reportOmittedFailureAttempts(
 }
 
 export function runFailureCode(error: unknown): RunFailureCode {
+  const policyFailure = findPolicyViolationError(error);
+  if (policyFailure) return policyFailure.code;
   const runtimeFailure = findRuntimeModelsExhaustedError(error);
   if (runtimeFailure) return runtimeFailure.code;
   return "workflow-failure";
@@ -352,6 +355,7 @@ export function runFailureMessage(error: unknown): string {
 export function runFailureRuntime(
   error: unknown,
 ): DurableRuntimeFailureSummary | undefined {
+  if (findPolicyViolationError(error)) return undefined;
   const runtimeFailure = findRuntimeModelsExhaustedError(error);
   return runtimeFailure
     ? sanitizeDurableRuntimeFailureSummary(runtimeFailure.runtime)
@@ -405,12 +409,49 @@ export function safeFailureMessage(message: string): string {
 }
 
 export function assertRuntimeIdentity(
-  result: RuntimeFinishedResult,
+  result: RuntimeResult,
   role: RoleId,
+  trustedRequestedModel: string,
 ): void {
-  if (result.actualModel && result.actualModel !== result.requestedModel) {
-    throw new Error(
-      `${role} requested ${normalizeModelDisplay(result.requestedModel)}, but runtime reported ${normalizeModelDisplay(result.actualModel)}.`,
+  const untrustedResult = result as unknown as {
+    requestedModel?: unknown;
+    actualModel?: unknown;
+  };
+  const reportedRequestedModel = untrustedResult.requestedModel;
+  const reportedActualModel = untrustedResult.actualModel;
+  const validModelIdentity = (value: unknown): value is string =>
+    typeof value === "string" && value.trim().length > 0;
+
+  if (!validModelIdentity(trustedRequestedModel)) {
+    throw new PolicyViolationError(
+      "policy-runtime-identity-mismatch",
+      `${role} trusted requested model identity is missing or invalid.`,
+    );
+  }
+  if (!validModelIdentity(reportedRequestedModel)) {
+    throw new PolicyViolationError(
+      "policy-runtime-identity-mismatch",
+      `${role} runtime reported a missing or invalid requested model identity.`,
+    );
+  }
+  if (reportedActualModel !== undefined && !validModelIdentity(reportedActualModel)) {
+    throw new PolicyViolationError(
+      "policy-runtime-identity-mismatch",
+      `${role} runtime reported an invalid actual model identity.`,
+    );
+  }
+
+  const requestedModelMismatch = reportedRequestedModel !== trustedRequestedModel;
+  const actualModelMismatch =
+    reportedActualModel !== undefined &&
+    reportedActualModel !== trustedRequestedModel;
+  if (requestedModelMismatch || actualModelMismatch) {
+    const reportedActual = reportedActualModel === undefined
+      ? "not reported"
+      : normalizeModelDisplay(reportedActualModel);
+    throw new PolicyViolationError(
+      "policy-runtime-identity-mismatch",
+      `${role} requested ${normalizeModelDisplay(trustedRequestedModel)}, but runtime reported requested model ${normalizeModelDisplay(reportedRequestedModel)} and actual model ${reportedActual}.`,
     );
   }
 }

@@ -22,6 +22,11 @@ MASWE must prevent untrusted requests, model output, repository content, and PR 
 - Feature requests, repository text, dependency code, and PR comments may be malicious.
 - A model may misunderstand policy, hallucinate evidence, or follow prompt injection.
 
+MASWE assumes a trusted local user and operating system. It does not claim to close every
+same-user ancestor replacement race between filesystem checks; bounded no-follow reads and
+post-read identity checks are the local fail-closed boundary, not a sandbox against a malicious
+local peer.
+
 The current execution dependencies are Cursor CLI and optional Cursor SDK. Future harnesses remain
 external dependencies whose output and metadata are untrusted, but their exact capability,
 permission, and identity contracts are governed by MH-00/#32 and are not implemented yet.
@@ -48,10 +53,15 @@ permission, and identity contracts are governed by MH-00/#32 and are not impleme
 **Controls:**
 
 - Cursor CLI omits `--force` for read-only roles.
-- All read-only adapters compare a workspace fingerprint before and after execution.
+- The orchestrator, outside runtime adapters, captures the workspace fingerprint and Git `HEAD`
+  before every read-only invocation and checks both again in `finally` after either a normal return
+  or a thrown runtime error.
 - In Git checkouts the fingerprint covers git status, unstaged/staged diffs, and untracked content, with `.maswe/` excluded from those Git-plane probes via explicit pathspecs (independent of `.git/info/exclude`).
 - In both Git and non-Git working directories the fingerprint also covers authoritative `.maswe` state under `cwd` (project config, `runs/*/run.json`, durable artifacts) via the MASWE-plane hashing contract.
-- A mismatch fails the run.
+- The orchestrator classifies its post-run state HEAD-first: a moved or unreadable Git `HEAD`
+  fails with `policy-read-only-head-moved`, even when the fingerprint also changed; only a stable
+  readable `HEAD` plus a fingerprint mismatch fails with
+  `policy-read-only-workspace-mutation`. Adapter-local fingerprint checks remain defense in depth.
 
 **Gap:** Detection occurs after the process runs; it is a mutation detector, not a preventive
 OS-level sandbox. External side effects outside the fingerprinted working directory are not
@@ -73,6 +83,9 @@ the digest fingerprint.
 - PR comments require a read-only scope classification before resolution.
 - Out-of-scope comments stop for a human.
 - Deterministic quality and fresh independent verification follow edits.
+- Writer-scope matching preserves Git-reported candidate path identity. Only configured glob
+  separator syntax is normalized; a literal POSIX `\\` in a Git filename cannot be reinterpreted
+  as `/` to enter an allowed subtree.
 
 **Gap:** v0.2 isolates builders in a dedicated worktree and rejects commits outside `policy.allowedPathGlobs`. Fine-grained path policy derived from design artifacts remains future work.
 
@@ -93,10 +106,17 @@ the digest fingerprint.
 
 **Controls:**
 
-- Requested model is stored in configuration and event details.
+- The persisted model spelling is resolved to the trusted catalogue entry's canonical identity
+  before execution. That value drives the request and comparison; runtime metadata cannot replace
+  it.
 - Default policy does not attempt configured fallbacks.
-- Reported actual-model mismatch fails the run.
-- Doctor checks available model catalogue with fail-closed structured row parsing. Empty or unparseable catalogues are failures. Logical names resolve only for new runs; existing runs validate persisted exact IDs without substitution.
+- Reported actual-model mismatch fails with `policy-runtime-identity-mismatch`.
+- Policy failures bypass fallback selection and all-attempt aggregation; only ordinary runtime
+  attempt failures may proceed to a configured fallback.
+- Doctor checks available model catalogue with fail-closed structured row parsing. Empty or
+  unparseable catalogues are failures. Logical names resolve only for new runs; existing runs
+  resolve only a case-insensitive exact selector to the canonical catalogue entry, without
+  family/provider/effort substitution.
 
 **Gap:** Not every runtime reports actual model identity. Provider-side substitution may remain opaque.
 
@@ -214,8 +234,16 @@ authentication field.
 **Controls:**
 
 - Artifacts have SHA-256 digests in the run record.
+- Generated physical names use an injective escape namespace, and publication rejects a target
+  already owned by another logical artifact or unexpectedly present on disk; distinct handoffs
+  cannot silently overwrite one another.
+- An artifact reference must name one portable direct child of its run's `artifacts/` directory.
+  Reads reject symlink/non-directory ancestors and non-regular final objects, require no-follow
+  support, bound content to 1 MiB, recheck the namespace, and verify the recorded digest.
 
-**Gap:** Digests are revalidated on every read in v0.2 but are not cryptographically signed. Future versions should bind approvals to artifact digests with signatures where needed.
+**Gap:** Digests are revalidated on every read in v0.2 but are not cryptographically signed.
+Same-user ancestor replacement races remain outside the trusted-local-user boundary. Future
+versions should bind approvals to artifact digests with signatures where needed.
 
 ### T9 — Verification on stale code
 
@@ -303,17 +331,33 @@ the current threat model. NFS, SMB, distributed FUSE, object-store mounts, cross
 filesystems without coherent no-clobber hard links are unsupported. General Windows support is not
 claimed without exact-head native NTFS validation.
 
+## Deterministic role authority
+
+The enforced role-permission matrix is the authorization decision, independent of a model prompt:
+
+| Role | Required permission | One-call exception |
+|---|---|---|
+| Brainstormer | `read-only` | None |
+| Designer | `read-only` | None |
+| Builder | `workspace-write` | None |
+| Verifier | `read-only` | None |
+| PR resolver | `workspace-write` | `read-only` for comment classification only |
+
+Project configuration, persisted run snapshots, and execution overrides that violate this table
+fail closed with `policy-role-permission-mismatch`.
+
 ## Least-privilege target design
 
-| Role | Repository read | Repository write | Shell | Network/integrations |
-|---|---:|---:|---:|---:|
-| Brainstormer | Yes | No | Read-only inspection | Limited |
-| Designer | Yes | Documentation artifact only | Read-only inspection | Limited |
-| Builder | Yes | Feature worktree | Project commands | Approved integrations |
-| Verifier | Yes | No | Test commands only | None by default |
-| PR resolver | Yes | Allowed files only | Targeted tests | GitHub reply through orchestrator only |
+| Role | Configured permission | Repository read | Repository write | Shell | Network/integrations |
+|---|---|---:|---:|---:|---:|
+| Brainstormer | `read-only` | Yes | No | Read-only inspection | Limited |
+| Designer | `read-only` | Yes | No | Read-only inspection | Limited |
+| Builder | `workspace-write` | Yes | Workspace | Project commands | Approved integrations |
+| Verifier | `read-only` | Yes | No | Test commands only | None by default |
+| PR resolver | `workspace-write` (or read-only while classifying) | Yes | Workspace except while classifying | Targeted tests | No GitHub reply in current Phase A |
 
-v0.1 approximates this policy through prompts, Cursor CLI flags, and post-run fingerprinting. It does not yet enforce the full matrix.
+Adapter flags and prompts supplement this deterministic matrix; the local read-only check remains
+post-run detection rather than a preventive operating-system sandbox.
 
 ## Dependency and supply-chain policy
 

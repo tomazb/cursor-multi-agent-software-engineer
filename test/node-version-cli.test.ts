@@ -75,10 +75,47 @@ test("supported Node preserves help behavior without creating state", async () =
     console.log = (...values: unknown[]) => output.push(values.map(String).join(" "));
     await runCli({ argv: ["help", "--cwd", cwd], observedNodeVersion: CANONICAL_NODE_VERSION });
     assert.match(output.join("\n"), /Multi-Agent Software Engineer/);
+    assert.match(
+      output.join("\n"),
+      /String option values beginning with "-" require --name=value\./,
+    );
     await assertPathAbsent(path.join(cwd, ".maswe"));
     assert.deepEqual(await readdir(cwd), []);
   } finally {
     console.log = originalLog;
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("supported Node accepts global options before the help command", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-node-global-before-"));
+  const output: string[] = [];
+  const originalLog = console.log;
+  try {
+    console.log = (...values: unknown[]) => output.push(values.map(String).join(" "));
+    await runCli({ argv: ["--cwd", cwd, "help"], observedNodeVersion: CANONICAL_NODE_VERSION });
+    assert.match(output.join("\n"), /Multi-Agent Software Engineer/);
+    await assertPathAbsent(path.join(cwd, ".maswe"));
+    assert.deepEqual(await readdir(cwd), []);
+  } finally {
+    console.log = originalLog;
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("strict CLI grammar rejects duplicate init flags before writing configuration", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-node-strict-cli-"));
+  try {
+    await assert.rejects(
+      () => runCli({
+        argv: ["init", "--force", "--force", "--cwd", cwd],
+        observedNodeVersion: CANONICAL_NODE_VERSION,
+      }),
+      /duplicate|more than once/i,
+    );
+    await assertPathAbsent(path.join(cwd, ".maswe"));
+    assert.deepEqual(await readdir(cwd), []);
+  } finally {
     await rm(cwd, { recursive: true, force: true });
   }
 });

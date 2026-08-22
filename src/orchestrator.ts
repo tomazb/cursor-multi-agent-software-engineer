@@ -2,6 +2,7 @@ import type {
   AgentRuntime,
   DurableRuntimeFailureAttempt,
   DurableRuntimeFailureSummary,
+  PermissionMode,
   RoleId,
   RunFailureCode,
   RunRecord,
@@ -14,6 +15,7 @@ import {
   gitRevParse,
   gitRun,
   gitWorkspaceFingerprint,
+  isGitRepository,
   isGitWorkspaceClean,
 } from "./git-snapshot.ts";
 import {
@@ -29,7 +31,10 @@ import {
   workingDirectoryFor,
 } from "./git-workspace.ts";
 import { parseRoleMarker } from "./markers.ts";
-import { resolveProjectModels } from "./model-resolution.ts";
+import {
+  resolveProjectModels,
+  validatePersistedExactModel,
+} from "./model-resolution.ts";
 import { renderQualityReport, runQualityChecks } from "./quality.ts";
 import { isHumanGate, isTerminal } from "./state-machine.ts";
 import { FileRunStore, type RunStore } from "./store.ts";
@@ -86,6 +91,57 @@ import {
   withRunMutationFence,
   type RunMutationLease,
 } from "./run-mutation.ts";
+import {
+  findPolicyViolationError,
+  PolicyViolationError,
+  resolveExecutionPermission,
+} from "./policy.ts";
+
+interface ReadOnlyExecutionState {
+  fingerprint: string;
+  head?: string;
+}
+
+async function captureReadOnlyExecutionState(
+  workdir: string,
+): Promise<ReadOnlyExecutionState> {
+  const fingerprint = await gitWorkspaceFingerprint(workdir);
+  const git = await isGitRepository(workdir);
+  const head = git ? await gitRevParse(workdir, "HEAD") : undefined;
+  return { fingerprint, ...(head !== undefined ? { head } : {}) };
+}
+
+async function assertReadOnlyExecutionState(
+  workdir: string,
+  role: RoleId,
+  before: ReadOnlyExecutionState,
+): Promise<void> {
+  let afterHead: string | undefined;
+  if (before.head !== undefined) {
+    try {
+      afterHead = await gitRevParse(workdir, "HEAD");
+    } catch (error) {
+      throw new PolicyViolationError(
+        "policy-read-only-head-moved",
+        `${role} changed HEAD during read-only execution.`,
+        { cause: error },
+      );
+    }
+  }
+  if (before.head !== undefined && afterHead !== before.head) {
+    throw new PolicyViolationError(
+      "policy-read-only-head-moved",
+      `${role} changed HEAD during read-only execution.`,
+    );
+  }
+  const afterFingerprint = await gitWorkspaceFingerprint(workdir);
+  if (afterFingerprint !== before.fingerprint) {
+    throw new PolicyViolationError(
+      "policy-read-only-workspace-mutation",
+      `${role} modified the workspace during read-only execution.`,
+    );
+  }
+}
 
 class RolePublicationOutcomeUnknownError extends AggregateError {
   constructor(errors: Iterable<unknown>, message: string) {
@@ -1547,8 +1603,7 @@ export class Orchestrator {
           const comment = (await this.store.readArtifact(run, "07-review-comment.md")) ?? "";
           const prompt = await buildCommentClassifierPrompt(run, this.store, comment);
           const result = await this.executeAgent(run, "prResolver", prompt, {
-            ...run.config.roles.prResolver,
-            permissions: "read-only",
+            permissionOverride: "read-only",
           });
           const markers = parseRoleMarker("prResolver", result.output, { mode: "classify" });
           if (!markers.ok) throw new Error(markers.message);
@@ -1932,14 +1987,20 @@ export class Orchestrator {
     run: RunRecord,
     role: RoleId,
     prompt: string,
-    roleOverride?: RunRecord["config"]["roles"][RoleId],
+    executionOptions?: { permissionOverride?: PermissionMode },
     workdirOverride?: string,
     managedWorktreeOverride?: boolean,
   ): Promise<RuntimeFinishedResult> {
-    const configured = roleOverride ?? run.config.roles[role];
+    const configured = run.config.roles[role];
+    const permissions = resolveExecutionPermission(
+      role,
+      configured.permissions,
+      executionOptions?.permissionOverride,
+    );
+    const effective = { ...configured, permissions };
     const candidates = run.config.policy.rejectModelFallback
-      ? [configured.model]
-      : [configured.model, ...(configured.fallbackModels ?? [])];
+      ? [effective.model]
+      : [effective.model, ...(effective.fallbackModels ?? [])];
     let aggregate = `${role} failed for all configured models: `;
     let aggregateHasEntries = false;
     let aggregateFull = false;
@@ -1949,48 +2010,92 @@ export class Orchestrator {
     const workdir = workdirOverride ?? workingDirectoryFor(run);
 
     for (const model of candidates) {
+      let trustedModel = model;
+      const before = permissions === "read-only"
+        ? await captureReadOnlyExecutionState(workdir)
+        : undefined;
+      let runtimeOutcome:
+        | { ok: true; result: Awaited<ReturnType<AgentRuntime["execute"]>> }
+        | { ok: false; error: unknown };
       try {
-        const result = await this.runtime.execute({
-          runId: run.id,
-          role,
-          prompt,
-          cwd: workdir,
-          roleConfig: { ...configured, model },
-          timeoutMs: run.config.policy.roleTimeoutMs,
-          managedWorktree: managedWorktreeOverride ?? Boolean(
-            run.workspace?.worktreePath && path.resolve(workdir) === path.resolve(run.workspace.worktreePath),
-          ),
-        });
-        ensureRuntimeSuccess(result, role);
-        if (
-          run.config.policy.rejectModelFallback &&
-          result.actualModel &&
-          result.actualModel !== result.requestedModel
-        ) {
-          assertRuntimeIdentity(result, role);
+        const catalogue = await this.runtime.listModels();
+        if (catalogue.length > 0) {
+          trustedModel = validatePersistedExactModel(model, catalogue);
         }
-        return result;
+        runtimeOutcome = {
+          ok: true,
+          result: await this.runtime.execute({
+            runId: run.id,
+            role,
+            prompt,
+            cwd: workdir,
+            roleConfig: { ...effective, model: trustedModel },
+            timeoutMs: run.config.policy.roleTimeoutMs,
+            managedWorktree: managedWorktreeOverride ?? Boolean(
+              run.workspace?.worktreePath && path.resolve(workdir) === path.resolve(run.workspace.worktreePath),
+            ),
+          }),
+        };
       } catch (error) {
-        totalFailureAttempts += 1;
-        const failure = runtimeAttemptFailure(model, error);
-        if (
-          durableAttempts.length <
-          DURABLE_RUNTIME_FAILURE_ATTEMPT_LIMIT
-        ) {
-          durableAttempts.push(failure.durable);
+        runtimeOutcome = { ok: false, error };
+      }
+
+      let fenceError: unknown;
+      let fenceFailed = false;
+      if (before) {
+        try {
+          await assertReadOnlyExecutionState(workdir, role, before);
+        } catch (error) {
+          fenceError = error;
+          fenceFailed = true;
         }
-        if (aggregateFull) {
-          aggregateOmittedAttempts += 1;
-        } else {
-          const appended = appendFailureAggregate(
-            aggregate,
-            failure.rendered,
-            aggregateHasEntries,
-          );
-          aggregate = appended.text;
-          aggregateFull = appended.full;
-          aggregateHasEntries = true;
+      }
+
+      const fencePolicyViolation = fenceFailed
+        ? findPolicyViolationError(fenceError)
+        : undefined;
+      const runtimePolicyViolation = runtimeOutcome.ok
+        ? undefined
+        : findPolicyViolationError(runtimeOutcome.error);
+      const policyViolation = fencePolicyViolation ?? runtimePolicyViolation;
+      if (policyViolation) throw policyViolation;
+      if (fenceFailed) throw fenceError;
+
+      let attemptError: unknown;
+      if (runtimeOutcome.ok) {
+        const { result } = runtimeOutcome;
+        try {
+          assertRuntimeIdentity(result, role, trustedModel);
+          ensureRuntimeSuccess(result, role);
+          return result;
+        } catch (error) {
+          const resultPolicyViolation = findPolicyViolationError(error);
+          if (resultPolicyViolation) throw resultPolicyViolation;
+          attemptError = error;
         }
+      } else {
+        attemptError = runtimeOutcome.error;
+      }
+
+      totalFailureAttempts += 1;
+      const failure = runtimeAttemptFailure(trustedModel, attemptError);
+      if (
+        durableAttempts.length <
+        DURABLE_RUNTIME_FAILURE_ATTEMPT_LIMIT
+      ) {
+        durableAttempts.push(failure.durable);
+      }
+      if (aggregateFull) {
+        aggregateOmittedAttempts += 1;
+      } else {
+        const appended = appendFailureAggregate(
+          aggregate,
+          failure.rendered,
+          aggregateHasEntries,
+        );
+        aggregate = appended.text;
+        aggregateFull = appended.full;
+        aggregateHasEntries = true;
       }
     }
     const message = reportOmittedFailureAttempts(

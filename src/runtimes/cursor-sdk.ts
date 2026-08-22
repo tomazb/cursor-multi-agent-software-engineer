@@ -1,6 +1,7 @@
 import type { AgentRuntime, RuntimeDoctorResult, RuntimeRequest, RuntimeResult } from "../domain.ts";
 import { gitWorkspaceFingerprint } from "../git-snapshot.ts";
 import { sanitizeDiagnostic } from "../redaction.ts";
+import { PolicyViolationError } from "../policy.ts";
 
 const importOptional = new Function("specifier", "return import(specifier)") as (
   specifier: string,
@@ -51,7 +52,8 @@ export class CursorSdkRuntime implements AgentRuntime {
     });
     const after = await gitWorkspaceFingerprint(request.cwd);
     if (request.roleConfig.permissions === "read-only" && before !== after) {
-      throw new Error(
+      throw new PolicyViolationError(
+        "policy-read-only-workspace-mutation",
         `${request.role} changed the workspace despite read-only policy. Review and revert the changes before continuing.`,
       );
     }

@@ -23,7 +23,12 @@
   "properties": {
     "schemaVersion": { "const": 1 },
     "version": { "type": "integer", "minimum": 1 },
-    "id": { "type": "string", "minLength": 1 },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
     "title": { "type": "string" },
     "request": { "type": "string" },
     "repositoryPath": { "type": "string" },
@@ -53,12 +58,16 @@
       "type": "array",
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["name", "logicalName", "attempt", "path", "sha256", "createdAt"],
         "properties": {
           "name": { "type": "string" },
           "logicalName": { "type": "string" },
           "attempt": { "type": "integer", "minimum": 1 },
-          "path": { "type": "string" },
+          "path": {
+            "type": "string",
+            "pattern": "^\\.maswe[\\\\/]runs[\\\\/][A-Za-z0-9][A-Za-z0-9._-]{0,127}[\\\\/]artifacts[\\\\/](?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.|$))[A-Za-z0-9._-]*[A-Za-z0-9_-]$"
+          },
           "sha256": {
             "type": "string",
             "pattern": "^[a-f0-9]{64}$"
@@ -210,7 +219,11 @@
           "enum": [
             "runtime-models-exhausted",
             "workflow-failure",
-            "automatic-transition-limit-exceeded"
+            "automatic-transition-limit-exceeded",
+            "policy-read-only-workspace-mutation",
+            "policy-runtime-identity-mismatch",
+            "policy-role-permission-mismatch",
+            "policy-read-only-head-moved"
           ]
         },
         "message": { "type": "string" },

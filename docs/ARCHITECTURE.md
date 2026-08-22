@@ -56,11 +56,40 @@ NVM is optional contributor tooling, not a product dependency. Adding another su
 
 The CLI contains no transition logic beyond selecting a public orchestrator operation.
 
+Its grammar is strict: it accepts only declared long options, rejects short or abbreviated
+options, duplicate options, the option terminator, empty string values, invalid command options,
+and extra operands. The global `--config` and `--cwd` options may appear before or after the
+command; command-specific options may likewise be interleaved with that command's operands. Both
+split (`--title "Title"`) and equals (`--title=Title`) forms are valid. A string value beginning
+with `-` must use equals form (for example, `--request=--literal`); split form would treat that
+value as another option.
+
 ### 3.2 Configuration loader
 
 `src/config.ts` supplies safe defaults, loads project JSON, applies environment overrides, validates essential values, and returns an immutable configuration snapshot for each run.
 
 The configuration snapshot prevents later project edits from silently changing an in-progress run.
+Only an omitted project configuration supplies `undefined` and selects the built-in defaults; an
+explicit top-level JSON `null` is malformed configuration. Persisted `run.config` is required
+historical policy, so both an omitted value and `null` fail closed instead of being replaced with
+current defaults. Omitted fields within an otherwise valid configuration retain their documented
+migration defaults.
+
+Role permissions are deterministic authority, not a prompt preference. Project configuration and
+persisted run snapshots must use this exact matrix:
+
+| Role | Required permission | Allowed per-execution narrowing |
+|---|---|---|
+| `brainstormer` | `read-only` | None |
+| `designer` | `read-only` | None |
+| `builder` | `workspace-write` | None |
+| `verifier` | `read-only` | None |
+| `prResolver` | `workspace-write` | `read-only` only for comment classification |
+
+Any other configured permission or execution override is rejected before runtime invocation.
+`quality.commands` is a list of trusted shell strings: `[]` is a valid empty list, while every
+present entry must be a non-empty, non-whitespace string. The list is never derived from model or
+review input.
 
 ### 3.3 Domain model
 
@@ -176,6 +205,18 @@ checks; a mismatch requires operator reconciliation.
 
 It does not contain Cursor SDK implementation details, shell output parsing, or persistence internals.
 
+The policy boundary is also owned here. The orchestrator applies the authoritative read-only
+workspace fence around runtime adapters: it captures the workspace fingerprint and, in Git
+repositories, exact `HEAD` before every read-only invocation. It checks both again in a `finally`
+path after either a runtime return or a runtime throw. The final classification is HEAD-first: a
+changed or unreadable post-run `HEAD` is `policy-read-only-head-moved` even if the fingerprint also
+changed; only a stable/readable `HEAD` followed by a changed fingerprint is
+`policy-read-only-workspace-mutation`. Cursor adapters retain local fingerprint checks as defense
+in depth, but the orchestrator's fence is the authoritative classification. Runtime-reported
+actual-model identity is compared with the requested model by the orchestrator; a mismatch is a
+policy failure, not an ordinary model attempt failure. Policy failures are re-thrown directly and
+never enter runtime fallback or all-attempt aggregation.
+
 ### 3.6 Run and artifact store
 
 `src/store.ts` persists each run below:
@@ -209,13 +250,30 @@ scan after its reload: an already-published queued target claim wins; a target c
 after that scan observes the completed publication. The journal is separate from the store journal
 so protected callbacks can take ordinary run data locks without recursive acquisition.
 
-Artifacts are SHA-256 hashed when written. A future store can place content in object storage and keep the same reference contract.
+Artifacts are SHA-256 hashed when written. A reference names exactly one direct child of
+`.maswe/runs/<run-id>/artifacts/`: no absolute paths, traversal, nested paths, or non-portable
+filenames are valid. Its physical leaf is ASCII `[A-Za-z0-9._-]+`, is neither `.` nor `..`, does
+not end in `.`, and cannot have a Windows reserved device stem (including an extension or the
+`¹`/`²`/`³` device-number variants). When a generated writer leaf would be reserved, the writer
+uses an injective hexadecimal escape namespace; uppercase and escape-prefix-shaped generated
+leaves use the same encoding so distinct logical names remain distinct on case-insensitive
+filesystems. Lowercase portable leaves keep their historical form, and existing schema-version-1
+references remain readable. Publication rejects a physical path owned by another logical artifact
+or an unexpected existing target instead of overwriting it. Reads verify every namespace ancestor
+is an ordinary directory, open only an ordinary final file with no-follow support, bound the read to 1 MiB,
+recheck the namespace, and compare the content digest with the recorded SHA-256. This prevents
+accidental pathname escape and fails closed when no-follow support is unavailable. A future store
+can place content in object storage and keep the same reference contract.
 
 ### 3.7 Prompt builder
 
 `src/prompt-builder.ts` loads versioned templates from `prompts/`, injects the request and previously approved artifacts, and creates a self-contained stage prompt.
 
 Prompts are implementation assets, not the workflow source of truth. A prompt cannot authorize a transition or bypass policy.
+
+Template rendering is a single pass over declared uppercase placeholders. Values are inserted
+literally and are never rescanned, so placeholder-shaped request or artifact text remains data.
+An unknown placeholder fails deterministically before runtime invocation.
 
 ### 3.8 Runtime adapter interface
 
@@ -229,7 +287,7 @@ doctor(): Promise<RuntimeDoctorResult>
 Implemented adapters:
 
 - `MockRuntime`: deterministic outputs for tests and workflow development.
-- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode. **New runs** resolve logical model names via `resolveProjectModels` against a fail-closed structured catalogue parse; **existing-run stages** call `validatePersistedExactModel` and never substitute. Unwraps JSON/`stream-json` stdout by decoding the transport envelope once and reading only the authoritative string `result` field (text mode keeps raw stdout); never treats stderr as successful assistant content; structured modes never fall back to raw envelope text. Terminal markers are validated only on that decoded logical text. Non-zero process stderr stays inside the adapter: the returned error contains a structured failure code, safe execution metadata, and a redacted bounded diagnostic; metadata stores `stderrPresent`, never raw stderr. Adds `--mode ask` for read-only roles and `--force` only for write roles; adds `--trust` when `policy.trustManagedWorktrees` is set for MASWE-managed worktrees. Doctor emits typed check codes, isolates catalogue discovery from per-role resolution, and, for normal Cursor CLI commands, skips downstream checks with explicit prerequisites when catalogue or model checks fail. The documented Node transport-only stand-in is an explicit test seam: its `node -e` stdin probe needs no model, so catalogue/model failures do not block it. Every eligible stdin probe uses `policy.doctorProbeTimeoutMs` and cleans its probe branch/worktree by recorded probe identity in `finally`.
+- `CursorCliRuntime`: invokes the Cursor `agent` command in print mode. **New runs** resolve logical model names via `resolveProjectModels` against a fail-closed structured catalogue parse; **existing-run stages** resolve a case-insensitive exact selector to the trusted catalogue entry's canonical spelling before execution and never substitute family, provider, or effort variants. That canonical entry drives the runtime request and the orchestrator's trusted identity comparison. Unwraps JSON/`stream-json` stdout by decoding the transport envelope once and reading only the authoritative string `result` field (text mode keeps raw stdout); never treats stderr as successful assistant content; structured modes never fall back to raw envelope text. Terminal markers are validated only on that decoded logical text. `requestedModel` records the exact candidate MASWE selected. Cursor CLI output does not provide an authoritative mapping from its optional stream initialization model label to that exact candidate, so this adapter omits `actualModel` in every output mode instead of synthesizing identity evidence; the orchestrator treats absence as identity unavailable, while any malformed present identity or exact mismatch is a policy failure. Non-zero process stderr stays inside the adapter: the returned error contains a structured failure code, safe execution metadata, and a redacted bounded diagnostic; metadata stores `stderrPresent`, never raw stderr. Adds `--mode ask` for read-only roles and `--force` only for write roles; adds `--trust` when `policy.trustManagedWorktrees` is set for MASWE-managed worktrees. Doctor emits typed check codes, isolates catalogue discovery from per-role resolution, and, for normal Cursor CLI commands, skips downstream checks with explicit prerequisites when catalogue or model checks fail. The documented Node transport-only stand-in is an explicit test seam: its `node -e` stdin probe needs no model, so catalogue/model failures do not block it. Every eligible stdin probe uses `policy.doctorProbeTimeoutMs` and cleans its probe branch/worktree by recorded probe identity in `finally`.
 - `CursorSdkRuntime`: dynamically imports `@cursor/sdk` and runs a local one-shot `Agent.prompt` call (no catalogue capability; empty-catalogue pass-through stays SDK-only). Both `execute()` and `doctor()` use an injectable import seam defaulting to dynamic import.
 
 The optional SDK import means the CLI can build and run without installing the beta SDK.
@@ -246,6 +304,15 @@ the attempted model display, code, a 512-code-point safe message, requested/conf
 displays where supplied, exit/timeout/duration/transport fields where supplied, `stderrPresent`,
 and `truncated`. Model displays are single-line, delimiter-neutral, and capped at 256 code points;
 the actual configured model passed to the runtime is not rewritten.
+
+The following policy failures have durable codes and do not become fallback attempts:
+
+| Code | Meaning |
+|---|---|
+| `policy-role-permission-mismatch` | A persisted/configured role permission or execution override violates the fixed matrix. |
+| `policy-read-only-workspace-mutation` | A read-only invocation changed the protected workspace fingerprint. |
+| `policy-read-only-head-moved` | A read-only invocation changed or made unreadable the exact Git `HEAD`. |
+| `policy-runtime-identity-mismatch` | The runtime reported an actual model different from the requested model. |
 
 Successful runtime-backed transition events cross the same untrusted runtime-to-persistence
 boundary. `runtimeEventIdentityDetails()` creates display-only copies of `requestedModel` and
@@ -273,7 +340,15 @@ roles cannot mutate handoffs undetected. Workspace identity fields (`baseSha` / 
 `branch`) may still record `not-a-git-repository` for non-Git trees; that sentinel is separate
 from the fingerprint digest.
 
-Read-only runtimes compare the fingerprint before and after execution. Any difference fails the run. This is a mutation detector, not an operating-system sandbox. A future sandbox can prevent writes rather than merely detecting them.
+The orchestrator performs the authoritative final comparison before and after every read-only
+runtime call and performs the Git `HEAD` check when applicable. Its `finally` fence runs after
+both a normal runtime return and a thrown runtime error. It checks post-run `HEAD` first: a changed
+or unreadable head is `policy-read-only-head-moved`, even if a later fingerprint check would also
+detect a change. With a stable/readable head, a changed fingerprint is
+`policy-read-only-workspace-mutation`. Cursor CLI and SDK adapters also retain local fingerprint
+checks as defense in depth, but do not replace the orchestrator's final classification. Neither
+policy failure is eligible for fallback aggregation. This is a mutation detector, not an
+operating-system sandbox. A future sandbox can prevent writes rather than merely detecting them.
 
 Bootstrap source-drift checks exclude the orchestrator-owned `.maswe` namespace; read-only role
 fingerprints continue to include authoritative `.maswe` state. The distinction prevents MASWE's
@@ -285,6 +360,17 @@ mutation from a read-only role.
 `src/quality.ts` runs trusted project commands sequentially with the system shell. It records exit code, stdout, stderr, and duration. It stops after the first failure. Timeouts use `src/process.ts`, which terminates the shell process tree (POSIX process group / Windows `taskkill /T`) and bounds Promise settlement even if a descendant held pipes open.
 
 Quality commands never come from model output, issue text, or PR comments.
+
+`policy.allowedPathGlobs` is portable and deterministic. MASWE normalizes configured glob strings
+from `\\` to `/`, but preserves each Git-reported candidate path as the authoritative scope
+subject, and anchors each match to the whole path. A literal POSIX `\\` therefore remains a
+filename character rather than becoming a directory separator. `*` matches zero or more
+non-separator characters; `?` exactly one non-separator; `**` zero or more characters,
+including separators; and `**/` zero or more complete path segments, including zero segments.
+`**` and `**/*` each permit every candidate path. Production working-tree candidates are
+non-empty file paths, but the matcher special-cases both forms without a non-empty restriction.
+Dotfiles are ordinary path characters, and regex metacharacters in a glob are literal rather than
+a second pattern language. A changed path is allowed when at least one configured glob matches.
 
 GitHub check publication uses a hash-addressed per-PR journal, separate from the short global
 association transaction. Old-head cancellation intent is also persisted on the run as a bounded
@@ -352,7 +438,11 @@ Model aliases are project configuration for **new runs only**. For runtimes that
 
 - **`start`:** discovers the catalogue, resolves logical role models to exact executable IDs (effort-aware: an explicit `-high`/`-medium`/`-low` suffix requires the same effort; otherwise fail closed), and **persists** those exact IDs in the new `run.config` snapshot.
 - **`doctor`:** for normal Cursor CLI commands, discovers the catalogue and resolves an exact ID for its stdin probe only. The Node transport-only test stand-in instead uses `node -e`, requires no model, and remains eligible when Node's unsupported catalogue command fails. Doctor does **not** create a run and does **not** persist a `run.config` snapshot. Probe timeout comes from `policy.doctorProbeTimeoutMs` (default `60_000`, hard bounds `1_000..300_000`, no clamping).
-- **Existing-run stages:** validate the persisted exact ID against the live catalogue and never substitute same-core, same-family, provider, or effort variants when the catalogue drifts.
+- **Existing-run stages:** treat the persisted spelling as a selector, resolve a case-insensitive exact
+  match to the live catalogue entry's canonical spelling before execution, and never substitute
+  same-core, same-family, provider, or effort variants when the catalogue drifts. The canonical
+  entry drives both the runtime request and the orchestrator's trusted comparison identity;
+  runtime-reported metadata cannot replace it.
 
 `CursorSdkRuntime` has no catalogue capability; doctor/start do not call `agent models`, and empty-catalogue pass-through keeps configured IDs as-is for SDK-only paths.
 

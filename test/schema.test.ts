@@ -197,6 +197,41 @@ test("DEFAULT_CONFIG satisfies config JSON schema required shape", async () => {
   assertMatches(schema, schema, DEFAULT_CONFIG, "config");
 });
 
+test("config schema encodes exact role permissions and nonblank quality commands", async () => {
+  const schema = await loadConfigSchema();
+  const roles = schema.properties?.roles?.properties;
+  const expected = {
+    brainstormer: "read-only",
+    designer: "read-only",
+    builder: "workspace-write",
+    verifier: "read-only",
+    prResolver: "workspace-write",
+  } as const;
+  for (const [role, permission] of Object.entries(expected)) {
+    const roleSchema = resolveRef(schema, roles?.[role] ?? {});
+    assert.ok(roleSchema, `${role} schema`);
+    const permissionSchema = roleSchema.allOf?.[1]?.properties?.permissions;
+    assert.equal(permissionSchema?.const, permission, `${role} permissions.const`);
+    const invalidConfig = structuredClone(DEFAULT_CONFIG) as unknown as {
+      roles: Record<string, { permissions: unknown }>;
+    };
+    invalidConfig.roles[role]!.permissions = null;
+    assert.throws(
+      () => assertMatches(schema, schema, invalidConfig, `config.roles.${role}.permissions.null`),
+      /enum|const/,
+    );
+  }
+
+  const commands = schema.properties?.quality?.properties?.commands;
+  assert.doesNotThrow(() => assertMatches(schema, commands!, [], "quality.commands.empty"));
+  for (const command of ["", " \t\n "]) {
+    assert.throws(
+      () => assertMatches(schema, commands!, [command], "quality.commands.blank"),
+      /pattern/,
+    );
+  }
+});
+
 test("config schema rejects enabled GitHub App write mode", async () => {
   const schema = await loadConfigSchema();
   const config = configWithGitHubApp({ readOnlyChecks: false });
@@ -255,6 +290,57 @@ test("persisted run records satisfy run-record schema required shape", async (t)
   const store = new FileRunStore(cwd);
   const run = await store.create("schema", "check", DEFAULT_CONFIG);
   assertMatches(schema, schema, run, "run");
+});
+
+test("run-record schema and runtime migration enforce the same run id grammar", async (t) => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-run-id-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const run = await new FileRunStore(cwd).create("schema", "run id grammar", DEFAULT_CONFIG);
+  const validIds = [
+    "a",
+    "run-123",
+    "A_b.c-9",
+    `a${"b".repeat(127)}`,
+  ];
+  const invalidIds = [
+    "../foreign",
+    "/absolute",
+    ".leading-dot",
+    "-leading-dash",
+    "contains/slash",
+    "contains\\backslash",
+    "white space",
+    "",
+    `a${"b".repeat(128)}`,
+  ];
+
+  for (const id of validIds) {
+    const candidate = structuredClone(run);
+    candidate.id = id;
+    assert.doesNotThrow(
+      () => assertMatches(schema, schema, candidate, `valid run id ${id.length}`),
+      id,
+    );
+    assert.doesNotThrow(() => migrateRunRecord(candidate), id);
+  }
+
+  for (const id of invalidIds) {
+    const candidate = structuredClone(run);
+    candidate.id = id;
+    assert.throws(
+      () => assertMatches(schema, schema, candidate, `invalid run id ${JSON.stringify(id)}`),
+      /run id|\.id|pattern|maxLength|minLength/i,
+      id,
+    );
+    assert.throws(
+      () => migrateRunRecord(candidate),
+      /invalid run id|Run record id must be a non-empty string/i,
+      id,
+    );
+  }
 });
 
 test("run-record schema and migration accept exact legal recovery metadata", async (t) => {
@@ -408,6 +494,22 @@ test("run-record schema workflow enums and exact event records stay synchronized
       invalid.label,
     );
   }
+});
+
+test("run-record schema contains every stable policy failure code", async () => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const failureCodes = schema.properties?.failure?.properties?.code?.enum;
+  assert.deepEqual(
+    failureCodes?.filter((code) => typeof code === "string" && code.startsWith("policy-")),
+    [
+      "policy-read-only-workspace-mutation",
+      "policy-runtime-identity-mismatch",
+      "policy-role-permission-mismatch",
+      "policy-read-only-head-moved",
+    ],
+  );
 });
 
 test("persisted run config uses the exact config schema and rejects nested secrets", async (t) => {

@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { loadConfig, mergeConfigForTest, migrateConfig } from "../src/config.ts";
+import { DEFAULT_CONFIG, loadConfig, mergeConfigForTest, migrateConfig } from "../src/config.ts";
 
 const MASWE_ENV_KEYS = [
   "MASWE_RUNTIME",
@@ -51,6 +51,35 @@ test("config merges user values with safe defaults", async () => {
     assert.equal(config.roles.builder.model, "custom-builder");
     assert.equal(config.roles.verifier.model, "gpt-5.6-sol-high");
     assert.deepEqual(config.quality.commands, []);
+  } finally {
+    restoreMasweEnv(env);
+  }
+});
+
+test("project config rejects explicit top-level null", async (t) => {
+  const env = snapshotMasweEnv();
+  clearMasweEnv();
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-config-null-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  try {
+    await mkdir(path.join(cwd, ".maswe"));
+    await writeFile(path.join(cwd, ".maswe", "config.json"), "null\n", "utf8");
+
+    await assert.rejects(() => loadConfig(cwd), /config.*object/i);
+  } finally {
+    restoreMasweEnv(env);
+  }
+});
+
+test("omitted project config still uses defaults", async (t) => {
+  const env = snapshotMasweEnv();
+  clearMasweEnv();
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-config-omitted-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  try {
+    const config = await loadConfig(cwd);
+
+    assert.deepEqual(config, DEFAULT_CONFIG);
   } finally {
     restoreMasweEnv(env);
   }
@@ -121,6 +150,21 @@ test("doctorProbeTimeoutMs accepts explicit bounds and rejects invalid values", 
       String(value),
     );
   }
+});
+
+test("quality commands accept an explicit empty list but reject blank entries", () => {
+  assert.deepEqual(mergeConfigForTest({ quality: { commands: [] } }).quality.commands, []);
+  for (const command of ["", " \t\n "]) {
+    assert.throws(
+      () => mergeConfigForTest({ quality: { commands: [command] } }),
+      /quality\.commands must contain only non-blank strings/,
+    );
+  }
+  const trustedText = "  npm test  ";
+  assert.deepEqual(
+    mergeConfigForTest({ quality: { commands: [trustedText] } }).quality.commands,
+    [trustedText],
+  );
 });
 
 test("githubApp is optional and omitted by default", () => {

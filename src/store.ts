@@ -1,11 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import {
   DurableAtomicWriteOutcomeUnknownError,
   MAX_AUTHORITATIVE_FILE_BYTES,
   readBoundedOrdinaryFile,
+  removeDurableFile,
   requireOrdinaryDirectory,
+  syncDurableDirectory,
   writeDurableAtomic,
   type DurableFileOptions,
 } from "./durable-file.ts";
@@ -41,6 +43,11 @@ import {
   requiredRunRecordString,
 } from "./run-record-validation.ts";
 import { transition } from "./state-machine.ts";
+import {
+  canonicalArtifactReferencePath,
+  generatedArtifactFileName,
+  validateArtifactReferencePath,
+} from "./artifact-path.ts";
 
 function now(): string {
   return new Date().toISOString();
@@ -236,6 +243,9 @@ export function migrateRunRecord(raw: unknown): RunRecord {
     throw new Error("Run record config is required");
   }
 
+  const runId = requiredRunRecordString(candidate.id, "Run record id", false);
+  assertSafeRunId(runId);
+
   if (candidate.artifacts !== undefined && !Array.isArray(candidate.artifacts)) {
     throw new Error("Run record artifacts must be an array");
   }
@@ -286,11 +296,16 @@ export function migrateRunRecord(raw: unknown): RunRecord {
     if (!/^[a-f0-9]{64}$/.test(digest)) {
       throw new Error(`Run artifact[${index}].sha256 is invalid`);
     }
+    const persistedPath = requiredRunRecordString(
+      artifact.path,
+      `Run artifact[${index}].path`,
+    );
+    const { canonicalPath } = validateArtifactReferencePath(runId, persistedPath);
     return {
       name,
       logicalName,
       attempt,
-      path: requiredRunRecordString(artifact.path, `Run artifact[${index}].path`),
+      path: canonicalPath,
       sha256: digest,
       createdAt: artifact.createdAt === undefined
         ? now()
@@ -422,11 +437,22 @@ export class FileRunStore implements RunStore {
     return path.join(this.runDirectory(runId), ".admin.lock");
   }
 
+  private async requireOrdinaryRunNamespace(runId: string): Promise<void> {
+    await requireOrdinaryDirectory(path.dirname(this.root), "MASWE state namespace");
+    await requireOrdinaryDirectory(this.root, "run store namespace");
+    await requireOrdinaryDirectory(this.runDirectory(runId), "run record namespace");
+  }
+
+  private async requireOrdinaryArtifactNamespace(runId: string): Promise<string> {
+    await this.requireOrdinaryRunNamespace(runId);
+    const artifactDirectory = path.join(this.runDirectory(runId), "artifacts");
+    await requireOrdinaryDirectory(artifactDirectory, "run artifact namespace");
+    return artifactDirectory;
+  }
+
   private async readRunFile(runId: string): Promise<RunRecord> {
     try {
-      await requireOrdinaryDirectory(path.dirname(this.root), "MASWE state namespace");
-      await requireOrdinaryDirectory(this.root, "run store namespace");
-      await requireOrdinaryDirectory(this.runDirectory(runId), "run record namespace");
+      await this.requireOrdinaryRunNamespace(runId);
       const raw = await readBoundedOrdinaryFile(
         this.runFile(runId),
         "run record",
@@ -488,6 +514,73 @@ export class FileRunStore implements RunStore {
       return observedContent === prepared.content ? observed : undefined;
     } catch {
       return undefined;
+    }
+  }
+
+  /**
+   * Same-invocation recovery for artifact DurableAtomicWriteOutcomeUnknownError.
+   * Provenance is limited to this write: exact path, redacted bytes, and digest.
+   * Foreign/mismatched targets are never adopted, overwritten, or blindly deleted.
+   */
+  private async confirmUncertainArtifactPublication(
+    runId: string,
+    absolutePath: string,
+    expectedContent: string,
+    expectedDigest: string,
+    publicationError: DurableAtomicWriteOutcomeUnknownError,
+  ): Promise<void> {
+    let recovered: string;
+    try {
+      await this.requireOrdinaryArtifactNamespace(runId);
+      recovered = await readBoundedOrdinaryFile(
+        absolutePath,
+        "run artifact",
+        MAX_AUTHORITATIVE_FILE_BYTES,
+      );
+      await this.requireOrdinaryArtifactNamespace(runId);
+    } catch (verifyError) {
+      throw new AggregateError(
+        [publicationError, verifyError],
+        `Run ${runId} artifact publication outcome is unknown and the published target could not be verified`,
+        { cause: publicationError },
+      );
+    }
+
+    const recoveredDigest = sha256(recovered);
+    if (recovered !== expectedContent || recoveredDigest !== expectedDigest) {
+      throw new AggregateError(
+        [
+          publicationError,
+          new Error(
+            `Run ${runId} artifact publication outcome is unknown and the published target content/digest mismatch`,
+          ),
+        ],
+        `Run ${runId} artifact publication outcome is unknown and the published target content/digest mismatch`,
+        { cause: publicationError },
+      );
+    }
+
+    try {
+      await syncDurableDirectory(path.dirname(absolutePath), this.durableOptions);
+    } catch (resyncError) {
+      try {
+        await removeDurableFile(
+          absolutePath,
+          "orphaned run artifact",
+          this.durableOptions,
+        );
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [publicationError, resyncError, cleanupError],
+          `Run ${runId} artifact publication outcome unknown, durability reconfirmation failed, and durable cleanup also failed`,
+          { cause: publicationError },
+        );
+      }
+      throw new AggregateError(
+        [publicationError, resyncError],
+        `Run ${runId} artifact publication outcome unknown and durability could not be reconfirmed`,
+        { cause: publicationError },
+      );
     }
   }
 
@@ -869,6 +962,15 @@ export class FileRunStore implements RunStore {
   }
 
   async writeArtifact(run: RunRecord, name: string, content: string): Promise<ArtifactReference> {
+    assertSafeRunId(run.id);
+    const redacted = redactSecrets(content);
+    const persistedBytes = Buffer.byteLength(redacted, "utf8");
+    if (persistedBytes > MAX_AUTHORITATIVE_FILE_BYTES) {
+      throw new Error(
+        `Run artifact exceeds the authoritative file byte limit of ${MAX_AUTHORITATIVE_FILE_BYTES} bytes`,
+      );
+    }
+
     return this.withLock(run.id, async () => {
       const onDisk = await this.readRunFile(run.id);
       if (onDisk.version !== run.version) {
@@ -881,10 +983,25 @@ export class FileRunStore implements RunStore {
       const logicalName = name.replace(/[^a-zA-Z0-9._-]/g, "-");
       const priorAttempts = next.artifacts.filter((artifact) => artifact.logicalName === logicalName);
       const attempt = priorAttempts.reduce((max, artifact) => Math.max(max, artifact.attempt), 0) + 1;
-      const fileName = `${logicalName.replace(/\.md$/i, "")}.attempt-${attempt}.md`;
-      const relativePath = path.join(".maswe", "runs", run.id, "artifacts", fileName);
-      const absolutePath = path.join(this.cwd, relativePath);
-      const redacted = redactSecrets(content);
+      const candidateFileName = `${logicalName.replace(/\.md$/i, "")}.attempt-${attempt}.md`;
+      const fileName = generatedArtifactFileName(candidateFileName);
+      const relativePath = canonicalArtifactReferencePath(run.id, fileName);
+      const absolutePath = path.join(this.root, run.id, "artifacts", fileName);
+
+      const conflictingOwner = next.artifacts.find(
+        (artifact) => artifact.path === relativePath && artifact.logicalName !== logicalName,
+      );
+      if (conflictingOwner) {
+        throw new Error(
+          `Artifact physical path ${relativePath} is already owned by logical artifact ${conflictingOwner.logicalName}`,
+        );
+      }
+      try {
+        await lstat(absolutePath);
+        throw new Error(`Artifact physical path ${relativePath} already exists`);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
 
       const reference: ArtifactReference = {
         name: logicalName,
@@ -910,12 +1027,23 @@ export class FileRunStore implements RunStore {
       // The authoritative record capacity is known before artifact publication, so a
       // deterministic record overflow cannot leave an orphaned artifact behind.
       const prepared = this.prepareRunRecord(next);
-      await writeDurableAtomic(
-        absolutePath,
-        redacted,
-        "run artifact",
-        this.durableOptions,
-      );
+      try {
+        await writeDurableAtomic(
+          absolutePath,
+          redacted,
+          "run artifact",
+          this.durableOptions,
+        );
+      } catch (error) {
+        if (!(error instanceof DurableAtomicWriteOutcomeUnknownError)) throw error;
+        await this.confirmUncertainArtifactPublication(
+          run.id,
+          absolutePath,
+          redacted,
+          reference.sha256,
+          error,
+        );
+      }
       try {
         await this.writePreparedRunRecord(prepared);
         this.adoptArtifactPublication(run, prepared.record);
@@ -923,6 +1051,20 @@ export class FileRunStore implements RunStore {
         if (error instanceof DurableAtomicWriteOutcomeUnknownError) {
           const observed = await this.matchingCanonicalRecord(prepared);
           if (observed) this.adoptArtifactPublication(run, observed);
+        } else {
+          try {
+            await removeDurableFile(
+              absolutePath,
+              "orphaned run artifact",
+              this.durableOptions,
+            );
+          } catch (cleanupError) {
+            throw new AggregateError(
+              [error, cleanupError],
+              `Run ${run.id} artifact record publication and durable cleanup both failed`,
+              { cause: error },
+            );
+          }
         }
         throw error;
       }
@@ -936,7 +1078,14 @@ export class FileRunStore implements RunStore {
       run.artifacts.find((artifact) => artifact.name === name) ??
       run.artifacts.find((artifact) => artifact.logicalName === name && artifact.name === name);
     if (!reference) return undefined;
-    const content = await readFile(path.join(this.cwd, reference.path), "utf8");
+    const { fileName } = validateArtifactReferencePath(run.id, reference.path);
+    const artifactDirectory = await this.requireOrdinaryArtifactNamespace(run.id);
+    const content = await readBoundedOrdinaryFile(
+      path.join(artifactDirectory, fileName),
+      "run artifact",
+      MAX_AUTHORITATIVE_FILE_BYTES,
+    );
+    await this.requireOrdinaryArtifactNamespace(run.id);
     const digest = sha256(content);
     if (digest !== reference.sha256) {
       throw new Error(

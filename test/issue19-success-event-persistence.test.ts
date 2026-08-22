@@ -95,8 +95,8 @@ class HostileSuccessfulRuntime implements AgentRuntime {
     return {
       status: "finished",
       output: `safe ${request.role} output\n${marker}\n`,
-      requestedModel: HOSTILE_MODEL_DISPLAY,
-      actualModel: HOSTILE_MODEL_DISPLAY,
+      requestedModel: request.roleConfig.model,
+      actualModel: request.roleConfig.model,
       agentId: HOSTILE_AGENT_DISPLAY,
       runId: HOSTILE_RUN_DISPLAY,
     };
@@ -148,16 +148,8 @@ function assertSafeIdentityEvents(run: {
     const matching = run.events.filter((event) => event.type === eventType);
     assert.ok(matching.length > 0, `${eventType} must be exercised`);
     for (const event of matching) {
-      assertSafeDisplay(
-        event.details?.requestedModel,
-        "safe-model-prefix",
-        "safe-model-suffix",
-      );
-      assertSafeDisplay(
-        event.details?.actualModel,
-        "safe-model-prefix",
-        "safe-model-suffix",
-      );
+      assert.equal(event.details?.requestedModel, SAFE_EXECUTION_MODEL);
+      assert.equal(event.details?.actualModel, SAFE_EXECUTION_MODEL);
       assertSafeDisplay(
         event.details?.agentId,
         "safe-agent-prefix",

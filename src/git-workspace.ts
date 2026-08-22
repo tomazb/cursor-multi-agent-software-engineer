@@ -37,18 +37,37 @@ export function assertSafeRunId(runId: string): void {
 }
 
 function matchGlob(filePath: string, glob: string): boolean {
-  if (glob === "**" || glob === "**/*") return true;
-  const escaped = glob
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*\*/g, "{{GLOBSTAR}}")
-    .replace(/\*/g, "[^/]*")
-    .replace(/{{GLOBSTAR}}/g, ".*");
-  return new RegExp(`^${escaped}$`).test(filePath);
+  const normalizedGlob = glob.replace(/\\/g, "/");
+  if (normalizedGlob === "**" || normalizedGlob === "**/*") return true;
+
+  let source = "";
+  for (let index = 0; index < normalizedGlob.length; index += 1) {
+    const token = normalizedGlob.charAt(index);
+    if (token === "*") {
+      if (normalizedGlob[index + 1] === "*") {
+        if (normalizedGlob[index + 2] === "/") {
+          source += "(?:[\\s\\S]*/)?";
+          index += 2;
+        } else {
+          source += "[\\s\\S]*";
+          index += 1;
+        }
+      } else {
+        source += "[^/]*";
+      }
+    } else if (token === "?") {
+      source += "[^/]";
+    } else if (".+^${}()|[]\\".includes(token)) {
+      source += `\\${token}`;
+    } else {
+      source += token;
+    }
+  }
+  return new RegExp(`^${source}$`).test(filePath);
 }
 
 export function pathAllowed(filePath: string, globs: string[]): boolean {
-  const normalized = filePath.replace(/\\/g, "/");
-  return globs.some((glob) => matchGlob(normalized, glob.replace(/\\/g, "/")));
+  return globs.some((glob) => matchGlob(filePath, glob));
 }
 
 export function externalWorktreePath(repositoryPath: string, runId: string): string {

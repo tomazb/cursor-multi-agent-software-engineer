@@ -8,6 +8,14 @@ The project follows semantic versioning once a public release process is establi
 
 ### Added
 
+- Issue #29 policy boundaries: enforced fixed role-permission matrix, policy-classified runtime
+  identity mismatch, orchestrator-owned read-only fingerprint and exact-HEAD fence around both
+  runtime returns and throws, and direct policy propagation outside fallback aggregation.
+- Strict CLI grammar coverage for declared long options, duplicate/empty-value rejection, global
+  option placement, and equals-form dash-prefixed string values; portable path-glob semantics;
+  valid empty quality-command lists with blank entries rejected; single-pass prompt rendering; and
+  direct-child, no-follow bounded artifact reads with digest revalidation.
+
 - GitHub App Phase A read-only pilot (`src/github/`): webhook signature verification,
   `X-GitHub-Delivery` deduplication, event normalization, PR/run association, SHA-bound check
   publishing for four MASWE checks, installation suspension, and CLI commands
