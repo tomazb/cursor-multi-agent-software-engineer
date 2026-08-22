@@ -19,11 +19,16 @@ Artifacts are the durable handoff protocol between roles. A later API or databas
   schema-version-1 physical names remain valid. Absolute paths, nested paths, separator tricks,
   and other non-portable physical filenames are rejected; historical `\\` separators are
   normalized to `/` before validation.
-- Artifact reads require every namespace ancestor to be an ordinary directory, require an ordinary
-  final file opened with no-follow support, read at most 1 MiB, recheck the namespace after the
-  bounded read, then recompute and compare the recorded SHA-256 digest. Lack of no-follow support
-  fails closed. The trusted-local-user boundary does not claim to prevent every concurrent
-  same-user ancestor-replacement race between filesystem operations.
+- Artifact publication redacts content first, then measures the exact UTF-8 bytes that would be
+  stored. Post-redaction content above the shared 1 MiB authoritative-file bound is rejected before
+  artifact-file or run-record publication; content at exactly 1 MiB is allowed. Artifact reads use
+  the same 1 MiB bound, so an artifact accepted by the writer cannot later be rejected solely for
+  exceeding it. Reads still require every namespace ancestor to be an ordinary directory, require
+  an ordinary final file opened with no-follow support, recheck the namespace after the bounded
+  read, then recompute and compare the recorded SHA-256 digest. This independent read-side check
+  protects against tampering, historical malformed data, filesystem replacement, and bypassed
+  writers. Lack of no-follow support fails closed. The trusted-local-user boundary does not claim
+  to prevent every concurrent same-user ancestor-replacement race between filesystem operations.
 - Agents must not rely on prior chat messages that are absent from the supplied prompt.
 - Model output cannot authorize a transition unless the orchestrator recognizes the required terminal marker after structured response decoding: exactly one bare marker token on the final logical line of the authoritative assistant text (no backticks, quotes, earlier mentions, duplicates, or conflicting markers).
 - For Cursor CLI `json` / `stream-json` modes, marker validation runs only on the decoded authoritative `result` string. Transport JSON quoting is not treated as embedded model content. Malformed envelopes, unsupported shapes, and missing `result` fields fail closed before marker validation.

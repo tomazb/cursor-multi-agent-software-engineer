@@ -910,6 +910,12 @@ export class FileRunStore implements RunStore {
       const relativePath = canonicalArtifactReferencePath(run.id, fileName);
       const absolutePath = path.join(this.root, run.id, "artifacts", fileName);
       const redacted = redactSecrets(content);
+      const persistedBytes = Buffer.byteLength(redacted, "utf8");
+      if (persistedBytes > MAX_AUTHORITATIVE_FILE_BYTES) {
+        throw new Error(
+          `Run artifact exceeds the authoritative file byte limit of ${MAX_AUTHORITATIVE_FILE_BYTES} bytes`,
+        );
+      }
 
       const conflictingOwner = next.artifacts.find(
         (artifact) => artifact.path === relativePath && artifact.logicalName !== logicalName,

@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rename,
   rm,
   symlink,
@@ -37,6 +39,15 @@ const INVALID_PORTABLE_FILE_NAMES = [
   "question?.md",
   "pipe|name.md",
 ] as const;
+
+async function directoryContentsOrMissing(directory: string): Promise<string[] | undefined> {
+  try {
+    return (await readdir(directory)).sort();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
 
 async function runFixture(t: test.TestContext, prefix: string) {
   const cwd = await mkdtemp(path.join(os.tmpdir(), prefix));
@@ -208,6 +219,103 @@ test("a valid direct artifact still round-trips with digest verification", async
   const { store, run } = await runFixture(t, "maswe-artifact-roundtrip-");
 
   assert.equal(await store.readArtifact(run, "note.md"), TRUSTED_ARTIFACT);
+});
+
+test("writeArtifact rejects ASCII content larger than the authoritative-file bound", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-artifact-write-oversized-ascii-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("artifact size", "test", DEFAULT_CONFIG);
+
+  await assert.rejects(
+    store.writeArtifact(
+      run,
+      "oversized.md",
+      "x".repeat(MAX_AUTHORITATIVE_FILE_BYTES + 1),
+    ),
+    /artifact.*exceeds.*authoritative.*byte limit/i,
+  );
+});
+
+test("writeArtifact accepts and readArtifact verifies the exact authoritative-file bound", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-artifact-write-exact-bound-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("artifact size", "test", DEFAULT_CONFIG);
+  const content = "x".repeat(MAX_AUTHORITATIVE_FILE_BYTES);
+
+  const reference = await store.writeArtifact(run, "exact-boundary.md", content);
+
+  assert.equal(reference.attempt, 1);
+  assert.equal(reference.sha256, createHash("sha256").update(content).digest("hex"));
+  assert.equal(await store.readArtifact(run, "exact-boundary.md"), content);
+});
+
+test("writeArtifact enforces the authoritative-file bound in UTF-8 bytes", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-artifact-write-multibyte-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("artifact size", "test", DEFAULT_CONFIG);
+  const content = "é".repeat(MAX_AUTHORITATIVE_FILE_BYTES / 2 + 1);
+  assert.ok(content.length <= MAX_AUTHORITATIVE_FILE_BYTES);
+  assert.ok(Buffer.byteLength(content, "utf8") > MAX_AUTHORITATIVE_FILE_BYTES);
+
+  await assert.rejects(
+    store.writeArtifact(run, "multibyte.md", content),
+    /artifact.*exceeds.*authoritative.*byte limit/i,
+  );
+});
+
+test("writeArtifact applies the authoritative-file bound after redaction", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-artifact-write-redacted-bound-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("artifact size", "test", DEFAULT_CONFIG);
+  const content = [
+    "-----BEGIN PRIVATE KEY-----",
+    "x".repeat(MAX_AUTHORITATIVE_FILE_BYTES),
+    "-----END PRIVATE KEY-----",
+  ].join("\n");
+  assert.ok(Buffer.byteLength(content, "utf8") > MAX_AUTHORITATIVE_FILE_BYTES);
+
+  const reference = await store.writeArtifact(run, "redacted-boundary.md", content);
+
+  assert.equal(reference.attempt, 1);
+  assert.equal(
+    await store.readArtifact(run, "redacted-boundary.md"),
+    "-----BEGIN PRIVATE KEY-----\n[REDACTED]\n-----END PRIVATE KEY-----",
+  );
+});
+
+test("oversized artifact rejection is publication-atomic and preserves the next attempt", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-artifact-write-atomic-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("artifact size", "test", DEFAULT_CONFIG);
+  const runPath = path.join(store.root, run.id, "run.json");
+  const artifactDirectory = path.join(store.root, run.id, "artifacts");
+  const runSnapshot = structuredClone(run);
+  const persistedSnapshot = await readFile(runPath, "utf8");
+  const directorySnapshot = await directoryContentsOrMissing(artifactDirectory);
+  const oversized = `DO-NOT-ECHO-ARTIFACT-CONTENT\n${"x".repeat(MAX_AUTHORITATIVE_FILE_BYTES)}`;
+
+  await assert.rejects(
+    store.writeArtifact(run, "handoff.md", oversized),
+    (error: Error) => {
+      assert.match(error.message, /artifact.*exceeds.*authoritative.*byte limit/i);
+      assert.doesNotMatch(error.message, /DO-NOT-ECHO-ARTIFACT-CONTENT/);
+      return true;
+    },
+  );
+
+  assert.deepEqual(run, runSnapshot);
+  assert.deepEqual(await store.load(run.id), runSnapshot);
+  assert.equal(await readFile(runPath, "utf8"), persistedSnapshot);
+  assert.deepEqual(await directoryContentsOrMissing(artifactDirectory), directorySnapshot);
+
+  const reference = await store.writeArtifact(run, "handoff.md", "valid handoff");
+  assert.equal(reference.attempt, 1);
+  assert.equal(await store.readArtifact(run, "handoff.md"), "valid handoff");
 });
 
 test("readArtifact rejects a symlinked artifact directory", async (t) => {
